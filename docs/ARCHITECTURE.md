@@ -64,6 +64,16 @@ pub trait TouchSource {
 - `EvdevGeneric`: stub in Phase 1 (returns tier + `unimplemented` poll with
   a clear error, plus mock path for tests). Full impl Phase 2.
 
+### Phase-1 note (apple-parse): adopted tiers + `pressure_units()`
+
+`CapabilityTier` uses the `docs/RESEARCH.md` §4 split
+(`L0/L1a/L1b/L2s/L2p`), and `TouchSource` gains
+`fn pressure_units() -> PressureUnits` (`Arbitrary` vs `Grams`) so the
+L1a/L1b distinction is machine-checked. Apple MT2 reports
+`tier() == L2p` (proprietary device-autonomous pad) with
+`pressure_units() == Arbitrary`: pressure @ offset 7 is a nominal 0..253
+byte with `res == 0` — never grams/newtons, never `EV_FF`/`FF_HAPTIC`.
+
 ## Click state machine (spec)
 
 - Per-finger pressure vs `sensitivity` (press) / `sensitivity - margin` (release hysteresis).
