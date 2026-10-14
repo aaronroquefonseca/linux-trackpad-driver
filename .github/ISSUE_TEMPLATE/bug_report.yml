@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a problem with device init, reconnect, clicks, or packaging.
+title: "[bug]: "
+labels: [bug]
+body:
+  - type: input
+    id: ltd-version
+    attributes:
+      label: "ltd version"
+      description: Output of `ltd --version` (or commit SHA if built from source).
+      placeholder: "ltd 0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: vid-pid
+    attributes:
+      label: Device VID:PID and connection
+      description: e.g. `05ac:0265` over USB, or `004c:0324` over Bluetooth.
+      placeholder: "05ac:0265 over USB"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distro
+      description: e.g. Ubuntu 24.04, Fedora 41, Arch.
+      placeholder: "Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -r`.
+      placeholder: "6.8.0-52-generic"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal commands starting from a known state.
+      placeholder: |
+        1. sudo ltd run
+        2. suspend, resume
+        3. cursor frozen
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Run with `RUST_LOG=debug`, and include `journalctl -u linux-trackpad-driver`
+        output for service issues. Redact hostnames if you wish.
+      render: shell
+      placeholder: |
+        RUST_LOG=debug sudo ltd run ...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: Contents of your `config.toml` if non-default (or "default").
+      render: toml
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submit checklist
+      options:
+        - label: I searched existing issues for duplicates.
+          required: true
+        - label: I included full logs, not just the last line.
+          required: true
