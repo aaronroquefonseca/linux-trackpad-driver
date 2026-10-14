@@ -35,6 +35,7 @@ jobs:
         run: |
           while read -r src _; do
             case "$src" in ''|\#*) continue;; esac
+            case "$src" in target/*) continue;; esac
             test -e "$src" || { echo "missing install source: $src"; exit 1; }
           done < debian/linux-trackpad-driver.install
       - name: changelog + control syntax
