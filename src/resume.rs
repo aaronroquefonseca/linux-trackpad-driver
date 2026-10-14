@@ -36,6 +36,10 @@ pub const RESUME_REVERIFY_INTERVAL_SECS: u64 = 30;
 /// Bounded post-resume wait per node: the node normally survives suspend, so
 /// a short defer suffices and the daemon loop / hook never stalls on it.
 pub const RESUME_READY_TIMEOUT_MS: u64 = 1000;
+/// Ticks between reprobes of a node whose `GET_FEATURE` stays unreadable.
+/// Some firmware NAKs reads forever; without a cooldown every tick would
+/// send a full 3-report re-init + `Ready` for zero new information.
+pub const UNREADABLE_RETRY_EVERY_TICKS: u32 = 20;
 
 /// Outcome of one resume pass for one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,8 +58,31 @@ pub enum ResumeAction {
 /// Pure decision: only a matching read-back skips re-init. A mismatch means
 /// the dropout regression (or a mode switch) and an unreadable verify means
 /// we cannot prove multitouch is armed — both re-init (idempotent, safe).
+/// Callers layer the [`unreadable_disposition`] cooldown on top so a
+/// permanently-unreadable node does not re-init every tick.
 pub fn needs_reinit(verify: &Result<bool>) -> bool {
     !matches!(verify, Ok(true))
+}
+
+/// Cooldown verdict for a consecutively-unreadable node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableDisposition {
+    /// Send the re-init now.
+    ReinitNow,
+    /// Assume armed; send nothing this pass.
+    Suppress,
+}
+
+/// Pure cooldown: the first unreadable re-inits (assume transient), further
+/// consecutive unreadables suppress until every [`UNREADABLE_RETRY_EVERY_TICKS`]
+/// reprobe. `prior_streak` counts consecutive unreadables *before* this pass;
+/// a matching read-back resets it (caller-owned).
+pub fn unreadable_disposition(prior_streak: u32) -> UnreadableDisposition {
+    if prior_streak == 0 || (prior_streak + 1).is_multiple_of(UNREADABLE_RETRY_EVERY_TICKS) {
+        UnreadableDisposition::ReinitNow
+    } else {
+        UnreadableDisposition::Suppress
+    }
 }
 
 /// Expected polling report bytes for a requested rate (pure, unit-tested).
@@ -72,14 +99,20 @@ pub fn verify_node_polling(devnode: &str, polling_hz: u32) -> Result<bool> {
     init::verify_report(devnode, &expected)
 }
 
-/// Resume one USB node: bounded wait, verify, multitouch-first re-init on
-/// mismatch. `ready_hub` is `Some` on the daemon tick (live listeners:
-/// `Ready` re-attaches clicks) and `None` in the one-shot (hardware-only).
+/// Resume one USB node: bounded wait, then verify-or-reinit on the caller's
+/// `first_verify` — the tick and the one-shot read `GET_FEATURE` once per
+/// pass and thread it in, so the steady state costs exactly one read per
+/// node (the re-init path does its own inner verify, which is new
+/// information, not a duplicate).
+///
+/// `ready_hub` is `Some` on the daemon tick (live listeners: `Ready`
+/// re-attaches clicks) and `None` in the one-shot (hardware-only).
 /// Missing node → `Detached` (emitted only with a live hub).
 pub fn resume_usb_node(
     devnode: &str,
     polling_hz: u32,
     ready_hub: Option<&DeviceReadyHub>,
+    first_verify: &Result<bool>,
 ) -> Result<ResumeAction> {
     let (node, bound) = discovery::wait_for_ready(devnode, RESUME_READY_TIMEOUT_MS);
     if !node {
@@ -90,38 +123,36 @@ pub fn resume_usb_node(
         return Ok(ResumeAction::Detached);
     }
     if !bound {
-        log::debug!("resume: node {devnode} present, bind not yet visible; verify will cover it");
+        log::debug!("resume: node {devnode} present, bind not yet visible; re-init covers it");
     }
-    match verify_node_polling(devnode, polling_hz) {
-        Ok(true) => {
-            log::debug!("resume: {devnode} polling read-back matches; no re-init needed");
-            Ok(ResumeAction::UpToDate)
-        }
-        other => {
-            if other.is_err() {
-                log::warn!("resume: {devnode} verify unreadable; re-initing anyway");
-            } else {
-                log::warn!("resume: {devnode} polling mismatch (dropout?); re-sending from multitouch enable");
-            }
-            let sender = init::HidrawSender {
-                devnode: devnode.to_string(),
-            };
-            let verifier = init::HidrawVerifier {
-                devnode: devnode.to_string(),
-            };
-            let iface = discovery::interface_number_for_node(devnode);
-            let outcome = init::resume_usb_verified(&sender, &verifier, polling_hz, iface)?;
-            log::info!(
-                "resume: {devnode} re-init accepted (iface {:?}, polling [99 F2 {:02X}])",
-                outcome.iface,
-                outcome.plan.x,
-            );
-            if let Some(hub) = ready_hub {
-                hub.emit(&init::usb_ready(devnode));
-            }
-            Ok(ResumeAction::Reinitialized)
-        }
+    if !needs_reinit(first_verify) {
+        log::debug!("resume: {devnode} polling read-back matches; no re-init needed");
+        return Ok(ResumeAction::UpToDate);
     }
+    if first_verify.is_err() {
+        log::warn!("resume: {devnode} verify unreadable; re-initing anyway");
+    } else {
+        log::warn!(
+            "resume: {devnode} polling mismatch (dropout?); re-sending from multitouch enable"
+        );
+    }
+    let sender = init::HidrawSender {
+        devnode: devnode.to_string(),
+    };
+    let verifier = init::HidrawVerifier {
+        devnode: devnode.to_string(),
+    };
+    let iface = discovery::interface_number_for_node(devnode);
+    let outcome = init::resume_usb_verified(&sender, &verifier, polling_hz, iface)?;
+    log::info!(
+        "resume: {devnode} re-init accepted (iface {:?}, polling [99 F2 {:02X}])",
+        outcome.iface,
+        outcome.plan.x,
+    );
+    if let Some(hub) = ready_hub {
+        hub.emit(&init::usb_ready(devnode));
+    }
+    Ok(ResumeAction::Reinitialized)
 }
 
 /// Resume one BT node (one-shot hardware arm): no `GET_FEATURE` verify exists
@@ -180,7 +211,10 @@ pub fn run_resume_scan(
     let mut report = ResumeReport::default();
     for dev in devs {
         let outcome = match dev.transport {
-            Transport::Usb => resume_usb_node(&dev.devnode, polling_hz, None),
+            Transport::Usb => {
+                let first_verify = verify_node_polling(&dev.devnode, polling_hz);
+                resume_usb_node(&dev.devnode, polling_hz, None, &first_verify)
+            }
             Transport::Bluetooth => Ok(resume_bt_node(&dev.devnode, enhanced_clicks)),
         };
         match outcome {
@@ -254,16 +288,36 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_cooldown_reinits_once_then_suppresses() {
+        use UnreadableDisposition::{ReinitNow, Suppress};
+        // First sighting re-inits (assume transient).
+        assert_eq!(unreadable_disposition(0), ReinitNow);
+        // Then suppress until the periodic reprobe.
+        for streak in 1..UNREADABLE_RETRY_EVERY_TICKS - 1 {
+            assert_eq!(unreadable_disposition(streak), Suppress, "streak {streak}");
+        }
+        assert_eq!(
+            unreadable_disposition(UNREADABLE_RETRY_EVERY_TICKS - 1),
+            ReinitNow
+        );
+        assert_eq!(
+            unreadable_disposition(UNREADABLE_RETRY_EVERY_TICKS),
+            Suppress
+        );
+    }
+
+    #[test]
     fn missing_usb_node_records_detached_never_ready() {
         // One-shot (no hub): recorded only. Tick (live hub): single Detached
         // emit for clicks release.
-        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, None).unwrap();
+        let gone: Result<bool> = Err(anyhow::anyhow!("no node"));
+        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, None, &gone).unwrap();
         assert_eq!(action, ResumeAction::Detached);
         let hub = DeviceReadyHub::new();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = std::sync::Arc::clone(&seen);
         hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
-        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, Some(&hub)).unwrap();
+        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, Some(&hub), &gone).unwrap();
         assert_eq!(action, ResumeAction::Detached);
         let seen = seen.lock().expect("seen lock");
         assert_eq!(seen.len(), 1);

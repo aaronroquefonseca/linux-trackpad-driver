@@ -413,7 +413,6 @@ pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeR
         cfg.enhanced_clicks,
     ))
 }
-
 /// One daemon tick action, for logs/tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TickAction {
@@ -423,16 +422,25 @@ pub enum TickAction {
     Reinitialized(String),
     /// Known USB node still armed; nothing sent.
     UpToDate(String),
+    /// Known USB node unreadable several passes running; assuming armed,
+    /// nothing sent (reprobe every [`resume::UNREADABLE_RETRY_EVERY_TICKS`]).
+    AssumedArmed(String),
     /// Node vanished → `Detached` emitted (remove path).
     Detached(String),
 }
 
 /// Daemon-side resume/add/change/remove watch. Owns the last-seen device
-/// list; each [`ResumeWatch::tick`] diffs a fresh scan against it:
+/// list plus per-node unreadable streaks; each [`ResumeWatch::tick`] diffs a
+/// fresh scan against it:
 ///
 /// - added node → full [`init_node_with_config`] (same ordering as boot init);
-/// - still-present known USB node → `GET_FEATURE` re-verify, multitouch-first
-///   re-init on mismatch via [`resume::resume_usb_node`];
+/// - still-present known USB node → one `GET_FEATURE` re-verify, threaded
+///   into [`resume::resume_usb_node`] (no double read); multitouch-first
+///   re-init on mismatch, [`resume::needs_reinit`] as the decision;
+/// - still-present known USB node with a consecutively-unreadable verify →
+///   re-init once (assume transient), then assume armed until the periodic
+///   reprobe ([`resume::unreadable_disposition`]) — firmware that NAKs reads
+///   must not cause a re-init + `Ready` storm every pass;
 /// - still-present known BT node → nothing (no verify exists; the hook +
 ///   add events cover it; re-emitting `Ready` every pass would spam clicks);
 /// - vanished node → `Detached` emit so clicks releases it.
@@ -440,13 +448,24 @@ pub enum TickAction {
 /// Hub emits happen after each node's init step, never before — clicks
 /// re-attaches without reordering init.
 pub struct ResumeWatch {
-    known: Vec<DiscoveredDevice>,
+    known: Vec<NodeState>,
+}
+
+struct NodeState {
+    dev: DiscoveredDevice,
+    unreadable_streak: u32,
 }
 
 impl ResumeWatch {
     pub fn new(initial: &[DiscoveredDevice]) -> Self {
         Self {
-            known: initial.to_vec(),
+            known: initial
+                .iter()
+                .map(|dev| NodeState {
+                    dev: dev.clone(),
+                    unreadable_streak: 0,
+                })
+                .collect(),
         }
     }
 
@@ -460,63 +479,101 @@ impl ResumeWatch {
         };
         let mut actions = Vec::new();
         for dev in &current {
-            if self.known.iter().any(|k| k.devnode == dev.devnode) {
-                if dev.transport == Transport::Usb {
-                    match resume::verify_node_polling(&dev.devnode, cfg.polling_rate) {
-                        Ok(true) => actions.push(TickAction::UpToDate(dev.devnode.clone())),
-                        other => {
-                            if other.is_err() {
-                                log::warn!(
-                                    "resume tick: {} verify unreadable; re-initing",
-                                    dev.devnode
-                                );
-                            }
-                            match resume::resume_usb_node(
-                                &dev.devnode,
-                                cfg.polling_rate,
-                                Some(ready_hub),
-                            ) {
-                                Ok(resume::ResumeAction::Reinitialized) => {
-                                    actions.push(TickAction::Reinitialized(dev.devnode.clone()))
-                                }
-                                Ok(resume::ResumeAction::Detached) => {
-                                    actions.push(TickAction::Detached(dev.devnode.clone()))
-                                }
-                                Ok(resume::ResumeAction::UpToDate) => {
-                                    actions.push(TickAction::UpToDate(dev.devnode.clone()))
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "resume tick: re-init failed for {}: {e:#}",
-                                        dev.devnode
-                                    );
-                                }
-                            }
-                        }
+            let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
+                match init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, ready_hub) {
+                    Ok(_) => {
+                        log::info!("resume tick: initialized newly appeared {}", dev.devnode);
+                        actions.push(TickAction::Initialized(dev.devnode.clone()));
                     }
+                    Err(e) => log::error!(
+                        "resume tick: init failed for newly appeared {}: {e:#}",
+                        dev.devnode
+                    ),
                 }
+                continue;
+            };
+            if dev.transport != Transport::Usb {
                 // Known BT: steady state, no hub traffic.
                 continue;
             }
-            match init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, ready_hub) {
-                Ok(_) => {
-                    log::info!("resume tick: initialized newly appeared {}", dev.devnode);
-                    actions.push(TickAction::Initialized(dev.devnode.clone()));
+            let verify = resume::verify_node_polling(&dev.devnode, cfg.polling_rate);
+            if !resume::needs_reinit(&verify) {
+                self.known[pos].unreadable_streak = 0;
+                actions.push(TickAction::UpToDate(dev.devnode.clone()));
+                continue;
+            }
+            if verify.is_err() {
+                let prior = self.known[pos].unreadable_streak;
+                self.known[pos].unreadable_streak = prior + 1;
+                match resume::unreadable_disposition(prior) {
+                    resume::UnreadableDisposition::Suppress => {
+                        if prior == 1 {
+                            log::warn!(
+                                "resume tick: {} verify unreadable again; assuming armed, suppressing re-init (reprobe every {} ticks)",
+                                dev.devnode,
+                                resume::UNREADABLE_RETRY_EVERY_TICKS,
+                            );
+                        } else {
+                            log::debug!(
+                                "resume tick: {} still unreadable (streak {}); assuming armed",
+                                dev.devnode,
+                                prior + 1,
+                            );
+                        }
+                        actions.push(TickAction::AssumedArmed(dev.devnode.clone()));
+                        continue;
+                    }
+                    resume::UnreadableDisposition::ReinitNow => {
+                        log::warn!(
+                            "resume tick: {} verify unreadable; re-initing anyway",
+                            dev.devnode
+                        );
+                    }
                 }
-                Err(e) => log::error!(
-                    "resume tick: init failed for newly appeared {}: {e:#}",
-                    dev.devnode
-                ),
+            } else {
+                self.known[pos].unreadable_streak = 0;
+            }
+            match resume::resume_usb_node(&dev.devnode, cfg.polling_rate, Some(ready_hub), &verify)
+            {
+                Ok(resume::ResumeAction::Reinitialized) => {
+                    actions.push(TickAction::Reinitialized(dev.devnode.clone()))
+                }
+                Ok(resume::ResumeAction::Detached) => {
+                    actions.push(TickAction::Detached(dev.devnode.clone()))
+                }
+                Ok(resume::ResumeAction::UpToDate) => {
+                    actions.push(TickAction::UpToDate(dev.devnode.clone()))
+                }
+                Err(e) => {
+                    log::error!("resume tick: re-init failed for {}: {e:#}", dev.devnode);
+                }
             }
         }
         for old in &self.known {
-            if !current.iter().any(|d| d.devnode == old.devnode) {
-                log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
-                ready_hub.emit(&init::detached(&old.devnode, old.transport));
-                actions.push(TickAction::Detached(old.devnode.clone()));
+            if !current.iter().any(|d| d.devnode == old.dev.devnode) {
+                log::info!(
+                    "resume tick: {} vanished; emitting Detached",
+                    old.dev.devnode
+                );
+                ready_hub.emit(&init::detached(&old.dev.devnode, old.dev.transport));
+                actions.push(TickAction::Detached(old.dev.devnode.clone()));
             }
         }
-        self.known = current;
+        // Rebuild from the fresh scan, preserving streaks of survivors.
+        self.known = current
+            .into_iter()
+            .map(|dev| {
+                let unreadable_streak = self
+                    .known
+                    .iter()
+                    .find(|k| k.dev.devnode == dev.devnode)
+                    .map_or(0, |k| k.unreadable_streak);
+                NodeState {
+                    dev,
+                    unreadable_streak,
+                }
+            })
+            .collect();
         actions
     }
 }
