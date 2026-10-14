@@ -12,10 +12,10 @@ coordinator verifies each claim in code. Merge gates: CI green, no unresolved L0
 
 | ID | Thread | Branch | Scope | Status |
 |----|--------|--------|-------|--------|
-| base-init | NEW T3 thread | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` + 500→cap clamp), BT single-node path, lock socket, `cargo fmt/clippy/test` green | DISPATCHED |
-| research-haptic | NEW T3 thread | docs only | Modern laptop haptic trackpads: vendors, HID usages, pressure/force exposure | DISPATCHED |
-| research-kernel | NEW T3 thread | docs only | Linux libinput/kernel hid/uinput/evdev status: what APIs expose pressure/force/haptics | DISPATCHED |
-| research-tiers | NEW T3 thread (or folded into above) | docs only | Validate L0/L1/L2 tier model against findings → `docs/RESEARCH.md` | DISPATCHED |
+| base-init | NEW T3 thread — ⚠️ NOT YET SPAWNED (no thread-spawn tool in this session; spawn manually with prompt below) | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` + 500→cap clamp), BT single-node path, lock socket, `cargo fmt/clippy/test` green | BLOCKED-ON-SPAWN |
+| research-haptic | DONE (subagent proxy — re-dispatch as NEW T3 thread if fuller depth needed) | docs only | Laptop haptic survey → `docs/RESEARCH.md` §2 | DONE |
+| research-kernel | DONE (subagent proxy) | docs only | libinput/kernel/uinput/evdev/systemd/suspend → `docs/RESEARCH.md` §3 | DONE |
+| research-tiers | DONE (merged by coordinator) | docs only | Tier correction adopted: L0/L1a/L1b/L2s/L2p → `docs/RESEARCH.md` §4 | DONE |
 
 Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-init; must inform Phase 1.
 
@@ -62,3 +62,7 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
 
 - 2026-10-14: coordinator boot; repo empty (`main`, no commits); wrote
   ROADMAP/ARCHITECTURE/TASKS; dispatched Phase-0 wave.
+- 2026-10-14: research wave DONE via subagent proxies (no T3-thread tool in
+  session). Findings merged to `docs/RESEARCH.md`. Tier correction adopted:
+  L0/L1a/L1b/L2s/L2p + `pressure_units()` contract. `base-init` still needs
+  manual NEW T3 thread spawn (prompt in file). Phase 1 stays queued behind it.
