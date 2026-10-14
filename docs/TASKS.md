@@ -12,10 +12,10 @@ coordinator verifies each claim in code. Merge gates: CI green, no unresolved L0
 
 | ID | Thread | Branch | Scope | Status |
 |----|--------|--------|-------|--------|
-| base-init | NEW T3 thread — ⚠️ NOT YET SPAWNED (no thread-spawn tool in this session; spawn manually with prompt below) | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` + 500→cap clamp), BT single-node path, lock socket, `cargo fmt/clippy/test` green | BLOCKED-ON-SPAWN |
-| research-haptic | DONE (subagent proxy — re-dispatch as NEW T3 thread if fuller depth needed) | docs only | Laptop haptic survey → `docs/RESEARCH.md` §2 | DONE |
-| research-kernel | DONE (subagent proxy) | docs only | libinput/kernel/uinput/evdev/systemd/suspend → `docs/RESEARCH.md` §3 | DONE |
-| research-tiers | DONE (merged by coordinator) | docs only | Tier correction adopted: L0/L1a/L1b/L2s/L2p → `docs/RESEARCH.md` §4 | DONE |
+| base-init | T3 `3ddd0a73` — branch `main`, worktree = project root, base `90b4c98` | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` + 500→cap clamp), BT single-node path, lock socket, `cargo fmt/clippy/test` green | RUNNING (turn started, handoff sha256 `121648e0…`) |
+| research-haptic | T3 `20ea67a8` (docs-only, no commit; report in-thread) | — | Laptop haptic deep survey; tier-split verdict | RUNNING (handoff `231007fa…`) |
+| research-kernel | T3 `33187ad9` (docs-only, no commit; report in-thread) | — | Input-stack deep survey; plan-element verdicts | RUNNING (handoff `830bcc30…`; note: turn receipt `sessionRevoked:false`, dispatch accepted HTTP 200 — monitor, no secret exposure) |
+| research-tiers | DONE — subagent proxies merged by coordinator | docs only | Tier correction adopted: L0/L1a/L1b/L2s/L2p → `docs/RESEARCH.md` §4 | DONE |
 
 Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-init; must inform Phase 1.
 
@@ -62,7 +62,9 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
 
 - 2026-10-14: coordinator boot; repo empty (`main`, no commits); wrote
   ROADMAP/ARCHITECTURE/TASKS; dispatched Phase-0 wave.
-- 2026-10-14: research wave DONE via subagent proxies (no T3-thread tool in
-  session). Findings merged to `docs/RESEARCH.md`. Tier correction adopted:
-  L0/L1a/L1b/L2s/L2p + `pressure_units()` contract. `base-init` still needs
-  manual NEW T3 thread spawn (prompt in file). Phase 1 stays queued behind it.
+- 2026-10-14: Phase-0 wave dispatched as real T3 threads (supervisor skill).
+  base-init `3ddd0a73`, research-haptic `20ea67a8`, research-kernel `33187ad9`.
+  All creates + first turns accepted, handoffs byte-verified in projections.
+  Model: Muse Spark 1.3 Contributor Xhigh (opencode/instance, build agent).
+  Prior subagent research kept as §2–§4 baseline in `docs/RESEARCH.md`;
+  T3 research threads deepen it and report in-thread (no commits).
