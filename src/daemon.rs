@@ -73,6 +73,11 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     let sock = lock::socket_path();
     let _lock = SocketLock::acquire(&sock)?;
     log::info!("lock acquired at {sock}");
+    log::info!(
+        "config: polling {} Hz, enhanced_clicks={}",
+        cfg.polling_rate,
+        cfg.enhanced_clicks
+    );
 
     let running = Arc::new(AtomicBool::new(true));
     let stop = Arc::clone(&running);
