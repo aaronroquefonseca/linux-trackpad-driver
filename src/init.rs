@@ -251,13 +251,14 @@ pub fn send_with_retry_on(
 ) -> Result<()> {
     let attempts = max_attempts.max(1);
     let mut delay_ms = 25u64;
-    for attempt in 1..=attempts {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         match sender.send(report) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                let last = attempt == attempts;
-                if last || !is_transient_send_error(&e) {
-                    if !last {
+                if attempt >= attempts || !is_transient_send_error(&e) {
+                    if attempt < attempts {
                         log::debug!("permanent send error on {label}, not retrying: {e:#}");
                     }
                     return Err(e).with_context(|| {
@@ -273,7 +274,6 @@ pub fn send_with_retry_on(
             }
         }
     }
-    Ok(())
 }
 
 /// Send with backoff retry against the hidraw/probe race (see

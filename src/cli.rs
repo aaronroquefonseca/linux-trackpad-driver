@@ -29,6 +29,32 @@ pub enum Command {
     Reconnect(ReconnectArgs),
 }
 
+/// Parse failure: usage/help text vs. a real error. Help exits 0.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParseFailure {
+    pub message: String,
+    pub is_help: bool,
+}
+
+impl From<String> for ParseFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            is_help: false,
+        }
+    }
+}
+
+/// Top-level usage text (also the `--help` payload, which exits 0).
+fn top_usage(prog: &str) -> ParseFailure {
+    ParseFailure {
+        message: format!(
+            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"
+        ),
+        is_help: true,
+    }
+}
+
 fn parse_polling_value(s: &str) -> Result<u32, String> {
     s.parse::<u32>()
         .map_err(|_| format!("invalid polling rate: '{s}'"))
@@ -42,16 +68,16 @@ fn parse_polling_value(s: &str) -> Result<u32, String> {
 }
 
 /// Parse argv (including program name at index 0) into a [`Command`].
-pub fn parse_args(args: &[String]) -> Result<Command, String> {
+/// Help output returns `Err(ParseFailure { is_help: true })` so [`dispatch`]
+/// can exit 0 for it and 1 for real errors.
+pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
     let prog = args.first().map_or("ltd", String::as_str);
     let rest = args.get(1..).unwrap_or(&[]);
     let Some(cmd) = rest.first() else {
-        return Err(format!("usage: {prog} <run|reconnect> [args...]"));
+        return Err(top_usage(prog));
     };
     match cmd.as_str() {
-        "-h" | "--help" | "help" => Err(format!(
-            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"
-        )),
+        "-h" | "--help" | "help" => Err(top_usage(prog)),
         "run" => {
             let mut config_path: Option<String> = None;
             let mut i = 1;
@@ -66,9 +92,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                         i += 1;
                     }
                     "-h" | "--help" => {
-                        return Err(format!("usage: {prog} run [-c config]"));
+                        return Err(ParseFailure {
+                            message: format!("usage: {prog} run [-c config]"),
+                            is_help: true,
+                        });
                     }
-                    other => return Err(format!("run: unknown option '{other}'")),
+                    other => return Err(format!("run: unknown option '{other}'").into()),
                 }
             }
             Ok(Command::Run(RunArgs { config_path }))
@@ -79,9 +108,10 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 .ok_or_else(|| format!("usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"))?
                 .clone();
             if devnode == "-h" || devnode == "--help" {
-                return Err(format!(
-                    "usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"
-                ));
+                return Err(ParseFailure {
+                    message: format!("usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"),
+                    is_help: true,
+                });
             }
             let mut force = false;
             let mut disengage = false;
@@ -105,7 +135,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                         polling_override = Some(parse_polling_value(v)?);
                         i += 1;
                     }
-                    other => return Err(format!("reconnect: unknown option '{other}'")),
+                    other => {
+                        return Err(format!("reconnect: unknown option '{other}'").into());
+                    }
                 }
             }
             Ok(Command::Reconnect(ReconnectArgs {
@@ -115,14 +147,21 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 disengage,
             }))
         }
-        other => Err(format!("unknown command '{other}'; see '{prog} help'")),
+        other => Err(format!("unknown command '{other}'; see '{prog} help'").into()),
     }
 }
 
 /// Parse + execute. Never panics on missing hardware; hardware errors map to
-/// log output + nonzero exit, not panics.
+/// log output + nonzero exit, not panics. `--help` prints to stdout, exit 0.
 pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
-    let cmd = parse_args(args).map_err(anyhow::Error::msg)?;
+    let cmd = match parse_args(args) {
+        Ok(cmd) => cmd,
+        Err(failure) if failure.is_help => {
+            println!("{}", failure.message);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(failure) => return Err(anyhow::Error::msg(failure.message)),
+    };
     match cmd {
         Command::Run(run) => {
             let cfg = config::load_or_default(run.config_path.as_deref())?;
@@ -215,6 +254,29 @@ mod tests {
 
     #[test]
     fn unknown_command_errors() {
-        assert!(parse_args(&argv(&["ltd", "frobnicate"])).is_err());
+        let err = parse_args(&argv(&["ltd", "frobnicate"])).unwrap_err();
+        assert!(!err.is_help);
+    }
+
+    #[test]
+    fn help_flags_are_help_not_errors() {
+        for args in [
+            vec!["ltd"],
+            vec!["ltd", "help"],
+            vec!["ltd", "--help"],
+            vec!["ltd", "run", "--help"],
+            vec!["ltd", "reconnect", "--help"],
+        ] {
+            let err = parse_args(&argv(&args)).unwrap_err();
+            assert!(err.is_help, "args {args:?} should be help");
+        }
+    }
+
+    #[test]
+    fn dispatch_help_exits_zero() {
+        assert_eq!(
+            dispatch(&argv(&["ltd", "--help"])).unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 }

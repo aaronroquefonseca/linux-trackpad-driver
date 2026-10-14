@@ -6,8 +6,12 @@
 //!
 //! Protocol: `bind()` wins. On `AddrInUse`, dial the existing socket: success
 //! means a live daemon owns it (new instance exits); connection-refused means
-//! a stale socket file (remove + rebind); any other dial failure (e.g. EACCES)
-//! leaves the file untouched and bails. Tests use temp dirs, never `/run`.
+//! a stale socket file (remove + rebind, tolerating a parallel starter that
+//! removed it first, then re-checking liveness once); any other dial failure
+//! (e.g. EACCES) leaves the file untouched and bails. `Drop` unlinks only
+//! when the path still refers to our own socket (dev+ino match), so a dying
+//! predecessor never removes a successor's rebound file.
+//! Tests use temp dirs, never `/run`.
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -56,41 +60,55 @@ impl SocketLock {
                     .with_context(|| format!("creating socket dir for '{path}'"))?;
             }
         }
-        match UnixListener::bind(path) {
-            Ok(listener) => Ok(Self {
-                path: path.to_string(),
-                _listener: listener,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Stale file or live daemon? A live owner accepts connections.
-                match UnixStream::connect(path) {
-                    Ok(_) => anyhow::bail!("daemon already running (socket '{path}' live)"),
-                    Err(conn_err) => match conn_err.kind() {
-                        // No listener behind the file: stale residue of a dead
-                        // daemon, safe to remove and rebind.
-                        std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NotFound => {
-                            log::warn!("removing stale socket '{path}'");
-                            std::fs::remove_file(path)
-                                .with_context(|| format!("removing stale socket '{path}'"))?;
-                            let listener = UnixListener::bind(path).with_context(|| {
-                                format!("binding socket '{path}' after stale cleanup")
-                            })?;
-                            Ok(Self {
-                                path: path.to_string(),
-                                _listener: listener,
-                            })
-                        }
-                        // Anything else (e.g. EACCES on a live daemon's socket):
-                        // unverifiable, so never delete — bail and keep the file.
-                        _ => anyhow::bail!(
-                            "socket '{path}' in use but not connectable ({conn_err}); refusing to remove"
-                        ),
-                    },
+        // Up to two passes: bind, or stale-cleanup then re-bind with a fresh
+        // liveness check (a parallel starter may have rebound between).
+        for _ in 0..2 {
+            match UnixListener::bind(path) {
+                Ok(listener) => {
+                    return Ok(Self {
+                        path: path.to_string(),
+                        _listener: listener,
+                    });
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    // Stale file or live daemon? A live owner accepts connections.
+                    match UnixStream::connect(path) {
+                        Ok(_) => {
+                            anyhow::bail!("daemon already running (socket '{path}' live)");
+                        }
+                        Err(conn_err) => match conn_err.kind() {
+                            // No listener behind the file: stale residue of a
+                            // dead daemon. A parallel starter may remove it
+                            // first — ignore NotFound and re-bind (which then
+                            // re-checks liveness if still AddrInUse).
+                            std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::NotFound => {
+                                log::warn!("removing stale socket '{path}'");
+                                match std::fs::remove_file(path) {
+                                    Ok(()) => {}
+                                    Err(rm)
+                                        if rm.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(rm) => {
+                                        return Err(rm).with_context(|| {
+                                            format!("removing stale socket '{path}'")
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            // Anything else (e.g. EACCES on a live daemon's
+                            // socket): unverifiable, so never delete — bail
+                            // and keep the file.
+                            _ => anyhow::bail!(
+                                "socket '{path}' in use but not connectable ({conn_err}); refusing to remove"
+                            ),
+                        },
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("binding socket '{path}'")),
             }
-            Err(e) => Err(e).with_context(|| format!("binding socket '{path}'")),
         }
+        anyhow::bail!("socket '{path}' still contested after stale cleanup; retry")
     }
 
     pub fn path(&self) -> &str {
@@ -100,7 +118,34 @@ impl SocketLock {
 
 impl Drop for SocketLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        // Unlink only if the path still refers to OUR socket (same dev+ino
+        // as the bound listener fd). After a stale handoff a successor may
+        // have rebound the path between our last use and this drop — its
+        // live file must survive our teardown. (Our fd is still open here;
+        // struct fields drop after this runs.)
+        let ours = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(self._listener.as_raw_fd(), &mut st) == 0 {
+                Some((st.st_dev as u64, st.st_ino as u64))
+            } else {
+                None
+            }
+        };
+        let path_id = std::fs::metadata(&self.path)
+            .ok()
+            .map(|m| (m.dev(), m.ino()));
+        match (ours, path_id) {
+            (Some(a), Some(b)) if a == b => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            _ => {
+                // Mismatch (successor rebound) or unreadable: leave the file.
+                // A stale residue is reclaimed by the next starter.
+                log::debug!("keeping socket '{}' (not ours or unreadable)", self.path);
+            }
+        }
     }
 }
 
@@ -155,6 +200,26 @@ mod tests {
             socket_path_with(Some("/tmp/test-ltd.sock")),
             "/tmp/test-ltd.sock"
         );
+    }
+
+    #[test]
+    fn predecessor_drop_keeps_successor_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("handoff.sock");
+        let sock = sock.to_str().unwrap();
+        let first = SocketLock::acquire(sock).unwrap();
+        // External deletion (stale-cleanup by another actor) + successor rebind.
+        std::fs::remove_file(sock).unwrap();
+        let second = SocketLock::acquire(sock).unwrap();
+        assert!(daemon_socket_present(sock));
+        drop(first); // dying predecessor must not unlink the successor's file
+        assert!(
+            daemon_socket_present(sock),
+            "successor socket must survive predecessor drop"
+        );
+        assert!(std::path::Path::new(sock).exists());
+        drop(second);
+        assert!(!daemon_socket_present(sock));
     }
 
     #[test]

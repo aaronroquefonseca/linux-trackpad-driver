@@ -146,14 +146,18 @@ New key vs reference: `enhanced_clicks` (explicit opt-in gate).
   when the clicks pipeline lands (Phase 1 `uinput-proxy` or later).
 - **Polling posture corrected (coordinator directive).** Default request is
   the capped device maximum ~110 Hz (`X = 0x23 = 35`, `3850/35 ≈ 110`) —
-  never 500 Hz. `resolve_polling` caps the request at 110 Hz *before*
-  mapping, so `X < 35` is never placed on the wire (unverified divisor
-  range; device may NAK/ignore). Config default `polling_rate = 110`;
-  `-p`/config values above 110 clamp identically (defense in depth).
+  never 500 Hz. `resolve_polling` maps the raw request to `X`, then floors
+  the wire byte at `0x23`, so requests above ~110 Hz still place `X = 0x23`
+  on the wire (unverified divisor range; device may NAK/ignore `X < 35`).
+  `theoretical_hz` reports the raw request's meaning pre-floor; over-cap
+  requests warn at the daemon layer. Config default `polling_rate = 110`;
+  requests below ~16 Hz are rejected (`X` saturates at 255).
 - **Ordering.** `reconnect`/`run` wait for the hidraw node (2 s poll), send
-  each report with backoff retry (25→500 ms, 5 attempts), retry the whole
-  USB sequence up to 3×, and best-effort verify the polling report via
-  `HIDIOCGFEATURE`. Resume MUST re-run the sequence from multitouch enable
+  each report with backoff retry (5 attempts; sleeps 25/50/100/200 ms),
+  retry the whole USB sequence up to 3× on transient (`ENOENT`, node
+  mid-bind) only — `EINVAL`/`ENOTTY`/`EACCES` fail fast at both layers —
+  and best-effort verify the polling report via `HIDIOCGFEATURE`. Resume
+  MUST re-run the sequence from multitouch enable
   (report `0x02` 21→8 byte regression across power transition).
 - **BT scope.** Single-node bring-up only; no init reports, no rate tuning.
   No exclusivity vs `hid-magicmouse` — double-input handling (unbind or
