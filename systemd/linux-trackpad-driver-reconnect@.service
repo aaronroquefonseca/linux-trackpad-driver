@@ -12,5 +12,9 @@ After=systemd-udevd.service
 
 [Service]
 Type=oneshot
+# System config for hotplug reconnects (udev passes no -c): explicit -c on
+# the command line still wins. A missing file falls back to defaults so
+# hotplug keeps working with no system config installed.
+Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
 ExecStart=/usr/bin/ltd reconnect /dev/%I
 Nice=10

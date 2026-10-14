@@ -295,9 +295,31 @@ pub struct HidrawSender {
     pub devnode: String,
 }
 
+/// Single-shot hidraw writer: one `HIDIOCSFEATURE`, no retry. Retry policy
+/// is applied exactly once, by [`HidrawSender`] via [`send_with_retry_on`];
+/// the sequence layer ([`init_usb_with_retry`]) adds sequence-level retries
+/// on top, with no hidden per-report multiplier beyond
+/// [`DEFAULT_SEND_ATTEMPTS`].
+struct RawHidrawSender<'a> {
+    devnode: &'a str,
+}
+
+impl FeatureSender for RawHidrawSender<'_> {
+    fn send(&self, report: &[u8]) -> Result<()> {
+        send_feature_report_hidraw(self.devnode, report)
+    }
+}
+
 impl FeatureSender for HidrawSender {
     fn send(&self, report: &[u8]) -> Result<()> {
-        send_with_retry(&self.devnode, report, DEFAULT_SEND_ATTEMPTS)
+        send_with_retry_on(
+            &RawHidrawSender {
+                devnode: &self.devnode,
+            },
+            report,
+            DEFAULT_SEND_ATTEMPTS,
+            &self.devnode,
+        )
     }
 }
 
@@ -398,6 +420,361 @@ pub enum ReadyKind {
     Detached,
 }
 
+/// Bluetooth multitouch-enable report (`F1 02 01`, kernel `magicmouse` BT
+/// path). Documented for bring-up verification only: the BT path sends NO
+/// init reports (single-node, straight to use); the constant exists so tests
+/// and future verify steps pin the expected bytes without drifting.
+pub const MULTITOUCH_BT: &[u8] = &[0xF1, 0x02, 0x01];
+/// Bluetooth host-click report builder (`F2 21 0X`). Same status as
+/// [`MULTITOUCH_BT`]: documented, not sent by the BT bring-up path.
+pub fn host_click_bt(enabled: bool) -> [u8; 3] {
+    [0xF2, 0x21, u8::from(enabled)]
+}
+
+/// Outcome of one idempotent USB init run: the polling plan plus which
+/// interface node the sequence was written to (per-interface routing
+/// groundwork).
+///
+/// Trust limits — sibling routing must NOT treat these as device-confirmed
+/// acceptance:
+/// - `iface` is caller-supplied (sysfs-derived at call time for the node the
+///   reports were written to), not a device confirmation.
+/// - `multitouch_accepted` is true iff the full sequence — starting with the
+///   multitouch write — returned success on this node. A sibling interface
+///   must still be initialized and verified itself; never skip it because
+///   another node reported success.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsbInitOutcome {
+    pub plan: PollingPlan,
+    /// Caller-supplied hint: interface number of the node written to
+    /// (`None` = unknown layout; full sequence still sent).
+    pub iface: Option<u8>,
+    /// True iff the multitouch-first sequence wrote without error on this node.
+    pub multitouch_accepted: bool,
+}
+
+/// [`init_usb`] recording which interface accepted multitouch.
+/// Idempotent: safe to re-run on the same node or a sibling interface node.
+pub fn init_usb_recorded(
+    sender: &dyn FeatureSender,
+    requested_hz: u32,
+    iface: Option<u8>,
+) -> Result<UsbInitOutcome> {
+    let plan = init_usb(sender, requested_hz)?;
+    if let Some(n) = iface {
+        log::debug!("USB init accepted on interface {n} (multitouch 02 01 sent)");
+    } else {
+        log::debug!("USB init accepted on unknown interface (multitouch 02 01 sent)");
+    }
+    Ok(UsbInitOutcome {
+        plan,
+        iface,
+        multitouch_accepted: true,
+    })
+}
+
+/// Resume re-init: re-send multitouch enable FIRST.
+///
+/// Resume regression (RESEARCH §6): Trackpad 2 USB drops out of multitouch
+/// mode across a power transition (report `0x02` shrinks 21→8 bytes; clicks
+/// survive, motion lost until re-init). The resume hook MUST re-run the full
+/// USB sequence starting at multitouch enable.
+/// SUSPEND-HOOK: this is the named entry point for the suspend-hook task —
+/// idempotent, same as init; call with the node iface hint when known.
+pub fn resume_usb(
+    sender: &dyn FeatureSender,
+    requested_hz: u32,
+    iface: Option<u8>,
+) -> Result<UsbInitOutcome> {
+    log::info!("resume re-init: re-sending multitouch enable first (21→8 byte dropout fix)");
+    init_usb_recorded(sender, requested_hz, iface)
+}
+
+/// Read-back side of verify-after-write. Real hardware vs. test stub.
+pub trait ReportVerifier {
+    fn verify(&self, expected: &[u8]) -> Result<bool>;
+}
+
+/// [`ReportVerifier`] that reads back via `HIDIOCGFEATURE`.
+pub struct HidrawVerifier {
+    pub devnode: String,
+}
+
+impl ReportVerifier for HidrawVerifier {
+    fn verify(&self, expected: &[u8]) -> Result<bool> {
+        verify_report(&self.devnode, expected)
+    }
+}
+
+/// In-memory [`ReportVerifier`] for unit tests.
+#[derive(Default)]
+pub struct StubVerifier {
+    pub results: RefCell<Vec<Result<bool>>>,
+    pub calls: RefCell<Vec<Vec<u8>>>,
+}
+
+impl StubVerifier {
+    pub fn with_results(results: Vec<Result<bool>>) -> Self {
+        Self {
+            results: RefCell::new(results.into_iter().rev().collect()),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl ReportVerifier for StubVerifier {
+    fn verify(&self, expected: &[u8]) -> Result<bool> {
+        self.calls.borrow_mut().push(expected.to_vec());
+        self.results.borrow_mut().pop().unwrap_or(Ok(true))
+    }
+}
+
+/// [`init_usb`] + best-effort `HIDIOCGFEATURE` verify of the polling report.
+///
+/// Only an `Ok(false)` mismatch re-runs the whole sequence from multitouch
+/// enable (up to [`DEFAULT_INIT_ATTEMPTS`]×, no sleep after the final
+/// attempt). An unreadable verify (`Err` — some firmware NAKs reads) is a
+/// best-effort warning, not fatal: init still succeeds.
+pub fn init_usb_verified(
+    sender: &dyn FeatureSender,
+    verifier: &dyn ReportVerifier,
+    requested_hz: u32,
+    iface: Option<u8>,
+) -> Result<UsbInitOutcome> {
+    let mut last_mismatch = 0u32;
+    for attempt in 1..=DEFAULT_INIT_ATTEMPTS {
+        let plan = init_usb_with_retry(sender, requested_hz)?;
+        let expected = polling_report(plan.x);
+        match verifier.verify(&expected) {
+            Ok(true) => {
+                return Ok(UsbInitOutcome {
+                    iface,
+                    multitouch_accepted: true,
+                    plan,
+                });
+            }
+            Ok(false) => {
+                last_mismatch += 1;
+                if attempt >= DEFAULT_INIT_ATTEMPTS {
+                    break;
+                }
+                log::warn!(
+                    "polling verify mismatch (attempt {attempt}/{DEFAULT_INIT_ATTEMPTS}); re-running from multitouch enable"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
+            }
+            Err(e) => {
+                log::warn!(
+                    "polling verify unreadable: {e:#}; accepting init (firmware may NAK reads)"
+                );
+                return Ok(UsbInitOutcome {
+                    iface,
+                    multitouch_accepted: true,
+                    plan,
+                });
+            }
+        }
+    }
+    anyhow::bail!("polling verify mismatch after {DEFAULT_INIT_ATTEMPTS} attempts ({last_mismatch} mismatches)");
+}
+
+/// BT double-input policy (RESEARCH §6: hidraw coexists with
+/// `hid-magicmouse` on BT — NO exclusivity).
+///
+/// Default MUST leave kernel passthrough intact (plain libinput pointer
+/// keeps working with init alone). Only when `enhanced_clicks=true` (opt-in
+/// clicks pipeline) may we suppress the physical node's events — by
+/// unbinding the driver for our VID:PID or evdev-grabbing the physical node
+/// in the clicks pipeline (Phase-1 `uinput-proxy` owns the grab; here we do
+/// the best-effort unbind so bring-up is testable without clicks code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtCoexistence {
+    /// Leave the kernel device alone; passthrough continues, no double-input
+    /// handling. Default.
+    Passthrough,
+    /// Opt-in: suppress the physical node so only the proxy emits.
+    SuppressPhysical,
+}
+
+/// Pure policy decision: only the explicit opt-in suppresses BT passthrough.
+pub fn bt_coexistence_policy(enhanced_clicks: bool) -> BtCoexistence {
+    if enhanced_clicks {
+        BtCoexistence::SuppressPhysical
+    } else {
+        BtCoexistence::Passthrough
+    }
+}
+
+/// Apply the BT coexistence policy. Returns `true` when the physical node
+/// was actually suppressed, `false` when passthrough was (correctly) left
+/// intact or suppression was best-effort skipped. Never fails init: unbind
+/// errors are warnings.
+pub fn apply_bt_coexistence(devnode: &str, enhanced_clicks: bool) -> Result<bool> {
+    match bt_coexistence_policy(enhanced_clicks) {
+        BtCoexistence::Passthrough => {
+            log::debug!("BT {devnode}: passthrough intact (enhanced_clicks=false, no unbind/grab)");
+            Ok(false)
+        }
+        BtCoexistence::SuppressPhysical => {
+            // LOUD: uinput-proxy is not merged yet, so suppressing the
+            // physical node removes BT input with NO proxy replacement —
+            // the trackpad goes silent until re-bind/replug. This stays
+            // behind the explicit opt-in until the proxy lands.
+            log::warn!(
+                "BT {devnode}: enhanced_clicks=true with no uinput-proxy yet — suppressing physical input with no replacement; expect a silent trackpad until re-bind"
+            );
+            log::info!("BT {devnode}: enhanced_clicks=true — suppressing physical node (unbind hid-magicmouse for our VID:PID)");
+            match attempt_driver_unbind(devnode) {
+                Ok(true) => Ok(true),
+                Ok(false) => {
+                    log::warn!(
+                        "BT {devnode}: unbind skipped (node not resolved); clicks pipeline must evdev-grab the physical node instead"
+                    );
+                    Ok(false)
+                }
+                Err(e) => {
+                    log::warn!("BT {devnode}: unbind best-effort failed ({e:#}); continuing with passthrough");
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+/// HID device id (`XXXX:XXXX:XXXX.NNNN`) for a hidraw node, from the
+/// `device` symlink target's basename. `None` when unresolvable.
+fn hid_id_for_node(devnode: &str, class_root: &str) -> Option<String> {
+    let name = crate::discovery::hidraw_name(devnode)?;
+    let device_link = std::path::PathBuf::from(format!("{class_root}/{name}/device"));
+    let target = std::fs::read_link(&device_link).ok()?;
+    let hid_id = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if hid_id.is_empty() {
+        return None;
+    }
+    Some(hid_id)
+}
+
+/// Bound driver name for a hidraw node, from the `device/driver` symlink
+/// target's basename (e.g. `magicmouse`, `hid-generic`). `None` when the
+/// node is unbound or the layout is unknown.
+fn bound_driver_for_node(devnode: &str, class_root: &str) -> Option<String> {
+    let name = crate::discovery::hidraw_name(devnode)?;
+    let driver_link = std::path::PathBuf::from(format!("{class_root}/{name}/device/driver"));
+    let target = std::fs::read_link(&driver_link).ok()?;
+    let driver = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if driver.is_empty() {
+        return None;
+    }
+    Some(driver)
+}
+
+/// Whether an (un)bind write error means "already (un)bound elsewhere, try
+/// the next driver" (`ENODEV`/`ENXIO`/`ENOENT`) rather than a real failure.
+fn is_expected_bind_race(errno: i32) -> bool {
+    matches!(errno, libc::ENODEV | libc::ENXIO | libc::ENOENT)
+}
+
+/// Best-effort re-bind of the HID driver for one hidraw node: mirror of
+/// [`attempt_driver_unbind`] for the disengage path. Unbind is sticky — a
+/// suppressed BT node stays dead until re-bound or replugged — so disengage
+/// must restore passthrough.
+///
+/// Stateless by necessity (udev one-shots share no memory): the HID id is
+/// written to each known driver's `bind` file; the kernel rejects with
+/// `ENODEV`/`ENXIO`/`ENOENT` where the device does not belong, and with
+/// `EBUSY`/similar when already bound — all skipped, never fatal.
+/// Returns `Ok(true)` when a bind write succeeded, `Ok(false)` when nothing
+/// was done. Permission/I/O errors propagate (caller downgrades to warning).
+pub fn restore_bt_passthrough(devnode: &str) -> Result<bool> {
+    restore_with_root(devnode, "/sys/class/hidraw", "/sys/bus/hid/drivers")
+}
+
+fn restore_with_root(devnode: &str, class_root: &str, drivers_root: &str) -> Result<bool> {
+    let Some(hid_id) = hid_id_for_node(devnode, class_root) else {
+        return Ok(false);
+    };
+    for driver in ["magicmouse", "hid-generic"] {
+        let bind = std::path::PathBuf::from(format!("{drivers_root}/{driver}/bind"));
+        if std::fs::symlink_metadata(&bind).is_err() {
+            continue;
+        }
+        match std::fs::write(&bind, &hid_id) {
+            Ok(()) => {
+                log::info!("re-bound HID device {hid_id} to {driver}");
+                return Ok(true);
+            }
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                // EBUSY = already bound: nothing to do, not an error.
+                if is_expected_bind_race(errno) || errno == libc::EBUSY {
+                    log::debug!("bind {hid_id} to {driver}: {e} — trying next driver");
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Best-effort unbind of the HID driver for one hidraw node.
+/// Writes the HID device id to the *currently bound* driver's `unbind`
+/// file (resolved via the `device/driver` symlink), falling back to the
+/// known driver names when the link is unreadable. A write to the wrong
+/// driver fails with `ENODEV`/`ENXIO`/`ENOENT` and is skipped, never fatal;
+/// permission/I/O errors (`EACCES`/`EIO`/…) propagate to the caller (which
+/// downgrades to a warning anyway). Returns `Ok(false)` when nothing was
+/// done.
+pub fn attempt_driver_unbind(devnode: &str) -> Result<bool> {
+    attempt_driver_unbind_with_root(devnode, "/sys/class/hidraw", "/sys/bus/hid/drivers")
+}
+
+fn attempt_driver_unbind_with_root(
+    devnode: &str,
+    class_root: &str,
+    drivers_root: &str,
+) -> Result<bool> {
+    let Some(hid_id) = hid_id_for_node(devnode, class_root) else {
+        return Ok(false);
+    };
+    // Bound driver first, then the known fallbacks (deduped).
+    let mut drivers: Vec<String> = Vec::new();
+    if let Some(bound) = bound_driver_for_node(devnode, class_root) {
+        drivers.push(bound);
+    }
+    for fallback in ["magicmouse", "hid-generic"] {
+        if !drivers.iter().any(|d| d == fallback) {
+            drivers.push(fallback.to_string());
+        }
+    }
+    for driver in &drivers {
+        let unbind = std::path::PathBuf::from(format!("{drivers_root}/{driver}/unbind"));
+        if std::fs::symlink_metadata(&unbind).is_err() {
+            continue;
+        }
+        match std::fs::write(&unbind, &hid_id) {
+            Ok(()) => {
+                log::info!("unbound HID device {hid_id} from {driver}");
+                return Ok(true);
+            }
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                if is_expected_bind_race(errno) {
+                    log::debug!("unbind {hid_id} from {driver}: {e} — trying next driver");
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(false)
+}
 /// Device-ready event emitted after successful init (or immediately for BT).
 /// The future clicks pipeline subscribes via [`DeviceReadyHub`]; init holds
 /// no reference to clicks code.
@@ -685,5 +1062,215 @@ mod tests {
         hub.emit(&usb_ready("/dev/hidraw1"));
         assert_eq!(hub.listener_count(), 2);
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Flaky sender: fails the first `failures` sends with `errno`, then records.
+    struct FlakySender {
+        failures: RefCell<usize>,
+        errno: i32,
+        sent: RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl FeatureSender for FlakySender {
+        fn send(&self, report: &[u8]) -> Result<()> {
+            let mut f = self.failures.borrow_mut();
+            if *f > 0 {
+                *f -= 1;
+                return Err(anyhow::Error::from(std::io::Error::from_raw_os_error(
+                    self.errno,
+                )));
+            }
+            self.sent.borrow_mut().push(report.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retry_recovers_from_transient_flakes() {
+        let s = FlakySender {
+            failures: RefCell::new(2),
+            errno: libc::ENOENT,
+            sent: RefCell::new(Vec::new()),
+        };
+        // init_usb_with_retry re-runs the whole sequence per attempt; 2 transient
+        // flakes across attempts still converge to one full 3-report sequence.
+        let plan = init_usb_with_retry(&s, 110).unwrap();
+        assert_eq!(plan.x, 0x23);
+        assert_eq!(s.sent.borrow().len(), 3);
+        assert_eq!(s.sent.borrow()[0], vec![0x02, 0x01]);
+    }
+
+    #[test]
+    fn retry_gives_up_after_persistent_transient_failure() {
+        let s = FlakySender {
+            failures: RefCell::new(usize::MAX / 2),
+            errno: libc::ENOENT,
+            sent: RefCell::new(Vec::new()),
+        };
+        assert!(init_usb_with_retry(&s, 110).is_err());
+    }
+
+    #[test]
+    fn retry_fails_fast_on_permanent_error() {
+        // EINVAL is permanent: no whole-sequence retry, no backoff sleep.
+        let s = FlakySender {
+            failures: RefCell::new(usize::MAX / 2),
+            errno: libc::EINVAL,
+            sent: RefCell::new(Vec::new()),
+        };
+        let before = std::time::Instant::now();
+        assert!(init_usb_with_retry(&s, 110).is_err());
+        assert!(s.sent.borrow().is_empty());
+        assert!(before.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn sequence_retry_attempts_exact_count_no_multiplier() {
+        // Always-transient sender: each sequence attempt fails on its first
+        // report and the mock performs no per-report retry of its own, so the
+        // total write count is exactly DEFAULT_INIT_ATTEMPTS — no nesting
+        // multiplier between the sequence and per-report layers.
+        let sender = FailSender {
+            attempts: std::cell::Cell::new(0),
+            errno: libc::ENOENT,
+        };
+        assert!(init_usb_with_retry(&sender, 110).is_err());
+        assert_eq!(
+            sender.attempts.get(),
+            DEFAULT_INIT_ATTEMPTS as usize,
+            "sequence layer must attempt exactly DEFAULT_INIT_ATTEMPTS writes"
+        );
+    }
+
+    #[test]
+    fn idempotent_rerun_sends_same_sequence() {
+        // Safe re-run on the same node: two consecutive inits emit the same
+        // 3-report sequence (multitouch first — resume regression fix).
+        let rec = Recorder::default();
+        let first = init_usb_recorded(&rec, 110, Some(1)).unwrap();
+        let second = init_usb_recorded(&rec, 110, Some(1)).unwrap();
+        assert_eq!(first.plan, second.plan);
+        assert!(first.multitouch_accepted && second.multitouch_accepted);
+        assert_eq!(first.iface, Some(1));
+        let sent = rec.sent.borrow();
+        assert_eq!(sent.len(), 6);
+        assert_eq!(sent[0], vec![0x02, 0x01]);
+        assert_eq!(sent[3], vec![0x02, 0x01]);
+    }
+
+    #[test]
+    fn resume_resends_multitouch_first() {
+        let rec = Recorder::default();
+        let out = resume_usb(&rec, 110, Some(2)).unwrap();
+        assert!(out.multitouch_accepted);
+        assert_eq!(rec.sent.borrow()[0], vec![0x02, 0x01]);
+        assert_eq!(rec.sent.borrow().len(), 3);
+    }
+
+    #[test]
+    fn verified_init_accepts_matching_readback() {
+        let rec = Recorder::default();
+        let verifier = StubVerifier::with_results(vec![Ok(true)]);
+        let out = init_usb_verified(&rec, &verifier, 110, Some(1)).unwrap();
+        assert_eq!(out.plan.x, 0x23);
+        assert_eq!(verifier.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn verified_init_retries_whole_sequence_on_mismatch() {
+        let rec = Recorder::default();
+        let verifier = StubVerifier::with_results(vec![Ok(false), Ok(true)]);
+        let out = init_usb_verified(&rec, &verifier, 110, None).unwrap();
+        assert_eq!(out.plan.x, 0x23);
+        // Two full sequences (multitouch first each time).
+        assert_eq!(rec.sent.borrow().len(), 6);
+        assert_eq!(rec.sent.borrow()[3], vec![0x02, 0x01]);
+    }
+
+    #[test]
+    fn verified_init_tolerates_unreadable_readback() {
+        let rec = Recorder::default();
+        let verifier =
+            StubVerifier::with_results(vec![Err(anyhow::anyhow!("firmware NAKs reads"))]);
+        // Warning, not fatal.
+        assert!(init_usb_verified(&rec, &verifier, 110, None).is_ok());
+    }
+
+    #[test]
+    fn bt_report_constants_pinned() {
+        assert_eq!(MULTITOUCH_BT, &[0xF1, 0x02, 0x01]);
+        assert_eq!(host_click_bt(true), [0xF2, 0x21, 0x01]);
+        assert_eq!(host_click_bt(false), [0xF2, 0x21, 0x00]);
+    }
+
+    #[test]
+    fn bt_policy_defaults_to_passthrough() {
+        assert_eq!(bt_coexistence_policy(false), BtCoexistence::Passthrough);
+        assert_eq!(bt_coexistence_policy(true), BtCoexistence::SuppressPhysical);
+    }
+
+    #[test]
+    fn bt_passthrough_never_suppresses() {
+        // Default: leaves kernel passthrough intact, reports no suppression.
+        assert!(!apply_bt_coexistence("/dev/hidraw9", false).unwrap());
+    }
+
+    #[test]
+    fn bt_unbind_skipped_for_unresolvable_node() {
+        // enhanced=true but no sysfs node: best-effort skip, never an error.
+        assert!(!attempt_driver_unbind_with_root(
+            "/dev/hidraw77",
+            "/nonexistent-xyz",
+            "/nonexistent-xyz"
+        )
+        .unwrap());
+        assert!(!apply_bt_coexistence("/dev/hidraw77", true).unwrap());
+    }
+
+    /// Fake sysfs with a bound driver: `device` and `device/driver` symlinks
+    /// plus a writable `unbind`/`bind` file standing in for sysfs.
+    fn fake_bound_sysfs() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("devices/0005:004C:0324.000B")).unwrap();
+        std::fs::create_dir_all(root.join("class/hidraw3")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../devices/0005:004C:0324.000B",
+            root.join("class/hidraw3/device"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("magicmouse", root.join("class/hidraw3/device/driver")).unwrap();
+        std::fs::create_dir_all(root.join("drivers/magicmouse")).unwrap();
+        std::fs::write(root.join("drivers/magicmouse/unbind"), "").unwrap();
+        std::fs::write(root.join("drivers/magicmouse/bind"), "").unwrap();
+        let class = root.join("class").to_str().unwrap().to_string();
+        let drivers = root.join("drivers").to_str().unwrap().to_string();
+        (dir, class, drivers)
+    }
+
+    #[test]
+    fn unbind_writes_hid_id_to_bound_driver() {
+        let (_dir, class, drivers) = fake_bound_sysfs();
+        assert!(attempt_driver_unbind_with_root("/dev/hidraw3", &class, &drivers).unwrap());
+        let written = std::fs::read_to_string(format!("{drivers}/magicmouse/unbind")).unwrap();
+        assert_eq!(written, "0005:004C:0324.000B");
+    }
+
+    #[test]
+    fn unbind_falls_back_when_driver_link_absent() {
+        let (_dir, class, drivers) = fake_bound_sysfs();
+        // Remove the driver symlink: bound-driver resolution fails, the
+        // fallback list must still reach magicmouse.
+        std::fs::remove_file(format!("{class}/hidraw3/device/driver")).unwrap();
+        assert!(attempt_driver_unbind_with_root("/dev/hidraw3", &class, &drivers).unwrap());
+    }
+
+    #[test]
+    fn restore_rebinds_after_unbind() {
+        let (_dir, class, drivers) = fake_bound_sysfs();
+        assert!(restore_with_root("/dev/hidraw3", &class, &drivers).unwrap());
+        let written = std::fs::read_to_string(format!("{drivers}/magicmouse/bind")).unwrap();
+        assert_eq!(written, "0005:004C:0324.000B");
+        assert!(!restore_with_root("/dev/hidraw77", &class, &drivers).unwrap());
     }
 }

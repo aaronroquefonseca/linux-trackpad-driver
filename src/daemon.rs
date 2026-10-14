@@ -29,39 +29,65 @@ pub fn hub() -> DeviceReadyHub {
 }
 
 /// Initialize one discovered node and return its ready event.
-/// USB: wait-for-node → retrying feature reports → verify → ready.
-/// BT: single-node, no reports, straight to ready.
+/// USB: defer (node+bind) → retrying feature reports → verify → ready.
+/// BT: single-node, no reports, straight to ready + coexistence policy.
+///
+/// FOOTGUN: this convenience leaves `enhanced_clicks=false` (BT passthrough
+/// untouched). Production paths (`run`/`reconnect`) must use
+/// [`init_node_with_config`] so the opt-in is honored.
 pub fn init_node(
     dev: &DiscoveredDevice,
     polling_hz: u32,
+    ready_hub: &DeviceReadyHub,
+) -> Result<DeviceReadyEvent> {
+    init_node_with_config(dev, polling_hz, false, ready_hub)
+}
+
+/// [`init_node`] with the clicks opt-in plumbed through (BT double-input
+/// handling only; USB path is identical either way).
+pub fn init_node_with_config(
+    dev: &DiscoveredDevice,
+    polling_hz: u32,
+    enhanced_clicks: bool,
     ready_hub: &DeviceReadyHub,
 ) -> Result<DeviceReadyEvent> {
     match dev.transport {
         Transport::Bluetooth => {
             let ev = init::init_bluetooth(&dev.devnode);
             ready_hub.emit(&ev);
+            // Best-effort, never fails init; default leaves passthrough intact.
+            let _ = init::apply_bt_coexistence(&dev.devnode, enhanced_clicks);
             Ok(ev)
         }
         Transport::Usb => {
-            // Probe/bind race: node may lag udev `add`; brief wait, then
-            // retrying writes carry the rest.
-            if !discovery::wait_for_node(&dev.devnode, 2000) {
+            // Defer-retry-verify: node may lag udev `add`, bind may lag node;
+            // retrying writes + read-back verify carry the rest.
+            let (node, bound) = discovery::wait_for_ready(&dev.devnode, 2000);
+            if !node {
                 log::warn!(
                     "node {} not present after 2 s wait; attempting init anyway",
+                    dev.devnode
+                );
+            } else if !bound {
+                log::debug!(
+                    "node {} present, driver bind not yet visible; retrying writes will cover it",
                     dev.devnode
                 );
             }
             let sender = HidrawSender {
                 devnode: dev.devnode.clone(),
             };
-            let plan = init::init_usb_with_retry(&sender, polling_hz)?;
-            // Best-effort verify of the polling report; mismatch is a warning
-            // (some firmware NAKs reads), not a fatal error.
-            match init::verify_report(&dev.devnode, &init::polling_report(plan.x)) {
-                Ok(true) => log::debug!("polling verify OK on {}", dev.devnode),
-                Ok(false) => log::warn!("polling verify mismatch on {}", dev.devnode),
-                Err(e) => log::warn!("polling verify unreadable on {}: {e:#}", dev.devnode),
-            }
+            let verifier = init::HidrawVerifier {
+                devnode: dev.devnode.clone(),
+            };
+            let iface = discovery::interface_number_for_node(&dev.devnode);
+            let outcome = init::init_usb_verified(&sender, &verifier, polling_hz, iface)?;
+            log::debug!(
+                "USB init on {} accepted (iface {:?}, polling [99 F2 {:02X}])",
+                dev.devnode,
+                outcome.iface,
+                outcome.plan.x,
+            );
             let ev = init::usb_ready(&dev.devnode);
             ready_hub.emit(&ev);
             Ok(ev)
@@ -104,7 +130,9 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         Ok(devs) => {
             log::info!("found {} trackpad node(s)", devs.len());
             for dev in &devs {
-                if let Err(e) = init_node(dev, cfg.polling_rate, &ready_hub) {
+                if let Err(e) =
+                    init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, &ready_hub)
+                {
                     log::error!("init failed for {}: {e:#}", dev.devnode);
                 }
             }
@@ -131,20 +159,36 @@ pub fn classify_node(devnode: &str, devs: &[DiscoveredDevice]) -> Result<Transpo
         .with_context(|| format!("device node '{devnode}' is not a recognized trackpad"))
 }
 
-/// `reconnect` entry. Idempotent; safe to re-run on every udev `add`.
-/// Missing node / missing hardware → `Err` (caller logs + exits nonzero),
-/// never a panic.
-pub fn run_reconnect(
-    devnode: &str,
-    force: bool,
-    polling_override: Option<u32>,
-    disengage: bool,
-    cfg: &Config,
-) -> Result<()> {
-    if devnode.is_empty() {
-        anyhow::bail!("reconnect requires a hidraw device path");
+/// `reconnect` mode decision: pure, unit-tested.
+///
+/// Semantics (udev entry):
+/// - `-d`/`--disengage` always wins → host-click off, no init.
+/// - Daemon socket absent without `-f` → disengage mode (safe default: never
+///   init behind a dead daemon; udev rule relies on this).
+/// - Daemon socket absent with `-f` → init anyway (forced bring-up).
+/// - Daemon live (with or without `-f`) → init, unless `-d` was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectMode {
+    Init,
+    Disengage,
+}
+
+pub fn resolve_reconnect_mode(daemon_live: bool, force: bool, disengage: bool) -> ReconnectMode {
+    if disengage {
+        return ReconnectMode::Disengage;
     }
-    let polling_hz = polling_override.unwrap_or(cfg.polling_rate);
+    if !daemon_live && !force {
+        return ReconnectMode::Disengage;
+    }
+    ReconnectMode::Init
+}
+
+/// Validate a polling request for the USB arm: range, device floor
+/// (`MIN_EXPRESSIBLE_HZ`), cap warning. Kept out of the disengage/BT arms
+/// on purpose — both discard the rate, so rejecting there would break
+/// valid hotplug events. Pure so the USB-only gating is unit-tested
+/// without hardware.
+pub fn validate_polling_rate(polling_hz: u32) -> Result<()> {
     if polling_hz == 0 || polling_hz > u16::MAX as u32 {
         anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
     }
@@ -157,10 +201,30 @@ pub fn run_reconnect(
     if polling_hz > EFFECTIVE_CAP_HZ as u32 {
         log::warn!("requested {polling_hz} Hz above device cap; clamped to ~110 Hz (X=0x23)");
     }
+    Ok(())
+}
+
+/// `reconnect` entry. Idempotent; safe to re-run on every udev `add`.
+/// Missing node / missing hardware → `Err` (caller logs + exits nonzero),
+/// never a panic.
+///
+/// Order: defer (wait for the node) first, then scan + fail-closed
+/// classify — classifying before the node appears would reject live
+/// hardware on a stale scan.
+pub fn run_reconnect(
+    devnode: &str,
+    force: bool,
+    polling_override: Option<u32>,
+    disengage: bool,
+    cfg: &Config,
+) -> Result<()> {
+    if devnode.is_empty() {
+        anyhow::bail!("reconnect requires a hidraw device path");
+    }
 
     let sock = lock::socket_path();
     let daemon_live = lock::daemon_socket_present(&sock);
-    let disengage_mode = disengage || (!daemon_live && !force);
+    let mode = resolve_reconnect_mode(daemon_live, force, disengage);
     if disengage && daemon_live {
         log::info!("disengage requested while daemon live; applying host-click off");
     } else if !daemon_live && !force {
@@ -171,27 +235,39 @@ pub fn run_reconnect(
         log::info!("daemon socket absent but -f given; proceeding with init");
     }
 
+    // Defer first: the node may lag udev `add` (probe/bind race).
+    if !discovery::wait_for_node(devnode, 2000) {
+        anyhow::bail!("device node '{devnode}' not present");
+    }
     let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
     let transport = classify_node(devnode, &devs)?;
     let ready_hub = hub();
 
-    if disengage_mode {
+    if mode == ReconnectMode::Disengage {
         match transport {
             Transport::Bluetooth => {
-                // No host-click report defined for the BT bring-up path;
-                // disengage emits Detached (not Ready) so subscribers detach.
+                // No host-click report defined for the BT bring-up path.
+                // Unbind is sticky: restore passthrough for a previously
+                // suppressed node (best-effort no-op when already bound).
+                // SUSPEND-HOOK: resume re-suppresses via the init arm; the
+                // Detached event below is the re-attach signal.
                 log::info!("BT {devnode}: disengage (no reports sent)");
+                if let Err(e) = init::restore_bt_passthrough(devnode) {
+                    log::warn!("BT {devnode}: re-bind best-effort failed ({e:#})");
+                }
                 ready_hub.emit(&init::detached(devnode, Transport::Bluetooth));
                 return Ok(());
             }
             Transport::Usb => {
-                if !discovery::wait_for_node(devnode, 2000) {
-                    anyhow::bail!("device node '{devnode}' not present");
-                }
                 let sender = HidrawSender {
                     devnode: devnode.to_string(),
                 };
                 init::disengage_usb_with_retry(&sender)?;
+                // Stateless restore: no-op when already bound (EBUSY skip),
+                // re-binds when a previous suppress left the node unbound.
+                if let Err(e) = init::restore_bt_passthrough(devnode) {
+                    log::warn!("USB {devnode}: re-bind best-effort failed ({e:#})");
+                }
                 ready_hub.emit(&init::detached(devnode, Transport::Usb));
                 return Ok(());
             }
@@ -200,26 +276,46 @@ pub fn run_reconnect(
 
     match transport {
         Transport::Bluetooth => {
-            if !discovery::wait_for_node(devnode, 2000) {
-                anyhow::bail!("device node '{devnode}' not present");
+            // No BT polling-rate equivalent (USB-first scope): -p/ config rate
+            // is intentionally ignored here, never placed on the wire.
+            if polling_override.is_some() {
+                log::warn!(
+                    "BT {devnode}: skipping polling rate (unsupported on Bluetooth; USB-first)"
+                );
             }
             let ev = init::init_bluetooth(devnode);
             ready_hub.emit(&ev);
+            // Default leaves kernel passthrough intact; only
+            // enhanced_clicks=true suppresses the physical node.
+            let _ = init::apply_bt_coexistence(devnode, cfg.enhanced_clicks);
             Ok(())
         }
         Transport::Usb => {
-            if !discovery::wait_for_node(devnode, 2000) {
-                anyhow::bail!("device node '{devnode}' not present");
+            // Rate validation lives here only: disengage + BT discard the
+            // rate, so they must not reject it.
+            let polling_hz = polling_override.unwrap_or(cfg.polling_rate);
+            validate_polling_rate(polling_hz)?;
+            // Node is present (deferred above); still check the driver bind —
+            // retrying writes + read-back verify cover a lagging bind.
+            let (_, bound) = discovery::wait_for_ready(devnode, 2000);
+            if !bound {
+                log::debug!(
+                    "node {devnode} present, driver bind not yet visible; retrying writes will cover it"
+                );
             }
             let sender = HidrawSender {
                 devnode: devnode.to_string(),
             };
-            let plan = init::init_usb_with_retry(&sender, polling_hz)?;
-            match init::verify_report(devnode, &init::polling_report(plan.x)) {
-                Ok(true) => log::debug!("polling verify OK on {devnode}"),
-                Ok(false) => log::warn!("polling verify mismatch on {devnode}"),
-                Err(e) => log::warn!("polling verify unreadable on {devnode}: {e:#}"),
-            }
+            let verifier = init::HidrawVerifier {
+                devnode: devnode.to_string(),
+            };
+            let iface = discovery::interface_number_for_node(devnode);
+            let outcome = init::init_usb_verified(&sender, &verifier, polling_hz, iface)?;
+            log::info!(
+                "USB init on {devnode} accepted (iface {:?}, polling [99 F2 {:02X}])",
+                outcome.iface,
+                outcome.plan.x,
+            );
             ready_hub.emit(&init::usb_ready(devnode));
             Ok(())
         }
@@ -239,8 +335,12 @@ mod tests {
 
     #[test]
     fn reconnect_rejects_bad_polling() {
-        let cfg = Config::default();
-        assert!(run_reconnect("/dev/hidraw0", false, Some(0), false, &cfg).is_err());
+        // USB-arm validation is pure: no hardware, no 2 s node wait.
+        assert!(validate_polling_rate(0).is_err());
+        assert!(validate_polling_rate(70_000).is_err());
+        assert!(validate_polling_rate(110).is_ok());
+        // Above cap warns but still validates (clamped downstream).
+        assert!(validate_polling_rate(500).is_ok());
     }
 
     #[test]
@@ -261,8 +361,9 @@ mod tests {
 
     #[test]
     fn reconnect_rejects_below_floor() {
-        let cfg = Config::default();
-        assert!(run_reconnect("/dev/hidraw0", true, Some(1), false, &cfg).is_err());
+        assert!(validate_polling_rate(1).is_err());
+        assert!(validate_polling_rate(15).is_err());
+        assert!(validate_polling_rate(16).is_ok());
     }
 
     fn fixture_devs() -> Vec<DiscoveredDevice> {
@@ -323,5 +424,70 @@ mod tests {
         let plan = init::init_usb_with_retry(&rec, 110).unwrap();
         assert_eq!(plan.x, 0x23);
         assert_eq!(rec.sent.borrow().len(), 3);
+    }
+
+    #[test]
+    fn reconnect_mode_matrix() {
+        // All 8 (live, force, disengage) combos: -d always wins.
+        for (live, force) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                resolve_reconnect_mode(live, force, true),
+                ReconnectMode::Disengage,
+                "disengage must win for live={live} force={force}"
+            );
+        }
+        // Socket absent without -f → disengage (safe default for udev entry).
+        assert_eq!(
+            resolve_reconnect_mode(false, false, false),
+            ReconnectMode::Disengage
+        );
+        // Socket absent with -f → init anyway.
+        assert_eq!(
+            resolve_reconnect_mode(false, true, false),
+            ReconnectMode::Init
+        );
+        // Daemon live → init (with or without -f).
+        assert_eq!(
+            resolve_reconnect_mode(true, false, false),
+            ReconnectMode::Init
+        );
+        assert_eq!(
+            resolve_reconnect_mode(true, true, false),
+            ReconnectMode::Init
+        );
+    }
+
+    #[test]
+    fn socket_absent_without_force_disengages_not_inits() {
+        // Decision-level coverage for the udev socket-absent path: without
+        // -f the mode must be Disengage (host-click off only, no init).
+        assert_eq!(
+            resolve_reconnect_mode(
+                /* daemon_live */ false, /* force */ false, /* disengage */ false
+            ),
+            ReconnectMode::Disengage
+        );
+    }
+
+    #[test]
+    fn bt_node_with_config_plumbs_coexistence_without_reports() {
+        // BT bring-up emits Ready (never Detached) and applies the (default
+        // passthrough) policy — and takes no FeatureSender at all, so no
+        // feature report can be emitted on this path by construction.
+        let hub = DeviceReadyHub::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = std::sync::Arc::clone(&seen);
+        hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
+        let dev = DiscoveredDevice {
+            devnode: "/dev/hidraw9".into(),
+            vendor_id: 0x004c,
+            product_id: 0x0324,
+            transport: Transport::Bluetooth,
+        };
+        let ev = init_node_with_config(&dev, 500, false, &hub).unwrap();
+        assert_eq!(ev.transport, Transport::Bluetooth);
+        assert_eq!(ev.kind, crate::init::ReadyKind::Ready);
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(*seen, vec![ev]);
     }
 }

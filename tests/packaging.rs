@@ -126,4 +126,8 @@ fn reconnect_template_runs_reconnect_for_instance() {
         RECONNECT.contains("ExecStart=/usr/bin/ltd reconnect /dev/%I"),
         "template must run reconnect for the udev instance"
     );
+    assert!(
+        RECONNECT.contains("LTD_CONFIG="),
+        "template must pass the system config env so hotplug honors enhanced_clicks"
+    );
 }

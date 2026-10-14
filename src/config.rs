@@ -368,6 +368,37 @@ pub fn load_or_default(path: Option<&str>) -> Result<Config> {
     Ok(cfg)
 }
 
+/// Env var naming the config file for contexts that cannot take `-c`
+/// (udev/systemd one-shots run `ltd reconnect /dev/%I` with no room for
+/// per-call flags). An explicit `-c` path always wins over this.
+pub const CONFIG_ENV: &str = "LTD_CONFIG";
+
+/// Config path from the environment, if set and non-empty.
+pub fn config_path_from_env() -> Option<String> {
+    std::env::var(CONFIG_ENV).ok().filter(|v| !v.is_empty())
+}
+
+/// Load config for entry points: explicit `-c` path wins, else
+/// `$LTD_CONFIG`, else defaults.
+///
+/// A *missing* env-pointed file falls back to defaults with a log line
+/// (hotplug must keep working on machines with no system config installed);
+/// a present-but-unparsable file is still an error, as is a missing
+/// explicit `-c` file.
+pub fn load_or_default_with_env(explicit: Option<&str>) -> Result<Config> {
+    if let Some(path) = explicit {
+        return load_or_default(Some(path));
+    }
+    match config_path_from_env() {
+        None => Ok(Config::default()),
+        Some(path) if !Path::new(&path).exists() => {
+            log::info!("config env {CONFIG_ENV}='{path}' missing; using defaults");
+            Ok(Config::default())
+        }
+        Some(path) => load_or_default(Some(&path)),
+    }
+}
+
 /// Best-effort logging init; safe to call twice (tests, reconnect entry).
 pub fn init_logging(level: &str) {
     let filter = match level {
@@ -690,6 +721,53 @@ force_5 = "none"
     #[test]
     fn none_path_gives_defaults() {
         assert_eq!(load_or_default(None).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn env_config_propagates_non_default_values() {
+        // The reconnect path loads via env (udev passes no -c): a non-default
+        // value in the env-pointed file must reach the caller.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ltd.toml");
+        std::fs::write(&path, "enhanced_clicks = true\npolling_rate = 90\n").unwrap();
+        let old = std::env::var(CONFIG_ENV).ok();
+        unsafe { std::env::set_var(CONFIG_ENV, &path) };
+        let cfg = load_or_default_with_env(None).unwrap();
+        match old {
+            Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
+            None => unsafe { std::env::remove_var(CONFIG_ENV) },
+        }
+        assert!(cfg.enhanced_clicks);
+        assert_eq!(cfg.polling_rate, 90);
+    }
+
+    #[test]
+    fn explicit_path_wins_over_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("env.toml");
+        let cli_path = dir.path().join("cli.toml");
+        std::fs::write(&env_path, "enhanced_clicks = true\n").unwrap();
+        std::fs::write(&cli_path, "enhanced_clicks = false\n").unwrap();
+        let old = std::env::var(CONFIG_ENV).ok();
+        unsafe { std::env::set_var(CONFIG_ENV, &env_path) };
+        let cfg = load_or_default_with_env(Some(cli_path.to_str().unwrap())).unwrap();
+        match old {
+            Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
+            None => unsafe { std::env::remove_var(CONFIG_ENV) },
+        }
+        assert!(!cfg.enhanced_clicks);
+    }
+
+    #[test]
+    fn missing_env_file_falls_back_to_defaults() {
+        let old = std::env::var(CONFIG_ENV).ok();
+        unsafe { std::env::set_var(CONFIG_ENV, "/nonexistent-ltd-config-xyz.toml") };
+        let cfg = load_or_default_with_env(None).unwrap();
+        match old {
+            Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
+            None => unsafe { std::env::remove_var(CONFIG_ENV) },
+        }
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]
