@@ -26,10 +26,95 @@ Higher requests are clamped, never sent. BT has no rate tuning (USB-first).
 
 ## Install
 
+### Arch Linux (AUR)
+
 ```sh
-cargo build --release
+yay -S linux-trackpad-driver-git
+# or: paru -S linux-trackpad-driver-git
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+Verify:
+
+```sh
+ltd doctor
+systemctl status linux-trackpad-driver.service
+journalctl -u linux-trackpad-driver.service --since "5 min ago"
+```
+
+The AUR package (`packaging/arch/PKGBUILD`) ships the full file set:
+`/usr/bin/ltd`, the udev rules, all three units (main service, reconnect
+template, resume service), the system-sleep hook, and
+`/etc/linux-trackpad-driver/config.toml` (a conffile via `backup=`,
+preserved on upgrade). Post-install reloads udev + systemd and
+re-triggers hidraw `add`; the daemon is never auto-started — enabling
+is one explicit step.
+
+### Debian / Ubuntu (.deb)
+
+```sh
+sudo dpkg -i linux-trackpad-driver_0.1.0_amd64.deb
+sudo apt-get install -f   # only if dpkg reports missing dependencies
+```
+
+Post-install steps (the package only reloads daemons; enabling is an
+explicit admin step by policy — see `debian/README.Debian`):
+
+```sh
+sudo systemctl daemon-reload
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw --action=add
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+Then verify with `ltd doctor` (below).
+
+### Fedora / other distros (from source)
+
+```sh
+cargo build --locked --release
 sudo install -m755 target/release/ltd /usr/bin/ltd
 ```
+
+Then install the rules, units, hook, and default config manually — exact
+commands in [`INSTALL.md`](INSTALL.md) — and enable:
+
+```sh
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+## First run: `ltd doctor` checklist
+
+```sh
+ltd doctor
+ltd doctor -c /etc/linux-trackpad-driver/config.toml
+```
+
+`ltd doctor` is read-only: sysfs device scan + config validate + daemon
+socket dial. It never sends feature reports, never grabs, never changes
+hardware state. Exit 0 = config valid and a trackpad node seen; exit 1
+otherwise. Each checklist question maps to one line plus a manual
+follow-up:
+
+| Question | `ltd doctor` line | Manual follow-up |
+|---|---|---|
+| Is a device seen? | `[ok] device seen: /dev/hidrawN …` | `ls /sys/class/hidraw`, `dmesg \| grep -i hid` |
+| Is the hidraw node there? | `(present …)` per node | `ls -l /dev/hidrawN` |
+| Is the driver bound yet? | `(driver bound …)` per node | fresh `add` may need a second: probe/bind race is normal |
+| Did the udev rule fire? | — (rule hands off to systemd) | `udevadm monitor --udev --subsystem-match=hidraw`, then replug; `systemctl status 'linux-trackpad-driver-reconnect@hidrawN.service'` |
+| Is the daemon active? | `[ok] daemon socket live …` / `[..] socket absent …` | `systemctl is-active linux-trackpad-driver.service` |
+| How to read logs? | — | `journalctl -u linux-trackpad-driver.service --since "5 min ago"` |
+
+## Troubleshooting
+
+| Symptom | Check | Fix |
+|---|---|---|
+| `doctor`: no trackpad seen | cable seated? BT paired? `ls /sys/class/hidraw`; `dmesg \| grep -i hid` | replug / finish BT pairing, re-run `ltd doctor` |
+| `doctor`: config invalid | line names the key + accepted range | edit `/etc/linux-trackpad-driver/config.toml` (unknown keys are rejected — usually a typo); re-run `ltd doctor -c <file>` first |
+| Permission denied on a manual run | `getfacl /dev/hidrawN`; `groups` | `sudo -E ltd …` (keeps `$LTD_SOCKET`/`$LTD_CONFIG`); or on `input`-grouped distros `sudo usermod -aG input $USER` + re-login. The system daemon runs as root and needs nothing extra. |
+| Udev rule not firing | `udevadm monitor --udev --subsystem-match=hidraw` while replugging; `udevadm test /sys/class/hidraw/hidrawN` | `sudo udevadm control --reload-rules` + `sudo udevadm trigger --subsystem-match=hidraw --action=add`; confirm the rules file exists under `/usr/lib/udev/rules.d/` (packaged) or `/etc/udev/rules.d/` (manual). Note: reconnect without a live daemon disengages unless `-f` — start the main service first. |
+| Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | hidraw coexists with `hid-magicmouse` on BT: the kernel keeps emitting evdev unless suppressed. Prefer USB, or set `enhanced_clicks = true` so the proxy grabs the node (grab suppresses the kernel duplicate). |
+| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup. |
 
 Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).
 
@@ -40,6 +125,7 @@ sudo ltd run                          # daemon: init + idle (passthrough via lib
 sudo ltd run -c /etc/linux-trackpad-driver/config.toml
 sudo ltd reconnect /dev/hidrawN       # udev entry / manual re-init
 sudo ltd reconnect /dev/hidrawN -f -p 90 -d
+ltd doctor                            # read-only first-run checklist (scan + config + socket)
 ```
 
 Config: [`config/default.toml`](config/default.toml). Key gate:

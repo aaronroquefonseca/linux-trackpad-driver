@@ -9,6 +9,12 @@ cargo build --release
 sudo install -m755 target/release/ltd /usr/bin/ltd
 ```
 
+First-run check (read-only — scan + config + socket, never touches HW):
+
+```sh
+ltd doctor
+```
+
 ## udev rules
 
 ```sh
