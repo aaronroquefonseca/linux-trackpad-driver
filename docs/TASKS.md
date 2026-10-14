@@ -38,13 +38,17 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
 | uinput-proxy | T3 `72899193` — PR #6 `ac25da8` (5 L1 + L2 fixed, verified, head==PR head) | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | DONE, MERGED (`e81d15e`). Owner + 3 reviewers SETTLED |
-| suspend-hook | T3 `01236349` — PR #7 `4e31c5d` (174+10 green, verified) | `feat/suspend-hook` @ `ltd-wt/suspend-hook` | resume re-init, re-attach | OPEN, IN REVIEW (3 threads: `594e8659` Spark, `65e67c9d` MiMo, `ce690279` Step5) |
+| suspend-hook | T3 `01236349` — PR #7 `da81c73` (L1 A/B/C + L2 fixed, verified) | `feat/suspend-hook` | resume re-init, re-attach | DONE, MERGED (`3c641e0`). Owner + 3 reviewers SETTLED |
+| packaging-deb | T3 `5f88ee50` | `feat/packaging-deb` @ `ltd-wt/packaging-deb` | Debian package | RUNNING |
+| packaging-aur | T3 `ef21e59c` — PR #10 (packaging-only, validated) | `feat/packaging-aur` | AUR PKGBUILD | DONE, MERGED. Owner SETTLED |
+| env-flake | T3 `086f869b` — PR #11 `3524627` (verified green) | `fix/env-test-serial` | serialize env tests | DONE, MERGED. Owner SETTLED |
+| evdev-stub | T3 `c409658b` — PR #9 `692f8e2` (180+11 green at head) | `feat/evdev-generic-stub` | tier scaffold | DONE, MERGED. Owner SETTLED |
 
 ## Phase 1 — wave 3 (unblocked: #6 merged)
 
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
-| force-click | T3 `bc87d3ce` | `feat/force-click` @ `ltd-wt/force-click` | 2nd level + force actions | RUNNING |
+| force-click | T3 `bc87d3ce` | `feat/force-click` @ `ltd-wt/force-click` | 2nd level + force actions | OPEN, IN REVIEW (3 threads: `ad0baf73` Spark done, `99ada008` MiMo done, `1faa216d` Step5 done; combined follow-up relayed) |
 
 ## Phase 2 — later (not yet queued for dispatch)
 
