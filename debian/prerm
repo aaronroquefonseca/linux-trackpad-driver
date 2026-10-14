@@ -1,0 +1,18 @@
+#!/bin/sh
+# prerm for linux-trackpad-driver: leave the machine with no enabled units
+# behind. Removal never starts anything; it only disables.
+set -e
+
+case "${1:-}" in
+    remove|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --no-reload disable \
+                linux-trackpad-driver.service \
+                linux-trackpad-driver-resume.service || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

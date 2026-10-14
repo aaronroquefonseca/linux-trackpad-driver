@@ -1,0 +1,21 @@
+Source: linux-trackpad-driver
+Section: utils
+Priority: optional
+Maintainer: Aarón Roque Fonseca <aaronroquefonseca@gmail.com>
+Standards-Version: 4.6.2
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Rules-Requires-Root: no
+
+Package: linux-trackpad-driver
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, udev, systemd
+Description: Linux driver core-init for Apple Magic Trackpad 2 (USB/BT)
+ Sends the USB feature-report init sequence (multitouch enable,
+ host-click mode, capped polling rate) for Apple Magic Trackpad 2
+ (Lightning 05ac:0265/004c:0265, USB-C 05ac:0324/004c:0324) over USB,
+ handles Bluetooth single-node attach, hotplug reconnect via udev plus
+ systemd, and suspend/resume re-init via a system-sleep hook.
+ .
+ Ships the ltd binary, udev rules, systemd units (main service,
+ reconnect template, resume service, system-sleep hook), and a default
+ system config. Units ship disabled: enable explicitly, see README.Debian.
