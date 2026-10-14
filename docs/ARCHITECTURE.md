@@ -78,7 +78,10 @@ pub trait TouchSource {
 
 ```toml
 log_level = "info"        # debug|info|warn|error
-polling_rate = 500        # requested Hz; device caps (~110); honest clamp
+polling_rate = 110        # requested Hz, CAPPED: device max demonstrated ~111
+                          # (0x99 report `99 F2 XX`, ≈3850/XX; XX=0x23 → ~111 Hz).
+                          # Never request above device max; verify by measurement.
+                          # BT rate equivalent unknown — USB-first.
 enhanced_clicks = false   # opt-in gate for entire clicks pipeline
 sensitivity = 64          # 1..=255
 margin = 5

@@ -16,9 +16,10 @@ Key hardware facts carried over as requirements (reimplement, don't copy):
 - USB init via feature reports: multitouch `02 01`, host-click `21 01`,
   polling `99 F2 X`. BT path is single-node (no init dance, straight to use).
 - Polling cap: issue mr-cal/Linux-Magic-Trackpad-2-USB-C-Driver#26 —
-  requested 90 Hz → ~110 Hz effective cap, formula `153,242,X` → `3850/X`.
-  New code must express high-rate intent (default request 500 Hz) while
-  clamping to device capability, and document the cap honestly.
+  `99 F2 X`, `≈3850/X` Hz, max demonstrated `X=0x23` → ~111 Hz; divisor table
+  beyond `X=35` unverified (may NAK/ignore). New code requests a CAPPED value
+  (default ~110 Hz), clamps to device max, verifies by measurement.
+  Never requests 500 Hz. BT rate equivalent unknown (USB-first scope).
 - Click proxy (opt-in): hidraw 9-byte block parse, pressure at offset 7,
   evdev grab + uinput emit, sensitivity / margin / haptic / quiet-click,
   force second level, 1–5 finger action map.

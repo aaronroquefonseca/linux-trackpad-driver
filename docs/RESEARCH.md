@@ -118,7 +118,7 @@ https://sensel.com/product
   watch hidraw add/remove + udev `changed` + sleep hooks, re-open +
   re-`SET_FEATURE` with backoff. No kernel persistence for userspace reports.
 
-## 4. Tier-model verdict (CORRECTION ADOPTED)
+## 4. Tier-model verdict (CORRECTION ADOPTED, confirmed by T3 deep survey)
 
 Base L0/L1/L2 holds as shorthand but needs splits. Adopted tiers:
 
@@ -154,3 +154,71 @@ Rules derived:
   `EVIOCGRAB` suppresses duplicate libinput events; risks: hides native quirks
   unless re-implemented, `input`-group perms, Wayland re-enumeration race,
   resume re-grab. Opt-in default-off confirmed correct.
+
+## 6. T3 deep-survey deltas (2026-10-14, threads `research-haptic`, `research-kernel`)
+
+Full reports live in the owning threads' final messages. Load-bearing deltas
+merged here; tier verdict + plan verdicts below supersede §4–§5 where they differ.
+
+### Polling posture CORRECTED (was §5 "request 500 + clamp")
+Independent USB-C measurement: `0x99` = `99 f2 XX`, `≈3850/XX` Hz, max tested
+`XX=0x23` → ~111 Hz; no higher device mode demonstrated; table beyond `XX=35`
+unverified (may NAK/ignore). Posture: request CAPPED value (~110), clamp to
+device max, verify by measurement — never 500 Hz. BT equivalent unknown.
+https://github.com/benjaminwestern/linux-apple-trackpad ,
+https://github.com/mr-cal/Linux-Magic-Trackpad-2-USB-C-Driver/issues/26
+ROADMAP + ARCHITECTURE amended; `base-init` notified in-flight.
+
+### hidraw ordering: defer-retry-verify (new detail)
+Kernel probe sends its own init; userspace `HIDIOCSFEATURE` at `add` races it.
+Watch udev `add`/`change` + `bind`, wait for node + driver bind, backoff-retry,
+verify via `HIDIOCGFEATURE`, re-apply on resume. Precedent: July 2026 kernel
+`.reset_resume` workqueue patch (inline too early).
+https://patchew.org/linux/20260725203446.35001-1-ckhordiasma@gmail.com
+
+### Resume regression (load-bearing, new)
+Trackpad 2 USB drops multitouch across power transition (report `0x02`
+21→8 bytes; clicks survive, motion lost until replug). Fix = re-enable
+multitouch from `.reset_resume` via workqueue. Userspace `reconnect` + resume
+hook MUST re-send multitouch enable. Same patch link.
+
+### BT: no exclusivity (REFUTED exclusivity assumption)
+hidraw coexists with `hid-magicmouse` on BT; kernel keeps emitting evdev unless
+handled (unbind driver for VID:PID, or evdev-grab physical node behind opt-in
+flag), else double-input. https://docs.kernel.org/hid/hidraw.html
+Scope BT to bring-up + init verification first (USB-first for rate tuning).
+
+### uinput contract (hardened)
+Proxy node: `res==0`, arbitrary 0..253, Type-B slots + tracking IDs, NO
+grams/newtons claim, NO `EV_FF`/`FF_HAPTIC` advertisement (no 2026
+libinput/Wayland consumer; series unmerged Jul–Oct 2025 Denose/Czubak).
+https://lwn.net/Articles/1034290 ,
+https://www.spinics.net/lists/kernel/msg5810859.html
+
+### udev trap (confirmed)
+systemd#37063: `ATTRS{idVendor}` never matches uinput event nodes. Match by
+`ATTRS{name}`/`ATTR` on `input` parent or `SUBSYSTEM=="input", ATTR{name}`.
+https://github.com/systemd/systemd/issues/37063
+
+### Sleep hooks (new constraint)
+`/usr/lib/systemd/system-sleep/` executables run `pre/post`; `user.slice`
+frozen during hooks → re-init must be system-side, no user-session IPC.
+https://www.freedesktop.org/software/systemd/man/latest/systemd-suspend.service.html
+
+### Tier verdict (confirmed + extended)
+L0/L1a/L1b/L2s/L2p HOLDS. Add **mode axis** (device- vs host-controlled) and
+**transport axis** (HID vs SPI): Apple internal pads off-HID; Dell XPS proves
+L2p silicon can expose L0/L1 software on Linux (Synaptics manual-trigger vs
+kernel auto-trigger-only gap → userspace daemon workaround exists:
+https://github.com/basecamp/omarchy/pull/5534). Framework 13 Pro (BOS1921):
+likely L2p via HID feature reports (`framework_tool --haptic-intensity`,
+PR FrameworkComputer/framework-system#332); `hid-recorder` dump still needed.
+Gate host-haptic UI on `PRESSUREPAD + FF_HAPTIC + 0x0E waveforms + units`,
+never on `ABS_MT_PRESSURE` alone.
+
+### Per-plan-element verdicts (final, supersede §5 prose)
+- (a) USB feature-report init — SUPPORTS (defer-retry-verify).
+- (b) BT single-node — PLAUSIBLE-WEAKER (no exclusivity; USB-first).
+- (c) evdev-grab + uinput proxy, opt-in default-off — SUPPORTS (res==0, no FF).
+- (d) udev/systemd — PLAUSIBLE-WEAKER (#37063 trap; match by name/ATTR).
+- (e) suspend/resume re-init — SUPPORTS (system-side, re-send enable; precedent).

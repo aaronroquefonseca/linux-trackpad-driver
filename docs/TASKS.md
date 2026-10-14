@@ -12,9 +12,9 @@ coordinator verifies each claim in code. Merge gates: CI green, no unresolved L0
 
 | ID | Thread | Branch | Scope | Status |
 |----|--------|--------|-------|--------|
-| base-init | T3 `3ddd0a73` — branch `main`, worktree = project root, base `90b4c98` | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` + 500→cap clamp), BT single-node path, lock socket, `cargo fmt/clippy/test` green | RUNNING (turn started, handoff sha256 `121648e0…`) |
-| research-haptic | T3 `20ea67a8` (docs-only, no commit; report in-thread) | — | Laptop haptic deep survey; tier-split verdict | RUNNING (handoff `231007fa…`) |
-| research-kernel | T3 `33187ad9` (docs-only, no commit; report in-thread) | — | Input-stack deep survey; plan-element verdicts | RUNNING (handoff `830bcc30…`; note: turn receipt `sessionRevoked:false`, dispatch accepted HTTP 200 — monitor, no secret exposure) |
+| base-init | T3 `3ddd0a73` — branch `main`, worktree = project root, base `90b4c98` | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` capped ~110, never 500), BT single-node path, lock socket, `cargo fmt/clippy/test` green | RUNNING (coding `src/init.rs`; polling-posture correction relayed + verified `0bac3d24…`, queued behind active turn) |
+| research-haptic | T3 `20ea67a8` — report received (10.3 KB, ≥8 sources), deltas merged to `docs/RESEARCH.md` §6 | — | Laptop haptic deep survey; tier-split verdict | DONE, SETTLED |
+| research-kernel | T3 `33187ad9` — report received (16.4 KB, 18 sources), deltas merged to `docs/RESEARCH.md` §6 | — | Input-stack deep survey; plan-element verdicts | DONE, SETTLED |
 | research-tiers | DONE — subagent proxies merged by coordinator | docs only | Tier correction adopted: L0/L1a/L1b/L2s/L2p → `docs/RESEARCH.md` §4 | DONE |
 
 Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-init; must inform Phase 1.
@@ -68,3 +68,8 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
   Model: Muse Spark 1.3 Contributor Xhigh (opencode/instance, build agent).
   Prior subagent research kept as §2–§4 baseline in `docs/RESEARCH.md`;
   T3 research threads deepen it and report in-thread (no commits).
+- 2026-10-14: T3 research DONE (`20ea67a8`, `33187ad9` reports in-thread,
+  deltas merged to `docs/RESEARCH.md` §6, threads SETTLED after verification).
+  Load-bearing change: polling posture 500 Hz → capped ~110 Hz
+  (`99 F2 0x23`); ROADMAP/ARCHITECTURE amended; correction relayed to
+  `base-init` in-flight (verified persisted). base-init still RUNNING.
