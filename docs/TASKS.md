@@ -33,18 +33,18 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | reconnect-bt | T3 `8a38d26b` — PR #4 | `feat/reconnect-bt` | idempotency, BT, resume re-init | OPEN, REBASING onto fixed main (rebase order sent + verified) |
 | tests-hw-mock | T3 `8f5054ba` — PR #3, verified clean-HEAD (52+5 green) | `feat/tests-hw-mock` | mock harness + CI workflow | DONE, MERGED (`25068e5`). Owner SETTLED |
 
-## Phase 1 — wave 2 (blocked on wave-1 merges)
+## Phase 1 — wave 2 (unblocked: #2 + #5 merged; #4 merged 2026-10-14)
 
-| ID | Branch | Depends | Scope | Status |
-|----|--------|---------|-------|--------|
-| uinput-proxy | T3 `72899193` — PR #6 `28f98ab` (119+5 green per owner) | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | OPEN, IN REVIEW (3 threads: `21ee3a3b` Spark, `80fcd0c5` MiMo, `eec4e988` Step5) |
-| suspend-hook | waits for #4 merge | `feat/suspend-hook` | resume re-init, re-attach | QUEUED |
+| ID | Thread | Branch/worktree | Scope | Status |
+|----|--------|-----------------|-------|--------|
+| uinput-proxy | T3 `72899193` — PR #6 `ac25da8` (5 L1 + L2 fixed, verified, head==PR head) | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | DONE, MERGED (`e81d15e`). Owner + 3 reviewers SETTLED |
+| suspend-hook | T3 `01236349` | `feat/suspend-hook` @ `ltd-wt/suspend-hook` | resume re-init, re-attach | RUNNING |
 
-## Phase 1 — wave 3
+## Phase 1 — wave 3 (unblocked: #6 merged)
 
-| ID | Branch | Depends | Scope | Status |
-|----|--------|---------|-------|--------|
-| force-click | `feat/force-click` | uinput-proxy merged | 2nd level + force actions | QUEUED |
+| ID | Thread | Branch/worktree | Scope | Status |
+|----|--------|-----------------|-------|--------|
+| force-click | T3 `bc87d3ce` | `feat/force-click` @ `ltd-wt/force-click` | 2nd level + force actions | RUNNING |
 
 ## Phase 2 — later (not yet queued for dispatch)
 
