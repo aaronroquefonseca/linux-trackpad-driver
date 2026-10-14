@@ -5,11 +5,16 @@
 //! USB-C `05ac:0324` / `004c:0324`). Graceful with no hardware: empty list.
 //!
 //! Ordering note (probe race): a freshly added node may not yet be bound to
-//! `hid-magicmouse`. [`wait_for_node`] polls for the devnode so callers can
-//! wait before the first `HIDIOCSFEATURE`; init itself retries with backoff
-//! (see [`crate::init::send_with_retry`]). Per-interface routing (USB If1 vs
-//! If2) is intentionally NOT done here — init is idempotent per node and the
-//! Phase-1 `reconnect-bt` task owns refined routing.
+//! `hid-magicmouse`. [`wait_for_ready`] polls for the devnode *and* the driver
+//! bind so callers can defer past the probe window before the first
+//! `HIDIOCSFEATURE`; init itself retries with backoff
+//! (see [`crate::init::send_with_retry`]) and verifies via `HIDIOCGFEATURE`.
+//! Per-interface routing groundwork (USB If1 vs If2): init stays idempotent
+//! per node (safe to re-run whichever interface node udev hands us), and
+//! [`interface_number_for_node`] records which interface accepted multitouch
+//! for diagnostics. The reference routes multitouch+polling to If1 and
+//! host-click to If2; until sibling discovery lands, we send the full sequence
+//! to the given node (device ignores what is not for it) and log the iface.
 
 use anyhow::Result;
 
@@ -118,6 +123,10 @@ fn scan_sysfs(class_dir: &str) -> Result<Vec<DiscoveredDevice>> {
 /// Wait for a devnode path to appear (probe/bind race), polling every
 /// 50 ms up to `timeout_ms`. Returns `true` if the node exists.
 pub fn wait_for_node(devnode: &str, timeout_ms: u64) -> bool {
+    wait_for_node_with_deadline(devnode, timeout_ms)
+}
+
+fn wait_for_node_with_deadline(devnode: &str, timeout_ms: u64) -> bool {
     let waited = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(timeout_ms);
     while waited.elapsed() < budget {
@@ -127,6 +136,93 @@ pub fn wait_for_node(devnode: &str, timeout_ms: u64) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     std::path::Path::new(devnode).exists()
+}
+
+/// Basename of a hidraw devnode (`/dev/hidraw3` → `Some("hidraw3")`).
+/// Returns `None` for non-hidraw paths.
+pub fn hidraw_name(devnode: &str) -> Option<String> {
+    let base = devnode.rsplit('/').next()?;
+    if base.starts_with("hidraw") && base.len() > "hidraw".len() {
+        Some(base.to_string())
+    } else {
+        None
+    }
+}
+
+/// Read a `bInterfaceNumber` attribute file (`"01\n"` → `Some(1)`).
+/// Pure, unit-tested.
+pub fn parse_interface_number(text: &str) -> Option<u8> {
+    let t = text.trim().trim_start_matches('0');
+    let t = if t.is_empty() { "0" } else { t };
+    t.parse::<u8>().ok()
+}
+
+/// USB interface number for a hidraw node, via sysfs.
+///
+/// Walks `<class_root>/<hidraw>/device` up to 3 parents looking for a
+/// `bInterfaceNumber` attribute (the HID device itself has none; the USB
+/// interface parent does). Returns `None` for BT nodes / unknown layouts —
+/// callers treat that as "route the full idempotent sequence anyway".
+pub fn interface_number_for_node(devnode: &str) -> Option<u8> {
+    interface_number_with_root(devnode, "/sys/class/hidraw")
+}
+
+fn interface_number_with_root(devnode: &str, class_root: &str) -> Option<u8> {
+    let name = hidraw_name(devnode)?;
+    let mut dir = std::path::PathBuf::from(format!("{class_root}/{name}/device"));
+    for _ in 0..4 {
+        let candidate = dir.join("bInterfaceNumber");
+        if let Ok(text) = std::fs::read_to_string(&candidate) {
+            if let Some(n) = parse_interface_number(&text) {
+                return Some(n);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+    None
+}
+
+/// True when the hidraw node's HID device is bound to a driver
+/// (`.../device/driver` symlink exists). Best-effort: `false` on any error.
+pub fn driver_bound_for_node(devnode: &str) -> bool {
+    driver_bound_with_root(devnode, "/sys/class/hidraw")
+}
+
+fn driver_bound_with_root(devnode: &str, class_root: &str) -> bool {
+    let Some(name) = hidraw_name(devnode) else {
+        return false;
+    };
+    let link = std::path::PathBuf::from(format!("{class_root}/{name}/device/driver"));
+    std::fs::symlink_metadata(&link).is_ok()
+}
+
+/// Defer past the probe/bind race: wait for the node *and* the driver bind.
+/// Returns `(node_present, driver_bound)`; callers proceed with retrying
+/// writes when the node exists even if the bind is not yet visible (the
+/// bind symlink layout varies across kernels).
+pub fn wait_for_ready(devnode: &str, timeout_ms: u64) -> (bool, bool) {
+    wait_for_ready_with_root(devnode, timeout_ms, "/sys/class/hidraw")
+}
+
+fn wait_for_ready_with_root(devnode: &str, timeout_ms: u64, class_root: &str) -> (bool, bool) {
+    let waited = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(timeout_ms);
+    let mut ready = (
+        std::path::Path::new(devnode).exists(),
+        driver_bound_with_root(devnode, class_root),
+    );
+    while waited.elapsed() < budget {
+        let node = std::path::Path::new(devnode).exists();
+        let bound = driver_bound_with_root(devnode, class_root);
+        ready = (node, bound);
+        if node && bound {
+            return ready;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    ready
 }
 
 #[cfg(test)]
@@ -189,5 +285,56 @@ mod tests {
     #[test]
     fn wait_for_node_present_returns_fast() {
         assert!(wait_for_node("/dev/null", 1000));
+    }
+
+    #[test]
+    fn hidraw_name_basename() {
+        assert_eq!(hidraw_name("/dev/hidraw3").as_deref(), Some("hidraw3"));
+        assert_eq!(hidraw_name("/dev/input/event5"), None);
+        assert_eq!(hidraw_name(""), None);
+    }
+
+    #[test]
+    fn parses_interface_numbers() {
+        assert_eq!(parse_interface_number("01\n"), Some(1));
+        assert_eq!(parse_interface_number("2"), Some(2));
+        assert_eq!(parse_interface_number("0"), Some(0));
+        assert_eq!(parse_interface_number("nope"), None);
+    }
+
+    #[test]
+    fn interface_and_bind_from_fake_sysfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(root.join("hidraw7/device")).unwrap();
+        std::fs::write(root.join("hidraw7/device/bInterfaceNumber"), "02\n").unwrap();
+        assert_eq!(
+            interface_number_with_root("/dev/hidraw7", root.to_str().unwrap()),
+            Some(2)
+        );
+        assert!(!driver_bound_with_root(
+            "/dev/hidraw7",
+            root.to_str().unwrap()
+        ));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp", root.join("hidraw7/device/driver")).unwrap();
+        assert!(driver_bound_with_root(
+            "/dev/hidraw7",
+            root.to_str().unwrap()
+        ));
+        assert_eq!(
+            interface_number_with_root("/dev/hidraw9", root.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn ready_waits_for_both_signals() {
+        // /dev/null exists but has no hidraw sysfs entry: node true, bind false.
+        let (node, bound) = wait_for_ready_with_root("/dev/null", 60, "/nonexistent-xyz");
+        assert!(node);
+        assert!(!bound);
+        let (node, _) = wait_for_ready_with_root("/nonexistent-hidraw-xyz", 60, "/nonexistent-xyz");
+        assert!(!node);
     }
 }
