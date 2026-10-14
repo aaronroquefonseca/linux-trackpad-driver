@@ -2,6 +2,8 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
+#[cfg(test)]
+pub mod hw_mock;
 pub mod init;
 pub mod lock;
 
