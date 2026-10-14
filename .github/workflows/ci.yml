@@ -18,3 +18,30 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y debhelper devscripts lintian
+      - name: maintainer script syntax + exec bits
+        run: |
+          test -x debian/rules
+          test -x debian/postinst
+          test -x debian/prerm
+          sh -n debian/postinst
+          sh -n debian/prerm
+      - name: install manifest targets exist
+        run: |
+          while read -r src _; do
+            case "$src" in ''|\#*) continue;; esac
+            test -e "$src" || { echo "missing install source: $src"; exit 1; }
+          done < debian/linux-trackpad-driver.install
+      - name: changelog + control syntax
+        run: |
+          dpkg-parsechangelog -l debian/changelog
+          dpkg-checkbuilddeps -d 2>&1 || true
+      - name: source package build
+        run: dpkg-buildpackage -S -us -uc -d
+      - name: lintian (advisory)
+        run: lintian --tag-display-limit 0 ../*.dsc || echo "::warning ::lintian reported tags"
