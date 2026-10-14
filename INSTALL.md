@@ -81,8 +81,12 @@ systemctl status linux-trackpad-driver-resume.service
 - Daemon side (belt-and-braces): the running daemon re-verifies each known
   USB node every 30 s (`GET_FEATURE` read-back of the polling report) and
   re-inits on mismatch; newly appeared nodes get full init, vanished nodes
-  emit `Detached`. Clicks re-attaches via the device-ready hub after init,
-  never before.
+  emit `Detached`.
+- Re-attach path: the `ltd resume` one-shot re-arms hardware only (its hub
+  would reach zero listeners, so it emits nothing). Clicks re-attaches on
+  the daemon hub: the tick re-inits a drifted node and emits `Ready` after
+  the sequence, or fully inits a re-enumerated node — at most ~30 s after
+  the hook when the hook path misses.
 
 No udev `change` rule is needed: resume re-enumeration already emits `add`,
 which the rules above hand to the reconnect template; the hook + daemon

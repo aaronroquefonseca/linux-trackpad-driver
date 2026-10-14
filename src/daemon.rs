@@ -301,8 +301,9 @@ pub fn run_reconnect(
     let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
     let transport = classify_node(devnode, &devs)?;
     // No proxy subscription here: reconnect is a short-lived udev process
-    // and must never grab. The daemon owns the proxy and re-attaches on the
-    // Ready events init_node/reconnect emit through its own hub.
+    // and must never grab. Its hub is a per-process orphan reaching zero
+    // listeners; the daemon owns the proxy and re-attaches tick-mediated
+    // (rescan → init on its own hub, ≤30 s latency).
     let ready_hub = hub();
 
     if mode == ReconnectMode::Disengage {
@@ -312,8 +313,9 @@ pub fn run_reconnect(
                 // Unbind is sticky: restore passthrough for a previously
                 // suppressed node (best-effort no-op when already bound).
                 // Resume re-suppresses via the init arm when the opt-in is
-                // set; the Detached event below is the clicks re-attach
-                // signal (resume re-emits Ready after re-init).
+                // set; the Detached event below lets clicks release the
+                // node (re-attach is tick-mediated: rescan → init → Ready
+                // on the daemon hub).
                 log::info!("BT {devnode}: disengage (no reports sent)");
                 if let Err(e) = init::restore_bt_passthrough(devnode) {
                     log::warn!("BT {devnode}: re-bind best-effort failed ({e:#})");
@@ -405,12 +407,10 @@ pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeR
     if devs.is_empty() {
         log::info!("resume: no supported trackpads found; nothing to re-init");
     }
-    let ready_hub = hub();
     Ok(resume::run_resume_scan(
         &devs,
         polling_hz,
         cfg.enhanced_clicks,
-        &ready_hub,
     ))
 }
 
@@ -471,8 +471,11 @@ impl ResumeWatch {
                                     dev.devnode
                                 );
                             }
-                            match resume::resume_usb_node(&dev.devnode, cfg.polling_rate, ready_hub)
-                            {
+                            match resume::resume_usb_node(
+                                &dev.devnode,
+                                cfg.polling_rate,
+                                Some(ready_hub),
+                            ) {
                                 Ok(resume::ResumeAction::Reinitialized) => {
                                     actions.push(TickAction::Reinitialized(dev.devnode.clone()))
                                 }

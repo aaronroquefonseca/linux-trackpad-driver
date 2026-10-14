@@ -8,16 +8,21 @@
 //! Two layers, either sufficient alone:
 //! - System side: the `system-sleep` hook / resume unit runs `ltd resume`
 //!   (see [`run_resume_scan`]), which re-verifies every node and re-inits on
-//!   mismatch. System-side only: no user-session IPC (user.slice is frozen
-//!   while sleep hooks run).
+//!   mismatch. Hardware-only: the one-shot owns no listeners, so it emits
+//!   nothing — re-arming the device is its whole job. System-side only: no
+//!   user-session IPC (user.slice is frozen while sleep hooks run).
 //! - Daemon side: the `run` loop calls [`ResumeWatch::tick`] every
 //!   [`RESUME_REVERIFY_INTERVAL_SECS`], covering add/change/remove between or
 //!   without sleep hooks (re-verify polling via `GET_FEATURE`, re-init on
 //!   mismatch).
 //!
 //! Clicks contract: re-init emits `Ready` on the [`DeviceReadyHub`] *after*
-//! the sequence succeeds, so the future clicks pipeline re-attaches without
-//! ever reordering init. A node that vanished emits `Detached` instead, never
+//! the sequence succeeds, so the clicks pipeline re-attaches without ever
+//! reordering init. Those emits only happen on a live daemon hub (boot init,
+//! tick): the one-shot's hub would be a per-process orphan reaching zero
+//! listeners, so cross-process re-attach is tick-mediated (≤
+//! [`RESUME_REVERIFY_INTERVAL_SECS`] latency) plus the udev `add` path for
+//! re-enumerated nodes. A node that vanished emits `Detached` instead, never
 //! `Ready`.
 
 use anyhow::Result;
@@ -37,10 +42,12 @@ pub const RESUME_READY_TIMEOUT_MS: u64 = 1000;
 pub enum ResumeAction {
     /// Polling read-back matched; no reports sent, no hub traffic.
     UpToDate,
-    /// Mismatch (or unreadable verify) → multitouch-first re-init sent,
-    /// `Ready` emitted for clicks re-attach.
+    /// Mismatch (or unreadable verify) → multitouch-first re-init sent.
+    /// Hub `Ready` is emitted only when a live hub is passed (daemon tick);
+    /// the one-shot passes none (its hub would reach zero listeners).
     Reinitialized,
-    /// Node gone → `Detached` emitted, never `Ready`.
+    /// Node gone → recorded as detached (`Detached` emitted only with a
+    /// live hub), never `Ready`.
     Detached,
 }
 
@@ -66,16 +73,20 @@ pub fn verify_node_polling(devnode: &str, polling_hz: u32) -> Result<bool> {
 }
 
 /// Resume one USB node: bounded wait, verify, multitouch-first re-init on
-/// mismatch, `Ready` emit for clicks re-attach. Missing node → `Detached`.
+/// mismatch. `ready_hub` is `Some` on the daemon tick (live listeners:
+/// `Ready` re-attaches clicks) and `None` in the one-shot (hardware-only).
+/// Missing node → `Detached` (emitted only with a live hub).
 pub fn resume_usb_node(
     devnode: &str,
     polling_hz: u32,
-    ready_hub: &DeviceReadyHub,
+    ready_hub: Option<&DeviceReadyHub>,
 ) -> Result<ResumeAction> {
     let (node, bound) = discovery::wait_for_ready(devnode, RESUME_READY_TIMEOUT_MS);
     if !node {
-        log::warn!("resume: node {devnode} gone after suspend; emitting Detached");
-        ready_hub.emit(&init::detached(devnode, Transport::Usb));
+        log::warn!("resume: node {devnode} gone after suspend; recording Detached");
+        if let Some(hub) = ready_hub {
+            hub.emit(&init::detached(devnode, Transport::Usb));
+        }
         return Ok(ResumeAction::Detached);
     }
     if !bound {
@@ -105,24 +116,22 @@ pub fn resume_usb_node(
                 outcome.iface,
                 outcome.plan.x,
             );
-            ready_hub.emit(&init::usb_ready(devnode));
+            if let Some(hub) = ready_hub {
+                hub.emit(&init::usb_ready(devnode));
+            }
             Ok(ResumeAction::Reinitialized)
         }
     }
 }
 
-/// Resume one BT node: no `GET_FEATURE` verify exists on this path, so always
-/// re-emit `Ready` (clicks re-attach) and re-apply the coexistence policy
-/// (re-suppresses when the opt-in is set — the unbind did not survive sleep).
-pub fn resume_bt_node(
-    devnode: &str,
-    enhanced_clicks: bool,
-    ready_hub: &DeviceReadyHub,
-) -> ResumeAction {
-    let ev = init::init_bluetooth(devnode);
-    ready_hub.emit(&ev);
+/// Resume one BT node (one-shot hardware arm): no `GET_FEATURE` verify exists
+/// on this path, so re-apply the coexistence policy (re-suppresses when the
+/// opt-in is set — the unbind did not survive sleep). Emits nothing: clicks
+/// re-attach is tick/udev-mediated (daemon re-emits `Ready` when the node
+/// re-appears or the tick re-inits it).
+pub fn resume_bt_node(devnode: &str, enhanced_clicks: bool) -> ResumeAction {
     let _ = init::apply_bt_coexistence(devnode, enhanced_clicks);
-    log::info!("resume: BT {devnode} re-attached (Ready re-emitted)");
+    log::info!("resume: BT {devnode} policy re-applied (hub re-attach is tick-mediated)");
     ResumeAction::Reinitialized
 }
 
@@ -155,18 +164,24 @@ impl ResumeReport {
 
 /// One resume pass over an explicit device list (scan lives with the caller
 /// so both the `ltd resume` one-shot and the daemon tick share this core).
-/// Per-node failures are collected, never fatal to sibling nodes.
+/// Hardware-only: passes no hub, emits nothing — the caller's process owns
+/// no listeners. Per-node failures are collected, never fatal to siblings.
+///
+/// Single scan, no rescan loop: each node gets one bounded
+/// [`RESUME_READY_TIMEOUT_MS`] wait, then verify-or-reinit. A node that
+/// vanishes mid-pass is recorded `Detached`; the daemon tick reconciles any
+/// skew on its next pass. Hook, tick, and udev interleave benignly: every
+/// path sends the same idempotent multitouch-first sequence.
 pub fn run_resume_scan(
     devs: &[DiscoveredDevice],
     polling_hz: u32,
     enhanced_clicks: bool,
-    ready_hub: &DeviceReadyHub,
 ) -> ResumeReport {
     let mut report = ResumeReport::default();
     for dev in devs {
         let outcome = match dev.transport {
-            Transport::Usb => resume_usb_node(&dev.devnode, polling_hz, ready_hub),
-            Transport::Bluetooth => Ok(resume_bt_node(&dev.devnode, enhanced_clicks, ready_hub)),
+            Transport::Usb => resume_usb_node(&dev.devnode, polling_hz, None),
+            Transport::Bluetooth => Ok(resume_bt_node(&dev.devnode, enhanced_clicks)),
         };
         match outcome {
             Ok(action) => report.nodes.push(NodeResume {
@@ -212,29 +227,25 @@ mod tests {
     }
 
     #[test]
-    fn bt_resume_reattaches_ready_via_hub() {
-        let hub = DeviceReadyHub::new();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = std::sync::Arc::clone(&seen);
-        hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
-        let action = resume_bt_node("/dev/hidraw9", false, &hub);
+    fn bt_oneshot_reapplies_policy_without_hub_traffic() {
+        // One-shot BT re-arms hardware only (coexistence policy); it owns no
+        // listeners, so it takes no hub and emits nothing. Ready re-emit is
+        // tick/udev-mediated.
+        let action = resume_bt_node("/dev/hidraw9", false);
         assert_eq!(action, ResumeAction::Reinitialized);
-        let seen = seen.lock().expect("seen lock");
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].kind, ReadyKind::Ready);
-        assert_eq!(seen[0].transport, Transport::Bluetooth);
     }
 
     #[test]
     fn detach_then_reattach_sequence_is_distinct() {
-        // Clicks must tell "device going away" from "device back": Detached
+        // Hub contract clicks relies on: "device going away" (Detached)
         // first, then a fresh Ready — never two Readys, never Ready for gone.
+        // Pinned at hub level; the tick is the production emitter.
         let hub = DeviceReadyHub::new();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = std::sync::Arc::clone(&seen);
         hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
         hub.emit(&init::detached("/dev/hidraw9", Transport::Bluetooth));
-        resume_bt_node("/dev/hidraw9", false, &hub);
+        hub.emit(&init::init_bluetooth("/dev/hidraw9"));
         let seen = seen.lock().expect("seen lock");
         assert_eq!(
             seen.iter().map(|e| e.kind).collect::<Vec<_>>(),
@@ -243,12 +254,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_usb_node_emits_detached_never_ready() {
+    fn missing_usb_node_records_detached_never_ready() {
+        // One-shot (no hub): recorded only. Tick (live hub): single Detached
+        // emit for clicks release.
+        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, None).unwrap();
+        assert_eq!(action, ResumeAction::Detached);
         let hub = DeviceReadyHub::new();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = std::sync::Arc::clone(&seen);
         hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
-        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, &hub).unwrap();
+        let action = resume_usb_node("/nonexistent-hidraw-xyz", 110, Some(&hub)).unwrap();
         assert_eq!(action, ResumeAction::Detached);
         let seen = seen.lock().expect("seen lock");
         assert_eq!(seen.len(), 1);
@@ -258,9 +273,8 @@ mod tests {
     #[test]
     fn scan_core_collects_per_node_errors() {
         // /dev/null exists but is not a trackpad: USB resume fails on
-        // ioctl, BT re-attaches fine — one node's failure never takes the
+        // ioctl, BT re-arms fine — one node's failure never takes the
         // pass (or the sibling) down.
-        let hub = DeviceReadyHub::new();
         let devs = vec![
             DiscoveredDevice {
                 devnode: "/dev/null".into(),
@@ -275,7 +289,7 @@ mod tests {
                 transport: Transport::Bluetooth,
             },
         ];
-        let report = run_resume_scan(&devs, 110, false, &hub);
+        let report = run_resume_scan(&devs, 110, false);
         assert_eq!(report.nodes.len(), 1);
         assert_eq!(report.nodes[0].action, ResumeAction::Reinitialized);
         assert_eq!(report.errors.len(), 1);
