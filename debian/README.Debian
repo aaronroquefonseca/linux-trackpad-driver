@@ -1,0 +1,36 @@
+linux-trackpad-driver for Debian
+=================================
+
+The package ships: /usr/bin/ltd, udev rules
+(lib/udev/rules.d/99-linux-trackpad-driver.rules), systemd units
+(lib/systemd/system/linux-trackpad-driver.service,
+linux-trackpad-driver-reconnect@.service,
+linux-trackpad-driver-resume.service), the system-sleep hook
+(lib/systemd/system-sleep/ltd-resume), and the default config
+(/etc/linux-trackpad-driver/config.toml, a conffile — local edits are
+preserved across upgrades).
+
+No auto-enable, no auto-start (policy choice, debconf-free)
+------------------------------------------------------------
+Installing the package never enables or starts the daemon:
+
+  * debian/rules runs dh_installsystemd with --no-enable --no-start,
+    so no unit is enabled at install and nothing is started.
+  * debian/postinst only reloads systemd (daemon-reload) and udev
+    (udevadm control --reload-rules), then prints how to enable.
+  * No debconf template exists: there is nothing to ask, because the
+    safe default (disabled) always applies.
+
+Rationale: the daemon touches hardware (feature-report init on attach,
+resume re-init). Starting it implicitly on install would change device
+behaviour without admin consent. One explicit step enables it:
+
+  systemctl enable --now linux-trackpad-driver.service
+
+The reconnect template needs no enabling (udev instantiates it per
+device). The resume service can additionally be enabled for an
+idempotent re-init pass at boot; the post-resume trigger itself is the
+system-sleep hook, which runs whenever installed and executable.
+
+Removal (debian/prerm) disables the main and resume units so no enabled
+state is left behind.

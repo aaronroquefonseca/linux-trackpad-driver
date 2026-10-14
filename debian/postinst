@@ -1,0 +1,32 @@
+#!/bin/sh
+# postinst for linux-trackpad-driver.
+#
+# Policy choice (documented in README.Debian): this package NEVER enables
+# or starts the daemon on install. The driver re-inits hardware on attach
+# and resume, so an automatic start would surprise the admin and touch
+# hardware without consent. Enabling is one explicit admin step:
+#   systemctl enable --now linux-trackpad-driver.service
+# No debconf questions are asked; the default (disabled) is safe.
+set -e
+
+case "${1:-}" in
+    configure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules || true
+        fi
+        cat <<'NOTE'
+linux-trackpad-driver: units are installed disabled (see README.Debian).
+To start the driver:  systemctl enable --now linux-trackpad-driver.service
+Hotplug reconnect works once the main service runs; udev rules were reloaded.
+hwdb note (optional, libinput palm pressure tuning): add a local override,
+then run `systemd-hwdb update` and retrigger the input node — see INSTALL.md.
+NOTE
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
