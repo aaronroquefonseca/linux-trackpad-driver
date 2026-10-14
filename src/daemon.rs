@@ -189,10 +189,11 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     };
 
     // Belt-and-braces resume detection: the system-sleep hook (`ltd resume`)
-    // is the primary post-sleep re-init; this tick covers add/change/remove
-    // that arrive with no sleep hook (re-verify polling via GET_FEATURE,
-    // multitouch-first re-init on mismatch). Initial init above always runs
-    // first; ticks never reorder it.
+    // is the primary post-sleep re-init (immediate); this tick covers
+    // add/change/remove that arrive with no sleep hook (re-verify polling
+    // via GET_FEATURE, multitouch-first re-init on mismatch), at most
+    // RESUME_REVERIFY_INTERVAL_SECS of cross-process re-attach latency.
+    // Initial init above always runs first; ticks never reorder it.
     let mut watch = ResumeWatch::new(&initial);
     let mut last_tick = std::time::Instant::now();
     while running.load(Ordering::SeqCst) {
@@ -413,6 +414,17 @@ pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeR
         cfg.enhanced_clicks,
     ))
 }
+/// Ticks between BT coexistence re-applies for known nodes (10 × 30 s =
+/// 5 min). The hook's one-shot is the primary re-suppressor; this is the
+/// backstop for hook-missed sleeps. Never emits hub traffic.
+pub const BT_REAPPLY_EVERY_TICKS: u64 = 10;
+
+/// Pure cadence: re-apply on every Nth tick (unit-tested; the tick itself
+/// needs hardware).
+pub fn bt_reapply_due(ticks: u64) -> bool {
+    ticks > 0 && ticks.is_multiple_of(BT_REAPPLY_EVERY_TICKS)
+}
+
 /// One daemon tick action, for logs/tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TickAction {
@@ -441,14 +453,18 @@ pub enum TickAction {
 ///   re-init once (assume transient), then assume armed until the periodic
 ///   reprobe ([`resume::unreadable_disposition`]) — firmware that NAKs reads
 ///   must not cause a re-init + `Ready` storm every pass;
-/// - still-present known BT node → nothing (no verify exists; the hook +
-///   add events cover it; re-emitting `Ready` every pass would spam clicks);
+/// - still-present known BT node → slow-cadence coexistence re-apply only
+///   (every [`BT_REAPPLY_EVERY_TICKS`]; the hook is primary, this backstops
+///   hook-missed sleeps; never emits — re-emitting `Ready` every pass would
+///   spam clicks);
 /// - vanished node → `Detached` emit so clicks releases it.
 ///
 /// Hub emits happen after each node's init step, never before — clicks
 /// re-attaches without reordering init.
 pub struct ResumeWatch {
     known: Vec<NodeState>,
+    /// Pass counter for slow-cadence work (BT re-apply).
+    ticks: u64,
 }
 
 struct NodeState {
@@ -466,10 +482,12 @@ impl ResumeWatch {
                     unreadable_streak: 0,
                 })
                 .collect(),
+            ticks: 0,
         }
     }
 
     pub fn tick(&mut self, cfg: &Config, ready_hub: &DeviceReadyHub) -> Vec<TickAction> {
+        self.ticks += 1;
         let current = match discovery::scan_trackpads() {
             Ok(devs) => devs,
             Err(e) => {
@@ -478,6 +496,11 @@ impl ResumeWatch {
             }
         };
         let mut actions = Vec::new();
+        // Nodes recorded Detached mid-pass (present in the scan but gone by
+        // the wait) are dropped from the stored snapshot below — trusting
+        // the fresher wait over the stale scan. They re-enter as added nodes
+        // if they come back.
+        let mut detached: Vec<String> = Vec::new();
         for dev in &current {
             let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
                 match init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, ready_hub) {
@@ -493,7 +516,16 @@ impl ResumeWatch {
                 continue;
             };
             if dev.transport != Transport::Usb {
-                // Known BT: steady state, no hub traffic.
+                // Known BT: steady state, no hub traffic — except a
+                // slow-cadence coexistence re-apply (the hook's one-shot is
+                // primary; this backstops hook-missed sleeps). Never emits.
+                if bt_reapply_due(self.ticks) {
+                    log::debug!(
+                        "resume tick: re-applying BT coexistence for {}",
+                        dev.devnode
+                    );
+                    let _ = init::apply_bt_coexistence(&dev.devnode, cfg.enhanced_clicks);
+                }
                 continue;
             }
             let verify = resume::verify_node_polling(&dev.devnode, cfg.polling_rate);
@@ -539,6 +571,11 @@ impl ResumeWatch {
                     actions.push(TickAction::Reinitialized(dev.devnode.clone()))
                 }
                 Ok(resume::ResumeAction::Detached) => {
+                    log::info!(
+                        "resume tick: {} detached mid-pass; dropping from snapshot",
+                        dev.devnode
+                    );
+                    detached.push(dev.devnode.clone());
                     actions.push(TickAction::Detached(dev.devnode.clone()))
                 }
                 Ok(resume::ResumeAction::UpToDate) => {
@@ -559,9 +596,11 @@ impl ResumeWatch {
                 actions.push(TickAction::Detached(old.dev.devnode.clone()));
             }
         }
-        // Rebuild from the fresh scan, preserving streaks of survivors.
+        // Rebuild from the fresh scan, preserving streaks of survivors and
+        // dropping mid-pass detachments (list-skew fix).
         self.known = current
             .into_iter()
+            .filter(|d| !detached.contains(&d.devnode))
             .map(|dev| {
                 let unreadable_streak = self
                     .known
@@ -582,6 +621,16 @@ impl ResumeWatch {
 mod tests {
     use super::*;
     use crate::init::Recorder;
+
+    #[test]
+    fn bt_reapply_fires_every_nth_tick_only() {
+        assert!(!bt_reapply_due(0));
+        assert!(!bt_reapply_due(1));
+        assert!(!bt_reapply_due(BT_REAPPLY_EVERY_TICKS - 1));
+        assert!(bt_reapply_due(BT_REAPPLY_EVERY_TICKS));
+        assert!(!bt_reapply_due(BT_REAPPLY_EVERY_TICKS + 1));
+        assert!(bt_reapply_due(2 * BT_REAPPLY_EVERY_TICKS));
+    }
 
     #[test]
     fn reconnect_rejects_empty_node() {

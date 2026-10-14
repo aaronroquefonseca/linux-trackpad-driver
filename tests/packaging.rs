@@ -154,6 +154,12 @@ fn resume_unit_shape() {
         RESUME_UNIT.contains("ExecStart=/usr/bin/ltd resume"),
         "resume unit must run the resume entry (multitouch-first re-init)"
     );
+    // The After= line itself must carry all four sleep targets — a bare
+    // contains() could match a comment instead.
+    let after = RESUME_UNIT
+        .lines()
+        .find(|l| l.trim_start().starts_with("After="))
+        .expect("resume unit needs an After= line");
     for target in [
         "suspend.target",
         "hibernate.target",
@@ -161,8 +167,8 @@ fn resume_unit_shape() {
         "suspend-then-hibernate.target",
     ] {
         assert!(
-            RESUME_UNIT.contains("After=") && RESUME_UNIT.contains(target),
-            "resume unit must order After={target}"
+            after.contains(target),
+            "After= line must order {target}: {after}"
         );
     }
     assert!(
@@ -196,30 +202,30 @@ fn sleep_hook_reinits_on_post_only() {
         SLEEP_HOOK.starts_with("#!"),
         "sleep hook must be an executable script with a shebang"
     );
-    assert!(
-        SLEEP_HOOK.contains("post"),
-        "sleep hook must handle the post branch (after resume)"
-    );
-    assert!(
-        SLEEP_HOOK.contains("resume"),
-        "sleep hook must run the resume entry"
-    );
-    // Ordering: the post match precedes the resume invocation, so re-init
+    // Code lines only: the header comment names pre|post for documentation,
+    // which must not satisfy this test.
+    let hook_code = code_lines(SLEEP_HOOK);
+    // The case arm itself must match post for every sleep type.
+    let arm = hook_code
+        .lines()
+        .find(|l| l.contains("post "))
+        .expect("sleep hook needs a post case arm");
+    for sleep in [
+        "post suspend",
+        "post hibernate",
+        "post hybrid-sleep",
+        "post suspend-then-hibernate",
+    ] {
+        assert!(arm.contains(sleep), "post arm must cover {sleep}: {arm}");
+    }
+    // Ordering: the post arm precedes the resume invocation, so re-init
     // runs after resume — never on the pre branch.
-    let post = SLEEP_HOOK.find("post").expect("post branch");
-    let resume = SLEEP_HOOK.find("\"$LTD_BIN\" resume").expect("resume call");
+    let post = hook_code.find("\"post ").expect("post arm");
+    let resume = hook_code.find("\"$LTD_BIN\" resume").expect("resume call");
     assert!(
         post < resume,
-        "resume invocation must sit under the post match (after resume, not pre)"
+        "resume invocation must sit under the post arm (after resume, not pre)"
     );
-    for sleep in [
-        "suspend",
-        "hibernate",
-        "hybrid-sleep",
-        "suspend-then-hibernate",
-    ] {
-        assert!(SLEEP_HOOK.contains(sleep), "sleep hook must cover {sleep}");
-    }
 }
 
 #[test]

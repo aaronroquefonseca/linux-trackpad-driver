@@ -73,6 +73,13 @@ systemctl status linux-trackpad-driver-resume.service
   `hybrid-sleep`, `suspend-then-hibernate`); `pre` is a no-op. The hook is
   system-side only — `user.slice` is frozen while sleep hooks run, so it
   never touches user sessions (no `--user` units, no session D-Bus).
+  Sleep hooks inherit PID1's environment, so the hook sets and exports
+  `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml` (same path as the
+  units) before exec — otherwise resume would re-init at defaults while
+  the daemon verifies against the system rate. Hook runtime is bounded
+  (~1 s node wait + backoff retries per node); failures are logged and
+  swallowed, the hook always exits 0 so a driver hiccup never perturbs
+  the sleep cycle.
 - Resume unit: `Type=oneshot`, `After=` the sleep targets, runs
   `ltd resume`. There is no `resume.target` to bind to (`WantedBy=` sleep
   targets would run *before* suspend), so the hook is the post-resume
@@ -91,6 +98,8 @@ systemctl status linux-trackpad-driver-resume.service
 No udev `change` rule is needed: resume re-enumeration already emits `add`,
 which the rules above hand to the reconnect template; the hook + daemon
 tick cover the no-re-enumeration case (node persists, only mode is lost).
+Hook, tick, and udev interleave benignly: every path sends the same
+idempotent multitouch-first sequence, so a double re-init is harmless.
 
 ## hwdb note (libinput quirks, optional)
 

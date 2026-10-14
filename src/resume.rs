@@ -157,10 +157,15 @@ pub fn resume_usb_node(
 
 /// Resume one BT node (one-shot hardware arm): no `GET_FEATURE` verify exists
 /// on this path, so re-apply the coexistence policy (re-suppresses when the
-/// opt-in is set — the unbind did not survive sleep). Emits nothing: clicks
-/// re-attach is tick/udev-mediated (daemon re-emits `Ready` when the node
-/// re-appears or the tick re-inits it).
+/// opt-in is set — the unbind did not survive sleep). Emits nothing by
+/// design: clicks re-attach is tick/udev-mediated (daemon re-emits `Ready`
+/// when the node re-appears or the tick re-inits it). A node that vanished
+/// between scan and arm is recorded `Detached`, mirroring the USB arm.
 pub fn resume_bt_node(devnode: &str, enhanced_clicks: bool) -> ResumeAction {
+    if !std::path::Path::new(devnode).exists() {
+        log::warn!("resume: BT node {devnode} gone after suspend; recording Detached");
+        return ResumeAction::Detached;
+    }
     let _ = init::apply_bt_coexistence(devnode, enhanced_clicks);
     log::info!("resume: BT {devnode} policy re-applied (hub re-attach is tick-mediated)");
     ResumeAction::Reinitialized
@@ -254,6 +259,13 @@ mod tests {
     }
 
     #[test]
+    fn reverify_interval_matches_install_claim() {
+        // INSTALL.md promises a 30 s daemon tick; pin the constant so the
+        // doc cannot drift silently.
+        assert_eq!(RESUME_REVERIFY_INTERVAL_SECS, 30);
+    }
+
+    #[test]
     fn expected_polling_pins_wire_bytes() {
         assert_eq!(expected_polling(110).unwrap(), [153, 242, 0x23]);
         assert!(expected_polling(0).is_err());
@@ -264,9 +276,15 @@ mod tests {
     fn bt_oneshot_reapplies_policy_without_hub_traffic() {
         // One-shot BT re-arms hardware only (coexistence policy); it owns no
         // listeners, so it takes no hub and emits nothing. Ready re-emit is
-        // tick/udev-mediated.
-        let action = resume_bt_node("/dev/hidraw9", false);
+        // tick/udev-mediated. (/dev/null stands in for a present node: the
+        // passthrough policy touches no hardware.)
+        let action = resume_bt_node("/dev/null", false);
         assert_eq!(action, ResumeAction::Reinitialized);
+        // Vanished between scan and arm → Detached, mirroring the USB arm.
+        assert_eq!(
+            resume_bt_node("/nonexistent-hidraw-xyz", false),
+            ResumeAction::Detached
+        );
     }
 
     #[test]
@@ -337,7 +355,7 @@ mod tests {
                 transport: Transport::Usb,
             },
             DiscoveredDevice {
-                devnode: "/dev/hidraw9".into(),
+                devnode: "/dev/null".into(),
                 vendor_id: 0x004c,
                 product_id: 0x0324,
                 transport: Transport::Bluetooth,
