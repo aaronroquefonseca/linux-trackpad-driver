@@ -1,0 +1,21 @@
+# Default configuration for linux-trackpad-driver (Phase 0, core-init subset).
+#
+# Full schema (click maps, force levels, validation) is owned by the Phase-1
+# `config-schema` task. Only keys needed by core-init live here.
+
+# log_level: debug|info|warn|error
+log_level = "info"
+
+# Requested polling rate in Hz. CAPPED posture: the default is the
+# demonstrated device maximum, ~110 Hz (X = 0x23 = 35, 3850/35 ≈ 110).
+# Never set above 110: higher device modes are unverified — independent
+# USB-C measurement confirms `99 F2 XX` ≈ 3850/XX with max demonstrated
+# XX = 0x23 → ~111 Hz, and X < 35 may be NAKed/ignored by the device.
+# The driver clamps any higher request (config or `-p` override) to 110
+# before mapping to X, so X >= 0x23 is always what hits the wire.
+polling_rate = 110
+
+# Opt-in gate for the entire future clicks pipeline. Default OFF: the device
+# must work perfectly with init alone (plain kernel/libinput passthrough).
+# Parsed now, acted on in Phase 1.
+enhanced_clicks = false
