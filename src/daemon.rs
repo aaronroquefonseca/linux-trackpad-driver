@@ -22,6 +22,7 @@ use crate::init::{
     self, DeviceReadyEvent, DeviceReadyHub, HidrawSender, Transport, EFFECTIVE_CAP_HZ,
 };
 use crate::lock::{self, SocketLock};
+use crate::resume::{self, ResumeReport};
 
 /// Shared device-ready hub for this process. Clicks subscribes in Phase 1.
 pub fn hub() -> DeviceReadyHub {
@@ -165,9 +166,10 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
 
     let ready_hub = hub();
     subscribe_click_proxy(cfg, &ready_hub);
-    match discovery::scan_trackpads() {
+    let initial: Vec<DiscoveredDevice> = match discovery::scan_trackpads() {
         Ok(devs) if devs.is_empty() => {
             log::info!("no supported trackpads found; idling until signal");
+            Vec::new()
         }
         Ok(devs) => {
             log::info!("found {} trackpad node(s)", devs.len());
@@ -178,13 +180,28 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
                     log::error!("init failed for {}: {e:#}", dev.devnode);
                 }
             }
+            devs
         }
-        Err(e) => log::warn!("device scan failed (continuing idle): {e:#}"),
-    }
+        Err(e) => {
+            log::warn!("device scan failed (continuing idle): {e:#}");
+            Vec::new()
+        }
+    };
 
+    // Belt-and-braces resume detection: the system-sleep hook (`ltd resume`)
+    // is the primary post-sleep re-init; this tick covers add/change/remove
+    // that arrive with no sleep hook (re-verify polling via GET_FEATURE,
+    // multitouch-first re-init on mismatch). Initial init above always runs
+    // first; ticks never reorder it.
+    let mut watch = ResumeWatch::new(&initial);
+    let mut last_tick = std::time::Instant::now();
     while running.load(Ordering::SeqCst) {
         // 100 ms poll: prompt shutdown without burning CPU in the idle loop.
         std::thread::sleep(std::time::Duration::from_millis(100));
+        if last_tick.elapsed().as_secs() >= resume::RESUME_REVERIFY_INTERVAL_SECS {
+            last_tick = std::time::Instant::now();
+            watch.tick(cfg, &ready_hub);
+        }
     }
     log::info!("shutdown complete");
     Ok(())
@@ -294,8 +311,9 @@ pub fn run_reconnect(
                 // No host-click report defined for the BT bring-up path.
                 // Unbind is sticky: restore passthrough for a previously
                 // suppressed node (best-effort no-op when already bound).
-                // SUSPEND-HOOK: resume re-suppresses via the init arm; the
-                // Detached event below is the re-attach signal.
+                // Resume re-suppresses via the init arm when the opt-in is
+                // set; the Detached event below is the clicks re-attach
+                // signal (resume re-emits Ready after re-init).
                 log::info!("BT {devnode}: disengage (no reports sent)");
                 if let Err(e) = init::restore_bt_passthrough(devnode) {
                     log::warn!("BT {devnode}: re-bind best-effort failed ({e:#})");
@@ -367,6 +385,139 @@ pub fn run_reconnect(
     }
 }
 
+/// `resume` entry (system-sleep hook + resume unit + manual re-init).
+/// System-side only: re-verifies every discovered node and re-runs the USB
+/// sequence from multitouch enable on mismatch. Unlike `reconnect`, this
+/// always inits — it is the post-sleep authority and must work whether or
+/// not the daemon socket is present (the daemon may not have survived
+/// suspend). Per-node failures are collected in the report, never fatal to
+/// siblings; only a failed scan is an `Err`.
+pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeReport> {
+    let polling_hz = polling_override.unwrap_or(cfg.polling_rate);
+    validate_polling_rate(polling_hz)?;
+    let sock = lock::socket_path();
+    if lock::daemon_socket_present(&sock) {
+        log::debug!("resume: daemon socket present ({sock}); re-init covers live daemon too");
+    } else {
+        log::info!("resume: daemon socket absent ({sock}); re-initing hardware directly");
+    }
+    let devs = discovery::scan_trackpads().context("scanning hidraw for resume")?;
+    if devs.is_empty() {
+        log::info!("resume: no supported trackpads found; nothing to re-init");
+    }
+    let ready_hub = hub();
+    Ok(resume::run_resume_scan(
+        &devs,
+        polling_hz,
+        cfg.enhanced_clicks,
+        &ready_hub,
+    ))
+}
+
+/// One daemon tick action, for logs/tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickAction {
+    /// Node appeared since the last pass → full init (add path).
+    Initialized(String),
+    /// Known USB node drifted → multitouch-first re-init (change path).
+    Reinitialized(String),
+    /// Known USB node still armed; nothing sent.
+    UpToDate(String),
+    /// Node vanished → `Detached` emitted (remove path).
+    Detached(String),
+}
+
+/// Daemon-side resume/add/change/remove watch. Owns the last-seen device
+/// list; each [`ResumeWatch::tick`] diffs a fresh scan against it:
+///
+/// - added node → full [`init_node_with_config`] (same ordering as boot init);
+/// - still-present known USB node → `GET_FEATURE` re-verify, multitouch-first
+///   re-init on mismatch via [`resume::resume_usb_node`];
+/// - still-present known BT node → nothing (no verify exists; the hook +
+///   add events cover it; re-emitting `Ready` every pass would spam clicks);
+/// - vanished node → `Detached` emit so clicks releases it.
+///
+/// Hub emits happen after each node's init step, never before — clicks
+/// re-attaches without reordering init.
+pub struct ResumeWatch {
+    known: Vec<DiscoveredDevice>,
+}
+
+impl ResumeWatch {
+    pub fn new(initial: &[DiscoveredDevice]) -> Self {
+        Self {
+            known: initial.to_vec(),
+        }
+    }
+
+    pub fn tick(&mut self, cfg: &Config, ready_hub: &DeviceReadyHub) -> Vec<TickAction> {
+        let current = match discovery::scan_trackpads() {
+            Ok(devs) => devs,
+            Err(e) => {
+                log::warn!("resume tick: scan failed, keeping last-seen list: {e:#}");
+                return Vec::new();
+            }
+        };
+        let mut actions = Vec::new();
+        for dev in &current {
+            if self.known.iter().any(|k| k.devnode == dev.devnode) {
+                if dev.transport == Transport::Usb {
+                    match resume::verify_node_polling(&dev.devnode, cfg.polling_rate) {
+                        Ok(true) => actions.push(TickAction::UpToDate(dev.devnode.clone())),
+                        other => {
+                            if other.is_err() {
+                                log::warn!(
+                                    "resume tick: {} verify unreadable; re-initing",
+                                    dev.devnode
+                                );
+                            }
+                            match resume::resume_usb_node(&dev.devnode, cfg.polling_rate, ready_hub)
+                            {
+                                Ok(resume::ResumeAction::Reinitialized) => {
+                                    actions.push(TickAction::Reinitialized(dev.devnode.clone()))
+                                }
+                                Ok(resume::ResumeAction::Detached) => {
+                                    actions.push(TickAction::Detached(dev.devnode.clone()))
+                                }
+                                Ok(resume::ResumeAction::UpToDate) => {
+                                    actions.push(TickAction::UpToDate(dev.devnode.clone()))
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "resume tick: re-init failed for {}: {e:#}",
+                                        dev.devnode
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // Known BT: steady state, no hub traffic.
+                continue;
+            }
+            match init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, ready_hub) {
+                Ok(_) => {
+                    log::info!("resume tick: initialized newly appeared {}", dev.devnode);
+                    actions.push(TickAction::Initialized(dev.devnode.clone()));
+                }
+                Err(e) => log::error!(
+                    "resume tick: init failed for newly appeared {}: {e:#}",
+                    dev.devnode
+                ),
+            }
+        }
+        for old in &self.known {
+            if !current.iter().any(|d| d.devnode == old.devnode) {
+                log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
+                ready_hub.emit(&init::detached(&old.devnode, old.transport));
+                actions.push(TickAction::Detached(old.devnode.clone()));
+            }
+        }
+        self.known = current;
+        actions
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +527,42 @@ mod tests {
     fn reconnect_rejects_empty_node() {
         let cfg = Config::default();
         assert!(run_reconnect("", false, None, false, &cfg).is_err());
+    }
+
+    #[test]
+    fn resume_rejects_bad_polling_without_touching_hardware() {
+        let cfg = Config::default();
+        assert!(run_resume(&cfg, Some(0)).is_err());
+        assert!(run_resume(&cfg, Some(70_000)).is_err());
+    }
+
+    #[test]
+    fn resume_tick_emits_detached_for_vanished_node() {
+        // Watch thinks an impossible node exists; the real scan can never
+        // contain it → vanish path → Detached on the hub, never Ready.
+        let hub = DeviceReadyHub::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = std::sync::Arc::clone(&seen);
+        hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
+        let mut watch = ResumeWatch::new(&[DiscoveredDevice {
+            devnode: "/dev/hidraw-nope".into(),
+            vendor_id: 0x05ac,
+            product_id: 0x0324,
+            transport: Transport::Usb,
+        }]);
+        let cfg = Config::default();
+        let actions = watch.tick(&cfg, &hub);
+        assert_eq!(
+            actions,
+            vec![TickAction::Detached("/dev/hidraw-nope".into())]
+        );
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind, crate::init::ReadyKind::Detached);
+        // Second tick: steady state, no repeat traffic.
+        let actions = watch.tick(&cfg, &hub);
+        assert!(actions.is_empty());
+        assert_eq!(seen.len(), 1);
     }
 
     #[test]
