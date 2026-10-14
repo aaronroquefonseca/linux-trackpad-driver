@@ -115,3 +115,33 @@ New key vs reference: `enhanced_clicks` (explicit opt-in gate).
 - systemd: `Type=simple`, `Restart=on-failure`, `RuntimeDirectory=`.
 - suspend/resume: re-run init sequence on resume; clicks pipeline re-attaches,
   never reorders init.
+
+## Phase-0 decision record (base-init, 2026-10-14)
+
+- **Single crate, not workspace.** Binary `ltd` (`src/main.rs` + modules
+  `cli/config/discovery/init/lock/daemon`) instead of the proposed
+  `crates/ltd-*` workspace. Rationale: base is small enough that a workspace
+  adds scaffolding without isolation benefit; the hard isolation rule
+  (init has zero clicks deps) is enforced at module level plus a buildable,
+  tested stub hook (`DeviceReadyHub`). Split into `ltd-core/ltd-init/...`
+  when the clicks pipeline lands (Phase 1 `uinput-proxy` or later).
+- **Polling posture corrected (coordinator directive).** Default request is
+  the capped device maximum ~110 Hz (`X = 0x23 = 35`, `3850/35 ≈ 110`) —
+  never 500 Hz. `resolve_polling` caps the request at 110 Hz *before*
+  mapping, so `X < 35` is never placed on the wire (unverified divisor
+  range; device may NAK/ignore). Config default `polling_rate = 110`;
+  `-p`/config values above 110 clamp identically (defense in depth).
+- **Ordering.** `reconnect`/`run` wait for the hidraw node (2 s poll), send
+  each report with backoff retry (25→500 ms, 5 attempts), retry the whole
+  USB sequence up to 3×, and best-effort verify the polling report via
+  `HIDIOCGFEATURE`. Resume MUST re-run the sequence from multitouch enable
+  (report `0x02` 21→8 byte regression across power transition).
+- **BT scope.** Single-node bring-up only; no init reports, no rate tuning.
+  No exclusivity vs `hid-magicmouse` — double-input handling (unbind or
+  evdev-grab behind the opt-in flag) belongs to Phase 1.
+- **Socket.** `/run/linux-trackpad-driver/driver.sock` (never the legacy
+  `magic-trackpad-driver` path; legacy constant kept only as a refusal
+  guard). `$LTD_SOCKET` overrides for tests/unprivileged runs.
+- **Downstream contract note.** Future proxy node: `res == 0`, arbitrary
+  0..253 range, Type-B slots + tracking IDs; no grams/newtons claims, no
+  `EV_FF`/`FF_HAPTIC` advertisement (no 2026 libinput/Wayland consumer).
