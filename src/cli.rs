@@ -20,6 +20,7 @@ pub struct ReconnectArgs {
     pub force: bool,
     pub polling_override: Option<u32>,
     pub disengage: bool,
+    pub config_path: Option<String>,
 }
 
 /// Top-level command after parsing.
@@ -49,7 +50,7 @@ impl From<String> for ParseFailure {
 fn top_usage(prog: &str) -> ParseFailure {
     ParseFailure {
         message: format!(
-            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"
+            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]"
         ),
         is_help: true,
     }
@@ -105,17 +106,22 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
         "reconnect" => {
             let devnode = rest
                 .get(1)
-                .ok_or_else(|| format!("usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"))?
+                .ok_or_else(|| {
+                    format!("usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]")
+                })?
                 .clone();
             if devnode == "-h" || devnode == "--help" {
                 return Err(ParseFailure {
-                    message: format!("usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d]"),
+                    message: format!(
+                        "usage: {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]"
+                    ),
                     is_help: true,
                 });
             }
             let mut force = false;
             let mut disengage = false;
             let mut polling_override: Option<u32> = None;
+            let mut config_path: Option<String> = None;
             let mut i = 2;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -135,6 +141,14 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
                         polling_override = Some(parse_polling_value(v)?);
                         i += 1;
                     }
+                    "-c" | "--config" => {
+                        i += 1;
+                        let v = rest
+                            .get(i)
+                            .ok_or_else(|| "reconnect: -c/--config requires a value".to_string())?;
+                        config_path = Some(v.clone());
+                        i += 1;
+                    }
                     other => {
                         return Err(format!("reconnect: unknown option '{other}'").into());
                     }
@@ -145,6 +159,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
                 force,
                 polling_override,
                 disengage,
+                config_path,
             }))
         }
         other => Err(format!("unknown command '{other}'; see '{prog} help'").into()),
@@ -175,7 +190,10 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Reconnect(rc) => {
-            let cfg = config::load_or_default(None)?;
+            // No -c on the udev command line: fall back to $LTD_CONFIG (set
+            // by the reconnect template unit) so hotplug honors the system
+            // config, including enhanced_clicks.
+            let cfg = config::load_or_default_with_env(rc.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
             match daemon::run_reconnect(
                 &rc.devnode,
@@ -237,8 +255,30 @@ mod tests {
                 force: true,
                 polling_override: Some(500),
                 disengage: true,
+                config_path: None,
             }))
         );
+    }
+
+    #[test]
+    fn reconnect_with_config() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "ltd",
+                "reconnect",
+                "/dev/hidraw2",
+                "-c",
+                "/tmp/x.toml"
+            ])),
+            Ok(Command::Reconnect(ReconnectArgs {
+                devnode: "/dev/hidraw2".into(),
+                force: false,
+                polling_override: None,
+                disengage: false,
+                config_path: Some("/tmp/x.toml".into()),
+            }))
+        );
+        assert!(parse_args(&argv(&["ltd", "reconnect", "/dev/hidraw2", "-c"])).is_err());
     }
 
     #[test]
