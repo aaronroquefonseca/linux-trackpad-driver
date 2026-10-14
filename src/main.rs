@@ -1,3 +1,4 @@
+pub mod apple_parse;
 pub mod cli;
 pub mod config;
 pub mod daemon;
