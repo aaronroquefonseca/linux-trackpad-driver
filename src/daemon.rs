@@ -28,6 +28,47 @@ pub fn hub() -> DeviceReadyHub {
     DeviceReadyHub::new()
 }
 
+/// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
+/// Gate-off (`enhanced_clicks=false`) still subscribes — the proxy then
+/// short-circuits to passthrough. The gate is evaluated from the startup
+/// config; there is no live reload, so a config change needs a restart.
+/// Never blocks init: callbacks do bounded attach/detach only, and grab
+/// failure degrades to passthrough with a log.
+///
+/// Safety posture: the proxy starts pump-unready (`NullSource`, no pump
+/// loop, no created uinput node), so `attach` degrades to passthrough and
+/// never grabs. The transport task flips readiness once the emit path
+/// exists. The evdev node is never guessed: without `LTD_EVDEV_NODE` the
+/// proxy refuses and stays passthrough.
+pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
+    use crate::proxy::{
+        ClickProxy, DaemonGrab, NullSource, ProxySettings, RealGrab, RealHaptic, RealUinput,
+        RefusingGrab,
+    };
+    let grab = match std::env::var("LTD_EVDEV_NODE") {
+        Ok(node) => DaemonGrab::Real(RealGrab::new(&node)),
+        Err(_) => {
+            log::warn!(
+                "proxy: LTD_EVDEV_NODE unset, refusing evdev guess (hidraw→eventN lands with transport); passthrough until configured"
+            );
+            DaemonGrab::Refusing(RefusingGrab)
+        }
+    };
+    let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
+    let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
+        ProxySettings::from(cfg),
+        grab,
+        RealUinput::new(&uinput_node),
+        RealHaptic::new(),
+        NullSource,
+    )));
+    crate::proxy::subscribe_to_hub(ready_hub, proxy);
+    log::debug!(
+        "click proxy subscribed (enhanced_clicks={})",
+        cfg.enhanced_clicks
+    );
+}
+
 /// Initialize one discovered node and return its ready event.
 /// USB: defer (node+bind) → retrying feature reports → verify → ready.
 /// BT: single-node, no reports, straight to ready + coexistence policy.
@@ -123,6 +164,7 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("installing signal handler: {e}"))?;
 
     let ready_hub = hub();
+    subscribe_click_proxy(cfg, &ready_hub);
     match discovery::scan_trackpads() {
         Ok(devs) if devs.is_empty() => {
             log::info!("no supported trackpads found; idling until signal");
@@ -241,6 +283,9 @@ pub fn run_reconnect(
     }
     let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
     let transport = classify_node(devnode, &devs)?;
+    // No proxy subscription here: reconnect is a short-lived udev process
+    // and must never grab. The daemon owns the proxy and re-attaches on the
+    // Ready events init_node/reconnect emit through its own hub.
     let ready_hub = hub();
 
     if mode == ReconnectMode::Disengage {

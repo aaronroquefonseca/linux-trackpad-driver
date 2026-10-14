@@ -1,5 +1,6 @@
 pub mod apple_parse;
 pub mod cli;
+pub mod clicks;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
@@ -7,6 +8,7 @@ pub mod discovery;
 pub mod hw_mock;
 pub mod init;
 pub mod lock;
+pub mod proxy;
 
 use std::process::ExitCode;
 
