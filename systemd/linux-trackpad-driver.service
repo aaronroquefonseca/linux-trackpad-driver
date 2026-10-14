@@ -1,0 +1,17 @@
+[Unit]
+Description=Linux Trackpad Driver — Apple Magic Trackpad 2 core-init
+After=systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ltd run
+Restart=on-failure
+RestartSec=2
+# Creates /run/linux-trackpad-driver for driver.sock (see src/lock.rs:
+# DRIVER_SOCK). $LTD_SOCKET overrides for tests/unprivileged runs.
+RuntimeDirectory=linux-trackpad-driver
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
