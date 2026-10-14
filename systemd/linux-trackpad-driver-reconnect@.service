@@ -1,0 +1,16 @@
+# One-shot re-init for a hotplugged hidraw node, triggered by udev via
+# SYSTEMD_WANTS (see ../udev/99-linux-trackpad-driver.rules). Instance is the
+# kernel name, e.g. `systemctl start
+# linux-trackpad-driver-reconnect@hidraw2.service` runs
+# `ltd reconnect /dev/hidraw2`.
+#
+# Why a unit and not RUN+=: reconnect waits for the node + driver bind and
+# retries reports with backoff — seconds of work that must never block udev.
+[Unit]
+Description=Linux Trackpad Driver — reconnect %I
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ltd reconnect /dev/%I
+Nice=10
