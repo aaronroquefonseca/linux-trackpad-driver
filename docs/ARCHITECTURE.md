@@ -1,0 +1,114 @@
+# Architecture — linux-trackpad-driver (target)
+
+> Coordinator spec. Agents reimplement from this; do not copy reference code.
+
+## Crate layout (proposed, base-init may adjust with justification)
+
+```
+linux-trackpad-driver/
+  Cargo.toml            # workspace
+  crates/
+    ltd-core/           # config, logging, error types, daemon lifecycle
+    ltd-init/           # USB/BT init: feature reports, polling, BT single-node
+    ltd-input/          # TouchSource trait + AppleHidraw; EvdevGeneric stub
+    ltd-clicks/         # pressure state machine, haptics, 1-5 finger map, force
+    ltd-uinput/         # evdev grab + uinput emit (clicks only, never init)
+    ltd-daemon/         # `run` / `reconnect` CLI, udev hook entry, signals
+  udev/                 # 99-*.rules (add-only, hidraw, VID:PID-gated)
+  systemd/              # service unit (simple, Restart=on-failure)
+  config/               # default TOML
+  docs/
+```
+
+Single binary is acceptable for Phase 0/1 if workspace feels heavy —
+decision belongs to `base-init`, recorded here afterwards.
+
+## Layering
+
+```
+hidraw/evdev ──> ltd-init (always on) ──> kernel/libinput passthrough (default path)
+                        │
+                        └──> ltd-input ──> ltd-clicks ──> ltd-uinput (opt-in only)
+                                                  ▲
+                                            config (enhanced_clicks=false default)
+```
+
+- `ltd-init` has zero deps on `ltd-clicks` / `ltd-uinput`.
+- Clicks subscribe to init's device-ready events; never drive init.
+- Clicks failure mode: log, release grab, passthrough continues.
+
+## TouchSource trait (contract, names may evolve)
+
+```rust
+// Illustrative only — implementing agent owns final signatures.
+pub enum CapabilityTier { L0, L1, L2 }
+
+pub struct TouchFrame {
+    pub fingers: Vec<Finger>,
+    pub timestamp_ms: u64,
+}
+
+pub struct Finger {
+    pub id: u8,
+    pub pressure: u8,      // normalized 0..=255 where available
+    pub contact: bool,
+}
+
+pub trait TouchSource {
+    fn tier(&self) -> CapabilityTier;
+    fn poll_frame(&mut self) -> anyhow::Result<Option<TouchFrame>>;
+}
+```
+
+- `AppleHidraw`: hidraw 9-byte blocks, pressure @ offset 7, multitouch decode.
+- `EvdevGeneric`: stub in Phase 1 (returns tier + `unimplemented` poll with
+  a clear error, plus mock path for tests). Full impl Phase 2.
+
+## Click state machine (spec)
+
+- Per-finger pressure vs `sensitivity` (press) / `sensitivity - margin` (release hysteresis).
+- Finger-count at press edge selects action `click_1..=click_5`
+  (`left/right/middle/none/empty`/key-combo).
+- `force_offset > 0` arms second level at `sensitivity + force_offset`
+  with `force_1..=force_5`, optional `force_haptic` override.
+- `haptic` 0..=255 output strength; `quiet_click` selects soft waveform.
+- `speed` scales pointer motion only in proxy path; never touches init.
+
+## Config schema (target, `config-schema` task owns final)
+
+```toml
+log_level = "info"        # debug|info|warn|error
+polling_rate = 500        # requested Hz; device caps (~110); honest clamp
+enhanced_clicks = false   # opt-in gate for entire clicks pipeline
+sensitivity = 64          # 1..=255
+margin = 5
+haptic = 5                # 0..=255, 0 = silent
+quiet_click = false
+speed = 100
+click_1 = "left"          # left|right|middle|back|forward|none|empty|keys
+click_2 = "right"
+click_3 = "middle"
+click_4 = "none"
+click_5 = "none"
+force_offset = 0          # 0 disables force level
+# force_haptic, force_quiet_click, force_1..=force_5 optional
+```
+
+New key vs reference: `enhanced_clicks` (explicit opt-in gate).
+
+## Daemon CLI
+
+- `ltd run [-c config]` — init loop + optional clicks pipeline.
+- `ltd reconnect <hidraw-dev> [-f] [-p Hz] [-d]` — udev entry; idempotent;
+  `-f` proceeds when daemon socket absent; `-d` disengage path.
+- Single-instance lock via `/run/linux-trackpad-driver/driver.sock`
+  (name TBD by base-init; must not collide with old `magic-trackpad-driver` path
+  unless migration is handled).
+
+## Udev / systemd / suspend
+
+- udev: `ACTION=="add", SUBSYSTEM=="hidraw"`, VID:PID-gated
+  (`05ac`/`004c` × `0265`/`0324`), runs `reconnect /dev/%k`. No bind/unbind tricks.
+- systemd: `Type=simple`, `Restart=on-failure`, `RuntimeDirectory=`.
+- suspend/resume: re-run init sequence on resume; clicks pipeline re-attaches,
+  never reorders init.
