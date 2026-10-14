@@ -295,9 +295,31 @@ pub struct HidrawSender {
     pub devnode: String,
 }
 
+/// Single-shot hidraw writer: one `HIDIOCSFEATURE`, no retry. Retry policy
+/// is applied exactly once, by [`HidrawSender`] via [`send_with_retry_on`];
+/// the sequence layer ([`init_usb_with_retry`]) adds sequence-level retries
+/// on top, with no hidden per-report multiplier beyond
+/// [`DEFAULT_SEND_ATTEMPTS`].
+struct RawHidrawSender<'a> {
+    devnode: &'a str,
+}
+
+impl FeatureSender for RawHidrawSender<'_> {
+    fn send(&self, report: &[u8]) -> Result<()> {
+        send_feature_report_hidraw(self.devnode, report)
+    }
+}
+
 impl FeatureSender for HidrawSender {
     fn send(&self, report: &[u8]) -> Result<()> {
-        send_with_retry(&self.devnode, report, DEFAULT_SEND_ATTEMPTS)
+        send_with_retry_on(
+            &RawHidrawSender {
+                devnode: &self.devnode,
+            },
+            report,
+            DEFAULT_SEND_ATTEMPTS,
+            &self.devnode,
+        )
     }
 }
 
@@ -410,15 +432,24 @@ pub fn host_click_bt(enabled: bool) -> [u8; 3] {
 }
 
 /// Outcome of one idempotent USB init run: the polling plan plus which
-/// interface node accepted the sequence (per-interface routing groundwork).
+/// interface node the sequence was written to (per-interface routing
+/// groundwork).
+///
+/// Trust limits — sibling routing must NOT treat these as device-confirmed
+/// acceptance:
+/// - `iface` is caller-supplied (sysfs-derived at call time for the node the
+///   reports were written to), not a device confirmation.
+/// - `multitouch_accepted` is true iff the full sequence — starting with the
+///   multitouch write — returned success on this node. A sibling interface
+///   must still be initialized and verified itself; never skip it because
+///   another node reported success.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UsbInitOutcome {
     pub plan: PollingPlan,
-    /// USB interface number the reports were sent to (`None` = unknown/BT
-    /// layout; full idempotent sequence was still sent).
+    /// Caller-supplied hint: interface number of the node written to
+    /// (`None` = unknown layout; full sequence still sent).
     pub iface: Option<u8>,
-    /// True when the multitouch-enable write succeeded (per-node record:
-    /// re-running on a sibling interface must also set this).
+    /// True iff the multitouch-first sequence wrote without error on this node.
     pub multitouch_accepted: bool,
 }
 
@@ -447,8 +478,9 @@ pub fn init_usb_recorded(
 /// Resume regression (RESEARCH §6): Trackpad 2 USB drops out of multitouch
 /// mode across a power transition (report `0x02` shrinks 21→8 bytes; clicks
 /// survive, motion lost until re-init). The resume hook MUST re-run the full
-/// USB sequence starting at multitouch enable — this wrapper exists so the
-/// suspend-hook task has one named entry point (idempotent, same as init).
+/// USB sequence starting at multitouch enable.
+/// SUSPEND-HOOK: this is the named entry point for the suspend-hook task —
+/// idempotent, same as init; call with the node iface hint when known.
 pub fn resume_usb(
     sender: &dyn FeatureSender,
     requested_hz: u32,
@@ -499,10 +531,10 @@ impl ReportVerifier for StubVerifier {
 
 /// [`init_usb`] + best-effort `HIDIOCGFEATURE` verify of the polling report.
 ///
-/// Mismatch re-runs the whole sequence from multitouch enable (up to
-/// [`DEFAULT_INIT_ATTEMPTS`]×); an unreadable verify (some firmware NAKs
-/// reads) is a warning, not fatal — init still succeeds. I/O errors from the
-/// verifier propagate.
+/// Only an `Ok(false)` mismatch re-runs the whole sequence from multitouch
+/// enable (up to [`DEFAULT_INIT_ATTEMPTS`]×, no sleep after the final
+/// attempt). An unreadable verify (`Err` — some firmware NAKs reads) is a
+/// best-effort warning, not fatal: init still succeeds.
 pub fn init_usb_verified(
     sender: &dyn FeatureSender,
     verifier: &dyn ReportVerifier,
@@ -523,6 +555,9 @@ pub fn init_usb_verified(
             }
             Ok(false) => {
                 last_mismatch += 1;
+                if attempt >= DEFAULT_INIT_ATTEMPTS {
+                    break;
+                }
                 log::warn!(
                     "polling verify mismatch (attempt {attempt}/{DEFAULT_INIT_ATTEMPTS}); re-running from multitouch enable"
                 );
@@ -581,6 +616,13 @@ pub fn apply_bt_coexistence(devnode: &str, enhanced_clicks: bool) -> Result<bool
             Ok(false)
         }
         BtCoexistence::SuppressPhysical => {
+            // LOUD: uinput-proxy is not merged yet, so suppressing the
+            // physical node removes BT input with NO proxy replacement —
+            // the trackpad goes silent until re-bind/replug. This stays
+            // behind the explicit opt-in until the proxy lands.
+            log::warn!(
+                "BT {devnode}: enhanced_clicks=true with no uinput-proxy yet — suppressing physical input with no replacement; expect a silent trackpad until re-bind"
+            );
             log::info!("BT {devnode}: enhanced_clicks=true — suppressing physical node (unbind hid-magicmouse for our VID:PID)");
             match attempt_driver_unbind(devnode) {
                 Ok(true) => Ok(true),
@@ -599,12 +641,96 @@ pub fn apply_bt_coexistence(devnode: &str, enhanced_clicks: bool) -> Result<bool
     }
 }
 
+/// HID device id (`XXXX:XXXX:XXXX.NNNN`) for a hidraw node, from the
+/// `device` symlink target's basename. `None` when unresolvable.
+fn hid_id_for_node(devnode: &str, class_root: &str) -> Option<String> {
+    let name = crate::discovery::hidraw_name(devnode)?;
+    let device_link = std::path::PathBuf::from(format!("{class_root}/{name}/device"));
+    let target = std::fs::read_link(&device_link).ok()?;
+    let hid_id = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if hid_id.is_empty() {
+        return None;
+    }
+    Some(hid_id)
+}
+
+/// Bound driver name for a hidraw node, from the `device/driver` symlink
+/// target's basename (e.g. `magicmouse`, `hid-generic`). `None` when the
+/// node is unbound or the layout is unknown.
+fn bound_driver_for_node(devnode: &str, class_root: &str) -> Option<String> {
+    let name = crate::discovery::hidraw_name(devnode)?;
+    let driver_link = std::path::PathBuf::from(format!("{class_root}/{name}/device/driver"));
+    let target = std::fs::read_link(&driver_link).ok()?;
+    let driver = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if driver.is_empty() {
+        return None;
+    }
+    Some(driver)
+}
+
+/// Whether an (un)bind write error means "already (un)bound elsewhere, try
+/// the next driver" (`ENODEV`/`ENXIO`/`ENOENT`) rather than a real failure.
+fn is_expected_bind_race(errno: i32) -> bool {
+    matches!(errno, libc::ENODEV | libc::ENXIO | libc::ENOENT)
+}
+
+/// Best-effort re-bind of the HID driver for one hidraw node: mirror of
+/// [`attempt_driver_unbind`] for the disengage path. Unbind is sticky — a
+/// suppressed BT node stays dead until re-bound or replugged — so disengage
+/// must restore passthrough.
+///
+/// Stateless by necessity (udev one-shots share no memory): the HID id is
+/// written to each known driver's `bind` file; the kernel rejects with
+/// `ENODEV`/`ENXIO`/`ENOENT` where the device does not belong, and with
+/// `EBUSY`/similar when already bound — all skipped, never fatal.
+/// Returns `Ok(true)` when a bind write succeeded, `Ok(false)` when nothing
+/// was done. Permission/I/O errors propagate (caller downgrades to warning).
+pub fn restore_bt_passthrough(devnode: &str) -> Result<bool> {
+    restore_with_root(devnode, "/sys/class/hidraw", "/sys/bus/hid/drivers")
+}
+
+fn restore_with_root(devnode: &str, class_root: &str, drivers_root: &str) -> Result<bool> {
+    let Some(hid_id) = hid_id_for_node(devnode, class_root) else {
+        return Ok(false);
+    };
+    for driver in ["magicmouse", "hid-generic"] {
+        let bind = std::path::PathBuf::from(format!("{drivers_root}/{driver}/bind"));
+        if std::fs::symlink_metadata(&bind).is_err() {
+            continue;
+        }
+        match std::fs::write(&bind, &hid_id) {
+            Ok(()) => {
+                log::info!("re-bound HID device {hid_id} to {driver}");
+                return Ok(true);
+            }
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                // EBUSY = already bound: nothing to do, not an error.
+                if is_expected_bind_race(errno) || errno == libc::EBUSY {
+                    log::debug!("bind {hid_id} to {driver}: {e} — trying next driver");
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Best-effort unbind of the HID driver for one hidraw node.
-/// Resolves the HID device name (`XXXX:XXXX:XXXX.NNNN`) from
-/// `/sys/class/hidraw/<name>/device` and writes it to the bound driver's
-/// `unbind` file. Returns `Ok(false)` when nothing was done (unresolvable,
-/// unbind file absent); `Err` only on unexpected I/O mid-write (caller
-/// downgrades to warning anyway).
+/// Writes the HID device id to the *currently bound* driver's `unbind`
+/// file (resolved via the `device/driver` symlink), falling back to the
+/// known driver names when the link is unreadable. A write to the wrong
+/// driver fails with `ENODEV`/`ENXIO`/`ENOENT` and is skipped, never fatal;
+/// permission/I/O errors (`EACCES`/`EIO`/…) propagate to the caller (which
+/// downgrades to a warning anyway). Returns `Ok(false)` when nothing was
+/// done.
 pub fn attempt_driver_unbind(devnode: &str) -> Result<bool> {
     attempt_driver_unbind_with_root(devnode, "/sys/class/hidraw", "/sys/bus/hid/drivers")
 }
@@ -614,23 +740,20 @@ fn attempt_driver_unbind_with_root(
     class_root: &str,
     drivers_root: &str,
 ) -> Result<bool> {
-    let Some(name) = crate::discovery::hidraw_name(devnode) else {
+    let Some(hid_id) = hid_id_for_node(devnode, class_root) else {
         return Ok(false);
     };
-    let device_link = std::path::PathBuf::from(format!("{class_root}/{name}/device"));
-    let target = match std::fs::read_link(&device_link) {
-        Ok(t) => t,
-        Err(_) => return Ok(false),
-    };
-    let hid_id = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if hid_id.is_empty() {
-        return Ok(false);
+    // Bound driver first, then the known fallbacks (deduped).
+    let mut drivers: Vec<String> = Vec::new();
+    if let Some(bound) = bound_driver_for_node(devnode, class_root) {
+        drivers.push(bound);
     }
-    // Prefer the Apple path's driver (magicmouse), fall back to hid-generic.
-    for driver in ["magicmouse", "hid-generic", "hid_magicmouse"] {
+    for fallback in ["magicmouse", "hid-generic"] {
+        if !drivers.iter().any(|d| d == fallback) {
+            drivers.push(fallback.to_string());
+        }
+    }
+    for driver in &drivers {
         let unbind = std::path::PathBuf::from(format!("{drivers_root}/{driver}/unbind"));
         if std::fs::symlink_metadata(&unbind).is_err() {
             continue;
@@ -640,7 +763,14 @@ fn attempt_driver_unbind_with_root(
                 log::info!("unbound HID device {hid_id} from {driver}");
                 return Ok(true);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                let errno = e.raw_os_error().unwrap_or(0);
+                if is_expected_bind_race(errno) {
+                    log::debug!("unbind {hid_id} from {driver}: {e} — trying next driver");
+                    continue;
+                }
+                return Err(e.into());
+            }
         }
     }
     Ok(false)
@@ -995,6 +1125,24 @@ mod tests {
     }
 
     #[test]
+    fn sequence_retry_attempts_exact_count_no_multiplier() {
+        // Always-transient sender: each sequence attempt fails on its first
+        // report and the mock performs no per-report retry of its own, so the
+        // total write count is exactly DEFAULT_INIT_ATTEMPTS — no nesting
+        // multiplier between the sequence and per-report layers.
+        let sender = FailSender {
+            attempts: std::cell::Cell::new(0),
+            errno: libc::ENOENT,
+        };
+        assert!(init_usb_with_retry(&sender, 110).is_err());
+        assert_eq!(
+            sender.attempts.get(),
+            DEFAULT_INIT_ATTEMPTS as usize,
+            "sequence layer must attempt exactly DEFAULT_INIT_ATTEMPTS writes"
+        );
+    }
+
+    #[test]
     fn idempotent_rerun_sends_same_sequence() {
         // Safe re-run on the same node: two consecutive inits emit the same
         // 3-report sequence (multitouch first — resume regression fix).
@@ -1077,5 +1225,52 @@ mod tests {
         )
         .unwrap());
         assert!(!apply_bt_coexistence("/dev/hidraw77", true).unwrap());
+    }
+
+    /// Fake sysfs with a bound driver: `device` and `device/driver` symlinks
+    /// plus a writable `unbind`/`bind` file standing in for sysfs.
+    fn fake_bound_sysfs() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("devices/0005:004C:0324.000B")).unwrap();
+        std::fs::create_dir_all(root.join("class/hidraw3")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../devices/0005:004C:0324.000B",
+            root.join("class/hidraw3/device"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("magicmouse", root.join("class/hidraw3/device/driver")).unwrap();
+        std::fs::create_dir_all(root.join("drivers/magicmouse")).unwrap();
+        std::fs::write(root.join("drivers/magicmouse/unbind"), "").unwrap();
+        std::fs::write(root.join("drivers/magicmouse/bind"), "").unwrap();
+        let class = root.join("class").to_str().unwrap().to_string();
+        let drivers = root.join("drivers").to_str().unwrap().to_string();
+        (dir, class, drivers)
+    }
+
+    #[test]
+    fn unbind_writes_hid_id_to_bound_driver() {
+        let (_dir, class, drivers) = fake_bound_sysfs();
+        assert!(attempt_driver_unbind_with_root("/dev/hidraw3", &class, &drivers).unwrap());
+        let written = std::fs::read_to_string(format!("{drivers}/magicmouse/unbind")).unwrap();
+        assert_eq!(written, "0005:004C:0324.000B");
+    }
+
+    #[test]
+    fn unbind_falls_back_when_driver_link_absent() {
+        let (_dir, class, drivers) = fake_bound_sysfs();
+        // Remove the driver symlink: bound-driver resolution fails, the
+        // fallback list must still reach magicmouse.
+        std::fs::remove_file(format!("{class}/hidraw3/device/driver")).unwrap();
+        assert!(attempt_driver_unbind_with_root("/dev/hidraw3", &class, &drivers).unwrap());
+    }
+
+    #[test]
+    fn restore_rebinds_after_unbind() {
+        let (_dir, class, drivers) = fake_bound_sysfs();
+        assert!(restore_with_root("/dev/hidraw3", &class, &drivers).unwrap());
+        let written = std::fs::read_to_string(format!("{drivers}/magicmouse/bind")).unwrap();
+        assert_eq!(written, "0005:004C:0324.000B");
+        assert!(!restore_with_root("/dev/hidraw77", &class, &drivers).unwrap());
     }
 }
