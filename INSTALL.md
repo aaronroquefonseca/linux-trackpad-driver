@@ -52,8 +52,41 @@ systemctl status linux-trackpad-driver.service
   tests/unprivileged runs).
 - Reconnect template: `Type=oneshot`, runs `ltd reconnect /dev/%I`.
 
-Suspend/resume re-init is owned by the `suspend-hook` task (system-side
-hook re-sending multitouch enable); these units do not cover it.
+## Suspend/resume re-init
+
+Trackpad 2 USB drops out of multitouch mode across suspend (report `0x02`
+shrinks 21→8 bytes; clicks survive, motion lost until re-init — see
+`docs/RESEARCH.md` §6). Two layers re-send the USB sequence from multitouch
+enable; either suffices alone:
+
+```sh
+sudo install -m755 systemd/system-sleep/ltd-resume /usr/lib/systemd/system-sleep/ltd-resume
+sudo install -m644 systemd/linux-trackpad-driver-resume.service /etc/systemd/system/
+sudo systemctl daemon-reload
+# Manual re-init without sleeping (or to test the path):
+sudo ltd resume
+systemctl status linux-trackpad-driver-resume.service
+```
+
+- System side (primary): the `system-sleep` hook runs `ltd resume` on the
+  `post` branch of every sleep type (`suspend`, `hibernate`,
+  `hybrid-sleep`, `suspend-then-hibernate`); `pre` is a no-op. The hook is
+  system-side only — `user.slice` is frozen while sleep hooks run, so it
+  never touches user sessions (no `--user` units, no session D-Bus).
+- Resume unit: `Type=oneshot`, `After=` the sleep targets, runs
+  `ltd resume`. There is no `resume.target` to bind to (`WantedBy=` sleep
+  targets would run *before* suspend), so the hook is the post-resume
+  trigger; the unit covers manual runs plus a harmless idempotent pass at
+  boot when enabled.
+- Daemon side (belt-and-braces): the running daemon re-verifies each known
+  USB node every 30 s (`GET_FEATURE` read-back of the polling report) and
+  re-inits on mismatch; newly appeared nodes get full init, vanished nodes
+  emit `Detached`. Clicks re-attaches via the device-ready hub after init,
+  never before.
+
+No udev `change` rule is needed: resume re-enumeration already emits `add`,
+which the rules above hand to the reconnect template; the hook + daemon
+tick cover the no-re-enumeration case (node persists, only mode is lost).
 
 ## hwdb note (libinput quirks, optional)
 
