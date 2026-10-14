@@ -727,6 +727,9 @@ force_5 = "none"
     fn env_config_propagates_non_default_values() {
         // The reconnect path loads via env (udev passes no -c): a non-default
         // value in the env-pointed file must reach the caller.
+        // Holds the shared env lock: set_var racing any concurrent env
+        // read is unsound under the threaded harness.
+        let _env_guard = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ltd.toml");
         std::fs::write(&path, "enhanced_clicks = true\npolling_rate = 90\n").unwrap();
@@ -743,6 +746,8 @@ force_5 = "none"
 
     #[test]
     fn explicit_path_wins_over_env() {
+        // Serialized with all other env tests (see above).
+        let _env_guard = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join("env.toml");
         let cli_path = dir.path().join("cli.toml");
@@ -760,6 +765,8 @@ force_5 = "none"
 
     #[test]
     fn missing_env_file_falls_back_to_defaults() {
+        // Serialized with all other env tests (see above).
+        let _env_guard = crate::test_env::lock_env();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, "/nonexistent-ltd-config-xyz.toml") };
         let cfg = load_or_default_with_env(None).unwrap();
