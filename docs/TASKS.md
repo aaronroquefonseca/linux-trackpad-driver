@@ -25,11 +25,11 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
-| config-schema | T3 `e1271c64` — PR #5 `981b6bf6`, coordinator-verified (55 green) | `feat/config-schema` | Full TOML schema + validation | DONE, MERGED (`723f885`) |
-| apple-parse | T3 `30782f2f` — PR #2 `3ffe385e` | `feat/apple-parse` | 9B parser, pressure@7 | OPEN, IN REVIEW (3 threads: `27fdf93b` Spark, `10ff6908` MiMo, `2c6b43fd` Step5-corrected) |
-| udev-systemd | T3 `90edb8da` — PR #1, verified (rules + 5 packaging tests) | `feat/udev-systemd` | rules+unit+INSTALL | DONE, MERGED (`3bf2a23`) |
+| config-schema | T3 `e1271c64` — PR #5 `981b6bf6`, coordinator-verified (55 green) | `feat/config-schema` | Full TOML schema + validation | DONE, MERGED (`723f885`). Owner SETTLED |
+| apple-parse | T3 `30782f2f` — PR #2 `3d5a18c` (fixes verified, head==PR head, green) | `feat/apple-parse` | 9B parser, pressure@7 | DONE, MERGED (`8910089`). Owner + 3 reviewers SETTLED |
+| udev-systemd | T3 `90edb8da` — PR #1, verified (rules + 5 packaging tests) | `feat/udev-systemd` | rules+unit+INSTALL | DONE, MERGED (`3bf2a23`). Owner SETTLED |
 | reconnect-bt | T3 `8a38d26b` — PR #4 `f03ac4a` | `feat/reconnect-bt` | idempotency, BT, resume re-init | OPEN, HELD for base-init L0-fix rebase (touches `init.rs`) |
-| tests-hw-mock | T3 `8f5054ba` — PR #3, verified clean-HEAD (52+5 green) | `feat/tests-hw-mock` | mock harness + CI workflow | DONE, MERGED (`25068e5`) |
+| tests-hw-mock | T3 `8f5054ba` — PR #3, verified clean-HEAD (52+5 green) | `feat/tests-hw-mock` | mock harness + CI workflow | DONE, MERGED (`25068e5`). Owner SETTLED |
 
 ## Phase 1 — wave 2 (blocked on wave-1 merges)
 
