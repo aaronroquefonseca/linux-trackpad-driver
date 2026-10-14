@@ -1,43 +1,44 @@
 # Maintainer: Aaron Roque Fonseca <https://github.com/aaronroquefonseca>
-# AUR package for linux-trackpad-driver (VCS / -git).
+# AUR STABLE package for linux-trackpad-driver.
 #
-# pkgver choice (documented per task): the repo has NO git tags yet
-# (2026-10-14), so `git describe` has nothing to work from. Use the Arch
-# VCS fallback — commit date + rev-count + short hash
-# (YYYYMMDD.r<rev-count>.g<short-hash>). Once upstream tags releases
-# (e.g. v0.1.0), switch pkgver() to `git describe --long --tags`.
-pkgname=linux-trackpad-driver-git
-pkgver=20261014.r74.g4481b60
+# Split-repo model: stable releases live in the AUR repo
+# `linux-trackpad-driver` (this file); nightly VCS snapshots live in the
+# SEPARATE repo `linux-trackpad-driver-nightly` (see PKGBUILD-nightly).
+# This file is committed for review only — nothing pushes it to the AUR
+# until the owner arms .github/workflows/release-tag.yml (job `aur-stable`).
+#
+# Release procedure: the release workflow sets pkgver/pkgrel from the tag
+# and fills the tarball checksum from the draft Release's SHA256SUMS.
+# Manual equivalent:
+#   updpkgsums  # after pointing source= at the new release tarball
+pkgname=linux-trackpad-driver
+pkgver=0.1.0
 pkgrel=1
 pkgdesc="Userspace Rust driver for Apple Magic Trackpad 2 (USB/BT core-init)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/aaronroquefonseca/linux-trackpad-driver"
 license=('MIT' 'Apache-2.0')
 depends=('systemd' 'gcc-libs' 'glibc')
-makedepends=('cargo' 'git')
+makedepends=('cargo')
 optdepends=('libinput: pointer/palm processing for passthrough events and hwdb quirks (see INSTALL.md "hwdb note")')
-provides=('linux-trackpad-driver')
-conflicts=('linux-trackpad-driver')
 backup=('etc/linux-trackpad-driver/config.toml')
-source=("${pkgname}::git+https://github.com/aaronroquefonseca/linux-trackpad-driver.git")
+source=("linux-trackpad-driver-${pkgver}.tar.gz::https://github.com/aaronroquefonseca/linux-trackpad-driver/releases/download/v${pkgver}/linux-trackpad-driver-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+# Release tarballs are per-arch; aarch64 users build from the same source
+# tarball via the VCS -nightly package until per-arch release assets exist.
 sha256sums=('SKIP')
 install=ltd.install
 
-pkgver() {
-  cd "${pkgname}"
-  printf "%s.r%s.g%s" "$(git log -1 --format=%cd --date=short | tr -d -)" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
-}
-
 build() {
-  cd "${pkgname}"
-  cargo build --locked --release
+  cd "linux-trackpad-driver-v${pkgver}-x86_64-unknown-linux-gnu"
+  # Release tarballs ship a prebuilt `ltd`; nothing to compile.
+  test -x ltd
 }
 
 package() {
-  cd "${pkgname}"
+  cd "linux-trackpad-driver-v${pkgver}-x86_64-unknown-linux-gnu"
 
   # Binary.
-  install -Dm755 "target/release/ltd" "${pkgdir}/usr/bin/ltd"
+  install -Dm755 "ltd" "${pkgdir}/usr/bin/ltd"
 
   # Default config (conffile; see backup=() above).
   install -Dm644 "config/default.toml" "${pkgdir}/etc/linux-trackpad-driver/config.toml"
