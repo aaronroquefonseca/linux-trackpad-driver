@@ -87,3 +87,8 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
   Spark review REQUEST-CHANGES, L0/L1 verified REAL in code, verbatim
   follow-up relayed to base-init (see `docs/REVIEWS/base-init-6aa419b.md`).
   Step5 thread replaced (`c5969de2`, corrected model id) after provider error.
+- 2026-10-14: base-init fix DONE+pushed (`55ed6c9`, all 13 review findings),
+  coordinator-verified clean-HEAD (79+5 green, clippy/fmt clean). RESEARCH §4
+  tier label clarified per ap2-spark finding #2 (MT2 = L2p, L1a-class pressure).
+  ap2-spark APPROVE-WITH-NOTES (3×L1, no L0); ap2-mimo + ap2-step5c pending.
+  PRs #1/#3/#5 MERGED; #2 in review; #4 held for L0-fix rebase.

@@ -131,7 +131,8 @@ Base L0/L1/L2 holds as shorthand but needs splits. Adopted tiers:
 | L2p | proprietary pressure | device-autonomous | Apple MT2 (`0x22/0x23+0x53`), Sensel shipping FW |
 
 Rules derived:
-- Apple MT2 = L1b + L2p, NOT L2s. Internal MacBooks off-HID (out of scope).
+- Apple MT2 = L2p (pressure channel is L1a-class arbitrary units, NOT L1b
+  grams). Internal MacBooks off-HID (out of scope).
 - Lenovo/Dell/HP haptic hardware ships as L1-or-L0 software on Linux
   (device-autonomous click, no host waveforms, no force units to userspace).
 - Do NOT conflate L1a/L1b — thresholds break. Do NOT gate host-haptic UI on
