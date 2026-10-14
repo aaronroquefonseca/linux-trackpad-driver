@@ -159,8 +159,9 @@ pub fn parse_interface_number(text: &str) -> Option<u8> {
 
 /// USB interface number for a hidraw node, via sysfs.
 ///
-/// Walks `<class_root>/<hidraw>/device` up to 3 parents looking for a
-/// `bInterfaceNumber` attribute (the HID device itself has none; the USB
+/// `{class_root}/{hidraw}/device` is a symlink into the device hierarchy, so
+/// it is canonicalized first and then the resolved dir plus up to 3 parents
+/// are probed for `bInterfaceNumber` (the HID device itself has none; the USB
 /// interface parent does). Returns `None` for BT nodes / unknown layouts —
 /// callers treat that as "route the full idempotent sequence anyway".
 pub fn interface_number_for_node(devnode: &str) -> Option<u8> {
@@ -169,10 +170,13 @@ pub fn interface_number_for_node(devnode: &str) -> Option<u8> {
 
 fn interface_number_with_root(devnode: &str, class_root: &str) -> Option<u8> {
     let name = hidraw_name(devnode)?;
-    let mut dir = std::path::PathBuf::from(format!("{class_root}/{name}/device"));
+    let link = std::path::PathBuf::from(format!("{class_root}/{name}/device"));
+    // Canonicalize: `device` is a symlink; textual parent-walking from the
+    // class branch would never reach the device hierarchy where
+    // `bInterfaceNumber` actually lives.
+    let mut dir = std::fs::canonicalize(&link).ok()?;
     for _ in 0..4 {
-        let candidate = dir.join("bInterfaceNumber");
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
+        if let Ok(text) = std::fs::read_to_string(dir.join("bInterfaceNumber")) {
             if let Some(n) = parse_interface_number(&text) {
                 return Some(n);
             }
@@ -304,10 +308,18 @@ mod tests {
 
     #[test]
     fn interface_and_bind_from_fake_sysfs() {
+        // Mirror real sysfs: `device` is a symlink into the device hierarchy;
+        // `bInterfaceNumber` lives on the USB-interface parent, never on the
+        // HID device dir itself.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("hidraw");
-        std::fs::create_dir_all(root.join("hidraw7/device")).unwrap();
-        std::fs::write(root.join("hidraw7/device/bInterfaceNumber"), "02\n").unwrap();
+        let hiddev = root.join("devices/usb-iface/hiddev0");
+        std::fs::create_dir_all(&hiddev).unwrap();
+        std::fs::write(root.join("devices/usb-iface/bInterfaceNumber"), "02\n").unwrap();
+        std::fs::create_dir_all(root.join("hidraw7")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../devices/usb-iface/hiddev0", root.join("hidraw7/device"))
+            .unwrap();
         assert_eq!(
             interface_number_with_root("/dev/hidraw7", root.to_str().unwrap()),
             Some(2)
@@ -324,6 +336,25 @@ mod tests {
         ));
         assert_eq!(
             interface_number_with_root("/dev/hidraw9", root.to_str().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn interface_walk_ignores_class_branch_attrs() {
+        // A `bInterfaceNumber` sitting next to the symlink (i.e. on the class
+        // branch, a layout that never exists) must NOT be picked up: only
+        // the canonicalized device hierarchy counts.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        let hiddev = root.join("devices/hiddev1");
+        std::fs::create_dir_all(&hiddev).unwrap();
+        std::fs::create_dir_all(root.join("hidraw8")).unwrap();
+        std::fs::write(root.join("hidraw8/bInterfaceNumber"), "01\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../devices/hiddev1", root.join("hidraw8/device")).unwrap();
+        assert_eq!(
+            interface_number_with_root("/dev/hidraw8", root.to_str().unwrap()),
             None
         );
     }
