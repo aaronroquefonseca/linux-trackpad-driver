@@ -145,3 +145,25 @@ New key vs reference: `enhanced_clicks` (explicit opt-in gate).
 - **Downstream contract note.** Future proxy node: `res == 0`, arbitrary
   0..253 range, Type-B slots + tracking IDs; no grams/newtons claims, no
   `EV_FF`/`FF_HAPTIC` advertisement (no 2026 libinput/Wayland consumer).
+
+## Review follow-ups (base-init, 2026-10-14, verdict REQUEST-CHANGES → fixed)
+
+- **L0 ioctl dir.** `HIDIOCSFEATURE`/`HIDIOCGFEATURE` are
+  `_IOC(_IOC_WRITE|_IOC_READ, ...)` (dir = 3); the initial code used 1/2 and
+  would have failed with `ENOTTY` on hardware. Pinned to `0xC0024806` /
+  `0xC0034806` / `0xC0034807`, cross-checked against the host
+  `linux/hidraw.h` in tests and a compiled-C ground truth.
+- **Polling floor.** Requests below ~16 Hz (`X` saturates at 255) are
+  rejected instead of silently rounding up ~15×. `theoretical_hz` reflects
+  the raw request pre-cap; over-cap requests warn at the daemon layer.
+- **Fail-closed reconnect.** Unrecognized nodes are rejected, never defaulted
+  to USB; BT engage waits for the node like USB; BT disengage emits
+  `Detached`, not `Ready`.
+- **Retry policy.** Backoff retries `ENOENT` (node mid-bind) only; `EINVAL` /
+  `ENOTTY` / `EACCES` fail fast at both per-report and whole-sequence layers.
+- **Lock.** Stale-socket removal only on refused/missing connect; anything
+  else (e.g. `EACCES`) bails and preserves the file.
+- **Hub.** Listeners run on lock-free snapshots; mutex poison recovered, not
+  panicked; re-entrant subscribe safe.
+- Sibling `hw_mock` tests updated where they pinned pre-review behavior
+  (sub-16 sweep, EINVAL-retry expectations); transient tests now use `ENOENT`.

@@ -5,8 +5,9 @@
 //! coexist during migration (no migration handling: different path, no clash).
 //!
 //! Protocol: `bind()` wins. On `AddrInUse`, dial the existing socket: success
-//! means a live daemon owns it (new instance exits); refusal means a stale
-//! socket file (remove + rebind). Tests use temp dirs, never `/run`.
+//! means a live daemon owns it (new instance exits); connection-refused means
+//! a stale socket file (remove + rebind); any other dial failure (e.g. EACCES)
+//! leaves the file untouched and bails. Tests use temp dirs, never `/run`.
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -23,9 +24,18 @@ pub const LEGACY_SOCK: &str = "/run/magic-trackpad-driver/driver.sock";
 /// Production default is [`DRIVER_SOCK`].
 pub const SOCKET_ENV: &str = "LTD_SOCKET";
 
+/// Effective socket path: explicit override, else `$LTD_SOCKET`, else default.
+/// Pure over the override so tests never mutate process env.
+pub fn socket_path_with(override_path: Option<&str>) -> String {
+    override_path
+        .map(str::to_string)
+        .or_else(|| std::env::var(SOCKET_ENV).ok())
+        .unwrap_or_else(|| DRIVER_SOCK.to_string())
+}
+
 /// Effective socket path: `$LTD_SOCKET` when set, else [`DRIVER_SOCK`].
 pub fn socket_path() -> String {
-    std::env::var(SOCKET_ENV).unwrap_or_else(|_| DRIVER_SOCK.to_string())
+    socket_path_with(None)
 }
 
 /// Guard holding the bound socket; drops (and removes the file) on shutdown.
@@ -55,18 +65,28 @@ impl SocketLock {
                 // Stale file or live daemon? A live owner accepts connections.
                 match UnixStream::connect(path) {
                     Ok(_) => anyhow::bail!("daemon already running (socket '{path}' live)"),
-                    Err(_) => {
-                        log::warn!("removing stale socket '{path}'");
-                        std::fs::remove_file(path)
-                            .with_context(|| format!("removing stale socket '{path}'"))?;
-                        let listener = UnixListener::bind(path).with_context(|| {
-                            format!("binding socket '{path}' after stale cleanup")
-                        })?;
-                        Ok(Self {
-                            path: path.to_string(),
-                            _listener: listener,
-                        })
-                    }
+                    Err(conn_err) => match conn_err.kind() {
+                        // No listener behind the file: stale residue of a dead
+                        // daemon, safe to remove and rebind.
+                        std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotFound => {
+                            log::warn!("removing stale socket '{path}'");
+                            std::fs::remove_file(path)
+                                .with_context(|| format!("removing stale socket '{path}'"))?;
+                            let listener = UnixListener::bind(path).with_context(|| {
+                                format!("binding socket '{path}' after stale cleanup")
+                            })?;
+                            Ok(Self {
+                                path: path.to_string(),
+                                _listener: listener,
+                            })
+                        }
+                        // Anything else (e.g. EACCES on a live daemon's socket):
+                        // unverifiable, so never delete — bail and keep the file.
+                        _ => anyhow::bail!(
+                            "socket '{path}' in use but not connectable ({conn_err}); refusing to remove"
+                        ),
+                    },
                 }
             }
             Err(e) => Err(e).with_context(|| format!("binding socket '{path}'")),
@@ -128,11 +148,27 @@ mod tests {
 
     #[test]
     fn socket_path_default_and_override() {
-        // SAFETY: single-threaded test mutating process env for itself.
+        // Pure override parameter — no process-env mutation, safe threaded.
         unsafe { std::env::remove_var(SOCKET_ENV) };
         assert_eq!(socket_path(), DRIVER_SOCK);
-        unsafe { std::env::set_var(SOCKET_ENV, "/tmp/test-ltd.sock") };
-        assert_eq!(socket_path(), "/tmp/test-ltd.sock");
-        unsafe { std::env::remove_var(SOCKET_ENV) };
+        assert_eq!(
+            socket_path_with(Some("/tmp/test-ltd.sock")),
+            "/tmp/test-ltd.sock"
+        );
+    }
+
+    #[test]
+    fn stale_socket_file_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stale.sock");
+        let sock = sock.to_str().unwrap();
+        // Dead daemon residue: bound listener dropped without cleanup —
+        // file exists, nobody answers.
+        let listener = UnixListener::bind(sock).unwrap();
+        drop(listener);
+        assert!(!daemon_socket_present(sock));
+        let guard = SocketLock::acquire(sock).unwrap();
+        assert!(daemon_socket_present(sock));
+        drop(guard);
     }
 }

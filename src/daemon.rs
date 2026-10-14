@@ -2,8 +2,8 @@
 //!
 //! `run`: acquires [`SocketLock`], discovers devices, runs init per node
 //! (USB feature reports / BT single-node), emits [`DeviceReadyEvent`] on the
-//! shared [`DeviceReadyHub`], then idles until SIGINT/SIGTERM. No devices =
-//! log + idle (graceful, exit 0 on signal), never panic.
+//! shared [`DeviceReadyHub`], then idles until signal (SIGINT/SIGTERM/SIGHUP).
+//! No devices = log + idle (graceful, exit 0 on signal), never panic.
 //!
 //! `reconnect <dev>`: idempotent per-node re-init for udev `add`. Daemon
 //! socket absent without `-f` → disengage path (host-click off, no init).
@@ -14,11 +14,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::discovery::{self, DiscoveredDevice};
-use crate::init::{self, DeviceReadyEvent, DeviceReadyHub, HidrawSender, Transport};
+use crate::init::{
+    self, DeviceReadyEvent, DeviceReadyHub, HidrawSender, Transport, EFFECTIVE_CAP_HZ,
+};
 use crate::lock::{self, SocketLock};
 
 /// Shared device-ready hub for this process. Clicks subscribes in Phase 1.
@@ -68,7 +70,7 @@ pub fn init_node(
 }
 
 /// `run` daemon loop. Holds the socket lock, inits all current devices,
-/// then parks until SIGINT/SIGTERM. Clean exit removes the socket.
+/// then parks until signal. Clean exit removes the socket.
 pub fn run_daemon(cfg: &Config) -> Result<()> {
     let sock = lock::socket_path();
     let _lock = SocketLock::acquire(&sock)?;
@@ -78,11 +80,18 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         cfg.polling_rate,
         cfg.enhanced_clicks
     );
+    if cfg.polling_rate > EFFECTIVE_CAP_HZ as u32 {
+        log::warn!(
+            "requested {} Hz above device cap; clamped to ~110 Hz (X=0x23)",
+            cfg.polling_rate
+        );
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     let stop = Arc::clone(&running);
+    // ctrlc covers SIGINT/SIGTERM/SIGHUP on Unix.
     ctrlc::set_handler(move || {
-        log::info!("received SIGINT/SIGTERM, shutting down...");
+        log::info!("received shutdown signal, shutting down...");
         stop.store(false, Ordering::SeqCst);
     })
     .map_err(|e| anyhow::anyhow!("installing signal handler: {e}"))?;
@@ -104,24 +113,22 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     }
 
     while running.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // 100 ms poll: prompt shutdown without burning CPU in the idle loop.
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     log::info!("shutdown complete");
     Ok(())
 }
 
-/// Classify a devnode's transport for the reconnect path without a full
-/// sysfs scan: BT vendor nodes contain no USB markers. Falls back to sysfs
-/// matching when available, else USB (init dance is idempotent anyway).
-fn transport_for_node(devnode: &str) -> Transport {
-    match discovery::scan_trackpads() {
-        Ok(devs) => devs
-            .iter()
-            .find(|d| d.devnode == devnode)
-            .map(|d| d.transport)
-            .unwrap_or(Transport::Usb),
-        Err(_) => Transport::Usb,
-    }
+/// Classify a devnode against a scanned device list. Fails closed: an
+/// unrecognized node is rejected, never defaulted to USB — a stray BT node
+/// given the USB feature-report dance would just collect NAKs, and a
+/// non-trackpad node must not receive init reports at all.
+pub fn classify_node(devnode: &str, devs: &[DiscoveredDevice]) -> Result<Transport> {
+    devs.iter()
+        .find(|d| d.devnode == devnode)
+        .map(|d| d.transport)
+        .with_context(|| format!("device node '{devnode}' is not a recognized trackpad"))
 }
 
 /// `reconnect` entry. Idempotent; safe to re-run on every udev `add`.
@@ -141,6 +148,15 @@ pub fn run_reconnect(
     if polling_hz == 0 || polling_hz > u16::MAX as u32 {
         anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
     }
+    if polling_hz < crate::init::MIN_EXPRESSIBLE_HZ {
+        anyhow::bail!(
+            "polling rate {polling_hz} Hz below device floor (~{} Hz)",
+            crate::init::MIN_EXPRESSIBLE_HZ
+        );
+    }
+    if polling_hz > EFFECTIVE_CAP_HZ as u32 {
+        log::warn!("requested {polling_hz} Hz above device cap; clamped to ~110 Hz (X=0x23)");
+    }
 
     let sock = lock::socket_path();
     let daemon_live = lock::daemon_socket_present(&sock);
@@ -155,16 +171,17 @@ pub fn run_reconnect(
         log::info!("daemon socket absent but -f given; proceeding with init");
     }
 
-    let transport = transport_for_node(devnode);
+    let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
+    let transport = classify_node(devnode, &devs)?;
     let ready_hub = hub();
 
     if disengage_mode {
         match transport {
             Transport::Bluetooth => {
                 // No host-click report defined for the BT bring-up path;
-                // disengage = log + ready event so subscribers can detach.
+                // disengage emits Detached (not Ready) so subscribers detach.
                 log::info!("BT {devnode}: disengage (no reports sent)");
-                ready_hub.emit(&init::init_bluetooth(devnode));
+                ready_hub.emit(&init::detached(devnode, Transport::Bluetooth));
                 return Ok(());
             }
             Transport::Usb => {
@@ -175,6 +192,7 @@ pub fn run_reconnect(
                     devnode: devnode.to_string(),
                 };
                 init::disengage_usb_with_retry(&sender)?;
+                ready_hub.emit(&init::detached(devnode, Transport::Usb));
                 return Ok(());
             }
         }
@@ -182,6 +200,9 @@ pub fn run_reconnect(
 
     match transport {
         Transport::Bluetooth => {
+            if !discovery::wait_for_node(devnode, 2000) {
+                anyhow::bail!("device node '{devnode}' not present");
+            }
             let ev = init::init_bluetooth(devnode);
             ready_hub.emit(&ev);
             Ok(())
@@ -225,9 +246,61 @@ mod tests {
     #[test]
     fn reconnect_missing_node_errors_without_panic() {
         let cfg = Config::default();
-        // No hardware in test env; disengage path still needs the node.
+        // No hardware in test env; unrecognized node fails closed, no panic.
         let r = run_reconnect("/nonexistent-hidraw-xyz", true, Some(110), false, &cfg);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn reconnect_rejects_unrecognized_live_node() {
+        let cfg = Config::default();
+        // /dev/null exists but is not a trackpad: fail closed, never init-dance it.
+        let r = run_reconnect("/dev/null", true, Some(110), false, &cfg);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn reconnect_rejects_below_floor() {
+        let cfg = Config::default();
+        assert!(run_reconnect("/dev/hidraw0", true, Some(1), false, &cfg).is_err());
+    }
+
+    fn fixture_devs() -> Vec<DiscoveredDevice> {
+        vec![
+            DiscoveredDevice {
+                devnode: "/dev/hidraw1".into(),
+                vendor_id: 0x05ac,
+                product_id: 0x0324,
+                transport: Transport::Usb,
+            },
+            DiscoveredDevice {
+                devnode: "/dev/hidraw9".into(),
+                vendor_id: 0x004c,
+                product_id: 0x0324,
+                transport: Transport::Bluetooth,
+            },
+        ]
+    }
+
+    #[test]
+    fn classify_node_known_transports() {
+        let devs = fixture_devs();
+        assert_eq!(
+            classify_node("/dev/hidraw1", &devs).unwrap(),
+            Transport::Usb
+        );
+        assert_eq!(
+            classify_node("/dev/hidraw9", &devs).unwrap(),
+            Transport::Bluetooth
+        );
+    }
+
+    #[test]
+    fn classify_node_unknown_fails_closed() {
+        let devs = fixture_devs();
+        // Must err — never fall back to USB for a stray node.
+        assert!(classify_node("/dev/hidraw0", &devs).is_err());
+        assert!(classify_node("/dev/null", &devs).is_err());
     }
 
     #[test]
@@ -241,6 +314,7 @@ mod tests {
         };
         let ev = init_node(&dev, 110, &hub).unwrap();
         assert_eq!(ev.transport, Transport::Bluetooth);
+        assert_eq!(ev.kind, crate::init::ReadyKind::Ready);
     }
 
     #[test]

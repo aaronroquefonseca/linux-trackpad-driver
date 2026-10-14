@@ -248,8 +248,16 @@ mod tests {
 
     #[test]
     fn x_below_35_never_on_wire() {
+        // Below the device floor (~16 Hz, X saturates at 255) requests are
+        // rejected, not silently rounded up: pin the rejection.
+        for requested in 1..crate::init::MIN_EXPRESSIBLE_HZ {
+            assert!(
+                crate::init::resolve_polling(requested).is_err(),
+                "requested {requested} must be rejected (below floor)"
+            );
+        }
         // Pure mapping sweep: every representable request stays >= 35.
-        for requested in 1..=u16::MAX as u32 {
+        for requested in crate::init::MIN_EXPRESSIBLE_HZ..=u16::MAX as u32 {
             let plan = crate::init::resolve_polling(requested).unwrap();
             assert!(
                 plan.x >= MIN_X_FOR_CAP,
@@ -259,7 +267,7 @@ mod tests {
             assert!(plan.x >= 35);
         }
         // Wire sweep over representative rates through the public init path.
-        for requested in [1, 2, 30, 60, 90, 100, 110, 111, 200, 500, 65535] {
+        for requested in [16, 30, 60, 90, 100, 110, 111, 200, 500, 65535] {
             let fake = FakeHidrawDevice::new();
             init_usb(&fake, requested).unwrap();
             let wire = fake.last_write().unwrap();
@@ -343,8 +351,9 @@ mod tests {
 
     #[test]
     fn set_nak_fails_and_whole_sequence_retries() {
-        // Persistent NAK (EINVAL, not EPIPE/EIO): init fails; the retrying
-        // wrapper re-runs from multitouch enable 3×, one logged attempt each.
+        // Persistent NAK (EINVAL, not EPIPE/EIO): init fails on the first
+        // report. EINVAL is permanent (bad length / wrong node), so both the
+        // per-report and whole-sequence layers fail fast — one logged attempt.
         let fake = FakeHidrawDevice::new();
         fake.script_set_errors(&[Some(libc::EINVAL), Some(libc::EINVAL), Some(libc::EINVAL)]);
         assert!(init_usb(&fake, 110).is_err());
@@ -353,16 +362,34 @@ mod tests {
         let fake = FakeHidrawDevice::new();
         fake.script_set_errors(&[Some(libc::EINVAL), Some(libc::EINVAL), Some(libc::EINVAL)]);
         let err = crate::init::init_usb_with_retry(&fake, 110).unwrap_err();
-        assert!(format!("{err:#}").contains("3 attempts"));
-        assert_eq!(fake.writes().len(), 3);
+        assert!(format!("{err:#}").contains("1 attempt(s)"));
+        assert_eq!(fake.writes().len(), 1);
         assert_eq!(fake.eio_swallowed(), 0);
     }
 
     #[test]
-    fn set_transient_nak_recovers_on_retry() {
-        // First attempt NAKs on the opening report; second attempt runs clean.
+    fn set_persistent_transient_retries_per_report() {
+        // Persistent transient (ENOENT, node mid-bind): per-report backoff
+        // exhausts all attempts, then propagates.
         let fake = FakeHidrawDevice::new();
-        fake.script_set_errors(&[Some(libc::EINVAL), None, None, None]);
+        fake.script_set_errors(&[Some(libc::ENOENT); 6]);
+        let err = crate::init::send_with_retry_on(
+            &fake,
+            &[0x02, 0x01],
+            crate::init::DEFAULT_SEND_ATTEMPTS,
+            "fake",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("5 attempt(s)"));
+        assert_eq!(fake.writes().len(), 5);
+    }
+
+    #[test]
+    fn set_transient_nak_recovers_on_retry() {
+        // First attempt hits ENOENT (node mid-bind) on the opening report;
+        // second attempt runs clean.
+        let fake = FakeHidrawDevice::new();
+        fake.script_set_errors(&[Some(libc::ENOENT), None, None, None]);
         let plan = crate::init::init_usb_with_retry(&fake, 110).unwrap();
         assert_eq!(plan.x, 0x23);
         assert_eq!(fake.writes().len(), 4); // 1 failed + 3 clean

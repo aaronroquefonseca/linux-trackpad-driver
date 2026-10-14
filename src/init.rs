@@ -40,7 +40,7 @@
 
 use std::cell::RefCell;
 use std::os::unix::io::AsRawFd;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -60,6 +60,9 @@ pub const EFFECTIVE_CAP_HZ: f64 = 110.0;
 /// Minimum `X` ever placed on the wire (`0x23 = 35`). Values below 35 are
 /// unverified and may be NAKed/ignored by the device.
 pub const MIN_X_FOR_CAP: u8 = 0x23;
+/// Lowest rate the `X` byte can express (`3850/255 ≈ 15.1 Hz`). Requests
+/// below this are rejected instead of silently rounding up ~15×.
+pub const MIN_EXPRESSIBLE_HZ: u32 = 16;
 
 /// Transport of a discovered device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,11 +76,13 @@ pub enum Transport {
 pub struct PollingPlan {
     /// Requested Hz (config or `-p` override).
     pub requested_hz: u32,
-    /// `X` byte actually sent (`>= 35` after cap clamp).
+    /// `X` byte actually sent (`>= 0x23` after cap clamp).
     pub x: u8,
-    /// Theoretical output `3850/X` before cap.
+    /// Formula output `3850/raw_x` for the raw request, before the device
+    /// ceiling (`X >= 0x23`, `~110 Hz`) is applied — i.e. what the request
+    /// *means*, even when the wire byte is clamped.
     pub theoretical_hz: f64,
-    /// Output after honest cap (`min(theoretical, 110)`).
+    /// Output after honest cap (`min(3850/X, 110)`).
     pub effective_hz: f64,
 }
 
@@ -91,11 +96,16 @@ pub fn resolve_polling(requested_hz: u32) -> Result<PollingPlan> {
     if requested_hz == 0 || requested_hz > u16::MAX as u32 {
         anyhow::bail!("invalid polling rate {requested_hz} (want 1..=65535)");
     }
-    let capped = requested_hz.min(EFFECTIVE_CAP_HZ as u32);
-    let x = (POLLING_BASE_HZ / f64::from(capped)).round() as u32;
-    let x = (x.clamp(1, 255) as u8).max(MIN_X_FOR_CAP);
-    let theoretical_hz = POLLING_BASE_HZ / f64::from(x);
-    let effective_hz = theoretical_hz.min(EFFECTIVE_CAP_HZ);
+    if requested_hz < MIN_EXPRESSIBLE_HZ {
+        anyhow::bail!(
+            "polling rate {requested_hz} Hz below device floor (~{MIN_EXPRESSIBLE_HZ} Hz; X saturates at 255)"
+        );
+    }
+    let raw_x = (POLLING_BASE_HZ / f64::from(requested_hz)).round() as u32;
+    let raw_x = raw_x.clamp(1, 255) as u8;
+    let theoretical_hz = POLLING_BASE_HZ / f64::from(raw_x);
+    let x = raw_x.max(MIN_X_FOR_CAP);
+    let effective_hz = (POLLING_BASE_HZ / f64::from(x)).min(EFFECTIVE_CAP_HZ);
     Ok(PollingPlan {
         requested_hz,
         x,
@@ -109,13 +119,18 @@ pub fn polling_report(x: u8) -> [u8; 3] {
     [POLLING_PREFIX[0], POLLING_PREFIX[1], x]
 }
 
-/// Compute the `HIDIOCSFEATURE(len)` ioctl request code (Linux `_IOC_WRITE`,
-/// type `'H'`, nr `0x06`). Pure so tests can pin the encoding.
+/// Direction bits for both hidraw feature ioctls: the kernel defines them as
+/// `_IOC(_IOC_WRITE|_IOC_READ, 'H', ...)` (see `linux/hidraw.h`:
+/// `HIDIOCSFEATURE` nr 0x06, `HIDIOCGFEATURE` nr 0x07), so dir = 1|2 = 3.
+/// A dir of 1 or 2 encodes a *different* ioctl number and fails with ENOTTY.
+const HIDIOC_DIR: u64 = 3;
+const HIDIOC_TYPE: u64 = 0x48;
+
+/// Compute the `HIDIOCSFEATURE(len)` ioctl request code (Linux, nr `0x06`).
+/// Pure so tests can pin the encoding.
 pub fn hidiocsfeature_request(len: usize) -> u64 {
-    const IOC_WRITE: u64 = 1;
-    const TYPE_H: u64 = 0x48;
     const NR: u64 = 0x06;
-    (IOC_WRITE << 30) | ((len as u64) << 16) | (TYPE_H << 8) | NR
+    (HIDIOC_DIR << 30) | ((len as u64) << 16) | (HIDIOC_TYPE << 8) | NR
 }
 
 /// Send one feature report to a hidraw node via `HIDIOCSFEATURE`.
@@ -158,13 +173,11 @@ pub fn send_feature_report_hidraw(devnode: &str, report: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Compute the `HIDIOCGFEATURE(len)` ioctl request code (Linux `_IOC_READ`,
-/// type `'H'`, nr `0x07`). Pure so tests can pin the encoding.
+/// Compute the `HIDIOCGFEATURE(len)` ioctl request code (Linux, nr `0x07`).
+/// Pure so tests can pin the encoding.
 pub fn hidiocgfeature_request(len: usize) -> u64 {
-    const IOC_READ: u64 = 2;
-    const TYPE_H: u64 = 0x48;
     const NR: u64 = 0x07;
-    (IOC_READ << 30) | ((len as u64) << 16) | (TYPE_H << 8) | NR
+    (HIDIOC_DIR << 30) | ((len as u64) << 16) | (HIDIOC_TYPE << 8) | NR
 }
 
 /// Read back a feature report via `HIDIOCGFEATURE` for verify-after-write.
@@ -213,25 +226,46 @@ pub fn verify_report(devnode: &str, expected: &[u8]) -> Result<bool> {
 /// Attempts for [`send_with_retry`]: first try + 4 backoff retries.
 pub const DEFAULT_SEND_ATTEMPTS: u32 = 5;
 
-/// Send with backoff retry against the hidraw/probe race: the kernel probe
-/// owns init too, so an `add`-time write may hit `ENOENT` (node not yet
-/// bound) or `EPIPE`/`EIO` (mode-switch drop). Sleeps 25→50→100→200 ms
-/// between attempts; `EPIPE`/`EIO` count as mode-switch success (see
-/// [`send_feature_report_hidraw`]).
-pub fn send_with_retry(devnode: &str, report: &[u8], max_attempts: u32) -> Result<()> {
+/// True for errors worth retrying: the hidraw node mid-probe/bind (`ENOENT`
+/// — udev `add` fired before the driver bound the node).
+///
+/// Programming errors (`EINVAL` bad length, `ENOTTY` wrong node/driver,
+/// `EACCES` permissions) fail fast instead of burning 5 sleeps. Note
+/// `EPIPE`/`EIO` never reach here: [`send_feature_report_hidraw`] already
+/// treats them as mode-switch success one layer down.
+pub fn is_transient_send_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(libc::ENOENT))
+    })
+}
+
+/// Retry wrapper over any [`FeatureSender`]; `label` names the node in logs.
+/// Split from [`send_with_retry`] so tests can drive the policy with a mock.
+pub fn send_with_retry_on(
+    sender: &dyn FeatureSender,
+    report: &[u8],
+    max_attempts: u32,
+    label: &str,
+) -> Result<()> {
     let attempts = max_attempts.max(1);
     let mut delay_ms = 25u64;
     for attempt in 1..=attempts {
-        match send_feature_report_hidraw(devnode, report) {
+        match sender.send(report) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if attempt == attempts {
+                let last = attempt == attempts;
+                if last || !is_transient_send_error(&e) {
+                    if !last {
+                        log::debug!("permanent send error on {label}, not retrying: {e:#}");
+                    }
                     return Err(e).with_context(|| {
-                        format!("feature report failed after {attempts} attempts on '{devnode}'")
+                        format!("feature report failed after {attempt} attempt(s) on '{label}'")
                     });
                 }
                 log::warn!(
-                    "feature report {:02X?} on {devnode} attempt {attempt}/{attempts} failed ({e:#}); retrying in {delay_ms} ms",
+                    "feature report {:02X?} on {label} attempt {attempt}/{attempts} failed ({e:#}); retrying in {delay_ms} ms",
                     report
                 );
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
@@ -240,6 +274,15 @@ pub fn send_with_retry(devnode: &str, report: &[u8], max_attempts: u32) -> Resul
         }
     }
     Ok(())
+}
+
+/// Send with backoff retry against the hidraw/probe race (see
+/// [`is_transient_send_error`] for what retries vs. fails fast).
+pub fn send_with_retry(devnode: &str, report: &[u8], max_attempts: u32) -> Result<()> {
+    let sender = HidrawSender {
+        devnode: devnode.to_string(),
+    };
+    send_with_retry_on(&sender, report, max_attempts, devnode)
 }
 /// Sink for feature reports; real hardware vs. test recorder.
 pub trait FeatureSender {
@@ -308,6 +351,11 @@ pub fn init_usb_with_retry(sender: &dyn FeatureSender, requested_hz: u32) -> Res
         match init_usb(sender, requested_hz) {
             Ok(plan) => return Ok(plan),
             Err(e) => {
+                if !is_transient_send_error(&e) {
+                    log::debug!("permanent USB init error, not retrying sequence: {e:#}");
+                    return Err(e)
+                        .with_context(|| format!("USB init failed after {attempt} attempt(s)"));
+                }
                 log::warn!("USB init attempt {attempt}/{DEFAULT_INIT_ATTEMPTS} failed: {e:#}");
                 last_err = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
@@ -325,6 +373,12 @@ pub fn disengage_usb_with_retry(sender: &dyn FeatureSender) -> Result<()> {
         match disengage_usb(sender) {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if !is_transient_send_error(&e) {
+                    log::debug!("permanent USB disengage error, not retrying: {e:#}");
+                    return Err(e).with_context(|| {
+                        format!("USB disengage failed after {attempt} attempt(s)")
+                    });
+                }
                 log::warn!("USB disengage attempt {attempt}/{DEFAULT_INIT_ATTEMPTS} failed: {e:#}");
                 last_err = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
@@ -335,6 +389,15 @@ pub fn disengage_usb_with_retry(sender: &dyn FeatureSender) -> Result<()> {
         .with_context(|| format!("USB disengage failed after {DEFAULT_INIT_ATTEMPTS} attempts"))
 }
 
+/// Whether a [`DeviceReadyEvent`] announces a usable device or a detach.
+/// Disengage and engage emit *different* kinds so subscribers never confuse
+/// "device ready" with "device going away".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyKind {
+    Ready,
+    Detached,
+}
+
 /// Device-ready event emitted after successful init (or immediately for BT).
 /// The future clicks pipeline subscribes via [`DeviceReadyHub`]; init holds
 /// no reference to clicks code.
@@ -342,6 +405,7 @@ pub fn disengage_usb_with_retry(sender: &dyn FeatureSender) -> Result<()> {
 pub struct DeviceReadyEvent {
     pub devnode: String,
     pub transport: Transport,
+    pub kind: ReadyKind,
 }
 
 /// Bluetooth path: no init dance, straight to device-ready.
@@ -350,6 +414,7 @@ pub fn init_bluetooth(devnode: &str) -> DeviceReadyEvent {
     DeviceReadyEvent {
         devnode: devnode.to_string(),
         transport: Transport::Bluetooth,
+        kind: ReadyKind::Ready,
     }
 }
 
@@ -358,6 +423,18 @@ pub fn usb_ready(devnode: &str) -> DeviceReadyEvent {
     DeviceReadyEvent {
         devnode: devnode.to_string(),
         transport: Transport::Usb,
+        kind: ReadyKind::Ready,
+    }
+}
+
+/// Constructor for the detach event (call after a disengage path).
+/// Distinct from [`usb_ready`]/[`init_bluetooth`] so subscribers can tell
+/// detach apart from ready.
+pub fn detached(devnode: &str, transport: Transport) -> DeviceReadyEvent {
+    DeviceReadyEvent {
+        devnode: devnode.to_string(),
+        transport,
+        kind: ReadyKind::Detached,
     }
 }
 
@@ -365,10 +442,12 @@ pub fn usb_ready(devnode: &str) -> DeviceReadyEvent {
 pub type DeviceReadyCallback = dyn Fn(&DeviceReadyEvent) + Send + Sync;
 
 /// Stub fan-out hook for device-ready events. Clicks subscribes later;
-/// init only emits.
+/// init only emits. Listeners run on snapshots outside the lock, so a
+/// listener may (un)subscribe re-entrantly without deadlock; a poisoned
+/// mutex is recovered instead of panicking (daemon never-panic contract).
 #[derive(Default)]
 pub struct DeviceReadyHub {
-    listeners: Mutex<Vec<Box<DeviceReadyCallback>>>,
+    listeners: Mutex<Vec<Arc<DeviceReadyCallback>>>,
 }
 
 impl DeviceReadyHub {
@@ -381,22 +460,29 @@ impl DeviceReadyHub {
     where
         F: Fn(&DeviceReadyEvent) + Send + Sync + 'static,
     {
-        let mut guard = self.listeners.lock().expect("hub lock");
-        guard.push(Box::new(f));
+        let mut guard = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        guard.push(Arc::new(f));
         guard.len() - 1
     }
 
     /// Emit to all listeners; a panicking listener is isolated so init
     /// (and passthrough) is never taken down by clicks.
     pub fn emit(&self, event: &DeviceReadyEvent) {
-        let guard = self.listeners.lock().expect("hub lock");
-        for listener in guard.iter() {
+        let snapshot: Vec<Arc<DeviceReadyCallback>> = self
+            .listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for listener in snapshot.iter() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(event)));
         }
     }
 
     pub fn listener_count(&self) -> usize {
-        self.listeners.lock().expect("hub lock").len()
+        self.listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -421,6 +507,8 @@ mod tests {
         let plan = resolve_polling(500).unwrap();
         assert_eq!(plan.x, MIN_X_FOR_CAP);
         assert!(plan.effective_hz <= EFFECTIVE_CAP_HZ + 1e-6);
+        // Theoretical reflects the request's meaning, not the clamped wire byte.
+        assert!((plan.theoretical_hz - 3850.0 / 8.0).abs() < 1e-9);
     }
 
     #[test]
@@ -438,9 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_and_huge() {
+    fn rejects_zero_huge_and_below_floor() {
         assert!(resolve_polling(0).is_err());
         assert!(resolve_polling(100_000).is_err());
+        // 1 Hz would silently round to X=255 (~15.1 Hz): reject instead.
+        assert!(resolve_polling(1).is_err());
+        assert!(resolve_polling(15).is_err());
+        let plan = resolve_polling(16).unwrap();
+        assert_eq!(plan.x, 241); // round(3850/16)
     }
 
     #[test]
@@ -451,11 +544,33 @@ mod tests {
 
     #[test]
     fn ioctl_encoding_pins_linux_layout() {
-        // _IOC_WRITE(1)<<30 | len<<16 | 'H'(0x48)<<8 | 0x06
-        assert_eq!(hidiocsfeature_request(2), 0x4000_4806 + (2 << 16));
-        assert_eq!(hidiocsfeature_request(3), 0x4003_4806);
-        // _IOC_READ(2)<<30 | len<<16 | 'H'(0x48)<<8 | 0x07
-        assert_eq!(hidiocgfeature_request(3), 0x8003_4807);
+        // dir=3 (_IOC_WRITE|_IOC_READ) << 30 | len << 16 | 'H'(0x48) << 8 | nr.
+        // Ground truth: linux/hidraw.h HIDIOCSFEATURE nr 0x06, HIDIOCGFEATURE nr 0x07.
+        assert_eq!(hidiocsfeature_request(2), 0xC002_4806);
+        assert_eq!(hidiocsfeature_request(3), 0xC003_4806);
+        assert_eq!(hidiocgfeature_request(3), 0xC003_4807);
+    }
+
+    #[test]
+    fn ioctl_dir_matches_host_header() {
+        // Cross-check the direction bits against the host kernel header so a
+        // wrong-dir regression fails loudly instead of passing pinned values.
+        let Ok(text) = std::fs::read_to_string("/usr/include/linux/hidraw.h") else {
+            return; // headers absent (non-dev machine): pinned test above still guards.
+        };
+        for macro_name in ["HIDIOCSFEATURE", "HIDIOCGFEATURE"] {
+            let line = text
+                .lines()
+                .find(|l| l.contains(macro_name))
+                .unwrap_or_else(|| panic!("{macro_name} missing from host hidraw.h"));
+            assert!(
+                line.contains("_IOC_WRITE|_IOC_READ") || line.contains("_IOC_READ|_IOC_WRITE"),
+                "{macro_name} not _IOC_WRITE|_IOC_READ in host header: {line}"
+            );
+        }
+        // And our encoder must agree with dir=3 for those macros.
+        assert_eq!(hidiocsfeature_request(2) >> 30, 3);
+        assert_eq!(hidiocgfeature_request(3) >> 30, 3);
     }
 
     #[test]
@@ -488,8 +603,76 @@ mod tests {
         let ev = init_bluetooth("/dev/hidraw9");
         assert_eq!(ev.transport, Transport::Bluetooth);
         assert_eq!(ev.devnode, "/dev/hidraw9");
+        assert_eq!(ev.kind, ReadyKind::Ready);
     }
 
+    #[test]
+    fn detach_event_distinct_from_ready() {
+        let ready = usb_ready("/dev/hidraw1");
+        let off = detached("/dev/hidraw1", Transport::Usb);
+        assert_eq!(ready.kind, ReadyKind::Ready);
+        assert_eq!(off.kind, ReadyKind::Detached);
+        assert_ne!(ready, off);
+        let bt_off = detached("/dev/hidraw9", Transport::Bluetooth);
+        assert_eq!(bt_off.kind, ReadyKind::Detached);
+    }
+
+    #[test]
+    fn hub_supports_reentrant_subscribe() {
+        let hub = Arc::new(DeviceReadyHub::new());
+        let hub2 = Arc::clone(&hub);
+        hub.subscribe(move |_| {
+            hub2.subscribe(|_| {});
+        });
+        hub.emit(&usb_ready("/dev/hidraw1")); // must not deadlock
+        assert_eq!(hub.listener_count(), 2);
+    }
+
+    /// Failing sender with a programmed errno + attempt counter.
+    struct FailSender {
+        attempts: std::cell::Cell<usize>,
+        errno: i32,
+    }
+
+    impl FeatureSender for FailSender {
+        fn send(&self, _report: &[u8]) -> Result<()> {
+            self.attempts.set(self.attempts.get() + 1);
+            Err(anyhow::Error::from(std::io::Error::from_raw_os_error(
+                self.errno,
+            )))
+        }
+    }
+
+    #[test]
+    fn retry_transient_until_attempts_exhausted() {
+        let sender = FailSender {
+            attempts: std::cell::Cell::new(0),
+            errno: libc::ENOENT,
+        };
+        let r = send_with_retry_on(&sender, &[0x02, 0x01], 3, "test-node");
+        assert!(r.is_err());
+        assert_eq!(sender.attempts.get(), 3);
+        assert!(is_transient_send_error(&r.unwrap_err()));
+    }
+
+    #[test]
+    fn permanent_error_fails_fast_without_sleep() {
+        for errno in [libc::EINVAL, libc::ENOTTY, libc::EACCES] {
+            let sender = FailSender {
+                attempts: std::cell::Cell::new(0),
+                errno,
+            };
+            let before = std::time::Instant::now();
+            let r = send_with_retry_on(&sender, &[0x02, 0x01], 5, "test-node");
+            assert!(r.is_err(), "errno {errno} should fail");
+            assert_eq!(sender.attempts.get(), 1, "errno {errno} must not retry");
+            assert!(
+                before.elapsed() < std::time::Duration::from_millis(25),
+                "errno {errno} must fail fast (no backoff sleep)"
+            );
+            assert!(!is_transient_send_error(&r.unwrap_err()));
+        }
+    }
     #[test]
     fn hub_fans_out_and_isolates_panics() {
         let hub = DeviceReadyHub::new();
