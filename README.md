@@ -37,7 +37,7 @@ Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).
 
 ```sh
 sudo ltd run                          # daemon: init + idle (passthrough via libinput)
-sudo ltd run -c /etc/ltd/config.toml
+sudo ltd run -c /etc/linux-trackpad-driver/config.toml
 sudo ltd reconnect /dev/hidrawN       # udev entry / manual re-init
 sudo ltd reconnect /dev/hidrawN -f -p 90 -d
 ```

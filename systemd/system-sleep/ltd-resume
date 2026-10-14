@@ -18,6 +18,13 @@
 set -eu
 
 LTD_BIN="${LTD_BIN:-/usr/bin/ltd}"
+# Sleep hooks inherit PID1's environment, not the daemon's: without this,
+# `ltd resume` would re-init at defaults (110 Hz) while the daemon and its
+# tick verify against the system config — a perpetual mismatch re-init loop
+# — and BT re-suppression would never fire on the primary path. A missing
+# file falls back to defaults (same as the units below).
+LTD_CONFIG="${LTD_CONFIG:-/etc/linux-trackpad-driver/config.toml}"
+export LTD_CONFIG
 
 case "${1:-} ${2:-}" in
     "post suspend" | "post hibernate" | "post hybrid-sleep" | "post suspend-then-hibernate")

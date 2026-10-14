@@ -6,6 +6,11 @@ Wants=systemd-udevd.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/ltd run
+# System config for the daemon (polling rate, enhanced_clicks). `ltd run`
+# reads $LTD_CONFIG when no -c is given; without this the daemon would run
+# at defaults while the resume hook re-inits at the system rate, and the
+# tick would "mismatch" forever. A missing file falls back to defaults.
+Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
 Restart=on-failure
 RestartSec=2
 # Creates /run/linux-trackpad-driver for driver.sock (see src/lock.rs:

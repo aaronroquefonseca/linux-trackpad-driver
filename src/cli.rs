@@ -225,7 +225,10 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
     };
     match cmd {
         Command::Run(run) => {
-            let cfg = config::load_or_default(run.config_path.as_deref())?;
+            // Like reconnect/resume: $LTD_CONFIG (set by the main unit) wins
+            // over defaults so the daemon, the hook, and the tick verify
+            // against the same rate. Explicit -c still wins over env.
+            let cfg = config::load_or_default_with_env(run.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
             match daemon::run_daemon(&cfg) {
                 Ok(()) => Ok(ExitCode::SUCCESS),

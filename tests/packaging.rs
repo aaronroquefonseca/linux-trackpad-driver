@@ -22,6 +22,15 @@ fn rule_lines(rules: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Non-comment lines of a script/unit: prohibitions may be named in comments,
+/// but only code lines can touch user sessions.
+fn code_lines(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 const RULES: &str = include_str!("../udev/99-linux-trackpad-driver.rules");
 const SERVICE: &str = include_str!("../systemd/linux-trackpad-driver.service");
 const RECONNECT: &str = include_str!("../systemd/linux-trackpad-driver-reconnect@.service");
@@ -232,16 +241,33 @@ fn sleep_hook_is_executable() {
 }
 
 #[test]
+fn ltd_config_default_path_parity() {
+    // Daemon, hook, and tick must verify against the same rate: all four
+    // shipped files must agree on the system config path. (A hook at
+    // defaults vs. a daemon at /etc rate = perpetual mismatch re-init.)
+    const PATH: &str = "/etc/linux-trackpad-driver/config.toml";
+    for (name, text) in [
+        ("sleep hook", SLEEP_HOOK),
+        ("main unit", SERVICE),
+        ("reconnect template", RECONNECT),
+        ("resume unit", RESUME_UNIT),
+    ] {
+        assert!(text.contains(PATH), "{name} must reference {PATH}");
+    }
+    // Reference is not enough for the hook: sleep hooks inherit PID1's env,
+    // so the default must be set and exported in code, not just documented.
+    let hook_code = code_lines(SLEEP_HOOK);
+    assert!(
+        hook_code.contains("LTD_CONFIG=") && hook_code.contains("export LTD_CONFIG"),
+        "sleep hook must set and export LTD_CONFIG in code"
+    );
+}
+
+#[test]
 fn sleep_hook_and_resume_unit_never_touch_user_sessions() {
     // user.slice is frozen while sleep hooks run (RESEARCH §6): any of these
     // in *code* (non-comment lines) would block on, or signal into, a frozen
     // user session. Comments may name them only to prohibit them.
-    fn code_lines(text: &str) -> String {
-        text.lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
     let hook_code = code_lines(SLEEP_HOOK);
     let unit_code = code_lines(RESUME_UNIT);
     for banned in [
