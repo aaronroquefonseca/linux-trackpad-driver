@@ -1,0 +1,55 @@
+# Maintainer: Aaron Roque Fonseca <https://github.com/aaronroquefonseca>
+# AUR package for linux-trackpad-driver (VCS / -git).
+#
+# pkgver choice (documented per task): the repo has NO git tags yet
+# (2026-10-14), so `git describe` has nothing to work from. Use the Arch
+# VCS fallback — commit date + rev-count + short hash
+# (YYYYMMDD.r<rev-count>.g<short-hash>). Once upstream tags releases
+# (e.g. v0.1.0), switch pkgver() to `git describe --long --tags`.
+pkgname=linux-trackpad-driver-git
+pkgver=20261014.r52.g3c641e0
+pkgrel=1
+pkgdesc="Userspace Rust driver for Apple Magic Trackpad 2 (USB/BT core-init)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/aaronroquefonseca/linux-trackpad-driver"
+license=('MIT' 'Apache-2.0')
+depends=('systemd' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+optdepends=('libinput: pointer/palm processing for passthrough events and hwdb quirks (see INSTALL.md "hwdb note")')
+provides=('linux-trackpad-driver')
+conflicts=('linux-trackpad-driver')
+backup=('etc/linux-trackpad-driver/config.toml')
+source=("${pkgname}::git+https://github.com/aaronroquefonseca/linux-trackpad-driver.git")
+sha256sums=('SKIP')
+install=ltd.install
+
+pkgver() {
+  cd "${pkgname}"
+  printf "%s.r%s.g%s" "$(git log -1 --format=%cd --date=short | tr -d -)" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "${pkgname}"
+  cargo build --locked --release
+}
+
+package() {
+  cd "${pkgname}"
+
+  # Binary.
+  install -Dm755 "target/release/ltd" "${pkgdir}/usr/bin/ltd"
+
+  # Default config (conffile; see backup=() above).
+  install -Dm644 "config/default.toml" "${pkgdir}/etc/linux-trackpad-driver/config.toml"
+
+  # udev rules (vendor dir; never /etc/udev/rules.d for packaged rules).
+  install -Dm644 "udev/99-linux-trackpad-driver.rules" "${pkgdir}/usr/lib/udev/rules.d/99-linux-trackpad-driver.rules"
+
+  # systemd units (vendor dir).
+  install -Dm644 "systemd/linux-trackpad-driver.service" "${pkgdir}/usr/lib/systemd/system/linux-trackpad-driver.service"
+  install -Dm644 "systemd/linux-trackpad-driver-reconnect@.service" "${pkgdir}/usr/lib/systemd/system/linux-trackpad-driver-reconnect@.service"
+  install -Dm644 "systemd/linux-trackpad-driver-resume.service" "${pkgdir}/usr/lib/systemd/system/linux-trackpad-driver-resume.service"
+
+  # Suspend/resume hook (executable).
+  install -Dm755 "systemd/system-sleep/ltd-resume" "${pkgdir}/usr/lib/systemd/system-sleep/ltd-resume"
+}
