@@ -67,3 +67,11 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 Conventional Commits, small PRs, review policy in `docs/ROADMAP.md`.
 Reference implementation (read-only, never copied):
 `/home/aaronroque/Projects/AppleTrackpadUserSpaceApp` (outside this repo).
+
+## License
+
+Dual-licensed under MIT OR Apache-2.0 — see [`LICENSE-MIT`](LICENSE-MIT)
+and [`LICENSE-APACHE`](LICENSE-APACHE). `Cargo.toml` declares
+`license = "MIT OR Apache-2.0"` to match. No per-file license headers:
+the repo-level license files + `Cargo.toml` SPDX expression are
+authoritative.
