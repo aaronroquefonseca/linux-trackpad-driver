@@ -1,0 +1,79 @@
+name: Nightly (AUR -nightly)
+
+# READY BUT INERT — owner enables on public launch, nothing publishes before then.
+#
+# What this does once enabled: on each main push, bump pkgver in the
+# -nightly PKGBUILD template and push it to the SEPARATE AUR repo
+# `linux-trackpad-driver-nightly` (stable releases live in
+# `linux-trackpad-driver`; the two never share a repo).
+#
+# Enable (see docs/RELEASING.md, 5-minute checklist):
+#   1. Create the AUR package `linux-trackpad-driver-nightly` once (first push
+#      must be done manually with your AUR SSH key).
+#   2. Add secret AUR_SSH_PRIVATE_KEY (same AUR-registered key as stable).
+#   3. Set repo variable ENABLE_NIGHTLY_PUBLISH=true.
+#   4. Flip job `publish-nightly` below from `if: false` to
+#      `needs.preflight.outputs.publish == 'true'`.
+# Until then this workflow only computes/prints the would-be pkgver (no-op).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      pkgver: ${{ steps.ver.outputs.pkgver }}
+      publish: ${{ steps.ver.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: ver
+        run: |
+          PKGVER="$(git log -1 --format=%cd --date=short | tr -d -).r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+          echo "pkgver=$PKGVER" >> "$GITHUB_OUTPUT"
+          echo "would-be nightly pkgver: $PKGVER"
+          if [ "${{ vars.ENABLE_NIGHTLY_PUBLISH }}" = "true" ] \
+            && [ -n "${{ secrets.AUR_SSH_PRIVATE_KEY }}" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false (INERT: needs secret AUR_SSH_PRIVATE_KEY + repo variable ENABLE_NIGHTLY_PUBLISH=true + arming if:false below)" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish-nightly:
+    needs: preflight
+    # HARD-DISABLED: present for review, never runs until the owner arms it.
+    # Arm ALL three (secret + toggle + condition), see header + docs/RELEASING.md:
+    #   secret: AUR_SSH_PRIVATE_KEY (AUR-registered SSH private key)
+    #   toggle: repo variable ENABLE_NIGHTLY_PUBLISH=true
+    #   then flip this `if: false` to `needs.preflight.outputs.publish == 'true'`.
+    if: false
+    runs-on: ubuntu-latest
+    env:
+      PKGVER: ${{ needs.preflight.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: push bumped PKGBUILD to AUR -nightly repo
+        run: |
+          test -n "${{ secrets.AUR_SSH_PRIVATE_KEY }}" # fail loudly if key missing
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          printf 'Host aur.archlinux.org\n\tIdentityFile ~/.ssh/aur\n\tStrictHostKeyChecking yes\n' > ~/.ssh/config
+          rm -rf aur-nightly && git clone ssh://aur@aur.archlinux.org/linux-trackpad-driver-nightly.git aur-nightly
+          cp packaging/arch/PKGBUILD-nightly aur-nightly/PKGBUILD
+          cp packaging/arch/ltd.install aur-nightly/ltd.install
+          sed -i "s/^pkgver=.*/pkgver=$PKGVER/" aur-nightly/PKGBUILD
+          (cd aur-nightly && makepkg --printsrcinfo > .SRCINFO \
+            && git add PKGBUILD ltd.install .SRCINFO \
+            && git -c user.name="github-actions[bot]" \
+                 -c user.email="github-actions[bot]@users.noreply.github.com" \
+                 commit -m "nightly $PKGVER" && git push)

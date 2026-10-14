@@ -1,0 +1,54 @@
+# git-cliff config — CHANGELOG.md generated from Conventional Commits.
+#   Preview:  git-cliff --unreleased --strip all
+#   Release:  git-cliff --tag vX.Y.Z --strip all -o CHANGELOG.md
+#   Excerpt:  git-cliff --tag vX.Y.Z --strip all --output excerpt.md
+# (release-tag.yml runs the excerpt form per tag; see docs/RELEASING.md.)
+[changelog]
+header = """\
+# Changelog\n
+All notable changes to linux-trackpad-driver are documented here.\n
+"""
+body = """\
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {{ commit.message | upper_first | trim }}\
+          {% if commit.scope %} ({{ commit.scope }}){% endif %}\
+          {% if commit.breaking %} [!BREAKING]{% endif %}
+    {% endfor %}
+{% endfor %}\n
+"""
+trim = true
+render_always = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+require_conventional = false
+split_commits = false
+commit_preprocessors = [
+  # Allow `scope!:` breaking markers and normalize `Merge X` noise away.
+  { pattern = "^(Merge)\\s.*", replace = "chore(merge): \\1" },
+]
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Tests" },
+  { message = "^ci", group = "Continuous Integration" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactoring" },
+  { message = '^chore\(merge\)', group = "Merges", skip = true },
+  { message = "^chore", group = "Miscellaneous" },
+  { message = ".*", group = "Miscellaneous" },
+]
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "newest"
