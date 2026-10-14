@@ -38,6 +38,9 @@
 //!   Dropping below the force release (`sensitivity + offset - margin`)
 //!   releases force keys only back to the first-level hold; dropping below
 //!   the first release clears all. `force_offset = 0` disables force.
+//! - Shared codes across levels (`ctrl` in both chords, `left` in both maps)
+//!   are reference-held: down once, retained while either level holds, a
+//!   single up on final release — no phantom release+press mid-hold.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -437,6 +440,14 @@ where
         );
     }
 
+    /// True when `(ty, code)` is already down on the wire (held by either
+    /// level). Shared codes (e.g. `ctrl` in `ctrl+c` + `ctrl+v`, or `left`
+    /// in both levels) go down once and stay down until every holding level
+    /// releases them.
+    fn is_down(&self, pair: (u16, u16)) -> bool {
+        self.held_first.contains(&pair) || self.held_force.contains(&pair)
+    }
+
     fn press_level(&mut self, ev: &ClickEvent, force: bool) {
         use crate::config::ActionKind;
         let name = if force { "force" } else { "click" };
@@ -449,16 +460,22 @@ where
                 self.uinput.sync();
             }
             ActionKind::Keys(keys) => {
-                let held = if force {
-                    &mut self.held_force
-                } else {
-                    &mut self.held_first
-                };
                 for k in keys {
                     match key_token_to_code(k) {
                         Some((ty, code)) => {
-                            self.uinput.emit(ty, code, 1);
-                            held.push((ty, code));
+                            let pair = (ty, code);
+                            // Skip the re-emit when the other level already
+                            // holds the code down, but still record it in
+                            // this level's set so release accounting stays
+                            // per-level.
+                            if !self.is_down(pair) {
+                                self.uinput.emit(ty, code, 1);
+                            }
+                            if force {
+                                self.held_force.push(pair);
+                            } else {
+                                self.held_first.push(pair);
+                            }
                         }
                         None => log::warn!("proxy: no keycode for '{k}', skipped"),
                     }
@@ -480,13 +497,25 @@ where
     }
 
     fn release_held(&mut self) {
-        for (ty, code) in self.held_first.drain(..).chain(self.held_force.drain(..)) {
+        let first = std::mem::take(&mut self.held_first);
+        for &(ty, code) in &first {
+            self.uinput.emit(ty, code, 0);
+        }
+        for (ty, code) in self.held_force.drain(..) {
+            if first.contains(&(ty, code)) {
+                continue; // already released above; one up per code
+            }
             self.uinput.emit(ty, code, 0);
         }
     }
 
+    /// Release force-held keys, retaining codes the first level still holds
+    /// (no up-emit for those — the wire stays down until full release).
     fn release_force_held(&mut self) {
         for (ty, code) in self.held_force.drain(..) {
+            if self.held_first.contains(&(ty, code)) {
+                continue;
+            }
             self.uinput.emit(ty, code, 0);
         }
     }
@@ -1313,6 +1342,25 @@ mod tests {
             .collect()
     }
 
+    /// Ordered values for one `(EV_KEY, code)` on the wire (duplicates kept).
+    fn key_values(uinput: &FakeUinput, code: u16) -> Vec<i32> {
+        uinput
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == code)
+            .map(|(_, _, v)| v)
+            .collect()
+    }
+
+    /// Number of value transitions (e.g. `1` = exactly one down→up pair
+    /// modulo idempotent same-value re-emits).
+    fn transitions(vals: &[i32]) -> usize {
+        vals.windows(2).filter(|w| w[0] != w[1]).count()
+    }
+
     #[test]
     fn combo_hold_emits_no_btn_left() {
         // click_1 = ctrl+c must not chord a phantom BTN_LEFT — press frame
@@ -1652,5 +1700,87 @@ mod tests {
         assert!(!ev.is_force());
         assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
         assert!(!uinput.has(EV_KEY, BTN_EXTRA, 1));
+    }
+
+    #[test]
+    fn shared_modifier_survives_force_release() {
+        // `ctrl` in both chords: force release must not drop it mid-hold.
+        // Tail-asserted: the single ctrl up lands in the full-release frame.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            click_1: "ctrl+c".into(),
+            force_1: "ctrl+v".into(),
+            ..Config::default()
+        };
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        let mark = uinput.events.lock().unwrap().len();
+        px.handle_frame(&cfg).unwrap();
+        let evs = uinput.events.lock().unwrap().clone();
+        // ctrl (29): down once, up once, single transition — never 0 mid-hold.
+        let ctrl: Vec<i32> = evs
+            .iter()
+            .copied()
+            .filter(|&(t, c, _)| t == EV_KEY && c == 29)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(ctrl.first(), Some(&1));
+        assert_eq!(ctrl.last(), Some(&0));
+        assert_eq!(transitions(&ctrl), 1, "ctrl dropped mid-hold: {ctrl:?}");
+        let first_up = evs
+            .iter()
+            .position(|&e| e == (EV_KEY, 29, 0))
+            .expect("ctrl up missing");
+        assert!(
+            first_up >= mark,
+            "ctrl released before full release: {evs:?}"
+        );
+        // `v` (47) belongs to force only: exactly one down→up pair.
+        let v: Vec<i32> = evs
+            .iter()
+            .copied()
+            .filter(|&(t, c, _)| t == EV_KEY && c == 47)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(v, vec![1, 0]);
+    }
+
+    #[test]
+    fn shared_left_has_no_phantom_release() {
+        // click_1 == force_1 == left: one down, one up, no 0 while held.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "left".into(),
+            ..Config::default()
+        };
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left.first(), Some(&1));
+        assert_eq!(left.last(), Some(&0));
+        assert_eq!(transitions(&left), 1, "phantom BTN_LEFT release: {left:?}");
     }
 }
