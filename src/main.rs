@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod hw_mock;
 pub mod init;
 pub mod lock;
+pub mod proxy;
 
 use std::process::ExitCode;
 

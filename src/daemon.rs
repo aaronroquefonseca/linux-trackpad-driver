@@ -28,6 +28,32 @@ pub fn hub() -> DeviceReadyHub {
     DeviceReadyHub::new()
 }
 
+/// Subscribe the opt-in click proxy to `ready_hub`. Gate-off
+/// (`enhanced_clicks=false`) still subscribes — the proxy then short-circuits
+/// to passthrough — so enabling via config reload only changes behavior, not
+/// wiring. Never blocks init: callbacks do bounded attach/detach only, and
+/// grab failure degrades to passthrough with a log.
+pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
+    use crate::proxy::{ClickProxy, NullSource, ProxySettings, RealGrab, RealHaptic, RealUinput};
+    // Physical evdev node resolution lands with the transport task; until
+    // then the best-effort default keeps attach fallible-open (log +
+    // passthrough on failure).
+    let grab_node = std::env::var("LTD_EVDEV_NODE").unwrap_or("/dev/input/event0".to_string());
+    let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
+    let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
+        ProxySettings::from(cfg),
+        RealGrab::new(&grab_node),
+        RealUinput::new(&uinput_node),
+        RealHaptic::new(),
+        NullSource,
+    )));
+    crate::proxy::subscribe_to_hub(ready_hub, proxy);
+    log::debug!(
+        "click proxy subscribed (enhanced_clicks={})",
+        cfg.enhanced_clicks
+    );
+}
+
 /// Initialize one discovered node and return its ready event.
 /// USB: wait-for-node → retrying feature reports → verify → ready.
 /// BT: single-node, no reports, straight to ready.
@@ -97,6 +123,7 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("installing signal handler: {e}"))?;
 
     let ready_hub = hub();
+    subscribe_click_proxy(cfg, &ready_hub);
     match discovery::scan_trackpads() {
         Ok(devs) if devs.is_empty() => {
             log::info!("no supported trackpads found; idling until signal");
@@ -174,6 +201,9 @@ pub fn run_reconnect(
     let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
     let transport = classify_node(devnode, &devs)?;
     let ready_hub = hub();
+    // Reconnect path gets the same subscription so resume/replug re-attaches.
+    // Config here is the daemon default; run_daemon owns the live config.
+    subscribe_click_proxy(cfg, &ready_hub);
 
     if disengage_mode {
         match transport {
