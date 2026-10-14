@@ -9,11 +9,22 @@
 //!
 //! # Rules
 //!
-//! - Grab ONLY when `enhanced_clicks=true` (default false → zero behavior
-//!   change, pure passthrough: no grab, no uinput traffic).
+//! - Grab ONLY when `enhanced_clicks=true` AND the pump is ready (a real
+//!   `TouchSource` plus a draining pump loop plus a created uinput node).
+//!   Default false → zero behavior change, pure passthrough: no grab, no
+//!   uinput traffic. Grabbing without an emit path bricks the device, so
+//!   `attach` degrades to passthrough until readiness holds.
+//! - The physical evdev node is never guessed: `LTD_EVDEV_NODE` must name it
+//!   (hidraw→eventN auto-resolution belongs to the transport task). Unset →
+//!   refuse + passthrough, never `event0` roulette.
 //! - Proxy node: Type-B MT slots + tracking IDs, `res == 0` arbitrary
 //!   0..253 range, `BTN_LEFT`/`BTN_TOUCH` + `SYN`. NEVER advertises
 //!   `EV_FF`/`FF_HAPTIC` (no 2026 libinput/Wayland consumer).
+//! - `BTN_LEFT` derives from held codes (present only when the latched action
+//!   contains `left`) OR-ed with the physical `clicks & 1` bit — never from
+//!   latch state alone (a right/combo/empty hold must not chord left).
+//! - Slots are positional per frame (see [`ClickProxy::emit_touch_frame`]
+//!   slot-map docs); vacated slots are terminated with `TRACKING_ID=-1`.
 //! - Orientation emits `-(raw)`; pressure clamps to 253 (kernel `absmax`).
 //! - `poll_frame` errors → log + drop that frame, never abort the loop.
 //! - Grab failure → log + passthrough continues. Clicks NEVER blocks init:
@@ -28,7 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::apple_parse::{TouchFrame, TouchSource, PRESSURE_VALID_MAX};
+use crate::apple_parse::{TouchFrame, TouchSource};
 use crate::clicks::{self, ClickEvent, ClickMachine};
 use crate::config::Config;
 use crate::init::{DeviceReadyEvent, DeviceReadyHub, ReadyKind};
@@ -59,7 +70,10 @@ pub fn eviocgrab_request() -> u64 {
     (1u64 << 30) | ((4u64) << 16) | ((u64::from(b'E')) << 8) | 0x90
 }
 
-/// Capability allowlist for the virtual node. `EV_FF` must never appear.
+/// Event-bit disposition for the virtual node (honest: the setup ioctls
+/// `UI_SET_EVBIT`/`UI_ABS_SETUP`/`UI_DEV_CREATE` land with the transport
+/// task, which must set exactly these bits). `EV_FF` must never appear —
+/// no 2026 libinput/Wayland consumer (RESEARCH §6). Pinned by test.
 pub fn uinput_evbits() -> Vec<u16> {
     vec![EV_SYN, EV_KEY, EV_ABS]
 }
@@ -110,10 +124,14 @@ pub fn key_token_to_code(token: &str) -> Option<(u16, u16)> {
         "middle" => Some((EV_KEY, BTN_MIDDLE)),
         "back" => Some((EV_KEY, BTN_SIDE)),
         "forward" => Some((EV_KEY, BTN_EXTRA)),
-        "ctrl" | "control" | "lctrl" | "rctrl" => Some((EV_KEY, 29)),
-        "shift" | "lshift" | "rshift" => Some((EV_KEY, 42)),
-        "alt" | "lalt" | "ralt" => Some((EV_KEY, 56)),
-        "meta" | "super" | "cmd" | "command" | "win" | "lmeta" | "rmeta" => Some((EV_KEY, 125)),
+        "ctrl" | "control" | "lctrl" => Some((EV_KEY, 29)),
+        "rctrl" => Some((EV_KEY, 97)),
+        "shift" | "lshift" => Some((EV_KEY, 42)),
+        "rshift" => Some((EV_KEY, 54)),
+        "alt" | "lalt" => Some((EV_KEY, 56)),
+        "ralt" => Some((EV_KEY, 100)),
+        "meta" | "super" | "cmd" | "command" | "win" | "lmeta" => Some((EV_KEY, 125)),
+        "rmeta" => Some((EV_KEY, 126)),
         "esc" | "escape" => Some((EV_KEY, 1)),
         "enter" | "return" => Some((EV_KEY, 28)),
         "space" => Some((EV_KEY, 57)),
@@ -183,33 +201,33 @@ fn keycode_letter_digit(s: &str) -> Option<(u16, u16)> {
     Some((EV_KEY, code))
 }
 
+/// `KEY_F1..F10` are contiguous (`59..=68`); `F11`/`F12` jump to 87/88
+/// (`69`/`70` are `NUMLOCK`/`SCROLLLOCK` — a prior rev mapped them wrong).
 fn keycode_fn(s: &str) -> Option<(u16, u16)> {
     let n: u8 = s[1..].parse().ok()?;
-    if (1..=12).contains(&n) {
-        Some((EV_KEY, 58 + u16::from(n)))
-    } else {
-        None
+    match n {
+        1..=10 => Some((EV_KEY, 58 + u16::from(n))),
+        11 => Some((EV_KEY, 87)),
+        12 => Some((EV_KEY, 88)),
+        _ => None,
     }
 }
 
 // ---- proxy ----
 
-/// Snapshot of the settings this proxy acts on.
+/// Gate snapshot for the proxy. Single source is [`Config`]: this carries
+/// only the opt-in bit. Haptic strength/quiet ride on each [`ClickEvent`];
+/// pointer `speed` is read from the `&Config` passed per frame, so a restart
+/// with new tuning applies without touching this struct.
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
     pub enhanced: bool,
-    pub haptic: u16,
-    pub quiet: bool,
-    pub speed: u32,
 }
 
 impl From<&Config> for ProxySettings {
     fn from(c: &Config) -> Self {
         Self {
             enhanced: c.enhanced_clicks,
-            haptic: c.haptic,
-            quiet: c.quiet_click,
-            speed: c.speed,
         }
     }
 }
@@ -225,9 +243,15 @@ pub struct ClickProxy<G, U, H, S> {
     machine: ClickMachine,
     attached: bool,
     passthrough: bool,
+    /// Pump readiness: true only when a real `TouchSource` plus a draining
+    /// pump loop plus a created uinput node exist. Until the transport task
+    /// wires those, `attach` degrades to passthrough — grabbing without an
+    /// emit path would swallow the physical device with nothing replacing it.
+    pump_ready: bool,
     held: Vec<(u16, u16)>,
     last_pos: HashMap<u8, (i32, i32)>,
-    phys_node: String,
+    /// Highest slot index written so far; vacated slots are terminated.
+    max_slot: usize,
 }
 
 impl<G, U, H, S> ClickProxy<G, U, H, S>
@@ -247,9 +271,10 @@ where
             machine: ClickMachine::new(),
             attached: false,
             passthrough: true,
+            pump_ready: false,
             held: Vec::new(),
             last_pos: HashMap::new(),
-            phys_node: String::new(),
+            max_slot: 0,
         }
     }
 
@@ -257,13 +282,32 @@ where
         self.attached
     }
 
-    /// True when events flow untouched (gate off, or grab failed).
+    /// True when events flow untouched (gate off, pump unready, grab failed).
     pub fn is_passthrough(&self) -> bool {
         self.passthrough
     }
 
-    /// Attach on `Ready`: grab the physical node (opt-in only). Failure →
-    /// log + passthrough, never `Err` (clicks must not fail init).
+    /// Mark the pump path ready/unready (transport-task wiring). Clearing
+    /// while attached releases the grab so the device is never swallowed
+    /// without an emit path.
+    pub fn set_pump_ready(&mut self, ready: bool) {
+        self.pump_ready = ready;
+        if !ready && self.attached {
+            log::info!("proxy: pump lost, releasing grab (passthrough)");
+            self.grab.ungrab();
+            self.release_held();
+            self.uinput.sync();
+            self.machine.reset();
+            self.last_pos.clear();
+            self.attached = false;
+            self.passthrough = true;
+        }
+    }
+
+    /// Attach on `Ready`: grab the physical node only when the gate is on
+    /// AND the pump is ready. Anything else → log + passthrough, never `Err`
+    /// (clicks must not fail init, and must never swallow input it cannot
+    /// re-emit).
     pub fn attach(&mut self, event: &DeviceReadyEvent) {
         if event.kind != ReadyKind::Ready {
             return;
@@ -274,7 +318,15 @@ where
             self.passthrough = true;
             return;
         }
-        self.phys_node = event.devnode.clone();
+        if !self.pump_ready {
+            log::info!(
+                "proxy: pump not ready for {} (no TouchSource/loop/uinput yet); passthrough",
+                event.devnode
+            );
+            self.attached = false;
+            self.passthrough = true;
+            return;
+        }
         match self.grab.grab() {
             Ok(()) => {
                 log::info!("proxy: grabbed {} (uinput virtual node up)", event.devnode);
@@ -292,7 +344,8 @@ where
         }
     }
 
-    /// Detach on `Detached`: release grab, drop latch + held keys.
+    /// Detach on `Detached`: release grab, drop latch + held keys, trailing
+    /// `SYN` so no key-up is lost (stuck keys otherwise).
     pub fn detach(&mut self, event: &DeviceReadyEvent) {
         if event.kind != ReadyKind::Detached {
             return;
@@ -302,15 +355,18 @@ where
             self.grab.ungrab();
         }
         self.release_held();
+        self.uinput.sync();
         self.machine.reset();
         self.last_pos.clear();
+        self.max_slot = 0;
         self.attached = false;
         self.passthrough = true;
     }
 
     /// One poll step: `poll_frame` errors are logged + dropped (`Ok(None)`),
     /// never propagated (the read loop must not abort on a bad frame).
-    /// Gate-off or passthrough short-circuits without touching hardware.
+    /// Gate-off, pump-unready, or passthrough short-circuits without touching
+    /// hardware. Exactly one `SYN` is emitted per handled frame.
     pub fn handle_frame(&mut self, cfg: &Config) -> Result<Option<ClickEvent>> {
         if !self.settings.enhanced || !self.attached || self.passthrough {
             return Ok(None);
@@ -323,7 +379,6 @@ where
                 return Ok(None);
             }
         };
-        self.emit_touch_frame(&frame);
         let was_active = self.machine.active().is_some();
         let edge = match self.machine.update(&frame.fingers, frame.clicks, cfg) {
             Ok(e) => e,
@@ -332,20 +387,33 @@ where
                 return Ok(None);
             }
         };
+        // Touch slots first (post-update latch is visible to buttons below).
+        self.emit_touch_frame(&frame, cfg.speed);
         if let Some(ref ev) = edge {
             self.press_edge(ev);
             return Ok(edge);
         }
         if was_active && self.machine.active().is_none() {
             self.release_held();
-            self.uinput.sync();
         }
-        // Physical button held without a latched click still shows BTN_LEFT.
-        if !was_active && ClickMachine::physical_button(frame.clicks) {
-            self.uinput.emit(EV_KEY, BTN_LEFT, 1);
-            self.uinput.sync();
-        }
+        self.emit_btn_left(frame.clicks);
+        self.uinput.sync();
         Ok(None)
+    }
+
+    /// `BTN_LEFT` from held codes only (latched action contains `left`) or
+    /// the physical button bit — never from latch state alone, so a
+    /// right/middle/combo/empty hold cannot chord a phantom left.
+    fn emit_btn_left(&self, clicks: u8) {
+        let held_left = self
+            .held
+            .iter()
+            .any(|&(ty, code)| ty == EV_KEY && code == BTN_LEFT);
+        self.uinput.emit(
+            EV_KEY,
+            BTN_LEFT,
+            i32::from(held_left || ClickMachine::physical_button(clicks)),
+        );
     }
 
     fn press_edge(&mut self, ev: &ClickEvent) {
@@ -390,16 +458,26 @@ where
         }
     }
 
-    /// Emit Type-B MT slots for one frame (res==0 arbitrary units).
-    fn emit_touch_frame(&mut self, frame: &TouchFrame) {
+    /// Emit Type-B MT slots for one frame (`res == 0` arbitrary units).
+    /// No trailing `SYN`: the caller syncs once per frame after keys.
+    ///
+    /// Slot-map semantics (transport-task contract): slots are POSITIONAL —
+    /// slot N is the Nth contact in the frame, reassigned every frame, and
+    /// carries no identity across frames. Identity lives in `TRACKING_ID`
+    /// (the device id); libinput pairs slot↔id per `SYN`. A slot with no
+    /// contact this frame gets `TRACKING_ID = -1`, including slots that
+    /// existed only in earlier frames (`max_slot` termination) — without
+    /// that, a 2→1 finger transition leaves a ghost contact alive downstream.
+    fn emit_touch_frame(&mut self, frame: &TouchFrame, speed: u32) {
+        use std::collections::HashSet;
         let any_touch = frame.fingers.iter().any(|f| f.contact);
-        for (slot, f) in frame.fingers.iter().enumerate() {
-            let slot = slot.min(15) as i32;
-            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot);
+        let n = frame.fingers.len().min(16);
+        for (slot, f) in frame.fingers.iter().take(16).enumerate() {
+            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32);
             if f.contact {
                 self.uinput
                     .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id));
-                let (sx, sy) = self.scaled_pos(f.id, f.x, f.y);
+                let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, speed);
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx);
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy);
                 self.uinput.emit(
@@ -414,27 +492,37 @@ where
                 );
             } else {
                 self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+                self.last_pos.remove(&f.id);
             }
         }
+        // Terminate slots that existed in earlier frames but not this one.
+        if n <= self.max_slot {
+            for slot in n..=self.max_slot {
+                self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32);
+                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+            }
+        }
+        self.max_slot = n.saturating_sub(1);
+        // Drop stale motion anchors: ids absent from this frame must not
+        // anchor a future delta (stale-anchor jump on id reuse). Evict on
+        // every frame, not only the empty one.
+        let present: HashSet<u8> = frame.fingers.iter().map(|f| f.id).collect();
         if frame.fingers.is_empty() {
             self.last_pos.clear();
+        } else {
+            self.last_pos.retain(|id, _| present.contains(id));
         }
         self.uinput.emit(
             EV_KEY,
             BTN_TOUCH,
             i32::from(any_touch || ClickMachine::physical_button(frame.clicks)),
         );
-        let btn_left = self.machine.active().is_some_and(|e| !e.is_none())
-            || ClickMachine::physical_button(frame.clicks);
-        self.uinput.emit(EV_KEY, BTN_LEFT, i32::from(btn_left));
-        // PRESSURE_VALID_MAX documents the clamp duty; keep the import live.
-        debug_assert!(u32::from(PRESSURE_VALID_MAX) == 253);
-        self.uinput.sync();
     }
 
     /// Speed-scaled position: `prev + (cur - prev) * speed/100` per finger.
-    fn scaled_pos(&mut self, id: u8, x: i32, y: i32) -> (i32, i32) {
-        let speed = self.settings.speed;
+    /// `speed` comes from the per-frame `&Config` (single source), never a
+    /// frozen snapshot.
+    fn scaled_pos(&mut self, id: u8, x: i32, y: i32, speed: u32) -> (i32, i32) {
         match self.last_pos.get(&id).copied() {
             None => {
                 self.last_pos.insert(id, (x, y));
@@ -478,7 +566,7 @@ use std::os::unix::io::AsRawFd;
 
 /// `EVIOCGRAB` grabber for a physical evdev node. Opens lazily on `grab()`.
 pub struct RealGrab {
-    node: String,
+    node: Mutex<String>,
     fd: Mutex<Option<std::fs::File>>,
     grabbed: std::sync::atomic::AtomicBool,
 }
@@ -486,25 +574,35 @@ pub struct RealGrab {
 impl RealGrab {
     pub fn new(node: &str) -> Self {
         Self {
-            node: node.to_string(),
+            node: Mutex::new(node.to_string()),
             fd: Mutex::new(None),
             grabbed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Point at a (re-)resolved node. A live grab keeps its fd: re-grab
+    /// while grabbed is a no-op success, never a close+reopen (fd corrupt).
+    pub fn set_node(&self, node: &str) {
+        *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
     }
 }
 
 impl GrabDevice for RealGrab {
     fn grab(&self) -> Result<()> {
+        if self.is_grabbed() {
+            log::debug!("proxy: already grabbed, keeping fd");
+            return Ok(());
+        }
+        let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&self.node)
-            .map_err(|e| anyhow::anyhow!("opening evdev '{}': {e}", self.node))?;
+            .open(&node)
+            .map_err(|e| anyhow::anyhow!("opening evdev '{node}': {e}"))?;
         let ret = unsafe { libc::ioctl(file.as_raw_fd(), eviocgrab_request() as libc::c_ulong, 1) };
         if ret < 0 {
             return Err(anyhow::anyhow!(
-                "EVIOCGRAB on '{}': {}",
-                self.node,
+                "EVIOCGRAB on '{node}': {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -527,6 +625,52 @@ impl GrabDevice for RealGrab {
 
     fn is_grabbed(&self) -> bool {
         self.grabbed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Grabber that always refuses: used when no evdev node is configured.
+/// The physical node is never guessed (`event0` roulette could swallow a
+/// keyboard), so `attach` degrades to passthrough with a log instead.
+#[derive(Debug, Default)]
+pub struct RefusingGrab;
+
+impl GrabDevice for RefusingGrab {
+    fn grab(&self) -> Result<()> {
+        anyhow::bail!(
+            "no evdev node configured (LTD_EVDEV_NODE unset); refusing to guess — passthrough"
+        )
+    }
+    fn ungrab(&self) {}
+    fn is_grabbed(&self) -> bool {
+        false
+    }
+}
+
+/// Daemon grabber: real node when resolved, refusing otherwise. Single type
+/// so the daemon hookup stays monomorphic.
+pub enum DaemonGrab {
+    Real(RealGrab),
+    Refusing(RefusingGrab),
+}
+
+impl GrabDevice for DaemonGrab {
+    fn grab(&self) -> Result<()> {
+        match self {
+            DaemonGrab::Real(g) => g.grab(),
+            DaemonGrab::Refusing(g) => g.grab(),
+        }
+    }
+    fn ungrab(&self) {
+        match self {
+            DaemonGrab::Real(g) => g.ungrab(),
+            DaemonGrab::Refusing(g) => g.ungrab(),
+        }
+    }
+    fn is_grabbed(&self) -> bool {
+        match self {
+            DaemonGrab::Real(g) => g.is_grabbed(),
+            DaemonGrab::Refusing(g) => g.is_grabbed(),
+        }
     }
 }
 
@@ -597,7 +741,13 @@ impl UinputSink for RealUinput {
                 )
             };
             unsafe {
-                libc::write(f.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
+                let ret = libc::write(f.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
+                if ret < 0 {
+                    log::warn!(
+                        "proxy: uinput write failed (type={ev_type} code={code}): {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
             }
         }
     }
@@ -673,20 +823,20 @@ mod tests {
 
     struct FakeGrab {
         fail: bool,
-        grabbed: RefCell<bool>,
+        grabbed: Mutex<bool>,
     }
 
     impl FakeGrab {
         fn ok() -> Self {
             Self {
                 fail: false,
-                grabbed: RefCell::new(false),
+                grabbed: Mutex::new(false),
             }
         }
         fn failing() -> Self {
             Self {
                 fail: true,
-                grabbed: RefCell::new(false),
+                grabbed: Mutex::new(false),
             }
         }
     }
@@ -696,14 +846,30 @@ mod tests {
             if self.fail {
                 anyhow::bail!("fake grab: EACCES");
             }
-            *self.grabbed.borrow_mut() = true;
+            *self.grabbed.lock().unwrap() = true;
             Ok(())
         }
         fn ungrab(&self) {
-            *self.grabbed.borrow_mut() = false;
+            *self.grabbed.lock().unwrap() = false;
         }
         fn is_grabbed(&self) -> bool {
-            *self.grabbed.borrow()
+            *self.grabbed.lock().unwrap()
+        }
+    }
+
+    /// Shared grab handle so tests assert on the same object the proxy owns
+    /// (a detached handle would make grab assertions vacuous).
+    struct SharedGrab(Arc<FakeGrab>);
+
+    impl GrabDevice for SharedGrab {
+        fn grab(&self) -> Result<()> {
+            self.0.grab()
+        }
+        fn ungrab(&self) {
+            self.0.ungrab()
+        }
+        fn is_grabbed(&self) -> bool {
+            self.0.is_grabbed()
         }
     }
 
@@ -781,7 +947,7 @@ mod tests {
             x,
             y,
             size: 10,
-            orientation: 3,
+            orientation: 2,
             touch_major: 8,
             touch_minor: 6,
             pressure,
@@ -807,14 +973,15 @@ mod tests {
 
     #[test]
     fn gate_off_never_grabs_passthrough() {
-        let grab = FakeGrab::ok();
+        let grab = Arc::new(FakeGrab::ok());
         let mut px = ClickProxy::new(
             settings(false),
-            FakeGrab::ok(),
+            SharedGrab(Arc::clone(&grab)),
             FakeUinput::new(),
             FakeHaptic::new(),
             ScriptSource::new(vec![]),
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         assert!(!px.is_attached());
         assert!(px.is_passthrough());
@@ -822,6 +989,44 @@ mod tests {
         // handle_frame short-circuits even with a failing source.
         let cfg = Config::default();
         assert!(px.handle_frame(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn pump_unready_never_grabs() {
+        // Gate on but no pump loop/uinput yet → passthrough, device untouched.
+        let grab = Arc::new(FakeGrab::ok());
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            FakeUinput::new(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        assert!(!px.is_attached());
+        px.attach(&usb_ready("/dev/hidraw1"));
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
+    }
+
+    #[test]
+    fn pump_loss_releases_grab() {
+        let grab = Arc::new(FakeGrab::ok());
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            FakeUinput::new(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        assert!(px.is_attached());
+        assert!(grab.is_grabbed());
+        px.set_pump_ready(false);
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
     }
 
     #[test]
@@ -833,6 +1038,7 @@ mod tests {
             FakeHaptic::new(),
             ScriptSource::new(vec![]),
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         assert!(px.is_attached());
         assert!(!px.is_passthrough());
@@ -850,6 +1056,7 @@ mod tests {
             FakeHaptic::new(),
             ScriptSource::new(vec![]),
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         assert!(!px.is_attached());
         assert!(px.is_passthrough());
@@ -871,6 +1078,7 @@ mod tests {
             FakeHaptic::new(),
             src,
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         let cfg = Config::default();
         assert!(px.handle_frame(&cfg).unwrap().is_none()); // dropped
@@ -896,6 +1104,7 @@ mod tests {
 
     #[test]
     fn clamp_negation_and_buttons_on_wire() {
+        assert_eq!(crate::apple_parse::PRESSURE_VALID_MAX, 253);
         let uinput = Arc::new(FakeUinput::new());
         let haptic = Arc::new(FakeHaptic::new());
         let src = ScriptSource::new(vec![Ok(Some(frame(vec![finger(5, 255, 10, 20)], 0)))]);
@@ -906,13 +1115,14 @@ mod tests {
             SharedHaptic(Arc::clone(&haptic)),
             src,
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         let cfg = Config::default();
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert_eq!(ev.finger_count, 1);
-        // 255 clamps to 253; orientation 3 negates to -3.
+        // 255 clamps to 253; raw orientation 2 negates to -2.
         assert!(uinput.has(EV_ABS, ABS_MT_PRESSURE, 253));
-        assert!(uinput.has(EV_ABS, ABS_MT_ORIENTATION, -3));
+        assert!(uinput.has(EV_ABS, ABS_MT_ORIENTATION, -2));
         assert!(uinput.has(EV_ABS, ABS_MT_TRACKING_ID, 5));
         assert!(uinput.has(EV_KEY, BTN_TOUCH, 1));
         // click_1 = left → BTN_LEFT down; haptic fired (default 5).
@@ -932,6 +1142,7 @@ mod tests {
             SharedHaptic(Arc::clone(&haptic)),
             src,
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         let cfg = Config {
             haptic: 0,
@@ -955,6 +1166,7 @@ mod tests {
             SharedHaptic(Arc::clone(&haptic)),
             src,
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         let cfg = Config {
             click_1: "none".into(),
@@ -973,19 +1185,17 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 100, 0)], 0))),
         ]);
-        let mut st = settings(true);
-        st.speed = 200;
         let mut px = ClickProxy::new(
-            st,
+            settings(true),
             FakeGrab::ok(),
             SharedUinput(Arc::clone(&uinput)),
             SharedHaptic(Arc::clone(&haptic)),
             src,
         );
+        px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
+        // Speed is a single source: the per-frame Config, not a snapshot.
         let cfg = Config {
-            enhanced_clicks: true,
-            sensitivity: 64,
             speed: 200,
             ..Config::default()
         };
@@ -1001,10 +1211,255 @@ mod tests {
     }
 
     #[test]
+    fn eviocgrab_request_pins_linux_layout() {
+        // _IOW('E', 0x90, int): 1<<30 | sizeof(int)<<16 | 'E'<<8 | 0x90.
+        assert_eq!(eviocgrab_request(), 0x4004_4590);
+    }
+
+    #[test]
+    fn fn_keycodes_cover_all_twelve() {
+        let table: &[(&str, u16)] = &[
+            ("f1", 59),
+            ("f2", 60),
+            ("f3", 61),
+            ("f4", 62),
+            ("f5", 63),
+            ("f6", 64),
+            ("f7", 65),
+            ("f8", 66),
+            ("f9", 67),
+            ("f10", 68),
+            ("f11", 87),
+            ("f12", 88),
+        ];
+        for (name, code) in table {
+            assert_eq!(key_token_to_code(name), Some((EV_KEY, *code)), "{name}");
+        }
+        assert_eq!(key_token_to_code("f0"), None);
+        assert_eq!(key_token_to_code("f13"), None);
+    }
+
+    #[test]
+    fn right_modifiers_map_to_right_codes() {
+        assert_eq!(key_token_to_code("rctrl"), Some((EV_KEY, 97)));
+        assert_eq!(key_token_to_code("rshift"), Some((EV_KEY, 54)));
+        assert_eq!(key_token_to_code("ralt"), Some((EV_KEY, 100)));
+        assert_eq!(key_token_to_code("rmeta"), Some((EV_KEY, 126)));
+        assert_eq!(key_token_to_code("lctrl"), Some((EV_KEY, 29)));
+        assert_eq!(key_token_to_code("lshift"), Some((EV_KEY, 42)));
+        assert_eq!(key_token_to_code("lalt"), Some((EV_KEY, 56)));
+        assert_eq!(key_token_to_code("lmeta"), Some((EV_KEY, 125)));
+    }
+
+    fn drive_ready_proxy(
+        uinput: &Arc<FakeUinput>,
+        haptic: &Arc<FakeHaptic>,
+        frames: Vec<Result<Option<TouchFrame>>>,
+    ) -> ClickProxy<SharedGrab, SharedUinput, SharedHaptic, ScriptSource> {
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::new(FakeGrab::ok())),
+            SharedUinput(Arc::clone(uinput)),
+            SharedHaptic(Arc::clone(haptic)),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        assert!(px.is_attached());
+        px
+    }
+
+    fn key_downs(uinput: &FakeUinput) -> Vec<(u16, u16, i32)> {
+        uinput
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&(ty, _, v)| ty == EV_KEY && v == 1)
+            .collect()
+    }
+
+    #[test]
+    fn combo_hold_emits_no_btn_left() {
+        // click_1 = ctrl+c must not chord a phantom BTN_LEFT — press frame
+        // AND the 2nd hold frame (single-frame tests masked the hold path).
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            click_1: "ctrl+c".into(),
+            ..Config::default()
+        };
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(uinput.has(EV_KEY, 29, 1)); // ctrl down
+        assert!(uinput.has(EV_KEY, 46, 1)); // c down
+    }
+
+    #[test]
+    fn right_hold_emits_no_btn_left() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 1, 1), finger(2, 200, 9, 9)],
+                0,
+            ))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            click_2: "right".into(),
+            ..Config::default()
+        };
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert_eq!(ev.finger_count, 2);
+        px.handle_frame(&cfg).unwrap();
+        assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(uinput.has(EV_KEY, BTN_RIGHT, 1));
+    }
+
+    #[test]
+    fn empty_hold_emits_no_key_downs() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            click_1: "empty".into(),
+            ..Config::default()
+        };
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        // Only BTN_TOUCH=1 may be down (once per frame); no buttons, no
+        // keys, no BTN_LEFT.
+        let downs = key_downs(&uinput);
+        assert_eq!(downs.len(), 2, "{downs:?}");
+        assert!(
+            downs.iter().all(|&e| e == (EV_KEY, BTN_TOUCH, 1)),
+            "{downs:?}"
+        );
+        assert!(!haptic.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ghost_slot_terminated_on_contact_drop() {
+        // 2 contacts then 1: slot 1 must get TRACKING_ID=-1, or libinput
+        // keeps a ghost contact alive.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 10, 0, 0), finger(2, 10, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        let evs = uinput.events.lock().unwrap().clone();
+        let term1 = evs
+            .windows(2)
+            .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 1) && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1));
+        assert!(term1, "slot 1 never terminated: {evs:?}");
+    }
+
+    #[test]
+    fn id_reuse_after_lift_has_no_jump() {
+        // Lift id 7 at x=100, then a NEW id-7 contact at x=0: without
+        // eviction the scaler would emit prev + delta (a jump).
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut lift = finger(7, 0, 100, 0);
+        lift.contact = false;
+        let frames = vec![
+            Ok(Some(frame(vec![finger(7, 10, 100, 0)], 0))),
+            Ok(Some(frame(vec![lift], 0))),
+            Ok(Some(frame(vec![finger(7, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        // Fresh anchor: emitted x == raw x on first sighting.
+        let xs: Vec<i32> = uinput
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(xs.first(), Some(&100));
+        assert_eq!(xs.last(), Some(&0));
+    }
+
+    #[test]
+    fn clicks_high_bits_are_timestamp_not_buttons() {
+        // bits 6..7 are device-timestamp bits: 0xC0 must stay quiet, while
+        // 0xC1 still shows the button.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![], 0xC0))), Ok(Some(frame(vec![], 0xC1)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        let evs = uinput.events.lock().unwrap().clone();
+        let left_ones = evs
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_KEY && c == BTN_LEFT && v == 1)
+            .count();
+        assert_eq!(left_ones, 1, "exactly the 0xC1 frame: {evs:?}");
+        let touch_ones = evs
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_KEY && c == BTN_TOUCH && v == 1)
+            .count();
+        assert_eq!(touch_ones, 1, "exactly the 0xC1 frame: {evs:?}");
+    }
+
+    #[test]
+    fn detach_releases_held_keys_with_sync() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        px.detach(&detached("/dev/hidraw1", Transport::Usb));
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 0));
+        // Trailing SYN flushes the key-up; without it keys stick.
+        let evs = uinput.events.lock().unwrap().clone();
+        let up_at = evs
+            .iter()
+            .position(|&e| e == (EV_KEY, BTN_LEFT, 0))
+            .expect("key-up missing");
+        assert!(
+            evs[up_at + 1..].contains(&(EV_SYN, SYN_REPORT, 0)),
+            "no SYN after key-up: {evs:?}"
+        );
+    }
+
+    #[test]
     fn subscribe_attaches_on_ready() {
         let hub = DeviceReadyHub::new();
-        let grab_ok = Arc::new(FakeUinput::new());
-        let _ = grab_ok;
         let proxy = Arc::new(Mutex::new(ClickProxy::new(
             settings(true),
             FakeGrab::ok(),
@@ -1013,6 +1468,10 @@ mod tests {
             ScriptSource::new(vec![]),
         )));
         subscribe_to_hub(&hub, Arc::clone(&proxy));
+        // Pump unready → Ready must NOT grab (device stays usable).
+        hub.emit(&usb_ready("/dev/hidraw1"));
+        assert!(!proxy.lock().unwrap().is_attached());
+        proxy.lock().unwrap().set_pump_ready(true);
         hub.emit(&usb_ready("/dev/hidraw1"));
         assert!(proxy.lock().unwrap().is_attached());
         hub.emit(&detached("/dev/hidraw1", Transport::Usb));

@@ -135,15 +135,19 @@ impl ClickMachine {
     /// edge (including `none`/`empty` so the caller can decide haptic), or
     /// `None` when steady-state/released. Parse errors on `click_N` are
     /// returned as `Err` (caller logs + drops the frame edge, never aborts).
+    ///
+    /// `_clicks` (raw `report[1]`) is intentionally unused here: the physical
+    /// button bit (`clicks & 1`) is folded in by the proxy via
+    /// [`ClickMachine::physical_button`], keeping pressure latching and the
+    /// hardware button on separate, testable paths.
     pub fn update(
         &mut self,
         fingers: &[FingerContact],
-        clicks: u8,
+        _clicks: u8,
         cfg: &Config,
     ) -> Result<Option<ClickEvent>> {
         let press = press_threshold(cfg);
         let release = release_threshold(cfg);
-        let _ = clicks;
 
         // Update per-finger hysteresis.
         let mut newly_pressed = Vec::new();
@@ -346,6 +350,40 @@ mod tests {
         m.update(&[lifted(1)], 0, &cfg).unwrap();
         // Contact=false clears the bit but the latch releases when no bits set.
         m.update(&[], 0, &cfg).unwrap();
+        assert!(m.active().is_none());
+    }
+
+    #[test]
+    fn second_finger_mid_latch_does_not_refire() {
+        let cfg = Config {
+            click_1: "left".into(),
+            click_2: "right".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let ev = m.update(&[finger(1, 200)], 0, &cfg).unwrap().unwrap();
+        assert_eq!(ev.finger_count, 1);
+        // 2nd finger presses while latched: no edge, latch keeps count 1.
+        assert!(m
+            .update(&[finger(1, 200), finger(2, 200)], 0, &cfg)
+            .unwrap()
+            .is_none());
+        assert_eq!(m.active().unwrap().finger_count, 1);
+    }
+
+    #[test]
+    fn margin_zero_releases_at_threshold() {
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 0,
+            ..Config::default()
+        };
+        assert_eq!(release_threshold(&cfg), 64);
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 200)], 0, &cfg).unwrap();
+        assert!(m.active().is_some());
+        // At exactly the threshold with margin 0 the finger lets go.
+        m.update(&[finger(1, 64)], 0, &cfg).unwrap();
         assert!(m.active().is_none());
     }
 

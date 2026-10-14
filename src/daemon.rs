@@ -28,21 +28,36 @@ pub fn hub() -> DeviceReadyHub {
     DeviceReadyHub::new()
 }
 
-/// Subscribe the opt-in click proxy to `ready_hub`. Gate-off
-/// (`enhanced_clicks=false`) still subscribes — the proxy then short-circuits
-/// to passthrough — so enabling via config reload only changes behavior, not
-/// wiring. Never blocks init: callbacks do bounded attach/detach only, and
-/// grab failure degrades to passthrough with a log.
+/// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
+/// Gate-off (`enhanced_clicks=false`) still subscribes — the proxy then
+/// short-circuits to passthrough. The gate is evaluated from the startup
+/// config; there is no live reload, so a config change needs a restart.
+/// Never blocks init: callbacks do bounded attach/detach only, and grab
+/// failure degrades to passthrough with a log.
+///
+/// Safety posture: the proxy starts pump-unready (`NullSource`, no pump
+/// loop, no created uinput node), so `attach` degrades to passthrough and
+/// never grabs. The transport task flips readiness once the emit path
+/// exists. The evdev node is never guessed: without `LTD_EVDEV_NODE` the
+/// proxy refuses and stays passthrough.
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
-    use crate::proxy::{ClickProxy, NullSource, ProxySettings, RealGrab, RealHaptic, RealUinput};
-    // Physical evdev node resolution lands with the transport task; until
-    // then the best-effort default keeps attach fallible-open (log +
-    // passthrough on failure).
-    let grab_node = std::env::var("LTD_EVDEV_NODE").unwrap_or("/dev/input/event0".to_string());
+    use crate::proxy::{
+        ClickProxy, DaemonGrab, NullSource, ProxySettings, RealGrab, RealHaptic, RealUinput,
+        RefusingGrab,
+    };
+    let grab = match std::env::var("LTD_EVDEV_NODE") {
+        Ok(node) => DaemonGrab::Real(RealGrab::new(&node)),
+        Err(_) => {
+            log::warn!(
+                "proxy: LTD_EVDEV_NODE unset, refusing evdev guess (hidraw→eventN lands with transport); passthrough until configured"
+            );
+            DaemonGrab::Refusing(RefusingGrab)
+        }
+    };
     let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
     let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
         ProxySettings::from(cfg),
-        RealGrab::new(&grab_node),
+        grab,
         RealUinput::new(&uinput_node),
         RealHaptic::new(),
         NullSource,
@@ -200,10 +215,10 @@ pub fn run_reconnect(
 
     let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
     let transport = classify_node(devnode, &devs)?;
+    // No proxy subscription here: reconnect is a short-lived udev process
+    // and must never grab. The daemon owns the proxy and re-attaches on the
+    // Ready events init_node/reconnect emit through its own hub.
     let ready_hub = hub();
-    // Reconnect path gets the same subscription so resume/replug re-attaches.
-    // Config here is the daemon default; run_daemon owns the live config.
-    subscribe_click_proxy(cfg, &ready_hub);
 
     if disengage_mode {
         match transport {
