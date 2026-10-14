@@ -80,8 +80,10 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
   Model: Muse Spark 1.3 Contributor Xhigh (opencode/instance, build agent).
   Prior subagent research kept as §2–§4 baseline in `docs/RESEARCH.md`;
   T3 research threads deepen it and report in-thread (no commits).
-- 2026-10-14: T3 research DONE (`20ea67a8`, `33187ad9` reports in-thread,
-  deltas merged to `docs/RESEARCH.md` §6, threads SETTLED after verification).
-  Load-bearing change: polling posture 500 Hz → capped ~110 Hz
-  (`99 F2 0x23`); ROADMAP/ARCHITECTURE amended; correction relayed to
-  `base-init` in-flight (verified persisted). base-init still RUNNING.
+- 2026-10-14: T3 research DONE, deltas merged (§6), threads SETTLED.
+  Polling posture 500 Hz → capped ~110; ROADMAP/ARCHITECTURE amended.
+- 2026-10-14: base-init DONE+pushed (`bba35b5`, `6aa419b`), coordinator-verified.
+  Wave 1 dispatched (5 impl + 3 retro-reviews). PRs #1/#2/#3 OPEN+linked.
+  Spark review REQUEST-CHANGES, L0/L1 verified REAL in code, verbatim
+  follow-up relayed to base-init (see `docs/REVIEWS/base-init-6aa419b.md`).
+  Step5 thread replaced (`c5969de2`, corrected model id) after provider error.
