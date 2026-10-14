@@ -38,7 +38,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
 | uinput-proxy | T3 `72899193` — PR #6 `ac25da8` (5 L1 + L2 fixed, verified, head==PR head) | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | DONE, MERGED (`e81d15e`). Owner + 3 reviewers SETTLED |
-| suspend-hook | T3 `01236349` | `feat/suspend-hook` @ `ltd-wt/suspend-hook` | resume re-init, re-attach | RUNNING |
+| suspend-hook | T3 `01236349` — PR #7 `4e31c5d` (174+10 green, verified) | `feat/suspend-hook` @ `ltd-wt/suspend-hook` | resume re-init, re-attach | OPEN, IN REVIEW (3 threads: `594e8659` Spark, `65e67c9d` MiMo, `ce690279` Step5) |
 
 ## Phase 1 — wave 3 (unblocked: #6 merged)
 
@@ -98,3 +98,8 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
   relayed to apple-parse (`ebd238a0…`). Mimo base-init review adds 5 small L2s →
   relayed to base-init (`4f805627…`). Known gaps: reconnect ignores user config
   (later task); suspend-hook + uinput-proxy queued (wave 2).
+- 2026-10-14: PRs #4 + #6 MERGED (fixes verified, heads==PR heads, green).
+  suspend-hook PR #7 OPEN+linked, in 3-review. force-click RUNNING.
+  ZOMBIES (excluded from polls): `c5969de2`, `2c6b43fd` — bad model id,
+  status `starting`, 0 turns ever, settle/archive refused by guard, 0 usage.
+  Superseded by delivered+settled `2fe321b1`.
