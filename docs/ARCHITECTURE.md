@@ -73,6 +73,10 @@ L1a/L1b distinction is machine-checked. Apple MT2 reports
 `tier() == L2p` (proprietary device-autonomous pad) with
 `pressure_units() == Arbitrary`: pressure @ offset 7 is a nominal 0..253
 byte with `res == 0` — never grams/newtons, never `EV_FF`/`FF_HAPTIC`.
+Decode-only: `poll_frame` errs (transport belongs to `uinput-proxy`);
+the caller logs and drops the failed frame, never aborts the read loop.
+`TouchFrame.clicks` is raw `report[1]`: button state is `clicks & 1`;
+bits 6..7 are device-timestamp bits, not buttons.
 
 ## Click state machine (spec)
 

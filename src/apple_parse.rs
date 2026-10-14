@@ -22,7 +22,8 @@
 //! - `id = b[8] & 0x0f`
 //! - `x = ((b[1] << 27) | (b[0] << 19)) >> 19` (13-bit signed)
 //! - `y = -(((b[3] << 30) | (b[2] << 22) | (b[1] << 14)) >> 19)`
-//! - `orientation = (b[8] >> 5) - 4` (−4..=3)
+//! - `orientation = (b[8] >> 5) - 4` (−4..=3, raw; the kernel negates it
+//!   for `ABS_MT_ORIENTATION`, so uinput-proxy must emit `-(raw)`)
 //! - `contact = (b[3] & 0xC0) == 0x80`
 //!
 //! # Pressure semantics (offset 7)
@@ -30,14 +31,18 @@
 //! Pressure is a raw byte with nominal device range **0..=253**,
 //! resolution **0** — i.e. arbitrary units, NOT grams/newtons. Downstream
 //! must keep `res == 0` on any virtual device and must not advertise
-//! `EV_FF`/`FF_HAPTIC`. Values 254..=255 pass through untouched (observed
-//! saturation/reserved range, never remapped here).
+//! `EV_FF`/`FF_HAPTIC`. Values 254..=255 are unobserved/reserved: they
+//! pass through untouched here (matching the kernel, which reports the
+//! byte unclamped), and the downstream uinput stage MUST clamp to
+//! [`PRESSURE_VALID_MAX`] (kernel `absmax`) before emitting
+//! `ABS_MT_PRESSURE`.
 //!
 //! # Frame framing
 //!
 //! - USB report `0x02`: 12-byte prefix + N × 9-byte contacts.
 //! - BT report `0x31`: 4-byte prefix + N × 9-byte contacts.
-//! - `clicks` = raw `report[1]` (physical button byte, for later stages).
+//! - `clicks` = raw `report[1]`; button state is `clicks & 1` — bits 6..7
+//!   are device-timestamp bits, not buttons (for later stages).
 //! - Double report `0xf7`: two back-to-back sub-reports, see
 //!   [`parse_double_report`]; [`parse_frame`] rejects it so frame
 //!   boundaries are never silently merged.
@@ -122,7 +127,8 @@ pub struct FingerContact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TouchFrame {
     pub fingers: Vec<FingerContact>,
-    /// Raw physical-button byte (`report[1]`).
+    /// Raw physical-button byte (`report[1]`): button state is `clicks & 1`
+    /// (bits 6..7 carry device-timestamp bits, not buttons).
     pub clicks: u8,
     /// Always 0: device timestamp bits are unused.
     pub timestamp_ms: u64,
@@ -240,7 +246,11 @@ fn parse_frame_with_prefix(report: &[u8], prefix: usize) -> Result<TouchFrame> {
 }
 
 /// Split a `0xf7` double report into its two frames.
-/// Layout: `[0xf7, first_len, <first..>, <second..>]`.
+/// Layout: `[0xf7, first_len, <first..>, <second..>]` where `first_len` is
+/// the byte length of the first sub-report starting at offset 2 — the
+/// kernel `hid-magicmouse.c` `magicmouse_raw_event` `DOUBLE_REPORT_ID`
+/// path recurses with `(data + 2, data[1])` then
+/// `(data + 2 + data[1], size - 2 - data[1])`.
 pub fn parse_double_report(report: &[u8]) -> Result<(TouchFrame, TouchFrame)> {
     if report.first() != Some(&DOUBLE_REPORT_ID) {
         bail!("not a double report (missing 0xf7 id)");
@@ -298,7 +308,7 @@ mod tests {
         assert_eq!(c.touch_minor, 0x20);
         assert_eq!(c.size, 0x30);
         assert_eq!(c.pressure, 0x64);
-        assert_eq!(c.orientation, (0x45u8 >> 5) as i8 - 4); // 2 - 4 = -2
+        assert_eq!(c.orientation, -2); // (0x45 >> 5) - 4 = 2 - 4
         assert!(c.contact); // 0x85 & 0xC0 == 0x80
     }
 
@@ -328,8 +338,9 @@ mod tests {
             let c = parse_contact(&contact_bytes(&[(3, 0x80), (7, p)])).unwrap();
             assert_eq!(c.pressure, p);
         }
-        assert!(253 <= PRESSURE_VALID_MAX);
-        // Above-nominal bytes are preserved, never remapped here.
+        assert_eq!(PRESSURE_VALID_MAX, 253);
+        // Unobserved/reserved bytes pass through (kernel reports unclamped);
+        // the uinput stage MUST clamp to PRESSURE_VALID_MAX.
         for p in [254u8, 255] {
             let c = parse_contact(&contact_bytes(&[(3, 0x80), (7, p)])).unwrap();
             assert_eq!(c.pressure, p);
@@ -446,5 +457,46 @@ mod tests {
         assert_eq!(a.clicks, 1);
         assert!(parse_double_report(&sub1).is_err());
         assert!(parse_double_report(&[0xF7]).is_err());
+    }
+
+    #[test]
+    fn byte1_high_bits_are_y_not_x() {
+        // b[1] bits 5..7 are Y-low; they must not leak into x.
+        let a = parse_contact(&[0x00, 0x00, 0x00, 0x80, 0, 0, 0, 50, 0]).unwrap();
+        let b = parse_contact(&[0x00, 0xE0, 0x00, 0x80, 0, 0, 0, 50, 0]).unwrap();
+        assert_eq!((a.x, a.y), (0, 0));
+        assert_eq!(b.x, a.x);
+        assert_eq!(b.y, -7);
+    }
+
+    #[test]
+    fn double_report_rejects_malformed() {
+        let good_sub = |clicks: u8, pressure: u8| {
+            let mut r = vec![0x31, clicks, 0, 0];
+            r.extend_from_slice(&contact_bytes(&[(3, 0x80), (7, pressure), (8, 0x01)]));
+            r
+        };
+        // Overshoot: claims 255 first bytes, far fewer present.
+        let mut overshoot = vec![0xF7, 255];
+        overshoot.extend_from_slice(&good_sub(0, 10));
+        assert!(parse_double_report(&overshoot).is_err());
+        // Misaligned split: first_len lands mid-9B-block (body 8, remainder).
+        let mut misaligned = vec![0xF7, 12];
+        misaligned.extend_from_slice(&[0x31, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        misaligned.extend_from_slice(&good_sub(0, 10));
+        assert!(parse_double_report(&misaligned).is_err());
+        // Nested 0xf7 as second frame.
+        let s1 = good_sub(0, 10);
+        let mut nested = vec![0xF7, s1.len() as u8];
+        nested.extend_from_slice(&s1);
+        nested.extend_from_slice(&[0xF7, 0x00]);
+        assert!(parse_double_report(&nested).is_err());
+        // Trailing garbage after second frame.
+        let mut s2 = good_sub(0, 20);
+        s2.push(0xFF);
+        let mut trailing = vec![0xF7, s1.len() as u8];
+        trailing.extend_from_slice(&s1);
+        trailing.extend_from_slice(&s2);
+        assert!(parse_double_report(&trailing).is_err());
     }
 }
