@@ -194,12 +194,21 @@ mod tests {
     #[test]
     fn socket_path_default_and_override() {
         // Pure override parameter — no process-env mutation, safe threaded.
+        // The default-arm read still touches process env, so hold the
+        // shared env lock; restore the prior value instead of leaking
+        // the removal.
+        let _env_guard = crate::test_env::lock_env();
+        let old = std::env::var(SOCKET_ENV).ok();
         unsafe { std::env::remove_var(SOCKET_ENV) };
         assert_eq!(socket_path(), DRIVER_SOCK);
         assert_eq!(
             socket_path_with(Some("/tmp/test-ltd.sock")),
             "/tmp/test-ltd.sock"
         );
+        match old {
+            Some(v) => unsafe { std::env::set_var(SOCKET_ENV, v) },
+            None => unsafe { std::env::remove_var(SOCKET_ENV) },
+        }
     }
 
     #[test]
