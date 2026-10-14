@@ -3,7 +3,13 @@ name = "linux-trackpad-driver"
 version = "0.1.0"
 edition = "2021"
 description = "Linux driver core-init for Apple Magic Trackpad 2 (USB/BT)"
+authors = ["Aarón Roque Fonseca <aaronroquefonseca@gmail.com>"]
+homepage = "https://github.com/aaronroquefonseca/linux-trackpad-driver"
+repository = "https://github.com/aaronroquefonseca/linux-trackpad-driver"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
+keywords = ["trackpad", "hid", "hidraw", "driver", "apple"]
+categories = ["hardware-support", "command-line-utilities"]
 
 [[bin]]
 name = "ltd"
