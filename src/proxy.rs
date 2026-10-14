@@ -31,8 +31,13 @@
 //!   hub callbacks do bounded work only (no loops), and panics are already
 //!   isolated by [`crate::init::DeviceReadyHub`].
 //! - `speed` scales pointer deltas in the proxy path only; init untouched.
-//! - Force behavior belongs to the force-click task: only the arming
-//!   threshold is exposed ([`crate::clicks::ClickMachine::force_threshold`]).
+//! - Force second level: [`crate::clicks::ClickMachine`] latches an
+//!   independent force edge (`force_1..=force_5`, `effective_force_haptic`,
+//!   `force_quiet_click`) while the first-level hold continues. The proxy
+//!   holds both key sets; force supersedes in reporting while past threshold.
+//!   Dropping below the force release (`sensitivity + offset - margin`)
+//!   releases force keys only back to the first-level hold; dropping below
+//!   the first release clears all. `force_offset = 0` disables force.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -248,7 +253,8 @@ pub struct ClickProxy<G, U, H, S> {
     /// wires those, `attach` degrades to passthrough — grabbing without an
     /// emit path would swallow the physical device with nothing replacing it.
     pump_ready: bool,
-    held: Vec<(u16, u16)>,
+    held_first: Vec<(u16, u16)>,
+    held_force: Vec<(u16, u16)>,
     last_pos: HashMap<u8, (i32, i32)>,
     /// Highest slot index written so far; vacated slots are terminated.
     max_slot: usize,
@@ -272,7 +278,8 @@ where
             attached: false,
             passthrough: true,
             pump_ready: false,
-            held: Vec::new(),
+            held_first: Vec::new(),
+            held_force: Vec::new(),
             last_pos: HashMap::new(),
             max_slot: 0,
         }
@@ -379,35 +386,49 @@ where
                 return Ok(None);
             }
         };
-        let was_active = self.machine.active().is_some();
-        let edge = match self.machine.update(&frame.fingers, frame.clicks, cfg) {
+        let was_first = self.machine.active().is_some();
+        let was_force = self.machine.force_active().is_some();
+        let edges = match self.machine.update(&frame.fingers, frame.clicks, cfg) {
             Ok(e) => e,
             Err(e) => {
-                log::warn!("proxy: click_N parse failed, dropping edge: {e:#}");
+                log::warn!("proxy: click/force parse failed, dropping edge: {e:#}");
                 return Ok(None);
             }
         };
         // Touch slots first (post-update latch is visible to buttons below).
         self.emit_touch_frame(&frame, cfg.speed);
-        if let Some(ref ev) = edge {
-            self.press_edge(ev);
-            return Ok(edge);
+        // Press order: first then force; reporters see force (supersedes).
+        if let Some(ref ev) = edges.first {
+            self.press_level(ev, false);
         }
-        if was_active && self.machine.active().is_none() {
+        if let Some(ref ev) = edges.force {
+            self.press_level(ev, true);
+        }
+        if edges.first.is_some() || edges.force.is_some() {
+            return Ok(edges.primary());
+        }
+        let first_gone = was_first && self.machine.active().is_none();
+        let force_gone = was_force && self.machine.force_active().is_none();
+        if first_gone {
+            // Full release clears both levels.
             self.release_held();
+        } else if force_gone {
+            // Back to the first-level hold: force keys up, first keys stay.
+            self.release_force_held();
         }
         self.emit_btn_left(frame.clicks);
         self.uinput.sync();
         Ok(None)
     }
 
-    /// `BTN_LEFT` from held codes only (latched action contains `left`) or
-    /// the physical button bit — never from latch state alone, so a
+    /// `BTN_LEFT` from held codes only (either latched action contains `left`)
+    /// or the physical button bit — never from latch state alone, so a
     /// right/middle/combo/empty hold cannot chord a phantom left.
     fn emit_btn_left(&self, clicks: u8) {
         let held_left = self
-            .held
+            .held_first
             .iter()
+            .chain(self.held_force.iter())
             .any(|&(ty, code)| ty == EV_KEY && code == BTN_LEFT);
         self.uinput.emit(
             EV_KEY,
@@ -416,22 +437,28 @@ where
         );
     }
 
-    fn press_edge(&mut self, ev: &ClickEvent) {
+    fn press_level(&mut self, ev: &ClickEvent, force: bool) {
         use crate::config::ActionKind;
+        let name = if force { "force" } else { "click" };
         match &ev.action.kind {
             ActionKind::None => {
-                log::debug!("proxy: click_{} = none (swallowed)", ev.finger_count);
+                log::debug!("proxy: {name}_{} = none (swallowed)", ev.finger_count);
             }
             ActionKind::Empty => {
                 self.fire_haptic(ev);
                 self.uinput.sync();
             }
             ActionKind::Keys(keys) => {
+                let held = if force {
+                    &mut self.held_force
+                } else {
+                    &mut self.held_first
+                };
                 for k in keys {
                     match key_token_to_code(k) {
                         Some((ty, code)) => {
                             self.uinput.emit(ty, code, 1);
-                            self.held.push((ty, code));
+                            held.push((ty, code));
                         }
                         None => log::warn!("proxy: no keycode for '{k}', skipped"),
                     }
@@ -453,7 +480,13 @@ where
     }
 
     fn release_held(&mut self) {
-        for (ty, code) in self.held.drain(..) {
+        for (ty, code) in self.held_first.drain(..).chain(self.held_force.drain(..)) {
+            self.uinput.emit(ty, code, 0);
+        }
+    }
+
+    fn release_force_held(&mut self) {
+        for (ty, code) in self.held_force.drain(..) {
             self.uinput.emit(ty, code, 0);
         }
     }
