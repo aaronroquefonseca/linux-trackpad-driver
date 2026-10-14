@@ -48,7 +48,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
-| force-click | T3 `bc87d3ce` | `feat/force-click` @ `ltd-wt/force-click` | 2nd level + force actions | OPEN, IN REVIEW (3 threads: `ad0baf73` Spark done, `99ada008` MiMo done, `1faa216d` Step5 done; combined follow-up relayed) |
+| force-click | T3 `bc87d3ce` — PR #8 `30bfa7c` (L1 + L2 fixed, verified) | `feat/force-click` | 2nd level + force actions | DONE, MERGED (`fb8674f`). Owner + 3 reviewers SETTLED |
 
 ## Phase 2 — later (not yet queued for dispatch)
 
