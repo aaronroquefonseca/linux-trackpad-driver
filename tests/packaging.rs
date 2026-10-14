@@ -6,6 +6,7 @@
 //! unit shape (simple / on-failure / RuntimeDirectory for driver.sock).
 
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 fn repo_file(rel: &str) -> String {
@@ -24,6 +25,8 @@ fn rule_lines(rules: &str) -> Vec<&str> {
 const RULES: &str = include_str!("../udev/99-linux-trackpad-driver.rules");
 const SERVICE: &str = include_str!("../systemd/linux-trackpad-driver.service");
 const RECONNECT: &str = include_str!("../systemd/linux-trackpad-driver-reconnect@.service");
+const RESUME_UNIT: &str = include_str!("../systemd/linux-trackpad-driver-resume.service");
+const SLEEP_HOOK: &str = include_str!("../systemd/system-sleep/ltd-resume");
 
 const COMBOS: [(&str, &str); 4] = [
     ("05ac", "0265"),
@@ -130,4 +133,135 @@ fn reconnect_template_runs_reconnect_for_instance() {
         RECONNECT.contains("LTD_CONFIG="),
         "template must pass the system config env so hotplug honors enhanced_clicks"
     );
+}
+
+#[test]
+fn resume_unit_shape() {
+    assert!(
+        RESUME_UNIT.contains("Type=oneshot"),
+        "resume unit must be oneshot"
+    );
+    assert!(
+        RESUME_UNIT.contains("ExecStart=/usr/bin/ltd resume"),
+        "resume unit must run the resume entry (multitouch-first re-init)"
+    );
+    for target in [
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+        "suspend-then-hibernate.target",
+    ] {
+        assert!(
+            RESUME_UNIT.contains("After=") && RESUME_UNIT.contains(target),
+            "resume unit must order After={target}"
+        );
+    }
+    assert!(
+        RESUME_UNIT.contains("LTD_CONFIG="),
+        "resume unit must pass the system config env like the reconnect template"
+    );
+}
+
+#[test]
+fn resume_unit_never_runs_pre_sleep() {
+    // WantedBy=sleep targets would run BEFORE suspend — the wrong direction
+    // for re-init. Post-resume activation comes from the system-sleep hook
+    // (post branch); this unit must not bind to sleep targets.
+    for target in [
+        "WantedBy=suspend.target",
+        "WantedBy=hibernate.target",
+        "WantedBy=hybrid-sleep.target",
+        "WantedBy=suspend-then-hibernate.target",
+        "WantedBy=sleep.target",
+    ] {
+        assert!(
+            !RESUME_UNIT.contains(target),
+            "resume unit must not bind to sleep targets (pre-sleep direction): {target}"
+        );
+    }
+}
+
+#[test]
+fn sleep_hook_reinits_on_post_only() {
+    assert!(
+        SLEEP_HOOK.starts_with("#!"),
+        "sleep hook must be an executable script with a shebang"
+    );
+    assert!(
+        SLEEP_HOOK.contains("post"),
+        "sleep hook must handle the post branch (after resume)"
+    );
+    assert!(
+        SLEEP_HOOK.contains("resume"),
+        "sleep hook must run the resume entry"
+    );
+    // Ordering: the post match precedes the resume invocation, so re-init
+    // runs after resume — never on the pre branch.
+    let post = SLEEP_HOOK.find("post").expect("post branch");
+    let resume = SLEEP_HOOK.find("\"$LTD_BIN\" resume").expect("resume call");
+    assert!(
+        post < resume,
+        "resume invocation must sit under the post match (after resume, not pre)"
+    );
+    for sleep in [
+        "suspend",
+        "hibernate",
+        "hybrid-sleep",
+        "suspend-then-hibernate",
+    ] {
+        assert!(SLEEP_HOOK.contains(sleep), "sleep hook must cover {sleep}");
+    }
+}
+
+#[test]
+fn sleep_hook_is_executable() {
+    let p: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "systemd/system-sleep/ltd-resume",
+    ]
+    .iter()
+    .collect();
+    let mode = std::fs::metadata(&p)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+        .permissions()
+        .mode();
+    assert!(
+        mode & 0o111 != 0,
+        "sleep hook must be executable (systemd ignores non-executable hooks)"
+    );
+}
+
+#[test]
+fn sleep_hook_and_resume_unit_never_touch_user_sessions() {
+    // user.slice is frozen while sleep hooks run (RESEARCH §6): any of these
+    // in *code* (non-comment lines) would block on, or signal into, a frozen
+    // user session. Comments may name them only to prohibit them.
+    fn code_lines(text: &str) -> String {
+        text.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    let hook_code = code_lines(SLEEP_HOOK);
+    let unit_code = code_lines(RESUME_UNIT);
+    for banned in [
+        "systemctl --user",
+        "--user ",
+        "machinectl",
+        "notify-send",
+        "dbus-send",
+        "runuser",
+        "sudo -u",
+        "su -",
+        "DISPLAY=",
+    ] {
+        assert!(
+            !hook_code.contains(banned),
+            "sleep hook must not touch user sessions: {banned:?}"
+        );
+        assert!(
+            !unit_code.contains(banned),
+            "resume unit must not touch user sessions: {banned:?}"
+        );
+    }
 }
