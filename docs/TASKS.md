@@ -19,18 +19,30 @@ coordinator verifies each claim in code. Merge gates: CI green, no unresolved L0
 
 Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-init; must inform Phase 1.
 
-## Phase 1 — fan-out (blocked on base-init merged to `main`)
+| base-init | T3 `3ddd0a73` — 2 commits pushed (`bba35b5` + `6aa419b`), coordinator verified (build/test 39 green, clippy/fmt clean, no clicks deps) | `main` (direct) | Skeleton + core-init | DONE, MERGED. Retro-review: 3 threads (`f7dfd72c` Spark Xhigh, `8c876b6d` MiMo Xhigh, `ca101ddb` Step5 High) on HEAD `6aa419b` | IN REVIEW |
+
+## Phase 1 — wave 1 (base `6aa419b`, dispatched 2026-10-14, one writer per branch)
+
+| ID | Thread | Branch/worktree | Scope | Status |
+|----|--------|-----------------|-------|--------|
+| config-schema | T3 `e1271c64` | `feat/config-schema` @ `ltd-wt/config-schema` | Full TOML schema + validation | RUNNING |
+| apple-parse | T3 `30782f2f` | `feat/apple-parse` @ `ltd-wt/apple-parse` | 9B parser, pressure@7 | RUNNING |
+| udev-systemd | T3 `90edb8da` | `feat/udev-systemd` @ `ltd-wt/udev-systemd` | rules+unit+INSTALL (turn receipt `sessionRevoked:false`, accepted — monitor) | RUNNING |
+| reconnect-bt | T3 `8a38d26b` | `feat/reconnect-bt` @ `ltd-wt/reconnect-bt` | idempotency, BT, resume re-init | RUNNING |
+| tests-hw-mock | T3 `8f5054ba` | `feat/tests-hw-mock` @ `ltd-wt/tests-hw-mock` | mock harness + CI workflow (sole CI owner) | RUNNING |
+
+## Phase 1 — wave 2 (blocked on wave-1 merges)
 
 | ID | Branch | Depends | Scope | Status |
 |----|--------|---------|-------|--------|
-| udev-systemd | `feat/udev-systemd` | base-init | udev rules (VID:PID-gated add), systemd unit, install notes | QUEUED |
-| reconnect-bt | `feat/reconnect-bt` | base-init | `reconnect` idempotency, `-f/-p/-d`, BT single-node, daemon-socket check | QUEUED |
-| config-schema | `feat/config-schema` | base-init | TOML schema + `enhanced_clicks` gate, defaults, validation errors | QUEUED |
-| apple-parse | `feat/apple-parse` | base-init (+RESEARCH advisory) | hidraw 9B block parser, pressure@7, multitouch decode, unit tests | QUEUED |
-| uinput-proxy | `feat/uinput-proxy` | apple-parse, config-schema | evdev grab + uinput emit, sensitivity/margin/haptic/quiet, 1–5 map | QUEUED |
-| force-click | `feat/force-click` | uinput-proxy | second-level `sensitivity+offset`, force actions/haptic | QUEUED |
-| suspend-hook | `feat/suspend-hook` | reconnect-bt | resume re-init, pipeline re-attach, never blocks init | QUEUED |
-| tests-hw-mock | `feat/tests-hw-mock` | base-init | mock hidraw/evdev harness, polling-cap test (`3850/X`), CI job | QUEUED |
+| uinput-proxy | `feat/uinput-proxy` | apple-parse + config-schema merged | evdev grab + uinput emit, 1–5 map | QUEUED |
+| suspend-hook | `feat/suspend-hook` | reconnect-bt merged | resume re-init, re-attach | QUEUED |
+
+## Phase 1 — wave 3
+
+| ID | Branch | Depends | Scope | Status |
+|----|--------|---------|-------|--------|
+| force-click | `feat/force-click` | uinput-proxy merged | 2nd level + force actions | QUEUED |
 
 ## Phase 2 — later (not yet queued for dispatch)
 
