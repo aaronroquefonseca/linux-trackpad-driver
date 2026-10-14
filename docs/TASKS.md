@@ -12,7 +12,9 @@ coordinator verifies each claim in code. Merge gates: CI green, no unresolved L0
 
 | ID | Thread | Branch | Scope | Status |
 |----|--------|--------|-------|--------|
-| base-init | T3 `3ddd0a73` — branch `main`, worktree = project root, base `90b4c98` | `main` (direct) | Bare Rust skeleton + core-init: workspace/binary, `run`+`reconnect` CLI stubs, USB feature reports (`02 01`, `21 01`, `99 F2 X` capped ~110, never 500), BT single-node path, lock socket, `cargo fmt/clippy/test` green | RUNNING (coding `src/init.rs`; polling-posture correction relayed + verified `0bac3d24…`, queued behind active turn) |
+| base-init | T3 `3ddd0a73` — origin work DONE (`bba35b5` skeleton, `55ed6c9` L0 fix, `1628a22` L2 polish; 98+5 verified) | `main` | Skeleton + core-init + review fixes | DONE, SETTLED |
+| research-haptic | DONE, SETTLED | — | Haptic survey | DONE |
+| research-kernel | DONE, SETTLED | — | Input-stack survey | DONE |
 | research-haptic | T3 `20ea67a8` — report received (10.3 KB, ≥8 sources), deltas merged to `docs/RESEARCH.md` §6 | — | Laptop haptic deep survey; tier-split verdict | DONE, SETTLED |
 | research-kernel | T3 `33187ad9` — report received (16.4 KB, 18 sources), deltas merged to `docs/RESEARCH.md` §6 | — | Input-stack deep survey; plan-element verdicts | DONE, SETTLED |
 | research-tiers | DONE — subagent proxies merged by coordinator | docs only | Tier correction adopted: L0/L1a/L1b/L2s/L2p → `docs/RESEARCH.md` §4 | DONE |
@@ -28,7 +30,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | config-schema | T3 `e1271c64` — PR #5 `981b6bf6`, coordinator-verified (55 green) | `feat/config-schema` | Full TOML schema + validation | DONE, MERGED (`723f885`). Owner SETTLED |
 | apple-parse | T3 `30782f2f` — PR #2 `3d5a18c` (fixes verified, head==PR head, green) | `feat/apple-parse` | 9B parser, pressure@7 | DONE, MERGED (`8910089`). Owner + 3 reviewers SETTLED |
 | udev-systemd | T3 `90edb8da` — PR #1, verified (rules + 5 packaging tests) | `feat/udev-systemd` | rules+unit+INSTALL | DONE, MERGED (`3bf2a23`). Owner SETTLED |
-| reconnect-bt | T3 `8a38d26b` — PR #4 `f03ac4a` | `feat/reconnect-bt` | idempotency, BT, resume re-init | OPEN, HELD for base-init L0-fix rebase (touches `init.rs`) |
+| reconnect-bt | T3 `8a38d26b` — PR #4 | `feat/reconnect-bt` | idempotency, BT, resume re-init | OPEN, REBASING onto fixed main (rebase order sent + verified) |
 | tests-hw-mock | T3 `8f5054ba` — PR #3, verified clean-HEAD (52+5 green) | `feat/tests-hw-mock` | mock harness + CI workflow | DONE, MERGED (`25068e5`). Owner SETTLED |
 
 ## Phase 1 — wave 2 (blocked on wave-1 merges)
