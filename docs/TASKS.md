@@ -50,7 +50,18 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 |----|--------|-----------------|-------|--------|
 | force-click | T3 `bc87d3ce` — PR #8 `30bfa7c` (L1 + L2 fixed, verified) | `feat/force-click` | 2nd level + force actions | DONE, MERGED (`fb8674f`). Owner + 3 reviewers SETTLED |
 
-## Phase 2 — later (not yet queued for dispatch)
+## Phase 2 — public readiness (all DONE 2026-10-14, all SETTLED)
+
+| ID | PR | Scope | Status |
+|----|----|-------|--------|
+| hw-test-plan | #13 | TESTING.md hardware checklist | DONE, MERGED |
+| install-ux | #14 | PKGBUILD fix, README quickstart, `ltd doctor` | DONE, MERGED |
+| public-hygiene | #15 | LICENSEs, gitignore, metadata, templates, SECURITY | DONE, MERGED |
+| release-prep | #16 | inert tag/nightly workflows, cliff, PKGBUILD-nightly, RELEASING.md | DONE, MERGED |
+
+Final: 16/16 PRs merged, 0 open. Main green (210+11, clippy/fmt clean, CI green).
+Remaining (owner-side): hardware session per TESTING.md; public launch =
+docs/RELEASING.md 5-min checklist; full EvdevGeneric impl = future work.
 
 Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
 
