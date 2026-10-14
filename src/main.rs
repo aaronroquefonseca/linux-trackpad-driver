@@ -1,5 +1,6 @@
 pub mod apple_parse;
 pub mod cli;
+pub mod clicks;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
