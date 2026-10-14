@@ -92,3 +92,7 @@ Generic `EvdevGeneric` impl, packaging (deb/AUR), hardening, docs site.
   tier label clarified per ap2-spark finding #2 (MT2 = L2p, L1a-class pressure).
   ap2-spark APPROVE-WITH-NOTES (3×L1, no L0); ap2-mimo + ap2-step5c pending.
   PRs #1/#3/#5 MERGED; #2 in review; #4 held for L0-fix rebase.
+- 2026-10-14: ap2 reviews 3/3 APPROVE-WITH-NOTES, no L0 → combined L1 follow-up
+  relayed to apple-parse (`ebd238a0…`). Mimo base-init review adds 5 small L2s →
+  relayed to base-init (`4f805627…`). Known gaps: reconnect ignores user config
+  (later task); suspend-hook + uinput-proxy queued (wave 2).

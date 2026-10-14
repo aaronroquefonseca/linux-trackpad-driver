@@ -50,12 +50,17 @@ pub struct TouchFrame {
 
 pub struct Finger {
     pub id: u8,
-    pub pressure: u8,      // normalized 0..=255 where available
+    pub pressure: u8,      // RAW device byte (Apple: 0..=253 valid, 254/255
+                           // reserved passthrough — see RESEARCH §6). NOT
+                           // normalized: clicks thresholds operate on this
+                           // scale; uinput stage clamps to 253 (kernel absmax).
     pub contact: bool,
 }
 
 pub trait TouchSource {
     fn tier(&self) -> CapabilityTier;
+    /// L1a (area-proxy, res==0) vs L1b (true grams, res!=0). Apple MT2 = Arbitrary.
+    fn pressure_units(&self) -> PressureUnits;
     fn poll_frame(&mut self) -> anyhow::Result<Option<TouchFrame>>;
 }
 ```
