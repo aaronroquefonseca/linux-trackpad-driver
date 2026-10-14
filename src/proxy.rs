@@ -400,7 +400,8 @@ where
         };
         // Touch slots first (post-update latch is visible to buttons below).
         self.emit_touch_frame(&frame, cfg.speed);
-        // Press order: first then force; reporters see force (supersedes).
+        // Press order: first then force; reporters see force (supersedes,
+        // unless force is `none` — see `FrameOutcome::primary`).
         if let Some(ref ev) = edges.first {
             self.press_level(ev, false);
         }
@@ -408,6 +409,12 @@ where
             self.press_level(ev, true);
         }
         if edges.first.is_some() || edges.force.is_some() {
+            // Edge frames carry the same button state as hold frames
+            // (re-assert from held sets; same-value re-emits are idempotent
+            // downstream). Exactly one SYN per handled frame either way:
+            // `press_level` never syncs itself.
+            self.emit_btn_left(frame.clicks);
+            self.uinput.sync();
             return Ok(edges.primary());
         }
         let first_gone = was_first && self.machine.active().is_none();
@@ -448,6 +455,11 @@ where
         self.held_first.contains(&pair) || self.held_force.contains(&pair)
     }
 
+    /// Press one level's edge: keys down (deduplicated across levels, see
+    /// [`ClickProxy::is_down`]) plus that level's own haptic pulse. A
+    /// one-frame jump through both levels therefore emits both pulses in
+    /// press order (first then force) — identical to staged arrival. Never
+    /// syncs: the caller emits buttons + a single `SYN` per frame.
     fn press_level(&mut self, ev: &ClickEvent, force: bool) {
         use crate::config::ActionKind;
         let name = if force { "force" } else { "click" };
@@ -457,7 +469,6 @@ where
             }
             ActionKind::Empty => {
                 self.fire_haptic(ev);
-                self.uinput.sync();
             }
             ActionKind::Keys(keys) => {
                 for k in keys {
@@ -481,7 +492,6 @@ where
                     }
                 }
                 self.fire_haptic(ev);
-                self.uinput.sync();
             }
         }
     }
@@ -1782,5 +1792,109 @@ mod tests {
         assert_eq!(left.first(), Some(&1));
         assert_eq!(left.last(), Some(&0));
         assert_eq!(transitions(&left), 1, "phantom BTN_LEFT release: {left:?}");
+    }
+
+    #[test]
+    fn same_frame_both_edges_hold_then_release() {
+        // One-frame jump latches both: both key sets down, force reported;
+        // dropping below all thresholds releases both.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = force_cfg();
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        let mark = uinput.events.lock().unwrap().len();
+        px.handle_frame(&cfg).unwrap();
+        let tail = uinput.events.lock().unwrap()[mark..].to_vec();
+        assert!(
+            tail.contains(&(EV_KEY, BTN_LEFT, 0)),
+            "left never released: {tail:?}"
+        );
+        assert!(
+            tail.contains(&(EV_KEY, BTN_EXTRA, 0)),
+            "forward never released: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn force_silent_override_emits_no_force_haptic() {
+        // force_haptic = Some(0): force edge silent, first-level pulse kept.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            force_haptic: Some(0),
+            ..force_cfg()
+        };
+        px.handle_frame(&cfg).unwrap();
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(ev.haptic, 0);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(5, false)]);
+        // Keys still held on both levels despite the silent force edge.
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+    }
+
+    #[test]
+    fn one_frame_jump_emits_both_haptic_pulses() {
+        // Pins the single-vs-double decision: one frame through both levels
+        // emits both pulses in press order (first then force), identical to
+        // staged arrival.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            force_haptic: Some(9),
+            force_quiet_click: true,
+            ..force_cfg()
+        };
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(5, false), (9, true)]
+        );
+    }
+
+    #[test]
+    fn btn_left_reasserted_after_force_release() {
+        // click left + force forward: the force-release frame tail still
+        // carries BTN_LEFT=1 (first hold); the full-release tail ends at 0.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = force_cfg();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left.last(), Some(&1), "first hold lost: {left:?}");
+        let mark = uinput.events.lock().unwrap().len();
+        px.handle_frame(&cfg).unwrap();
+        let tail: Vec<(u16, u16, i32)> = uinput.events.lock().unwrap()[mark..].to_vec();
+        assert!(
+            tail.contains(&(EV_KEY, BTN_LEFT, 0)),
+            "left never released: {tail:?}"
+        );
+        assert_eq!(key_values(&uinput, BTN_LEFT).last(), Some(&0));
     }
 }

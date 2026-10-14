@@ -30,8 +30,14 @@
 //!   release returns to the first-level hold; falling below the first-level
 //!   release (`sensitivity - margin`) releases all.
 //! - Force haptic: [`crate::config::Config::effective_force_haptic`] (explicit
-//!   `force_haptic` override, else standard `haptic`); waveform from
-//!   `force_quiet_click`.
+//!   `force_haptic` override, else standard `haptic`; `Some(0)` is silent);
+//!   waveform from `force_quiet_click`. Each edge fires its own pulse: a
+//!   one-frame jump through both levels emits both (first then force),
+//!   identical to staged arrival.
+//! - Reporters surface [`FrameOutcome::primary`]: force while held past
+//!   threshold, except a force `none` never supersedes (it emits nothing).
+//! - `click_N`/`force_N` parse before any latch bit mutates: a bad action
+//!   leaves state untouched for retry instead of half-latching.
 //! - Haptic: `haptic == 0` = silent ([`should_emit_haptic`]); otherwise the
 //!   proxy sends the host-click report (`0x21 0x01`, see [`crate::init`])
 //!   with strength/quiet carried for logging. Strength byte mapping is
@@ -135,9 +141,14 @@ pub struct FrameOutcome {
 
 impl FrameOutcome {
     /// Superseding edge for reporters: force while held past threshold,
-    /// else the first-level edge.
+    /// else the first-level edge. A force `none` (swallowed gesture, no
+    /// haptic) never supersedes: reporters see the first-level edge that
+    /// actually emitted keys/haptic.
     pub fn primary(&self) -> Option<ClickEvent> {
-        self.force.clone().or_else(|| self.first.clone())
+        match &self.force {
+            Some(f) if !f.is_none() => self.force.clone(),
+            _ => self.first.clone(),
+        }
     }
     /// True when neither level fired this frame.
     pub fn is_empty(&self) -> bool {
@@ -188,10 +199,16 @@ impl ClickMachine {
 
     /// Force-level arming threshold (`sensitivity + force_offset`, `u16` so
     /// `255 + offset` never overflows; thresholds above 255 simply never
-    /// fire). `None` when `force_offset == 0` (force disabled entirely).
+    /// fire). Clamps mirror [`press_threshold`] (`1..=255`) and
+    /// [`release_threshold`] (`margin` capped at 255). `None` when
+    /// `force_offset == 0` (force disabled entirely).
     pub fn force_threshold(cfg: &Config) -> Option<u16> {
         if cfg.force_offset > 0 {
-            Some(cfg.sensitivity.saturating_add(cfg.force_offset))
+            Some(
+                cfg.sensitivity
+                    .clamp(1, 255)
+                    .saturating_add(cfg.force_offset.min(255)),
+            )
         } else {
             None
         }
@@ -200,7 +217,7 @@ impl ClickMachine {
     /// Force release point: `sensitivity + force_offset - margin`, saturating
     /// at 0 (mirrors [`release_threshold`]). `None` when disabled.
     pub fn force_release_threshold(cfg: &Config) -> Option<u16> {
-        Self::force_threshold(cfg).map(|press| press.saturating_sub(cfg.margin))
+        Self::force_threshold(cfg).map(|press| press.saturating_sub(cfg.margin.min(255)))
     }
 
     /// Physical button bit from the raw `clicks` byte (`clicks & 1`).
@@ -211,8 +228,10 @@ impl ClickMachine {
     /// Feed one decoded frame. Returns fresh press edges (including
     /// `none`/`empty` so the caller can decide haptic), in press order:
     /// `first` then `force`. Steady-state/released frames yield `None`s.
-    /// Parse errors on `click_N`/`force_N` are returned as `Err` (caller logs
-    /// + drops the frame edge, never aborts).
+    /// `click_N`/`force_N` are parsed BEFORE any latch bit mutates, so a
+    /// parse error returns `Err` with state untouched (caller logs + drops
+    /// the frame, never aborts; the next frame retries the edge instead of
+    /// swallowing a half-latched click).
     ///
     /// Force fires only when `force_offset > 0` and some finger's pressure
     /// (`u16`-compared, no overflow) reaches `sensitivity + force_offset`;
@@ -221,6 +240,11 @@ impl ClickMachine {
     /// deep finger fell to/below `sensitivity + force_offset - margin` or
     /// lifted) while the first-level hold continues; the first level drops
     /// when nothing remains above `sensitivity - margin`.
+    ///
+    /// If `force_offset` returns to 0 mid-hold the force latch + bits clear
+    /// on that frame (the proxy sees the `force_active` transition and
+    /// releases force-held keys, retaining codes the first level still
+    /// holds). No re-attach needed.
     ///
     /// `_clicks` (raw `report[1]`) is intentionally unused here: the physical
     /// button bit (`clicks & 1`) is folded in by the proxy via
@@ -236,44 +260,71 @@ impl ClickMachine {
         let release = release_threshold(cfg);
         let force_press = Self::force_threshold(cfg);
         let force_release = Self::force_release_threshold(cfg);
+        let armed = force_press.is_some();
 
-        // Update per-finger hysteresis (first level).
+        // Phase 1 (read-only): decide per-finger bit writes. Nothing mutates
+        // here so a parse failure below leaves state untouched.
+        let mut first_write = Vec::new();
         let mut newly_pressed = Vec::new();
         for f in fingers {
             if !f.contact {
-                self.pressed.insert(f.id, false);
+                first_write.push((f.id, false));
                 continue;
             }
             let was = self.finger_pressed(f.id);
             if was {
                 if f.pressure <= release {
-                    self.pressed.insert(f.id, false);
+                    first_write.push((f.id, false));
                 }
             } else if f.pressure >= press {
-                self.pressed.insert(f.id, true);
+                first_write.push((f.id, true));
                 newly_pressed.push(f.id);
             }
         }
-        // Update per-finger hysteresis (force level, same shape, u16 compare
-        // so `sensitivity + offset` above 255 simply never fires).
+        // Force level: same shape, u16 compare so `sensitivity + offset`
+        // above 255 simply never fires.
+        let mut force_write = Vec::new();
         let mut newly_force = Vec::new();
         if let (Some(fp), Some(fr)) = (force_press, force_release) {
             for f in fingers {
                 if !f.contact {
-                    self.force_pressed.insert(f.id, false);
+                    force_write.push((f.id, false));
                     continue;
                 }
                 let p = u16::from(f.pressure);
                 let was = self.finger_force_pressed(f.id);
                 if was {
                     if p <= fr {
-                        self.force_pressed.insert(f.id, false);
+                        force_write.push((f.id, false));
                     }
                 } else if p >= fp {
-                    self.force_pressed.insert(f.id, true);
+                    force_write.push((f.id, true));
                     newly_force.push(f.id);
                 }
             }
+        }
+
+        // Phase 2: parse before mutating. `n` is shared: both edges capture
+        // the contacting count of their edge frame, clamped 1..=5.
+        let contacting = fingers.iter().filter(|f| f.contact).count();
+        let n = (contacting.clamp(1, 5)) as u8;
+        let first_action = if self.active.is_none() && !newly_pressed.is_empty() {
+            Some(cfg.click_action(n)?)
+        } else {
+            None
+        };
+        let force_action = if armed && self.force_active.is_none() && !newly_force.is_empty() {
+            Some(cfg.force_action(n)?)
+        } else {
+            None
+        };
+
+        // Phase 3: commit bit writes.
+        for (id, bit) in first_write {
+            self.pressed.insert(id, bit);
+        }
+        for (id, bit) in force_write {
+            self.force_pressed.insert(id, bit);
         }
         // Fingers absent from this frame keep their bits unless the frame is
         // empty (all lifted).
@@ -281,6 +332,13 @@ impl ClickMachine {
             for v in self.pressed.values_mut() {
                 *v = false;
             }
+            for v in self.force_pressed.values_mut() {
+                *v = false;
+            }
+        }
+        if !armed {
+            // Disarmed mid-hold: drop the force latch + bits outright.
+            self.force_active = None;
             for v in self.force_pressed.values_mut() {
                 *v = false;
             }
@@ -303,10 +361,7 @@ impl ClickMachine {
         let mut out = FrameOutcome::default();
 
         // Press edge: first newly-pressed finger while idle latches.
-        if self.active.is_none() && !newly_pressed.is_empty() {
-            let contacting = fingers.iter().filter(|f| f.contact).count();
-            let n = (contacting.clamp(1, 5)) as u8;
-            let action = cfg.click_action(n)?;
+        if let Some(action) = first_action {
             let ev = ClickEvent {
                 finger_count: n,
                 action,
@@ -320,10 +375,7 @@ impl ClickMachine {
             out.first = Some(ev);
         }
         // Force edge: same latch shape, disabled entirely when offset is 0.
-        if force_press.is_some() && self.force_active.is_none() && !newly_force.is_empty() {
-            let contacting = fingers.iter().filter(|f| f.contact).count();
-            let n = (contacting.clamp(1, 5)) as u8;
-            let action = cfg.force_action(n)?;
+        if let Some(action) = force_action {
             let ev = ClickEvent {
                 finger_count: n,
                 action,
@@ -684,5 +736,168 @@ mod tests {
         assert!(out.first.is_some());
         assert!(out.force.is_none());
         assert!(m.force_active().is_none());
+    }
+
+    #[test]
+    fn primary_skips_force_none() {
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            click_1: "left".into(),
+            force_1: "none".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let out = m.update(&[finger(1, 250)], 0, &cfg).unwrap();
+        assert!(out.first.is_some());
+        let force = out.force.as_ref().unwrap();
+        assert!(force.is_force() && force.is_none());
+        // Force still latches (swallows), but reporters see the first edge.
+        assert!(m.force_active().is_some());
+        let primary = out.primary().unwrap();
+        assert!(!primary.is_force());
+    }
+
+    #[test]
+    fn force_disarm_mid_hold_clears_latch() {
+        let armed = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "forward".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 70)], 0, &armed).unwrap();
+        assert!(m
+            .update(&[finger(1, 100)], 0, &armed)
+            .unwrap()
+            .force
+            .is_some());
+        // Offset back to 0 mid-hold: force drops, first holds, no re-attach.
+        let off = Config {
+            force_offset: 0,
+            ..armed
+        };
+        let out = m.update(&[finger(1, 100)], 0, &off).unwrap();
+        assert!(out.is_empty());
+        assert!(m.force_active().is_none());
+        assert!(!m.finger_force_pressed(1));
+        assert!(m.active().is_some());
+    }
+
+    #[test]
+    fn six_finger_clamp_both_levels() {
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let fingers: Vec<FingerContact> = (1..=6).map(|id| finger(id, 250)).collect();
+        let out = m.update(&fingers, 0, &cfg).unwrap();
+        assert_eq!(out.first.as_ref().unwrap().finger_count, 5);
+        assert_eq!(out.force.as_ref().unwrap().finger_count, 5);
+    }
+
+    #[test]
+    fn force_margin_zero_mirrors_first() {
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 0,
+            force_offset: 20,
+            force_1: "forward".into(),
+            ..Config::default()
+        };
+        // margin 0: force release == force press (84).
+        assert_eq!(ClickMachine::force_release_threshold(&cfg), Some(84));
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 70)], 0, &cfg).unwrap();
+        assert!(m
+            .update(&[finger(1, 100)], 0, &cfg)
+            .unwrap()
+            .force
+            .is_some());
+        // Exactly at the threshold the force finger lets go; first holds.
+        let out = m.update(&[finger(1, 84)], 0, &cfg).unwrap();
+        assert!(out.is_empty());
+        assert!(m.force_active().is_none());
+        assert!(m.active().is_some());
+    }
+
+    #[test]
+    fn force_threshold_clamp_symmetry() {
+        // Unvalidated extremes clamp exactly like press/release_threshold.
+        let cfg = Config {
+            sensitivity: 0,
+            margin: 300,
+            force_offset: 300,
+            ..Config::default()
+        };
+        assert_eq!(press_threshold(&cfg), 1);
+        assert_eq!(release_threshold(&cfg), 0);
+        assert_eq!(ClickMachine::force_threshold(&cfg), Some(1 + 255));
+        assert_eq!(ClickMachine::force_release_threshold(&cfg), Some(1));
+    }
+
+    #[test]
+    fn partial_finger_lift_releases_force_holds_first() {
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "forward".into(),
+            force_2: "forward".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        // A deep + B medium: both levels latch with count 2.
+        let out = m.update(&[finger(1, 100), finger(2, 70)], 0, &cfg).unwrap();
+        assert!(out.first.is_some() && out.force.is_some());
+        // A lifts, B stays medium: force drops (no deep finger left), first
+        // holds on B.
+        let out = m.update(&[lifted(1), finger(2, 70)], 0, &cfg).unwrap();
+        assert!(out.is_empty());
+        assert!(m.force_active().is_none());
+        assert!(m.active().is_some());
+    }
+
+    #[test]
+    fn parse_error_leaves_state_untouched() {
+        let bad = Config {
+            click_1: "bogus-key".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        assert!(m.update(&[finger(1, 200)], 0, &bad).is_err());
+        assert!(m.active().is_none());
+        assert!(!m.finger_pressed(1));
+        // Retry with a fixed config fires on the same pressure.
+        let out = m.update(&[finger(1, 200)], 0, &Config::default()).unwrap();
+        assert!(out.first.is_some());
+    }
+
+    #[test]
+    fn force_parse_error_does_not_swallow_first_edge() {
+        let bad = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "bogus-key".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        assert!(m.update(&[finger(1, 250)], 0, &bad).is_err());
+        // Neither level latched: the good first edge is retried, not lost.
+        assert!(m.active().is_none());
+        assert!(m.force_active().is_none());
+        let good = Config {
+            force_1: "forward".into(),
+            ..bad
+        };
+        let out = m.update(&[finger(1, 250)], 0, &good).unwrap();
+        assert!(out.first.is_some() && out.force.is_some());
     }
 }
