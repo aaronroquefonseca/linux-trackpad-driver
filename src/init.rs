@@ -477,10 +477,11 @@ pub fn init_usb_recorded(
 ///
 /// Resume regression (RESEARCH §6): Trackpad 2 USB drops out of multitouch
 /// mode across a power transition (report `0x02` shrinks 21→8 bytes; clicks
-/// survive, motion lost until re-init). The resume hook MUST re-run the full
+/// survive, motion lost until re-init). The resume path MUST re-run the full
 /// USB sequence starting at multitouch enable.
-/// SUSPEND-HOOK: this is the named entry point for the suspend-hook task —
-/// idempotent, same as init; call with the node iface hint when known.
+///
+/// Production entry for the resume path (`ltd resume` hook/one-shot and the
+/// daemon belt-and-braces tick): idempotent, same bytes as init.
 pub fn resume_usb(
     sender: &dyn FeatureSender,
     requested_hz: u32,
@@ -488,6 +489,77 @@ pub fn resume_usb(
 ) -> Result<UsbInitOutcome> {
     log::info!("resume re-init: re-sending multitouch enable first (21→8 byte dropout fix)");
     init_usb_recorded(sender, requested_hz, iface)
+}
+
+/// [`resume_usb`] with whole-sequence retry: same posture as
+/// [`init_usb_with_retry`] — transient failures re-run from multitouch
+/// enable, permanent errors fail fast.
+pub fn resume_usb_with_retry(
+    sender: &dyn FeatureSender,
+    requested_hz: u32,
+    iface: Option<u8>,
+) -> Result<UsbInitOutcome> {
+    let mut last_err = None;
+    for attempt in 1..=DEFAULT_INIT_ATTEMPTS {
+        match resume_usb(sender, requested_hz, iface) {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                if !is_transient_send_error(&e) {
+                    log::debug!("permanent resume re-init error, not retrying sequence: {e:#}");
+                    return Err(e).with_context(|| {
+                        format!("resume re-init failed after {attempt} attempt(s)")
+                    });
+                }
+                log::warn!(
+                    "resume re-init attempt {attempt}/{DEFAULT_INIT_ATTEMPTS} failed: {e:#}"
+                );
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
+            }
+        }
+    }
+    Err(last_err.expect("retry loop always errors here"))
+        .with_context(|| format!("resume re-init failed after {DEFAULT_INIT_ATTEMPTS} attempts"))
+}
+
+/// [`resume_usb`] + best-effort `HIDIOCGFEATURE` verify of the polling report.
+///
+/// Same contract as [`init_usb_verified`]: only an `Ok(false)` mismatch
+/// re-runs the whole sequence from multitouch enable; an unreadable verify
+/// (`Err`) is a best-effort warning, not fatal.
+pub fn resume_usb_verified(
+    sender: &dyn FeatureSender,
+    verifier: &dyn ReportVerifier,
+    requested_hz: u32,
+    iface: Option<u8>,
+) -> Result<UsbInitOutcome> {
+    let mut last_mismatch = 0u32;
+    for attempt in 1..=DEFAULT_INIT_ATTEMPTS {
+        let outcome = resume_usb_with_retry(sender, requested_hz, iface)?;
+        let expected = polling_report(outcome.plan.x);
+        match verifier.verify(&expected) {
+            Ok(true) => {
+                return Ok(outcome);
+            }
+            Ok(false) => {
+                last_mismatch += 1;
+                if attempt >= DEFAULT_INIT_ATTEMPTS {
+                    break;
+                }
+                log::warn!(
+                    "resume polling verify mismatch (attempt {attempt}/{DEFAULT_INIT_ATTEMPTS}); re-running from multitouch enable"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)));
+            }
+            Err(e) => {
+                log::warn!(
+                    "resume polling verify unreadable: {e:#}; accepting re-init (firmware may NAK reads)"
+                );
+                return Ok(outcome);
+            }
+        }
+    }
+    anyhow::bail!("resume polling verify mismatch after {DEFAULT_INIT_ATTEMPTS} attempts ({last_mismatch} mismatches)");
 }
 
 /// Read-back side of verify-after-write. Real hardware vs. test stub.
@@ -1165,6 +1237,57 @@ mod tests {
         assert!(out.multitouch_accepted);
         assert_eq!(rec.sent.borrow()[0], vec![0x02, 0x01]);
         assert_eq!(rec.sent.borrow().len(), 3);
+    }
+
+    #[test]
+    fn resume_with_retry_recovers_from_transient_flakes() {
+        let s = FlakySender {
+            failures: RefCell::new(2),
+            errno: libc::ENOENT,
+            sent: RefCell::new(Vec::new()),
+        };
+        let out = resume_usb_with_retry(&s, 110, Some(2)).unwrap();
+        assert_eq!(out.plan.x, 0x23);
+        assert_eq!(out.iface, Some(2));
+        assert!(out.multitouch_accepted);
+        assert_eq!(s.sent.borrow().len(), 3);
+        assert_eq!(s.sent.borrow()[0], vec![0x02, 0x01]);
+    }
+
+    #[test]
+    fn resume_with_retry_fails_fast_on_permanent_error() {
+        let s = FlakySender {
+            failures: RefCell::new(usize::MAX / 2),
+            errno: libc::EINVAL,
+            sent: RefCell::new(Vec::new()),
+        };
+        let before = std::time::Instant::now();
+        assert!(resume_usb_with_retry(&s, 110, None).is_err());
+        assert!(s.sent.borrow().is_empty());
+        assert!(before.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn resume_verified_retries_whole_sequence_on_mismatch() {
+        let rec = Recorder::default();
+        let verifier = StubVerifier::with_results(vec![Ok(false), Ok(true)]);
+        let out = resume_usb_verified(&rec, &verifier, 110, Some(1)).unwrap();
+        assert_eq!(out.plan.x, 0x23);
+        assert_eq!(out.iface, Some(1));
+        // Two full sequences (multitouch first each time).
+        assert_eq!(rec.sent.borrow().len(), 6);
+        assert_eq!(rec.sent.borrow()[0], vec![0x02, 0x01]);
+        assert_eq!(rec.sent.borrow()[3], vec![0x02, 0x01]);
+    }
+
+    #[test]
+    fn resume_verified_tolerates_unreadable_readback() {
+        let rec = Recorder::default();
+        let verifier =
+            StubVerifier::with_results(vec![Err(anyhow::anyhow!("firmware NAKs reads"))]);
+        // Warning, not fatal.
+        assert!(resume_usb_verified(&rec, &verifier, 110, None).is_ok());
+        assert_eq!(rec.sent.borrow()[0], vec![0x02, 0x01]);
     }
 
     #[test]
