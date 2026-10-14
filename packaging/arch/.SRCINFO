@@ -1,6 +1,6 @@
 pkgbase = linux-trackpad-driver-git
 	pkgdesc = Userspace Rust driver for Apple Magic Trackpad 2 (USB/BT core-init)
-	pkgver = 20261014.r52.g3c641e0
+	pkgver = 20261014.r74.g4481b60
 	pkgrel = 1
 	url = https://github.com/aaronroquefonseca/linux-trackpad-driver
 	install = ltd.install

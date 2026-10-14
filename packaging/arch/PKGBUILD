@@ -7,7 +7,7 @@
 # (YYYYMMDD.r<rev-count>.g<short-hash>). Once upstream tags releases
 # (e.g. v0.1.0), switch pkgver() to `git describe --long --tags`.
 pkgname=linux-trackpad-driver-git
-pkgver=20261014.r52.g3c641e0
+pkgver=20261014.r74.g4481b60
 pkgrel=1
 pkgdesc="Userspace Rust driver for Apple Magic Trackpad 2 (USB/BT core-init)"
 arch=('x86_64' 'aarch64')
