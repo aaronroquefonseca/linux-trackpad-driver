@@ -37,7 +37,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 
 | ID | Branch | Depends | Scope | Status |
 |----|--------|---------|-------|--------|
-| uinput-proxy | T3 `72899193` — branch `feat/uinput-proxy` @ `98e8c08` | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | RUNNING |
+| uinput-proxy | T3 `72899193` — PR #6 `28f98ab` (119+5 green per owner) | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | OPEN, IN REVIEW (3 threads: `21ee3a3b` Spark, `80fcd0c5` MiMo, `eec4e988` Step5) |
 | suspend-hook | waits for #4 merge | `feat/suspend-hook` | resume re-init, re-attach | QUEUED |
 
 ## Phase 1 — wave 3
