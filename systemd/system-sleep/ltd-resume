@@ -1,0 +1,39 @@
+#!/bin/sh
+# ltd-resume — systemd system-sleep hook: re-enable multitouch after resume.
+#
+# Install as /usr/lib/systemd/system-sleep/ltd-resume (or
+# /etc/systemd/system-sleep/ltd-resume for a local override), mode 0755.
+# systemd runs executables in system-sleep/ as:
+#   ltd-resume pre|post suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+#
+# SYSTEM-SIDE ONLY: user.slice is frozen while sleep hooks run (see
+# docs/RESEARCH.md §6 "Sleep hooks"), so this hook MUST NOT touch user
+# sessions: no systemctl --user, no su/sudo -u, no machinectl shell, no
+# session D-Bus, no notify-send. It only re-runs the system entry
+# `ltd resume`, which re-verifies every trackpad node and re-sends the USB
+# init sequence from multitouch enable on mismatch (report 0x02 21→8 byte
+# dropout fix: motion lost until re-init, clicks survive).
+#
+# `pre` is intentionally a no-op: suspend needs no disengage.
+set -eu
+
+LTD_BIN="${LTD_BIN:-/usr/bin/ltd}"
+# Sleep hooks inherit PID1's environment, not the daemon's: without this,
+# `ltd resume` would re-init at defaults (110 Hz) while the daemon and its
+# tick verify against the system config — a perpetual mismatch re-init loop
+# — and BT re-suppression would never fire on the primary path. A missing
+# file falls back to defaults (same as the units below).
+LTD_CONFIG="${LTD_CONFIG:-/etc/linux-trackpad-driver/config.toml}"
+export LTD_CONFIG
+
+case "${1:-} ${2:-}" in
+    "post suspend" | "post hibernate" | "post hybrid-sleep" | "post suspend-then-hibernate")
+        if [ -x "$LTD_BIN" ]; then
+            # Best-effort: a driver hiccup must never perturb the sleep
+            # cycle, so a failure is reported (journal) and swallowed.
+            "$LTD_BIN" resume || echo "ltd-resume: ltd resume failed (see journal)" >&2
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,29 @@
+# Post-resume re-init for linux-trackpad-driver, for setups that prefer
+# unit indirection over (or in addition to) the system-sleep hook.
+#
+# Activation: there is no resume.target to Want — WantedBy=sleep targets
+# would run BEFORE suspend (wrong direction for re-init). The post-resume
+# trigger is the system-sleep hook systemd/system-sleep/ltd-resume; this
+# unit also serves manual runs:
+#   sudo systemctl start linux-trackpad-driver-resume.service
+# The daemon's belt-and-braces tick covers anything in between (see
+# src/resume.rs). Enabling this unit adds a harmless idempotent re-init
+# pass at boot.
+#
+# SYSTEM-SIDE ONLY: no user-session IPC (user.slice is frozen while sleep
+# hooks run; see docs/RESEARCH.md §6). No --user units, no session D-Bus.
+[Unit]
+Description=Linux Trackpad Driver — resume re-init
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+Wants=systemd-udevd.service
+
+[Service]
+Type=oneshot
+# System config for resume re-inits (the hook passes no -c): explicit -c on
+# the command line still wins. A missing file falls back to defaults.
+Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
+ExecStart=/usr/bin/ltd resume
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
