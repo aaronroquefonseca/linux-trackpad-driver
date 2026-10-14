@@ -1510,4 +1510,147 @@ mod tests {
         hub.emit(&detached("/dev/hidraw1", Transport::Usb));
         assert!(!proxy.lock().unwrap().is_attached());
     }
+
+    fn force_cfg() -> Config {
+        Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "forward".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn force_disabled_no_behavior_change() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default(); // force_offset = 0
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(!ev.is_force());
+        assert_eq!(ev.finger_count, 1);
+        // First-level keys only; no forward key from the force map.
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(!uinput.has(EV_KEY, BTN_EXTRA, 1));
+    }
+
+    #[test]
+    fn force_edge_holds_both_key_sets() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = force_cfg();
+        let first = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(!first.is_force());
+        let second = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(second.is_force());
+        assert_eq!(second.finger_count, 1);
+        // Coexist: left (first) still down, forward (force) now down too.
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        // Force supersedes in reporting; haptic falls back to standard 5.
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(5, false), (5, false)]
+        );
+    }
+
+    #[test]
+    fn force_haptic_override_and_quiet_waveform() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            force_haptic: Some(9),
+            force_quiet_click: true,
+            ..force_cfg()
+        };
+        px.handle_frame(&cfg).unwrap();
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(ev.haptic, 9);
+        assert!(ev.quiet);
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(5, false), (9, true)]
+        );
+    }
+
+    #[test]
+    fn force_release_returns_to_first_hold_then_full_release() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        // 70 = first hold; 100 = past force press (84); 70 = below force
+        // release (79) but above first release (59); 10 = below all.
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = force_cfg();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        // Force release: forward up, left still down (BTN_LEFT re-asserted).
+        px.handle_frame(&cfg).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_EXTRA, 0));
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        // Full release: left up.
+        px.handle_frame(&cfg).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 0));
+    }
+
+    #[test]
+    fn force_two_finger_map_selects_force_2() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(
+                vec![finger(1, 100, 0, 0), finger(2, 100, 9, 9)],
+                0,
+            ))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            force_2: "right".into(),
+            ..force_cfg()
+        };
+        px.handle_frame(&cfg).unwrap();
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(ev.finger_count, 2);
+        assert!(uinput.has(EV_KEY, BTN_RIGHT, 1));
+    }
+
+    #[test]
+    fn force_never_fires_past_u8_range() {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![finger(1, 255, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            sensitivity: 255,
+            margin: 5,
+            force_offset: 255,
+            force_1: "forward".into(),
+            ..Config::default()
+        };
+        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        assert!(!ev.is_force());
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(!uinput.has(EV_KEY, BTN_EXTRA, 1));
+    }
 }
