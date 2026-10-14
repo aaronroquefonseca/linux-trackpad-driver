@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-use crate::{config, daemon};
+use crate::{config, daemon, discovery, lock};
 
 /// Parsed `run` invocation.
 #[derive(Debug, PartialEq, Eq)]
@@ -30,12 +30,19 @@ pub struct ResumeArgs {
     pub config_path: Option<String>,
 }
 
+/// Parsed `doctor` invocation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DoctorArgs {
+    pub config_path: Option<String>,
+}
+
 /// Top-level command after parsing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Run(RunArgs),
     Reconnect(ReconnectArgs),
     Resume(ResumeArgs),
+    Doctor(DoctorArgs),
 }
 
 /// Parse failure: usage/help text vs. a real error. Help exits 0.
@@ -58,7 +65,7 @@ impl From<String> for ParseFailure {
 fn top_usage(prog: &str) -> ParseFailure {
     ParseFailure {
         message: format!(
-            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-p Hz] [-c config]"
+            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-p Hz] [-c config]\n  {prog} doctor [-c config]"
         ),
         is_help: true,
     }
@@ -74,6 +81,71 @@ fn parse_polling_value(s: &str) -> Result<u32, String> {
                 Ok(v)
             }
         })
+}
+
+/// One scanned node plus read-only status for [`doctor_report`].
+/// All fields come from sysfs/`/dev` stat checks — nothing here sends
+/// reports or changes hardware state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorNode {
+    pub devnode: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub transport: String,
+    pub node_present: bool,
+    pub driver_bound: bool,
+}
+
+/// Render the `doctor` first-run checklist. Pure (no I/O) so unit tests
+/// cover the formatting.
+///
+/// Returns `(report, ok)`: `ok` is false when the config is invalid or no
+/// trackpad node was seen. The socket state is informational only — a
+/// stopped daemon is the expected pre-enable state, not a failure.
+pub fn doctor_report(
+    config_source: &str,
+    config_error: Option<&str>,
+    nodes: &[DoctorNode],
+    socket_path: &str,
+    socket_live: bool,
+) -> (String, bool) {
+    let mut out = String::new();
+    let mut ok = true;
+    match config_error {
+        None => out.push_str(&format!("[ok] config valid ({config_source})\n")),
+        Some(e) => {
+            out.push_str(&format!("[FAIL] config invalid ({config_source}): {e}\n"));
+            ok = false;
+        }
+    }
+    if nodes.is_empty() {
+        out.push_str("[FAIL] no trackpad seen: no 05ac:0265/0324 or 004c:0265/0324 hidraw node\n");
+        ok = false;
+    } else {
+        for n in nodes {
+            let presence = if n.node_present { "present" } else { "MISSING" };
+            let bind = if n.driver_bound {
+                "driver bound"
+            } else {
+                "driver not (yet) bound"
+            };
+            out.push_str(&format!(
+                "[ok] device seen: {} {:04x}:{:04x} ({}, {presence}, {bind})\n",
+                n.devnode, n.vendor_id, n.product_id, n.transport
+            ));
+            if !n.node_present {
+                ok = false;
+            }
+        }
+    }
+    if socket_live {
+        out.push_str(&format!("[ok] daemon socket live ({socket_path})\n"));
+    } else {
+        out.push_str(&format!(
+            "[..] daemon socket absent ({socket_path}); enable with: systemctl enable --now linux-trackpad-driver.service\n"
+        ));
+    }
+    (out, ok)
 }
 
 /// Parse argv (including program name at index 0) into a [`Command`].
@@ -208,6 +280,32 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
                 config_path,
             }))
         }
+        "doctor" => {
+            let mut config_path: Option<String> = None;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "-c" | "--config" => {
+                        i += 1;
+                        let v = rest
+                            .get(i)
+                            .ok_or_else(|| "doctor: -c/--config requires a value".to_string())?;
+                        config_path = Some(v.clone());
+                        i += 1;
+                    }
+                    "-h" | "--help" => {
+                        return Err(ParseFailure {
+                            message: format!("usage: {prog} doctor [-c config]"),
+                            is_help: true,
+                        });
+                    }
+                    other => {
+                        return Err(format!("doctor: unknown option '{other}'").into());
+                    }
+                }
+            }
+            Ok(Command::Doctor(DoctorArgs { config_path }))
+        }
         other => Err(format!("unknown command '{other}'; see '{prog} help'").into()),
     }
 }
@@ -273,6 +371,44 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
                     log::error!("resume failed: {e:#}");
                     Ok(ExitCode::from(1))
                 }
+            }
+        }
+        Command::Doctor(doc) => {
+            // Read-only by construction: sysfs scan + stat checks + socket
+            // dial only. Never sends feature reports, never grabs.
+            let source = doc
+                .config_path
+                .clone()
+                .or_else(config::config_path_from_env)
+                .unwrap_or_else(|| "<built-in defaults>".to_string());
+            let config_error = config::load_or_default_with_env(doc.config_path.as_deref())
+                .err()
+                .map(|e| format!("{e:#}"));
+            let nodes: Vec<DoctorNode> = match discovery::scan_trackpads() {
+                Ok(devs) => devs
+                    .iter()
+                    .map(|d| DoctorNode {
+                        devnode: d.devnode.clone(),
+                        vendor_id: d.vendor_id,
+                        product_id: d.product_id,
+                        transport: format!("{:?}", d.transport),
+                        node_present: std::path::Path::new(&d.devnode).exists(),
+                        driver_bound: discovery::driver_bound_for_node(&d.devnode),
+                    })
+                    .collect(),
+                Err(e) => {
+                    eprintln!("ltd doctor: sysfs scan failed: {e:#}");
+                    Vec::new()
+                }
+            };
+            let sock = lock::socket_path();
+            let live = lock::daemon_socket_present(&sock);
+            let (report, ok) = doctor_report(&source, config_error.as_deref(), &nodes, &sock, live);
+            print!("{report}");
+            if ok {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::from(1))
             }
         }
     }
@@ -399,10 +535,90 @@ mod tests {
             vec!["ltd", "--help"],
             vec!["ltd", "run", "--help"],
             vec!["ltd", "reconnect", "--help"],
+            vec!["ltd", "doctor", "--help"],
         ] {
             let err = parse_args(&argv(&args)).unwrap_err();
             assert!(err.is_help, "args {args:?} should be help");
         }
+    }
+
+    #[test]
+    fn doctor_defaults_and_flags() {
+        assert_eq!(
+            parse_args(&argv(&["ltd", "doctor"])),
+            Ok(Command::Doctor(DoctorArgs { config_path: None }))
+        );
+        assert_eq!(
+            parse_args(&argv(&["ltd", "doctor", "-c", "/tmp/x.toml"])),
+            Ok(Command::Doctor(DoctorArgs {
+                config_path: Some("/tmp/x.toml".into()),
+            }))
+        );
+        assert!(parse_args(&argv(&["ltd", "doctor", "-c"])).is_err());
+        assert!(parse_args(&argv(&["ltd", "doctor", "-f"])).is_err());
+    }
+
+    fn doctor_node() -> DoctorNode {
+        DoctorNode {
+            devnode: "/dev/hidraw2".to_string(),
+            vendor_id: 0x05ac,
+            product_id: 0x0324,
+            transport: "Usb".to_string(),
+            node_present: true,
+            driver_bound: true,
+        }
+    }
+
+    #[test]
+    fn doctor_report_healthy() {
+        let (report, ok) = doctor_report(
+            "<built-in defaults>",
+            None,
+            &[doctor_node()],
+            "/run/linux-trackpad-driver/driver.sock",
+            true,
+        );
+        assert!(ok);
+        assert!(report.contains("[ok] config valid"));
+        assert!(report.contains("/dev/hidraw2"));
+        assert!(report.contains("05ac:0324"));
+        assert!(report.contains("daemon socket live"));
+    }
+
+    #[test]
+    fn doctor_report_no_device_fails_but_socket_absent_only_warns() {
+        let (report, ok) = doctor_report("<built-in defaults>", None, &[], "/sock", false);
+        assert!(!ok);
+        assert!(report.contains("[FAIL] no trackpad seen"));
+        assert!(report.contains("[..] daemon socket absent"));
+
+        // Socket absent alone is not a failure (expected pre-enable state).
+        let (_, ok) = doctor_report(
+            "<built-in defaults>",
+            None,
+            &[doctor_node()],
+            "/sock",
+            false,
+        );
+        assert!(ok);
+    }
+
+    #[test]
+    fn doctor_report_bad_config_and_missing_node_fail() {
+        let (report, ok) = doctor_report(
+            "/tmp/bad.toml",
+            Some("invalid polling_rate 500 (want 1..=110)"),
+            &[],
+            "/sock",
+            false,
+        );
+        assert!(!ok);
+        assert!(report.contains("[FAIL] config invalid"));
+
+        let mut gone = doctor_node();
+        gone.node_present = false;
+        let (_, ok) = doctor_report("<built-in defaults>", None, &[gone], "/sock", true);
+        assert!(!ok);
     }
 
     #[test]
