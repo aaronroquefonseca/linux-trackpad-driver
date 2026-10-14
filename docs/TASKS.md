@@ -37,8 +37,8 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 
 | ID | Branch | Depends | Scope | Status |
 |----|--------|---------|-------|--------|
-| uinput-proxy | `feat/uinput-proxy` | apple-parse + config-schema merged | evdev grab + uinput emit, 1–5 map | QUEUED |
-| suspend-hook | `feat/suspend-hook` | reconnect-bt merged | resume re-init, re-attach | QUEUED |
+| uinput-proxy | T3 `72899193` — branch `feat/uinput-proxy` @ `98e8c08` | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | RUNNING |
+| suspend-hook | waits for #4 merge | `feat/suspend-hook` | resume re-init, re-attach | QUEUED |
 
 ## Phase 1 — wave 3
 
