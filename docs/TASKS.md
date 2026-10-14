@@ -39,7 +39,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 |----|--------|-----------------|-------|--------|
 | uinput-proxy | T3 `72899193` — PR #6 `ac25da8` (5 L1 + L2 fixed, verified, head==PR head) | `feat/uinput-proxy` @ `ltd-wt/uinput-proxy` | evdev grab + uinput emit, 1–5 map | DONE, MERGED (`e81d15e`). Owner + 3 reviewers SETTLED |
 | suspend-hook | T3 `01236349` — PR #7 `da81c73` (L1 A/B/C + L2 fixed, verified) | `feat/suspend-hook` | resume re-init, re-attach | DONE, MERGED (`3c641e0`). Owner + 3 reviewers SETTLED |
-| packaging-deb | T3 `5f88ee50` | `feat/packaging-deb` @ `ltd-wt/packaging-deb` | Debian package | RUNNING |
+| packaging-deb | T3 `5f88ee50` — PR #12 (CI ci+deb green, scripts verified) | `feat/packaging-deb` | Debian package | DONE, MERGED (`ff51b63`). Owner SETTLED |
 | packaging-aur | T3 `ef21e59c` — PR #10 (packaging-only, validated) | `feat/packaging-aur` | AUR PKGBUILD | DONE, MERGED. Owner SETTLED |
 | env-flake | T3 `086f869b` — PR #11 `3524627` (verified green) | `fix/env-test-serial` | serialize env tests | DONE, MERGED. Owner SETTLED |
 | evdev-stub | T3 `c409658b` — PR #9 `692f8e2` (180+11 green at head) | `feat/evdev-generic-stub` | tier scaffold | DONE, MERGED. Owner SETTLED |
