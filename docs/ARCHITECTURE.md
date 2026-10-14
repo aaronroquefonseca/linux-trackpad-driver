@@ -90,6 +90,11 @@ bits 6..7 are device-timestamp bits, not buttons.
   (`left/right/middle/none/empty`/key-combo).
 - `force_offset > 0` arms second level at `sensitivity + force_offset`
   with `force_1..=force_5`, optional `force_haptic` override.
+- Force releases at `sensitivity + force_offset - margin` (saturating);
+  since that is ≥ the first release, force always drops at or before the
+  first level. First and force latches are independent and coexist (both key
+  sets held; a code held by both stays down until both release); a drop below
+  the first release clears both. Disabling mid-hold clears force (proxy releases).
 - `haptic` 0..=255 output strength; `quiet_click` selects soft waveform.
 - `speed` scales pointer motion only in proxy path; never touches init.
 
