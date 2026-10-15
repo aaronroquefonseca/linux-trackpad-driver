@@ -170,7 +170,8 @@ pub fn resolve_haptic_node(
             if2.push(base);
         }
     }
-    if2.sort();
+    // Numeric (hidraw2 < hidraw10); lexicographic would invert them.
+    crate::discovery::sort_numerically(&mut if2);
     match if2.into_iter().next() {
         Some(base) => {
             let node = format!("{dev_prefix}/{base}");
@@ -431,6 +432,43 @@ mod tests {
         assert_eq!(
             resolve_haptic_node("/dev/hidraw9", &hroot, dp),
             ("/dev/hidraw9".to_string(), Some(2))
+        );
+    }
+
+    #[test]
+    fn haptic_resolves_if2_in_owner_four_iface_layout() {
+        // Owner 2026-10-15: hidraw8=If0, hidraw9=If1 (pump), hidraw10=If2
+        // (actuator), hidraw11=If3 — all under one USB device. From the If1
+        // pump node the haptic node must be the hidraw10-class If2 sibling,
+        // never If3 or the touch node itself.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw8")).unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw9")).unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw10")).unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw11")).unwrap();
+        let usb = dir.path().join("devices/usb1");
+        for (iface, hid) in [(0u8, "hid0"), (1, "hid1"), (2, "hid2"), (3, "hid3")] {
+            let if_dir = usb.join(format!("if{iface}"));
+            std::fs::create_dir_all(if_dir.join(hid)).unwrap();
+            std::fs::write(if_dir.join("bInterfaceNumber"), format!("{iface:02}\n")).unwrap();
+        }
+        #[cfg(unix)]
+        for (base, iface, hid) in [
+            ("hidraw8", 0u8, "hid0"),
+            ("hidraw9", 1, "hid1"),
+            ("hidraw10", 2, "hid2"),
+            ("hidraw11", 3, "hid3"),
+        ] {
+            std::os::unix::fs::symlink(
+                usb.join(format!("if{iface}/{hid}")),
+                dir.path().join(format!("hidraw/{base}/device")),
+            )
+            .unwrap();
+        }
+        let hroot = dir.path().join("hidraw").to_str().unwrap().to_string();
+        assert_eq!(
+            resolve_haptic_node("/dev/hidraw9", &hroot, "/dev"),
+            ("/dev/hidraw10".to_string(), Some(2))
         );
     }
 

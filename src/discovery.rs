@@ -16,16 +16,13 @@
 //! host-click to If2; until sibling discovery lands, we send the full sequence
 //! to the given node (device ignores what is not for it) and log the iface.
 //!
-//! Scan ordering (load-bearing for the pump): MT-proven interfaces
-//! first, then other input-having, then bare, then numeric trailing
-//! index. The daemon binds the first `Ready` permanently, so a
-//! lexicographic sort would hand the pump to hidraw10 —
-//! an input-less feature interface with no touch reports — and even
-//! numeric-first is not enough: hidraw numbers shift across
-//! enumeration (owner hardware 2026-10-15: silent hidraw8 sorted
-//! before streaming hidraw9). Only sysfs MT proof
-//! (`device/capabilities/abs` carrying `ABS_MT_SLOT`/multitouch bits
-//! on an input child) promotes a node to the front.
+//! Scan ordering (load-bearing for the pump): USB interface 1 first
+//! (old-driver rule: If1=pump, If2=actuator; owner hardware 2026-10-15:
+//! silent hidraw8=If0, streaming hidraw9=If1, hidraw10=If2, hidraw11=If3).
+//! MT abs-bit rank is a tiebreak only — If0 can carry MT-capable input
+//! children yet stay silent, so MT proof alone misbinds. Numeric /
+//! lexicographic order never decides (hidraw numbers shift across
+//! enumeration).
 
 use anyhow::Result;
 
@@ -128,19 +125,17 @@ fn scan_sysfs(class_dir: &str) -> Result<Vec<DiscoveredDevice>> {
         });
     }
     // Order matters: the daemon inits (and the pump binds) in scan order,
-    // so the multitouch interface must come first. Lexicographic sort
-    // puts hidraw10 before hidraw8 (and event10 before event2) — and
-    // hidraw10/11 are input-less feature interfaces that would bind the
-    // pump to a node with no touch reports. Worse, hidraw numbers shift
-    // across enumeration (owner 2026-10-15: silent hidraw8 before
-    // streaming hidraw9), so numeric order alone still misbinds.
-    // Proven order: MT-capable input children first (abs MT bits), then
-    // other input children, then bare; numeric trailing index breaks ties.
+    // so the multitouch USB interface (bInterfaceNumber == 1) comes first
+    // — the old-driver rule (If1=pump, If2=actuator), hardware-proven on
+    // owner MT2 USB-C 2026-10-15 (silent hidraw8=If0, streaming hidraw9=If1).
+    // MT abs-bit rank is a tiebreak only: If0 can expose MT-capable input
+    // children yet stay silent, so MT proof alone misbinds. Numeric /
+    // lexicographic order never decides: hidraw numbers shift across
+    // enumeration, and no trailing-index/devnode tiebreak is consulted.
     out.sort_by_cached_key(|d| {
         (
+            iface_preference_with_root(&d.devnode, class_dir),
             rank_with_root(&d.devnode, class_dir),
-            trailing_int(&d.devnode).unwrap_or(u64::MAX),
-            d.devnode.clone(),
         )
     });
     Ok(out)
@@ -175,6 +170,18 @@ fn rank_with_root(devnode: &str, class_root: &str) -> InterfaceRank {
     }
 }
 
+/// Pump-selection preference for a hidraw node: `0` for USB interface 1
+/// (the pump interface), `1` for anything else (other interface number,
+/// unknown layout, BT). Lower sorts first; MT rank tiebreaks within a
+/// preference tier. Pure ordering helper around
+/// [`interface_number_with_root`].
+fn iface_preference_with_root(devnode: &str, class_root: &str) -> u8 {
+    match interface_number_with_root(devnode, class_root) {
+        Some(1) => 0,
+        _ => 1,
+    }
+}
+
 /// Human-readable selection reason for the attach INFO log.
 /// Production root; see [`selection_reason_with_root`] for tests.
 pub fn selection_reason_for_node(devnode: &str) -> String {
@@ -182,15 +189,20 @@ pub fn selection_reason_for_node(devnode: &str) -> String {
 }
 
 pub(crate) fn selection_reason_with_root(devnode: &str, class_root: &str) -> String {
+    let iface = interface_number_with_root(devnode, class_root);
+    let basis = match iface {
+        Some(1) => "interface-1 preferred (If1 pump rule)",
+        _ => "not If1 (MT-rank tiebreak only)",
+    };
     match rank_with_root(devnode, class_root) {
         InterfaceRank::MtCapable => {
-            format!("{devnode}: MT-capable input children (abs MT bits present)")
+            format!("{devnode}: interface {iface:?}, {basis}; MT-capable input children (abs MT bits present)")
         }
         InterfaceRank::InputOnly => {
-            format!("{devnode}: input children without MT abs bits (silent-risk)")
+            format!("{devnode}: interface {iface:?}, {basis}; input children without MT abs bits (silent-risk)")
         }
         InterfaceRank::Bare => {
-            format!("{devnode}: no input children (feature-only interface?)")
+            format!("{devnode}: interface {iface:?}, {basis}; no input children (feature-only interface?)")
         }
     }
 }
@@ -643,7 +655,10 @@ mod tests {
     fn scan_prefers_input_having_node_numerically() {
         // Lexicographic order would be hidraw10, hidraw2, hidraw8: the
         // input-less feature interface first. The pump binds the first
-        // Ready permanently, so the touch interfaces must win, numerically.
+        // Ready permanently, so input-having interfaces must sort before
+        // the bare one. No interface layout here (all non-If1), so MT
+        // rank tiebreaks; the bare node sorts last while the two tied
+        // touch nodes may appear in either order (numeric never decides).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("hidraw");
         std::fs::create_dir_all(&root).unwrap();
@@ -657,8 +672,11 @@ mod tests {
         fake_trackpad_node(&root, "hidraw8", &hid_touch_a, true);
         fake_trackpad_node(&root, "hidraw2", &hid_touch_b, true);
         let devs = scan_sysfs(root.to_str().unwrap()).unwrap();
-        let nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
-        assert_eq!(nodes, vec!["/dev/hidraw2", "/dev/hidraw8", "/dev/hidraw10"]);
+        let mut nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
+        let last = nodes.pop().unwrap();
+        assert_eq!(last, "/dev/hidraw10");
+        nodes.sort_unstable();
+        assert_eq!(nodes, vec!["/dev/hidraw2", "/dev/hidraw8"]);
     }
 
     fn fake_trackpad_node_ranked(
@@ -719,6 +737,84 @@ mod tests {
             rank_with_root("/dev/hidraw8", root.to_str().unwrap()),
             InterfaceRank::InputOnly
         );
+    }
+
+    fn fake_iface_trackpad_node(
+        root: &std::path::Path,
+        base: &str,
+        usb_dev: &std::path::Path,
+        iface: u8,
+        hid_leaf: &str,
+        input_kind: &str,
+    ) {
+        // Owner USB layout: <usb_dev>/ifN/bInterfaceNumber + <usb_dev>/ifN/<hid>/...
+        // `device` symlinks into the HID dir; the iface number is found by
+        // walking up from the canonicalized HID dir.
+        let if_dir = usb_dev.join(format!("if{iface}"));
+        let hid_dir = if_dir.join(hid_leaf);
+        std::fs::create_dir_all(&hid_dir).unwrap();
+        std::fs::write(if_dir.join("bInterfaceNumber"), format!("{iface:02}\n")).unwrap();
+        std::fs::create_dir_all(root.join(base)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&hid_dir, root.join(base).join("device")).unwrap();
+        std::fs::write(
+            root.join(base).join("device/uevent"),
+            "HID_ID=0003:000005AC:00000324\nHID_NAME=Apple Inc. Magic Trackpad\n",
+        )
+        .unwrap();
+        match input_kind {
+            "mt" => {
+                let caps = hid_dir.join("input/input20/capabilities");
+                std::fs::create_dir_all(&caps).unwrap();
+                // Live owner abs value: carries bits 47 + 58.
+                std::fs::write(caps.join("abs"), "673800001000003\n").unwrap();
+            }
+            "input" => {
+                let caps = hid_dir.join("input/input21/capabilities");
+                std::fs::create_dir_all(&caps).unwrap();
+                std::fs::write(caps.join("abs"), "0\n").unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn scan_if1_beats_mt_capable_if0_owner_layout() {
+        // Owner 2026-10-15 (MT2 USB-C 05ac:0324): hidraw8=If0 silent,
+        // hidraw9=If1 STREAMS, hidraw10=If2, hidraw11=If3. Adversarial bit:
+        // If0 carries MT-capable input children (the old ranker promoted
+        // it) and is numerically first — If1 must still win on the
+        // interface-number rule; MT rank is a tiebreak only and numeric
+        // order never decides.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(&root).unwrap();
+        let usb_dev = dir.path().join("devices/usb1");
+        fake_iface_trackpad_node(&root, "hidraw8", &usb_dev, 0, "hid0", "mt");
+        fake_iface_trackpad_node(&root, "hidraw9", &usb_dev, 1, "hid1", "mt");
+        fake_iface_trackpad_node(&root, "hidraw10", &usb_dev, 2, "hid2", "bare");
+        fake_iface_trackpad_node(&root, "hidraw11", &usb_dev, 3, "hid3", "bare");
+        let rs = root.to_str().unwrap();
+        assert_eq!(interface_number_with_root("/dev/hidraw8", rs), Some(0));
+        assert_eq!(interface_number_with_root("/dev/hidraw9", rs), Some(1));
+        assert_eq!(interface_number_with_root("/dev/hidraw10", rs), Some(2));
+        assert_eq!(interface_number_with_root("/dev/hidraw11", rs), Some(3));
+        let devs = scan_sysfs(rs).unwrap();
+        let nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
+        // If1 pump node first; silent If0 second (MT tiebreak over the
+        // bare feature interfaces); bare If2/If3 trail in either order.
+        assert_eq!(nodes[0], "/dev/hidraw9");
+        assert_eq!(nodes[1], "/dev/hidraw8");
+        let mut tail = vec![nodes[2], nodes[3]];
+        tail.sort_unstable();
+        assert_eq!(tail, vec!["/dev/hidraw10", "/dev/hidraw11"]);
+        // Selection basis names the interface rule.
+        let reason = selection_reason_with_root("/dev/hidraw9", rs);
+        assert!(reason.contains("/dev/hidraw9"), "{reason}");
+        assert!(reason.contains("interface-1 preferred"), "{reason}");
+        assert!(reason.contains("Some(1)"), "{reason}");
+        let silent = selection_reason_with_root("/dev/hidraw8", rs);
+        assert!(silent.contains("not If1"), "{silent}");
     }
 
     #[test]
