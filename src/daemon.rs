@@ -404,9 +404,22 @@ pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeR
     } else {
         log::info!("resume: daemon socket absent ({sock}); re-initing hardware directly");
     }
-    let devs = discovery::scan_trackpads().context("scanning hidraw for resume")?;
+    // Journal trace proving the hook/one-shot ran (hook failures are
+    // swallowed to exit 0, so this line is the post-sleep evidence).
+    log::info!("resume: hook/one-shot pass starting (polling {polling_hz} Hz)");
+    // The hook can fire before the node re-enumerates: rescan bounded
+    // instead of recording a silent empty no-op. Anything slower is the
+    // daemon tick's job (≤ RESUME_REVERIFY_INTERVAL_SECS).
+    let devs = resume::scan_with_rescan(
+        &|| discovery::scan_trackpads().unwrap_or_default(),
+        resume::RESUME_RESCAN_TIMEOUT_MS,
+        resume::RESUME_RESCAN_INTERVAL_MS,
+    );
     if devs.is_empty() {
-        log::info!("resume: no supported trackpads found; nothing to re-init");
+        log::warn!(
+            "resume: no supported trackpads found after rescan; nothing to re-init; {}",
+            resume::empty_scan_recovery_hint()
+        );
     }
     Ok(resume::run_resume_scan(
         &devs,
@@ -500,9 +513,15 @@ impl ResumeWatch {
         // the wait) are dropped from the stored snapshot below — trusting
         // the fresher wait over the stale scan. They re-enter as added nodes
         // if they come back.
+        let known_devs: Vec<DiscoveredDevice> = self.known.iter().map(|k| k.dev.clone()).collect();
+        // Renumbers (hidraw2→hidraw3) surface here as one removal plus one
+        // addition: the add path below adopts the new node, the remove path
+        // Detaches the stale name — self-heal within this tick.
+        let (_added, removed) = resume::diff_scan(&known_devs, &current);
         let mut detached: Vec<String> = Vec::new();
         for dev in &current {
             let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
+                debug_assert!(_added.iter().any(|d| d.devnode == dev.devnode));
                 match init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, ready_hub) {
                     Ok(_) => {
                         log::info!("resume tick: initialized newly appeared {}", dev.devnode);
@@ -586,15 +605,10 @@ impl ResumeWatch {
                 }
             }
         }
-        for old in &self.known {
-            if !current.iter().any(|d| d.devnode == old.dev.devnode) {
-                log::info!(
-                    "resume tick: {} vanished; emitting Detached",
-                    old.dev.devnode
-                );
-                ready_hub.emit(&init::detached(&old.dev.devnode, old.dev.transport));
-                actions.push(TickAction::Detached(old.dev.devnode.clone()));
-            }
+        for old in &removed {
+            log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
+            ready_hub.emit(&init::detached(&old.devnode, old.transport));
+            actions.push(TickAction::Detached(old.devnode.clone()));
         }
         // Rebuild from the fresh scan, preserving streaks of survivors and
         // dropping mid-pass detachments (list-skew fix).

@@ -40,6 +40,13 @@ pub const RESUME_READY_TIMEOUT_MS: u64 = 1000;
 /// Some firmware NAKs reads forever; without a cooldown every tick would
 /// send a full 3-report re-init + `Ready` for zero new information.
 pub const UNREADABLE_RETRY_EVERY_TICKS: u32 = 20;
+/// Bounded post-resume rescan wait when the first scan sees no trackpad:
+/// the hook can fire before the node re-enumerates, and a single scan would
+/// then record a silent no-op. The resume entry rescans until this budget
+/// runs out; the daemon tick backstops anything slower.
+pub const RESUME_RESCAN_TIMEOUT_MS: u64 = 5000;
+/// Interval between resume rescan passes.
+pub const RESUME_RESCAN_INTERVAL_MS: u64 = 100;
 
 /// Outcome of one resume pass for one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +123,9 @@ pub fn resume_usb_node(
 ) -> Result<ResumeAction> {
     let (node, bound) = discovery::wait_for_ready(devnode, RESUME_READY_TIMEOUT_MS);
     if !node {
-        log::warn!("resume: node {devnode} gone after suspend; recording Detached");
+        log::warn!(
+            "resume: node {devnode} gone after suspend; recording Detached (tick adopts it within one pass if it re-enumerates under a new name)"
+        );
         if let Some(hub) = ready_hub {
             hub.emit(&init::detached(devnode, Transport::Usb));
         }
@@ -163,12 +172,60 @@ pub fn resume_usb_node(
 /// between scan and arm is recorded `Detached`, mirroring the USB arm.
 pub fn resume_bt_node(devnode: &str, enhanced_clicks: bool) -> ResumeAction {
     if !std::path::Path::new(devnode).exists() {
-        log::warn!("resume: BT node {devnode} gone after suspend; recording Detached");
+        log::warn!(
+            "resume: BT node {devnode} gone after suspend; recording Detached (tick adopts it within one pass if it re-enumerates under a new name)"
+        );
         return ResumeAction::Detached;
     }
     let _ = init::apply_bt_coexistence(devnode, enhanced_clicks);
     log::info!("resume: BT {devnode} policy re-applied (hub re-attach is tick-mediated)");
     ResumeAction::Reinitialized
+}
+
+/// Exact recovery command named by every resume dead-end log: no path may
+/// require a manual `systemctl restart` without saying so up front.
+pub fn empty_scan_recovery_hint() -> &'static str {
+    "retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume)"
+}
+
+/// Pure scan diff by devnode: renumbers (hidraw2→hidraw3) read as one
+/// removal plus one addition, so the tick's remove path (`Detached`) and
+/// add path (full init) together self-heal within one tick. An empty
+/// known-set (daemon restarted mid-sleep) adopts the whole scan.
+pub fn diff_scan(
+    known: &[DiscoveredDevice],
+    current: &[DiscoveredDevice],
+) -> (Vec<DiscoveredDevice>, Vec<DiscoveredDevice>) {
+    let added: Vec<DiscoveredDevice> = current
+        .iter()
+        .filter(|d| !known.iter().any(|k| k.devnode == d.devnode))
+        .cloned()
+        .collect();
+    let removed: Vec<DiscoveredDevice> = known
+        .iter()
+        .filter(|k| !current.iter().any(|d| d.devnode == k.devnode))
+        .cloned()
+        .collect();
+    (added, removed)
+}
+
+/// Bounded rescan for the resume entry: the first scan may run before the
+/// node re-enumerates. Returns the first non-empty scan, or the last (empty)
+/// one once `timeout_ms` runs out. The scanner is a parameter so unit tests
+/// cover the late-node path without hardware.
+pub fn scan_with_rescan(
+    scanner: &dyn Fn() -> Vec<DiscoveredDevice>,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Vec<DiscoveredDevice> {
+    let waited = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(timeout_ms);
+    let mut devs = scanner();
+    while devs.is_empty() && waited.elapsed() < budget {
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        devs = scanner();
+    }
+    devs
 }
 
 /// Per-node outcome of [`run_resume_scan`].
@@ -203,16 +260,23 @@ impl ResumeReport {
 /// Hardware-only: passes no hub, emits nothing — the caller's process owns
 /// no listeners. Per-node failures are collected, never fatal to siblings.
 ///
-/// Single scan, no rescan loop: each node gets one bounded
+/// Single scan, no rescan loop (the caller rescans: see
+/// [`scan_with_rescan`]): each node gets one bounded
 /// [`RESUME_READY_TIMEOUT_MS`] wait, then verify-or-reinit. A node that
 /// vanishes mid-pass is recorded `Detached`; the daemon tick reconciles any
 /// skew on its next pass. Hook, tick, and udev interleave benignly: every
 /// path sends the same idempotent multitouch-first sequence.
+///
+/// No automatic USB unbind/bind cycle: feature re-send is the demonstrated
+/// fix, and re-enumeration is destructive (fail-closed posture). A node that
+/// stays mismatched after the retry budget lands in `errors` with the exact
+/// recovery command; the tick keeps re-trying so a late recovery self-heals.
 pub fn run_resume_scan(
     devs: &[DiscoveredDevice],
     polling_hz: u32,
     enhanced_clicks: bool,
 ) -> ResumeReport {
+    log::info!("resume: starting pass over {} node(s)", devs.len());
     let mut report = ResumeReport::default();
     for dev in devs {
         let outcome = match dev.transport {
@@ -228,8 +292,16 @@ pub fn run_resume_scan(
                 action,
             }),
             Err(e) => {
-                log::error!("resume: re-init failed for {}: {e:#}", dev.devnode);
-                report.errors.push(format!("{}: {e:#}", dev.devnode));
+                log::error!(
+                    "resume: re-init failed for {}: {e:#}; {}",
+                    dev.devnode,
+                    empty_scan_recovery_hint()
+                );
+                report.errors.push(format!(
+                    "{}: {e:#}; {}",
+                    dev.devnode,
+                    empty_scan_recovery_hint()
+                ));
             }
         }
     }
@@ -340,6 +412,80 @@ mod tests {
         let seen = seen.lock().expect("seen lock");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].kind, ReadyKind::Detached);
+    }
+
+    fn usb_node(devnode: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            devnode: devnode.into(),
+            vendor_id: 0x05ac,
+            product_id: 0x0324,
+            transport: Transport::Usb,
+        }
+    }
+
+    #[test]
+    fn renumber_is_add_plus_remove_never_stuck() {
+        // (a) hidraw2→hidraw3 across sleep: old name must read as removed
+        // (Detached path) AND the new node as added (adopt path). If either
+        // side were missing the trackpad would need a manual restart.
+        let known = vec![usb_node("/dev/hidraw2")];
+        let current = vec![usb_node("/dev/hidraw3")];
+        let (added, removed) = diff_scan(&known, &current);
+        assert_eq!(added, vec![usb_node("/dev/hidraw3")]);
+        assert_eq!(removed, vec![usb_node("/dev/hidraw2")]);
+    }
+
+    #[test]
+    fn empty_known_rebuilds_from_scan() {
+        // (c) daemon restarted by systemd mid-sleep loses its known-set;
+        // a tick built on an empty snapshot must adopt everything scanned.
+        let (added, removed) = diff_scan(&[], &[usb_node("/dev/hidraw2")]);
+        assert_eq!(added, vec![usb_node("/dev/hidraw2")]);
+        assert!(removed.is_empty());
+        let (added, removed) = diff_scan(&[usb_node("/dev/hidraw2")], &[usb_node("/dev/hidraw2")]);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn rescan_adopts_late_enumerating_node() {
+        // (b) hook fired before the node re-enumerated: a single scan sees
+        // nothing and would record a silent no-op. Rescan must pick the
+        // late node up within the bounded wait.
+        let calls = std::cell::Cell::new(0);
+        let scanned = scan_with_rescan(
+            &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Vec::new()
+                } else {
+                    vec![usb_node("/dev/hidraw2")]
+                }
+            },
+            5000,
+            10,
+        );
+        assert_eq!(scanned, vec![usb_node("/dev/hidraw2")]);
+    }
+
+    #[test]
+    fn rescan_gives_up_bounded_on_still_empty() {
+        let scanned = scan_with_rescan(&Vec::new, 40, 10);
+        assert!(scanned.is_empty());
+    }
+
+    #[test]
+    fn empty_scan_hint_names_recovery_command() {
+        // Every dead-end names its recovery: no silent `Detached`/empty pass.
+        let hint = empty_scan_recovery_hint();
+        assert!(
+            hint.contains("systemctl start linux-trackpad-driver-resume.service"),
+            "hint must name the resume unit: {hint}"
+        );
+        assert!(
+            hint.contains("ltd resume"),
+            "hint must name ltd resume: {hint}"
+        );
     }
 
     #[test]

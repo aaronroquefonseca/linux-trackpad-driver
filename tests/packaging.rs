@@ -229,6 +229,31 @@ fn sleep_hook_reinits_on_post_only() {
 }
 
 #[test]
+fn sleep_hook_leaves_journal_trace_and_recovery() {
+    // (d) hook failures were swallowed by `|| echo` + unconditional
+    // exit 0 with no trace the hook ran at all. The post arm must log
+    // entry, success, and failure-with-rc, and the failure line must name
+    // the exact recovery command — else a dead resume is undebuggable.
+    let hook_code = code_lines(SLEEP_HOOK);
+    assert!(
+        hook_code.contains("running"),
+        "hook must log entry when the post arm fires"
+    );
+    assert!(
+        hook_code.contains("rc=") || hook_code.contains("rc=$?"),
+        "hook must capture the ltd resume exit code on failure"
+    );
+    assert!(
+        SLEEP_HOOK.contains("systemctl start linux-trackpad-driver-resume.service"),
+        "hook failure line must name the resume unit recovery command"
+    );
+    assert!(
+        SLEEP_HOOK.contains("ltd resume"),
+        "hook failure line must name ltd resume"
+    );
+}
+
+#[test]
 fn sleep_hook_is_executable() {
     let p: PathBuf = [
         env!("CARGO_MANIFEST_DIR"),

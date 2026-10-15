@@ -29,9 +29,20 @@ export LTD_CONFIG
 case "${1:-} ${2:-}" in
     "post suspend" | "post hibernate" | "post hybrid-sleep" | "post suspend-then-hibernate")
         if [ -x "$LTD_BIN" ]; then
+            # Journal trace proving the hook ran (failures below are
+            # swallowed to exit 0, so these lines are the evidence).
+            echo "ltd-resume: post ${2:-unknown}: running $LTD_BIN resume (LTD_CONFIG=$LTD_CONFIG)" >&2
             # Best-effort: a driver hiccup must never perturb the sleep
-            # cycle, so a failure is reported (journal) and swallowed.
-            "$LTD_BIN" resume || echo "ltd-resume: ltd resume failed (see journal)" >&2
+            # cycle, so a failure is reported (journal, with rc + exact
+            # recovery command) and swallowed.
+            if "$LTD_BIN" resume; then
+                echo "ltd-resume: post ${2:-unknown}: resume pass done" >&2
+            else
+                rc=$?
+                echo "ltd-resume: post ${2:-unknown}: ltd resume failed (rc=$rc); retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume); see journal" >&2
+            fi
+        else
+            echo "ltd-resume: $LTD_BIN missing or not executable; nothing re-inited" >&2
         fi
         ;;
 esac
