@@ -62,12 +62,13 @@ pub fn hub() -> DeviceReadyHub {
 /// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
     use crate::proxy::{
-        ClickProxy, DualSink, ProxySettings, RealGrab, RealHaptic, RealUinput, UinputSink,
+        AsyncHaptic, ClickProxy, DualSink, ProxySettings, RealGrab, RealHaptic, RealUinput,
+        UinputSink,
     };
     use crate::pump::PumpSource;
 
     type DaemonProxy =
-        ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, RealHaptic, PumpSource>;
+        ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
 
     struct PumpManager {
         proxy: std::sync::Arc<std::sync::Mutex<DaemonProxy>>,
@@ -228,12 +229,13 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                 let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
                 px.grab().set_node(&evdev.to_string_lossy());
                 let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
-                px.haptic_mut().set_node(&hnode);
+                px.haptic_mut().inner().set_node(&hnode);
                 log::info!(
                     "pump: haptic node {hnode} (interface {hiface:?}) for {}",
                     event.devnode
                 );
                 px.haptic_mut()
+                    .inner()
                     .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
                 px.replace_source(PumpSource::Live(source));
                 px.set_pump_ready(true);
@@ -295,7 +297,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
             RealUinput::new(&uinput_node),
             RealUinput::new_extras(&uinput_node),
         ),
-        RealHaptic::new(),
+        AsyncHaptic::new(RealHaptic::new()),
         PumpSource::Idle,
     )));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

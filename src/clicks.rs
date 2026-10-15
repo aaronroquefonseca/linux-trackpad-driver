@@ -407,14 +407,23 @@ impl ClickMachine {
                 self.force_pressed.insert(*id, false);
             }
         }
-        // Fingers absent from this frame keep their bits unless the frame is
-        // empty (all lifted).
-        if fingers.is_empty() {
-            for v in self.pressed.values_mut() {
-                *v = false;
+        // Evict ids absent from this frame (a lifted finger reports no
+        // block): without this a lifted finger's bit stays set and holds
+        // the latch while a remaining finger moves lightly (stale hold →
+        // stuck button across motion). Old-service parity: release follows
+        // the current frame's max pressure, so an absent finger can never
+        // hold it. An empty frame evicts every bit (full liftoff).
+        {
+            let present: std::collections::HashSet<u8> = fingers.iter().map(|f| f.id).collect();
+            for (id, bit) in self.pressed.iter_mut() {
+                if !present.contains(id) {
+                    *bit = false;
+                }
             }
-            for v in self.force_pressed.values_mut() {
-                *v = false;
+            for (id, bit) in self.force_pressed.iter_mut() {
+                if !present.contains(id) {
+                    *bit = false;
+                }
             }
         }
         if !armed {
@@ -1084,6 +1093,32 @@ mod tests {
         };
         let ev = m.update(&[deep], 0, &cfg).unwrap().first.unwrap();
         assert_eq!(ev.finger_count, 1);
+    }
+
+    #[test]
+    fn absent_finger_does_not_hold_latch() {
+        // Old-service parity: release follows the CURRENT frame's max
+        // pressure, so a finger that lifted (absent from the frame) must
+        // not hold the latch while the remaining finger moves lightly.
+        // Stale-bit hold = BTN stuck down across motion = ghostty drag.
+        let cfg = Config {
+            click_2: "right".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let ev = m
+            .update(&[finger(1, 200), finger(2, 200)], 0, &cfg)
+            .unwrap()
+            .first
+            .unwrap();
+        assert_eq!(ev.finger_count, 2);
+        // Finger 2 lifts (omitted, as the device reports it); finger 1
+        // stays, light and moving (pressure 10 <= release 59).
+        assert!(m.update(&[finger(1, 10)], 0, &cfg).unwrap().is_empty());
+        assert!(
+            m.active().is_none(),
+            "lifted finger holds stale latch (old: max_pressure 10 < 59 releases)"
+        );
     }
 
     #[test]
