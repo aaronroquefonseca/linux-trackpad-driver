@@ -41,8 +41,10 @@
 //!   (hardware-proven against the old driver; without them — or with
 //!   keyboard codes polluting the node — the pointer stays dead).
 //! - `BTN_LEFT` derives from held codes (present only when the latched action
-//!   contains `left`) OR-ed with the physical `clicks & 1` bit — never from
-//!   latch state alone (a right/combo/empty hold must not chord left).
+//!   contains `left`) OR-ed with the physical `clicks & 1` bit only when the
+//!   frame carries no contacts — never from latch state alone, and never
+//!   from the physical bit under fingers (a right/combo/empty hold must not
+//!   chord left; old-service parity).
 //! - Slots are positional per frame (see [`ClickProxy::emit_touch_frame`]
 //!   slot-map docs); vacated slots are terminated with `TRACKING_ID=-1`.
 //! - Orientation emits `-(raw)`; pressure/major/minor emit the
@@ -98,10 +100,10 @@ pub const BTN_EXTRA: u16 = 276;
 /// Touchpad classification bits (old-service parity): libinput only moves
 /// the cursor from MT slots when these are advertised + emitted per count.
 pub const BTN_TOOL_FINGER: u16 = 325;
-pub const BTN_TOOL_DOUBLETAP: u16 = 326;
-pub const BTN_TOOL_TRIPLETAP: u16 = 327;
-pub const BTN_TOOL_QUADTAP: u16 = 328;
-pub const BTN_TOOL_QUINTTAP: u16 = 329;
+pub const BTN_TOOL_DOUBLETAP: u16 = 333;
+pub const BTN_TOOL_TRIPLETAP: u16 = 334;
+pub const BTN_TOOL_QUADTAP: u16 = 335;
+pub const BTN_TOOL_QUINTTAP: u16 = 328;
 pub const BTN_TOUCH: u16 = 330;
 /// `INPUT_PROP_POINTER` (`linux/input.h`): marks the virtual node as a
 /// pointer device (old-service `PropType::POINTER` parity).
@@ -659,7 +661,7 @@ where
             // (emits only on change — `press_level` already put fresh
             // downs on the wire). Exactly one SYN per handled frame
             // either way: `press_level` never syncs itself.
-            self.emit_btn_left(frame.clicks);
+            self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
             self.uinput.sync();
             return Ok(edges.primary());
         }
@@ -683,24 +685,27 @@ where
             self.release_force_held();
             self.fire_release(true, haptic_pressure, cfg.force_quiet_click);
         }
-        self.emit_btn_left(frame.clicks);
+        self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
         self.uinput.sync();
         Ok(None)
     }
 
     /// `BTN_LEFT` from held codes only (either latched action contains `left`)
-    /// or the physical button bit — never from latch state alone, so a
-    /// right/middle/combo/empty hold cannot chord a phantom left. Edge
-    /// triggered: emits only on state change, so frames where left is and
-    /// was down stay silent (no `BTN_LEFT=0` releases for buttons never
-    /// pressed, no duplicate re-asserts).
-    fn emit_btn_left(&mut self, clicks: u8) {
+    /// or the physical button bit with no contacts on the frame — never from
+    /// latch state alone, and never from the physical bit while fingers are
+    /// present, so a right/middle/combo/empty hold cannot chord a phantom
+    /// left (old-service parity: buttons derive purely from the pressure
+    /// latch + finger count; the `clicks & 1` bit only covers the bare
+    /// no-contact button path). Edge triggered: emits only on state change,
+    /// so frames where left is and was down stay silent (no `BTN_LEFT=0`
+    /// releases for buttons never pressed, no duplicate re-asserts).
+    fn emit_btn_left(&mut self, clicks: u8, has_fingers: bool) {
         let held_left = self
             .held_first
             .iter()
             .chain(self.held_force.iter())
             .any(|&(ty, code)| ty == EV_KEY && code == BTN_LEFT);
-        let down = held_left || ClickMachine::physical_button(clicks);
+        let down = held_left || (!has_fingers && ClickMachine::physical_button(clicks));
         if down != self.btn_left_down {
             self.uinput.emit(EV_KEY, BTN_LEFT, i32::from(down));
             self.btn_left_down = down;
@@ -3868,6 +3873,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_keycodes_match_kernel_header() {
+        // Owner evtest 2026-10-16: the wire carried BTN_TOOL_MOUSE (326) /
+        // BTN_TOOL_LENS (327) on a touchpad — hand-rolled codes ran 325..=329
+        // sequentially, but the kernel header interleaves MOUSE / LENS /
+        // QUINTTAP / STYLUS3 between FINGER and DOUBLETAP. Pin exact numeric
+        // values so a wrong constant fails here first.
+        assert_eq!(BTN_TOOL_FINGER, 325); // 0x145
+        assert_eq!(BTN_TOOL_QUINTTAP, 328); // 0x148
+        assert_eq!(BTN_TOUCH, 330); // 0x14a
+        assert_eq!(BTN_TOOL_DOUBLETAP, 333); // 0x14d
+        assert_eq!(BTN_TOOL_TRIPLETAP, 334); // 0x14e
+        assert_eq!(BTN_TOOL_QUADTAP, 335); // 0x14f
+                                           // The mouse/lens codes must be nowhere near the touchpad tool row.
+        assert_ne!(BTN_TOOL_DOUBLETAP, 326);
+        assert_ne!(BTN_TOOL_TRIPLETAP, 327);
+    }
+
+    #[test]
     fn rapid_release_holds_latch_per_debounce() {
         // Production timing: back-to-back handle_frame calls land
         // microseconds apart, inside the 30 ms release window — the latch
@@ -4382,6 +4405,301 @@ mod tests {
         let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_MIDDLE, BTN_TOUCH]);
         assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
+        let middle = key_values(&sinks.pointer, BTN_MIDDLE);
+        assert_eq!(middle, vec![1, 0], "{middle:?}");
+        assert_strict_alternation(&middle, "BTN_MIDDLE");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
+    }
+
+    #[test]
+    fn single_finger_click_with_physical_bit_exact() {
+        // 1-finger left click with the hardware button bit set (real press):
+        // the latch holds left so BTN_LEFT still fires exactly once — the
+        // physical gate only suppresses LEFT under fingers with no left
+        // latch, never a genuine left press. Guards the multi-finger chord
+        // fix against over-suppression. Pins the COMPLETE stream.
+        let cfg = Config::default(); // click_1 = left
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 10, 20)], 0x01))),
+            Ok(Some(frame(vec![finger(1, 200, 10, 20)], 0x01))),
+            Ok(Some(frame(vec![finger(1, 10, 10, 20)], 0x01))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
+        let touch_block = || -> Vec<(u16, u16, i32)> {
+            vec![
+                (EV_ABS, ABS_MT_SLOT, 0),
+                (EV_ABS, ABS_MT_TRACKING_ID, 1),
+                (EV_ABS, ABS_MT_POSITION_X, 10),
+                (EV_ABS, ABS_MT_POSITION_Y, 20),
+                (EV_ABS, ABS_MT_PRESSURE, 60),
+                (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+                (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
+                (EV_ABS, ABS_MT_ORIENTATION, -2),
+            ]
+        };
+        let tool_finger = || -> Vec<(u16, u16, i32)> {
+            vec![
+                (EV_KEY, BTN_TOUCH, 1),
+                (EV_KEY, BTN_TOOL_FINGER, 1),
+                (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
+                (EV_KEY, BTN_TOOL_TRIPLETAP, 0),
+                (EV_KEY, BTN_TOOL_QUADTAP, 0),
+                (EV_KEY, BTN_TOOL_QUINTTAP, 0),
+            ]
+        };
+        let mut want: Vec<(u16, u16, i32)> = Vec::new();
+        // Press: touch + TOOL row + LEFT down + SYN.
+        want.extend(touch_block());
+        want.extend(tool_finger());
+        want.push((EV_KEY, BTN_LEFT, 1));
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Hold: touch + TOOL + SYN only.
+        want.extend(touch_block());
+        want.extend(tool_finger());
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Release: LEFT up + SYN (no flutter from the still-set button bit).
+        want.extend(touch_block());
+        want.extend(tool_finger());
+        want.push((EV_KEY, BTN_LEFT, 0));
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Liftoff: slot terminated, TOUCH up, TOOL row clear, SYN.
+        want.extend(vec![
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_KEY, BTN_TOOL_FINGER, 0),
+            (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
+            (EV_KEY, BTN_TOOL_TRIPLETAP, 0),
+            (EV_KEY, BTN_TOOL_QUADTAP, 0),
+            (EV_KEY, BTN_TOOL_QUINTTAP, 0),
+            (EV_SYN, SYN_REPORT, 0),
+        ]);
+        assert_eq!(got, want, "1-finger physical wire sequence drifted");
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
+    }
+
+    #[test]
+    fn two_finger_click_exact_wire_sequence() {
+        // Old-exact 2-finger right click with the hardware button bit set
+        // (real press: `clicks & 1 == 1` while deflecting the pad). The old
+        // driver derives buttons purely from the pressure latch + finger
+        // count and never ORs the physical bit into BTN_LEFT, so the wire
+        // carries RIGHT only — a LEFT+RIGHT chord reads as hold/drag in
+        // strict apps (owner ghostty 2026-10-16). Pins the COMPLETE stream.
+        let cfg = Config::default(); // click_2 = right
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 9, 9)],
+                0x01,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 9, 9)],
+                0x01,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 10, 0, 0), finger(2, 10, 9, 9)],
+                0x01,
+            ))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
+        let touch_block = |x0: i32, y0: i32, x1: i32, y1: i32| -> Vec<(u16, u16, i32)> {
+            vec![
+                (EV_ABS, ABS_MT_SLOT, 0),
+                (EV_ABS, ABS_MT_TRACKING_ID, 1),
+                (EV_ABS, ABS_MT_POSITION_X, x0),
+                (EV_ABS, ABS_MT_POSITION_Y, y0),
+                (EV_ABS, ABS_MT_PRESSURE, 60),
+                (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+                (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
+                (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_MT_SLOT, 1),
+                (EV_ABS, ABS_MT_TRACKING_ID, 2),
+                (EV_ABS, ABS_MT_POSITION_X, x1),
+                (EV_ABS, ABS_MT_POSITION_Y, y1),
+                (EV_ABS, ABS_MT_PRESSURE, 60),
+                (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+                (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
+                (EV_ABS, ABS_MT_ORIENTATION, -2),
+            ]
+        };
+        let tool_double = || -> Vec<(u16, u16, i32)> {
+            vec![
+                (EV_KEY, BTN_TOUCH, 1),
+                (EV_KEY, BTN_TOOL_FINGER, 0),
+                (EV_KEY, BTN_TOOL_DOUBLETAP, 1),
+                (EV_KEY, BTN_TOOL_TRIPLETAP, 0),
+                (EV_KEY, BTN_TOOL_QUADTAP, 0),
+                (EV_KEY, BTN_TOOL_QUINTTAP, 0),
+            ]
+        };
+        let mut want: Vec<(u16, u16, i32)> = Vec::new();
+        // Press: touch + TOOL row + RIGHT down + SYN. No LEFT despite the
+        // physical bit — the latch holds right, not left.
+        want.extend(touch_block(0, 0, 9, 9));
+        want.extend(tool_double());
+        want.push((EV_KEY, BTN_RIGHT, 1));
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Hold: touch + TOOL + SYN only, zero button traffic.
+        want.extend(touch_block(0, 0, 9, 9));
+        want.extend(tool_double());
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Release: latch drops, RIGHT up + SYN. Still no LEFT.
+        want.extend(touch_block(0, 0, 9, 9));
+        want.extend(tool_double());
+        want.push((EV_KEY, BTN_RIGHT, 0));
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Liftoff: both slots terminated, TOUCH up, TOOL row all up, SYN.
+        want.extend(vec![
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_ABS, ABS_MT_SLOT, 1),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_KEY, BTN_TOOL_FINGER, 0),
+            (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
+            (EV_KEY, BTN_TOOL_TRIPLETAP, 0),
+            (EV_KEY, BTN_TOOL_QUADTAP, 0),
+            (EV_KEY, BTN_TOOL_QUINTTAP, 0),
+            (EV_SYN, SYN_REPORT, 0),
+        ]);
+        assert_eq!(got, want, "2-finger wire sequence drifted");
+        assert_wire_pure(&got, &[BTN_RIGHT, BTN_TOUCH]);
+        // No BTN_LEFT traffic of any value on the whole stream.
+        assert!(
+            !got.iter().any(|&(t, c, _)| t == EV_KEY && c == BTN_LEFT),
+            "phantom BTN_LEFT alongside RIGHT: {got:?}"
+        );
+        let right = key_values(&sinks.pointer, BTN_RIGHT);
+        assert_eq!(right, vec![1, 0], "{right:?}");
+        assert_strict_alternation(&right, "BTN_RIGHT");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
+    }
+
+    #[test]
+    fn three_finger_click_exact_wire_sequence() {
+        // Old-exact 3-finger middle click with the hardware button bit set
+        // (same physical-chord hazard as the 2-finger test: LEFT must never
+        // ride alongside MIDDLE). Pins the COMPLETE stream.
+        let cfg = Config::default(); // click_3 = middle
+        let fingers = || {
+            vec![
+                finger(1, 200, 0, 0),
+                finger(2, 200, 9, 9),
+                finger(3, 200, 5, 5),
+            ]
+        };
+        let release = || {
+            vec![
+                finger(1, 10, 0, 0),
+                finger(2, 10, 9, 9),
+                finger(3, 10, 5, 5),
+            ]
+        };
+        let frames = vec![
+            Ok(Some(frame(fingers(), 0x01))),
+            Ok(Some(frame(fingers(), 0x01))),
+            Ok(Some(frame(release(), 0x01))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
+        let touch_block = || -> Vec<(u16, u16, i32)> {
+            vec![
+                (EV_ABS, ABS_MT_SLOT, 0),
+                (EV_ABS, ABS_MT_TRACKING_ID, 1),
+                (EV_ABS, ABS_MT_POSITION_X, 0),
+                (EV_ABS, ABS_MT_POSITION_Y, 0),
+                (EV_ABS, ABS_MT_PRESSURE, 60),
+                (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+                (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
+                (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_MT_SLOT, 1),
+                (EV_ABS, ABS_MT_TRACKING_ID, 2),
+                (EV_ABS, ABS_MT_POSITION_X, 9),
+                (EV_ABS, ABS_MT_POSITION_Y, 9),
+                (EV_ABS, ABS_MT_PRESSURE, 60),
+                (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+                (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
+                (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_MT_SLOT, 2),
+                (EV_ABS, ABS_MT_TRACKING_ID, 3),
+                (EV_ABS, ABS_MT_POSITION_X, 5),
+                (EV_ABS, ABS_MT_POSITION_Y, 5),
+                (EV_ABS, ABS_MT_PRESSURE, 60),
+                (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+                (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
+                (EV_ABS, ABS_MT_ORIENTATION, -2),
+            ]
+        };
+        let tool_triple = || -> Vec<(u16, u16, i32)> {
+            vec![
+                (EV_KEY, BTN_TOUCH, 1),
+                (EV_KEY, BTN_TOOL_FINGER, 0),
+                (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
+                (EV_KEY, BTN_TOOL_TRIPLETAP, 1),
+                (EV_KEY, BTN_TOOL_QUADTAP, 0),
+                (EV_KEY, BTN_TOOL_QUINTTAP, 0),
+            ]
+        };
+        let mut want: Vec<(u16, u16, i32)> = Vec::new();
+        // Press: touch + TOOL row + MIDDLE down + SYN. No LEFT.
+        want.extend(touch_block());
+        want.extend(tool_triple());
+        want.push((EV_KEY, BTN_MIDDLE, 1));
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Hold: touch + TOOL + SYN only.
+        want.extend(touch_block());
+        want.extend(tool_triple());
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Release: MIDDLE up + SYN. Still no LEFT.
+        want.extend(touch_block());
+        want.extend(tool_triple());
+        want.push((EV_KEY, BTN_MIDDLE, 0));
+        want.push((EV_SYN, SYN_REPORT, 0));
+        // Liftoff: all three slots terminated, TOUCH up, TOOL row clear, SYN.
+        want.extend(vec![
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_ABS, ABS_MT_SLOT, 1),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_ABS, ABS_MT_SLOT, 2),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_KEY, BTN_TOOL_FINGER, 0),
+            (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
+            (EV_KEY, BTN_TOOL_TRIPLETAP, 0),
+            (EV_KEY, BTN_TOOL_QUADTAP, 0),
+            (EV_KEY, BTN_TOOL_QUINTTAP, 0),
+            (EV_SYN, SYN_REPORT, 0),
+        ]);
+        assert_eq!(got, want, "3-finger wire sequence drifted");
+        assert_wire_pure(&got, &[BTN_MIDDLE, BTN_TOUCH]);
+        assert!(
+            !got.iter().any(|&(t, c, _)| t == EV_KEY && c == BTN_LEFT),
+            "phantom BTN_LEFT alongside MIDDLE: {got:?}"
+        );
         let middle = key_values(&sinks.pointer, BTN_MIDDLE);
         assert_eq!(middle, vec![1, 0], "{middle:?}");
         assert_strict_alternation(&middle, "BTN_MIDDLE");
