@@ -4356,6 +4356,61 @@ mod tests {
     }
 
     #[test]
+    fn right_partial_lift_releases_without_stale_hold() {
+        // Ghostty right-click stick: 2-finger press, then ONE finger lifts
+        // (omitted from the frame, as the device reports it) while the
+        // other keeps sliding lightly. The release (BTN_RIGHT 0 + SYN)
+        // must land on the pressure-drop frame — exactly one 1→0 pair —
+        // so no motion frame carries a stale held button (drag in ghostty).
+        let cfg = Config::default(); // click_2 = right
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(vec![finger(1, 10, 4, 4)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 8, 8)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        // Release lands on the pressure-drop frame, BEFORE the motion and
+        // liftoff frames: no stale hold across motion.
+        assert_eq!(
+            key_values(&uinput, BTN_RIGHT),
+            vec![1, 0],
+            "BTN_RIGHT up delayed past the lift (stale hold across motion)"
+        );
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_RIGHT, BTN_TOUCH]);
+        let right = key_values(&uinput, BTN_RIGHT);
+        assert_eq!(right, vec![1, 0], "{right:?}");
+        assert_strict_alternation(&right, "BTN_RIGHT");
+        // Motion flowed (cursor tracked the sliding finger) across the
+        // partial-lift frames: press frame carries both fingers (0 and 9),
+        // then slot 0 walks 0→4→8.
+        let xs: Vec<i32> = got
+            .iter()
+            .copied()
+            .filter(|&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(xs, vec![0, 9, 4, 8], "motion stalled across lift: {xs:?}");
+        // Trailing SYN after the key-up: exactly one SYN per handled frame.
+        let syns = got
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
+            .count();
+        assert_eq!(syns, 4, "exactly one SYN per frame: {got:?}");
+    }
+
+    #[test]
     fn middle_click_wire_pure() {
         let cfg = Config::default(); // click_3 = middle
         let fingers = || {
