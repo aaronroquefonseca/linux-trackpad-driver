@@ -10,6 +10,9 @@
 //! - Per-finger pressure vs `sensitivity` (press) / `sensitivity - margin`
 //!   (release hysteresis). Thresholds operate on the RAW pressure byte
 //!   (Apple nominal 0..=253, arbitrary units, `res == 0`).
+//! - Touch presence is the device flag OR pressure past
+//!   [`TOUCH_PRESSURE_FLOOR`] (10, old-service parity): light touches
+//!   drive cursor slots without latching clicks.
 //! - Finger-count at the press edge selects `click_1..=click_5` via the
 //!   existing [`crate::config::parse_click_action`].
 //! - Force second level: `force_offset > 0` arms force press at
@@ -52,6 +55,17 @@ use anyhow::Result;
 
 use crate::apple_parse::{FingerContact, PRESSURE_VALID_MAX};
 use crate::config::{ActionKind, ClickAction, Config};
+
+/// Touch-presence pressure floor (old-service parity): a contact counts as
+/// down when the device flag says so OR its pressure exceeds 10. Below the
+/// click threshold this still drives cursor slots; at/above `sensitivity`
+/// it also latches clicks (old `max_pressure` semantics, per-finger here).
+pub const TOUCH_PRESSURE_FLOOR: u8 = 10;
+
+/// Whether a decoded contact counts as touching (device flag or pressure).
+pub fn touch_present(f: &FingerContact) -> bool {
+    f.contact || f.pressure > TOUCH_PRESSURE_FLOOR
+}
 
 /// Scale a pointer delta by `speed` percent (`100` = 1:1). Proxy path only.
 pub fn scale_delta(delta: i32, speed: u32) -> i32 {
@@ -264,10 +278,13 @@ impl ClickMachine {
 
         // Phase 1 (read-only): decide per-finger bit writes. Nothing mutates
         // here so a parse failure below leaves state untouched.
+        // Presence is the device flag OR pressure past the touch floor
+        // (old `is_down || pressure > 10`): light touches drive slots
+        // without latching clicks.
         let mut first_write = Vec::new();
         let mut newly_pressed = Vec::new();
         for f in fingers {
-            if !f.contact {
+            if !touch_present(f) {
                 first_write.push((f.id, false));
                 continue;
             }
@@ -287,7 +304,7 @@ impl ClickMachine {
         let mut newly_force = Vec::new();
         if let (Some(fp), Some(fr)) = (force_press, force_release) {
             for f in fingers {
-                if !f.contact {
+                if !touch_present(f) {
                     force_write.push((f.id, false));
                     continue;
                 }
@@ -305,8 +322,8 @@ impl ClickMachine {
         }
 
         // Phase 2: parse before mutating. `n` is shared: both edges capture
-        // the contacting count of their edge frame, clamped 1..=5.
-        let contacting = fingers.iter().filter(|f| f.contact).count();
+        // the touching count of their edge frame, clamped 1..=5.
+        let contacting = fingers.iter().filter(|f| touch_present(f)).count();
         let n = (contacting.clamp(1, 5)) as u8;
         let first_action = if self.active.is_none() && !newly_pressed.is_empty() {
             Some(cfg.click_action(n)?)
