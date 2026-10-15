@@ -16,10 +16,16 @@
 //! host-click to If2; until sibling discovery lands, we send the full sequence
 //! to the given node (device ignores what is not for it) and log the iface.
 //!
-//! Scan ordering (load-bearing for the pump): input-having interfaces
-//! first, then numeric trailing index. The daemon binds the first `Ready`
-//! permanently, so a lexicographic sort would hand the pump to hidraw10 —
-//! an input-less feature interface with no touch reports.
+//! Scan ordering (load-bearing for the pump): MT-proven interfaces
+//! first, then other input-having, then bare, then numeric trailing
+//! index. The daemon binds the first `Ready` permanently, so a
+//! lexicographic sort would hand the pump to hidraw10 —
+//! an input-less feature interface with no touch reports — and even
+//! numeric-first is not enough: hidraw numbers shift across
+//! enumeration (owner hardware 2026-10-15: silent hidraw8 sorted
+//! before streaming hidraw9). Only sysfs MT proof
+//! (`device/capabilities/abs` carrying `ABS_MT_SLOT`/multitouch bits
+//! on an input child) promotes a node to the front.
 
 use anyhow::Result;
 
@@ -125,16 +131,136 @@ fn scan_sysfs(class_dir: &str) -> Result<Vec<DiscoveredDevice>> {
     // so the multitouch interface must come first. Lexicographic sort
     // puts hidraw10 before hidraw8 (and event10 before event2) — and
     // hidraw10/11 are input-less feature interfaces that would bind the
-    // pump to a node with no touch reports. Input-having nodes first,
-    // then numeric trailing index, then full string as tiebreak.
+    // pump to a node with no touch reports. Worse, hidraw numbers shift
+    // across enumeration (owner 2026-10-15: silent hidraw8 before
+    // streaming hidraw9), so numeric order alone still misbinds.
+    // Proven order: MT-capable input children first (abs MT bits), then
+    // other input children, then bare; numeric trailing index breaks ties.
     out.sort_by_cached_key(|d| {
         (
-            !has_input_children(&d.devnode, class_dir),
+            rank_with_root(&d.devnode, class_dir),
             trailing_int(&d.devnode).unwrap_or(u64::MAX),
             d.devnode.clone(),
         )
     });
     Ok(out)
+}
+
+/// Proven interface rank for hidraw selection (ordering key).
+///
+/// - `MtCapable`: an input child exposes multitouch abs bits — the only
+///   rank trusted to stream touch reports.
+/// - `InputOnly`: input children exist but none proves MT (silent
+///   multitouch-less interface; owner hidraw8 class).
+/// - `Bare`: no input children at all (feature-only hidraw10/11 class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InterfaceRank {
+    MtCapable,
+    InputOnly,
+    Bare,
+}
+
+/// Rank a node with the production sysfs root.
+pub fn rank_for_node(devnode: &str) -> InterfaceRank {
+    rank_with_root(devnode, "/sys/class/hidraw")
+}
+
+fn rank_with_root(devnode: &str, class_root: &str) -> InterfaceRank {
+    if has_mt_children(devnode, class_root) {
+        InterfaceRank::MtCapable
+    } else if has_input_children(devnode, class_root) {
+        InterfaceRank::InputOnly
+    } else {
+        InterfaceRank::Bare
+    }
+}
+
+/// Human-readable selection reason for the attach INFO log.
+/// Production root; see [`selection_reason_with_root`] for tests.
+pub fn selection_reason_for_node(devnode: &str) -> String {
+    selection_reason_with_root(devnode, "/sys/class/hidraw")
+}
+
+pub(crate) fn selection_reason_with_root(devnode: &str, class_root: &str) -> String {
+    match rank_with_root(devnode, class_root) {
+        InterfaceRank::MtCapable => {
+            format!("{devnode}: MT-capable input children (abs MT bits present)")
+        }
+        InterfaceRank::InputOnly => {
+            format!("{devnode}: input children without MT abs bits (silent-risk)")
+        }
+        InterfaceRank::Bare => {
+            format!("{devnode}: no input children (feature-only interface?)")
+        }
+    }
+}
+
+/// Attach-time stream health for a chosen node vs siblings that stream.
+///
+/// - `Healthy`: the chosen node itself streamed during the probe.
+/// - `SilentWhileSiblingStreams`: chosen silent, `streaming` sibling live —
+///   the 2026-10-15 owner failure (silent hidraw8 bound, hidraw9 live).
+/// - `IdleNoTraffic`: nothing streamed anywhere (finger off the pad is
+///   normal — no warning, just debug).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamHealth {
+    Healthy,
+    SilentWhileSiblingStreams { streaming: String },
+    IdleNoTraffic,
+}
+
+/// Pure decision: does the chosen node need a loud warn?
+/// `streaming` lists nodes that produced a touch report during the probe.
+pub fn check_stream_health(chosen: &str, streaming: &[String]) -> StreamHealth {
+    if streaming.iter().any(|n| n == chosen) {
+        return StreamHealth::Healthy;
+    }
+    match streaming.first() {
+        Some(live) => StreamHealth::SilentWhileSiblingStreams {
+            streaming: live.clone(),
+        },
+        None => StreamHealth::IdleNoTraffic,
+    }
+}
+
+/// Nonblocking probe: true when a touch report arrives within `timeout_ms`.
+/// Best-effort: open/read failures (vanished node, permissions) are `false`,
+/// never an error. Callee opens its own fd so sibling polling never disturbs
+/// the live pump fd.
+pub fn poll_has_report(devnode: &str, timeout_ms: u64) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(devnode) else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut buf = [0u8; 512];
+    while std::time::Instant::now() < deadline {
+        let ret = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if ret > 0 {
+            return true;
+        }
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN)
+                || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || err.raw_os_error() == Some(libc::EINTR)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            return false;
+        }
+        // 0-byte read: device dropped the node — not a stream.
+        return false;
+    }
+    false
 }
 
 /// Trailing decimal integer of a device path (`/dev/hidraw10` → 10).
@@ -182,6 +308,51 @@ fn has_input_children(devnode: &str, class_root: &str) -> bool {
                 .any(|e| e.file_name().to_string_lossy().starts_with("input"))
         })
         .unwrap_or(false)
+}
+
+/// True when any input child of the hidraw node's HID device dir carries
+/// multitouch abs bits (`ABS_MT_SLOT` / `ABS_MT_PRESSURE` in
+/// `device/capabilities/abs`). This is the SELECTION-time MT proof: the
+/// same bit test evdev applies at grab time, applied here to rank the
+/// streaming interface first. Layout walked: `<hid>/input/inputN/
+/// capabilities/abs` (two levels: `input/` container, then `inputN`
+/// device dirs) plus the direct `<hid>/<inputN>/capabilities/abs` form
+/// so fake trees and kernel variants both count.
+fn has_mt_children(devnode: &str, class_root: &str) -> bool {
+    let Some(base) = hidraw_name(devnode) else {
+        return false;
+    };
+    let link = std::path::PathBuf::from(format!("{class_root}/{base}/device"));
+    let Ok(canon) = std::fs::canonicalize(&link) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&canon) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("input") {
+            continue;
+        }
+        let child = entry.path();
+        // Direct form: <hid>/inputN/capabilities/abs.
+        if let Ok(text) = std::fs::read_to_string(child.join("capabilities/abs")) {
+            if crate::evdev::abs_has_mt(&text) {
+                return true;
+            }
+        }
+        // Container form: <hid>/input/inputN/capabilities/abs.
+        if let Ok(nested) = std::fs::read_dir(&child) {
+            for sub in nested.flatten() {
+                if let Ok(text) = std::fs::read_to_string(sub.path().join("capabilities/abs")) {
+                    if crate::evdev::abs_has_mt(&text) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Wait for a devnode path to appear (probe/bind race), polling every
@@ -488,6 +659,134 @@ mod tests {
         let devs = scan_sysfs(root.to_str().unwrap()).unwrap();
         let nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
         assert_eq!(nodes, vec!["/dev/hidraw2", "/dev/hidraw8", "/dev/hidraw10"]);
+    }
+
+    fn fake_trackpad_node_ranked(
+        root: &std::path::Path,
+        base: &str,
+        hid_dir: &std::path::Path,
+        input_kind: &str,
+    ) {
+        // input_kind: "bare" | "input" | "mt"
+        std::fs::create_dir_all(root.join(base)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(hid_dir, root.join(base).join("device")).unwrap();
+        std::fs::write(
+            root.join(base).join("device/uevent"),
+            "HID_ID=0003:000005AC:00000324\nHID_NAME=Apple Inc. Magic Trackpad\n",
+        )
+        .unwrap();
+        match input_kind {
+            "mt" => {
+                let caps = hid_dir.join("input/input20/capabilities");
+                std::fs::create_dir_all(&caps).unwrap();
+                // Live owner abs value: carries bits 47 + 58.
+                std::fs::write(caps.join("abs"), "673800001000003\n").unwrap();
+            }
+            "input" => {
+                let caps = hid_dir.join("input/input21/capabilities");
+                std::fs::create_dir_all(&caps).unwrap();
+                // Input child, zero MT bits (silent-risk class).
+                std::fs::write(caps.join("abs"), "0\n").unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn scan_mt_beats_numerically_first_input_only() {
+        // Owner 2026-10-15: silent hidraw8 (input, no MT proof) sorted
+        // before streaming hidraw9 (MT). Proven rank must invert that:
+        // MT-capable wins regardless of trailing index.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(&root).unwrap();
+        let hid_silent = dir.path().join("devices/silent");
+        let hid_live = dir.path().join("devices/live");
+        for d in [&hid_silent, &hid_live] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        fake_trackpad_node_ranked(&root, "hidraw8", &hid_silent, "input");
+        fake_trackpad_node_ranked(&root, "hidraw9", &hid_live, "mt");
+        let devs = scan_sysfs(root.to_str().unwrap()).unwrap();
+        let nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
+        assert_eq!(nodes, vec!["/dev/hidraw9", "/dev/hidraw8"]);
+        assert_eq!(
+            rank_with_root("/dev/hidraw9", root.to_str().unwrap()),
+            InterfaceRank::MtCapable
+        );
+        assert_eq!(
+            rank_with_root("/dev/hidraw8", root.to_str().unwrap()),
+            InterfaceRank::InputOnly
+        );
+    }
+
+    #[test]
+    fn scan_rank_tiers_mt_then_input_then_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(&root).unwrap();
+        let hid_bare = dir.path().join("devices/bare");
+        let hid_input = dir.path().join("devices/inp");
+        let hid_mt = dir.path().join("devices/mt");
+        for d in [&hid_bare, &hid_input, &hid_mt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // Numeric order deliberately adversarial: bare=1, input=2, mt=3.
+        fake_trackpad_node_ranked(&root, "hidraw1", &hid_bare, "bare");
+        fake_trackpad_node_ranked(&root, "hidraw2", &hid_input, "input");
+        fake_trackpad_node_ranked(&root, "hidraw3", &hid_mt, "mt");
+        let devs = scan_sysfs(root.to_str().unwrap()).unwrap();
+        let nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
+        assert_eq!(nodes, vec!["/dev/hidraw3", "/dev/hidraw2", "/dev/hidraw1"]);
+    }
+
+    #[test]
+    fn selection_reason_names_rank() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(&root).unwrap();
+        let hid_bare = dir.path().join("devices/b");
+        let hid_input = dir.path().join("devices/i");
+        let hid_mt = dir.path().join("devices/m");
+        for d in [&hid_bare, &hid_input, &hid_mt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        fake_trackpad_node_ranked(&root, "hidraw1", &hid_bare, "bare");
+        fake_trackpad_node_ranked(&root, "hidraw2", &hid_input, "input");
+        fake_trackpad_node_ranked(&root, "hidraw3", &hid_mt, "mt");
+        let rs = root.to_str().unwrap();
+        assert!(selection_reason_with_root("/dev/hidraw3", rs).contains("MT-capable"));
+        assert!(selection_reason_with_root("/dev/hidraw2", rs).contains("without MT"));
+        assert!(selection_reason_with_root("/dev/hidraw1", rs).contains("no input"));
+        // Reason embeds the node: the attach INFO log names the node.
+        assert!(selection_reason_with_root("/dev/hidraw3", rs).contains("/dev/hidraw3"));
+    }
+
+    #[test]
+    fn stream_health_warns_on_silent_chosen() {
+        // Chosen streaming → healthy, no warn.
+        assert_eq!(
+            check_stream_health("/dev/hidraw9", &["/dev/hidraw9".to_string()]),
+            StreamHealth::Healthy
+        );
+        // Owner failure: chosen hidraw8 silent, hidraw9 live → loud-warn path.
+        assert_eq!(
+            check_stream_health("/dev/hidraw8", &["/dev/hidraw9".to_string()]),
+            StreamHealth::SilentWhileSiblingStreams {
+                streaming: "/dev/hidraw9".to_string(),
+            }
+        );
+        // Finger off: nothing anywhere → idle, no warn.
+        assert_eq!(
+            check_stream_health("/dev/hidraw8", &[]),
+            StreamHealth::IdleNoTraffic
+        );
+    }
+
+    #[test]
+    fn poll_missing_node_is_silent_not_error() {
+        assert!(!poll_has_report("/nonexistent-hidraw-xyz", 20));
     }
 
     #[test]
