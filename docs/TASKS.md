@@ -63,9 +63,9 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
-| suspend-robust | T3 `51650f42` | `fix/suspend-robustness` @ `ltd-wt/suspend-robust` | post-resume dead-ends audit (renumber, hook timing, daemon restart, silent hook, re-enumeration) | RUNNING |
-| lo-minus | T3 `911e1a0b` | `fix/lo-minus-click` @ `ltd-wt/lo-minus` | stray '-' in LibreOffice: wire-purity tests + root-cause fix | RUNNING |
-| fkeys | T3 `4834bf4c` | `feat/f13-keys` @ `ltd-wt/fkeys` | F13–F24 + full key-table audit vs kernel header | RUNNING |
+| suspend-robust | T3 `51650f42` — PR #18 (5 dead-ends fixed, verified) | `fix/suspend-robustness` | post-resume dead-ends audit | DONE, MERGED. Owner SETTLED |
+| lo-minus | T3 `911e1a0b` — PR #19 `eb21d9e` (hygiene; LO causality UNPROVEN, bug stays open, TESTING capture row added) | `fix/lo-minus-click` | stray '-' in LibreOffice | DONE, MERGED as hygiene. Owner + 2 reviewers SETTLED (mimo silent, excluded) |
+| fkeys | T3 `4834bf4c` — PR #17 `7829c1b` (F13–F24 183–194, full table audit) | `feat/f13-keys` | F13–F24 + key audit | DONE, MERGED. Owner SETTLED |
 Remaining (owner-side): hardware session per TESTING.md; public launch =
 docs/RELEASING.md 5-min checklist; full EvdevGeneric impl = future work.
 
