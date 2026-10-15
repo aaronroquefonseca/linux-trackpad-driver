@@ -101,6 +101,12 @@ pub trait UinputSink: Send {
     fn sync(&self) {
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
+    /// True when the uinput node exists (UI_DEV_CREATE done).
+    /// Attach refuses to grab until this holds: grabbing without an
+    /// emit path would swallow the physical device.
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// Haptic feedback sender (host-click report path).
@@ -391,6 +397,15 @@ where
         if !self.pump_ready {
             log::info!(
                 "proxy: pump not ready for {} (no TouchSource/loop/uinput yet); passthrough",
+                event.devnode
+            );
+            self.attached = false;
+            self.passthrough = true;
+            return;
+        }
+        if !self.uinput.is_ready() {
+            log::info!(
+                "proxy: uinput not created for {} yet; passthrough (create before grab)",
                 event.devnode
             );
             self.attached = false;
@@ -859,14 +874,116 @@ impl GrabDevice for DaemonGrab {
     }
 }
 
-/// Best-effort uinput sink. Opens `/dev/uinput` lazily; full device setup
-/// (`UI_DEV_SETUP`, `UI_ABS_SETUP`, `UI_DEV_CREATE`) lands with hardware
-/// verification. Until then emits are logged and best-effort written as
-/// `input_event` structs when the fd is open. Never sets `EV_FF`
-/// (see [`uinput_evbits`]).
+/// uinput ioctl numbers (linux/uinput.h, `_IOW('U', nr, int)` etc).
+/// Computed here so tests pin the exact kernel layout without headers.
+pub const UINPUT_IOCTL_BASE: u8 = b'U';
+const fn iow(nr: u8, size: usize) -> u64 {
+    (1u64 << 30) | ((size as u64) << 16) | ((UINPUT_IOCTL_BASE as u64) << 8) | (nr as u64)
+}
+const fn io(nr: u8) -> u64 {
+    ((UINPUT_IOCTL_BASE as u64) << 8) | (nr as u64)
+}
+pub fn ui_set_evbit() -> u64 {
+    iow(100, 4)
+}
+pub fn ui_set_keybit() -> u64 {
+    iow(101, 4)
+}
+pub fn ui_set_absbit() -> u64 {
+    iow(103, 4)
+}
+pub fn ui_dev_setup() -> u64 {
+    iow(3, std::mem::size_of::<UinputSetup>())
+}
+pub fn ui_abs_setup() -> u64 {
+    iow(4, std::mem::size_of::<UinputAbsSetup>())
+}
+pub fn ui_dev_create() -> u64 {
+    io(1)
+}
+pub fn ui_dev_destroy() -> u64 {
+    io(2)
+}
+
+/// Virtual device identity (proxy node, not a hardware claim).
+pub const UINPUT_NAME: &str = "Linux Trackpad Driver";
+pub const UINPUT_BUSTYPE: u16 = 0x03;
+pub const UINPUT_VENDOR: u16 = 0x05ac;
+pub const UINPUT_PRODUCT: u16 = 0x0324;
+pub const UINPUT_VERSION: u16 = 1;
+
+/// Absolute axis ranges for the proxy node (`res == 0` everywhere:
+/// arbitrary units, never grams/newtons). Pressure clamps to 253
+/// (kernel `absmax`); orientation emits `-(raw)` so the range is the
+/// negated device range widened to ±32 (matches old-service tolerance).
+/// Positions use the old-service Trackpad2 dimensions.
+pub fn uinput_abs_setup() -> Vec<(u16, i32, i32, i32)> {
+    vec![
+        (ABS_MT_SLOT, 0, 15, 0),
+        (ABS_MT_TRACKING_ID, 0, 65535, 0),
+        (ABS_MT_POSITION_X, -3678, 3934, 0),
+        (ABS_MT_POSITION_Y, -2478, 2587, 0),
+        (ABS_MT_PRESSURE, 0, 253, 0),
+        (ABS_MT_ORIENTATION, -32, 32, 0),
+    ]
+}
+
+/// Key bits for the proxy node: buttons + every keyboard code the
+/// click maps can emit. `EV_FF` is never set (no 2026 consumer).
+pub fn uinput_keybits() -> Vec<u16> {
+    let mut keys: Vec<u16> = (1u16..=255).collect();
+    for extra in [
+        BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA, BTN_TOUCH, 364, 387,
+    ] {
+        if !keys.contains(&extra) {
+            keys.push(extra);
+        }
+    }
+    keys.sort_unstable();
+    keys
+}
+
+#[repr(C)]
+struct InputId {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+
+#[repr(C)]
+pub struct UinputSetup {
+    id: InputId,
+    name: [u8; 80],
+    ff_effects_max: u32,
+}
+
+#[repr(C)]
+struct InputAbsinfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+#[repr(C)]
+pub struct UinputAbsSetup {
+    code: u16,
+    filler: u16,
+    absinfo: InputAbsinfo,
+}
+
+/// Best-effort uinput sink with real device creation (`UI_DEV_SETUP` +
+/// `UI_SET_EVBIT/KEYBIT/ABSBIT` + `UI_ABS_SETUP` + `UI_DEV_CREATE`).
+/// Created BEFORE grab; [`UinputSink::is_ready`] gates attach.
+/// Never sets `EV_FF` (see [`uinput_evbits`]). Emits are `input_event`
+/// writes once the fd exists; pre-create emits are debug-logged only.
 pub struct RealUinput {
     node: String,
     fd: Mutex<Option<std::fs::File>>,
+    created: std::sync::atomic::AtomicBool,
 }
 
 impl RealUinput {
@@ -874,7 +991,116 @@ impl RealUinput {
         Self {
             node: node.to_string(),
             fd: Mutex::new(None),
+            created: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn is_created(&self) -> bool {
+        self.created.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn open_locked(
+        guard: &mut Option<std::fs::File>,
+        node: &str,
+    ) -> Result<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        if guard.is_none() {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(node)
+                .map_err(|e| anyhow::anyhow!("opening uinput '{node}': {e}"))?;
+            *guard = Some(f);
+        }
+        Ok(guard.as_ref().expect("just opened").as_raw_fd())
+    }
+
+    fn ioctl(fd: std::os::unix::io::RawFd, req: u64, arg: *mut libc::c_void) -> Result<()> {
+        let ret = unsafe { libc::ioctl(fd, req as libc::c_ulong, arg) };
+        if ret < 0 {
+            return Err(anyhow::anyhow!(
+                "uinput ioctl {req:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create the virtual node. Idempotent; fails gracefully without
+    /// hardware/`/dev/uinput` (caller logs + stays passthrough).
+    pub fn create(&self) -> Result<()> {
+        if self.is_created() {
+            return Ok(());
+        }
+        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+        let fd = Self::open_locked(&mut guard, &self.node)?;
+        for ev in uinput_evbits() {
+            let mut v = ev as libc::c_int;
+            Self::ioctl(fd, ui_set_evbit(), (&mut v as *mut libc::c_int).cast())?;
+        }
+        for key in uinput_keybits() {
+            let mut v = key as libc::c_int;
+            Self::ioctl(fd, ui_set_keybit(), (&mut v as *mut libc::c_int).cast())?;
+        }
+        for (code, mn, mx, res) in uinput_abs_setup() {
+            let mut v = code as libc::c_int;
+            Self::ioctl(fd, ui_set_absbit(), (&mut v as *mut libc::c_int).cast())?;
+            let setup = UinputAbsSetup {
+                code,
+                filler: 0,
+                absinfo: InputAbsinfo {
+                    value: 0,
+                    minimum: mn,
+                    maximum: mx,
+                    fuzz: 0,
+                    flat: 0,
+                    resolution: res,
+                },
+            };
+            Self::ioctl(
+                fd,
+                ui_abs_setup(),
+                (&setup as *const UinputAbsSetup).cast_mut().cast(),
+            )?;
+        }
+        let mut setup = UinputSetup {
+            id: InputId {
+                bustype: UINPUT_BUSTYPE,
+                vendor: UINPUT_VENDOR,
+                product: UINPUT_PRODUCT,
+                version: UINPUT_VERSION,
+            },
+            name: [0u8; 80],
+            ff_effects_max: 0,
+        };
+        let name = UINPUT_NAME.as_bytes();
+        let n = name.len().min(79);
+        setup.name[..n].copy_from_slice(&name[..n]);
+        Self::ioctl(
+            fd,
+            ui_dev_setup(),
+            (&setup as *const UinputSetup).cast_mut().cast(),
+        )?;
+        Self::ioctl(fd, ui_dev_create(), std::ptr::null_mut())?;
+        self.created
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        log::info!("proxy: uinput node {} created ({UINPUT_NAME})", self.node);
+        Ok(())
+    }
+
+    /// Destroy the virtual node (detach path). Syncs first so no
+    /// key-up is lost, then releases grab-side state via caller.
+    pub fn destroy(&self) {
+        use std::os::unix::io::AsRawFd;
+        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = guard.as_ref() {
+            unsafe {
+                libc::ioctl(f.as_raw_fd(), ui_dev_destroy() as libc::c_ulong);
+            }
+        }
+        *guard = None;
+        self.created
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        log::info!("proxy: uinput node {} destroyed", self.node);
     }
 
     pub fn ensure_open(&self) {
@@ -899,6 +1125,9 @@ impl RealUinput {
 }
 
 impl UinputSink for RealUinput {
+    fn is_ready(&self) -> bool {
+        self.is_created()
+    }
     fn emit(&self, ev_type: u16, code: u16, value: i32) {
         log::debug!("uinput emit: type={ev_type} code={code} value={value}");
         let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
@@ -1399,6 +1628,84 @@ mod tests {
     fn eviocgrab_request_pins_linux_layout() {
         // _IOW('E', 0x90, int): 1<<30 | sizeof(int)<<16 | 'E'<<8 | 0x90.
         assert_eq!(eviocgrab_request(), 0x4004_4590);
+    }
+
+    #[test]
+    fn uinput_ioctls_pin_kernel_layout() {
+        assert_eq!(ui_set_evbit(), 0x4004_5564);
+        assert_eq!(ui_set_keybit(), 0x4004_5565);
+        assert_eq!(ui_set_absbit(), 0x4004_5567);
+        assert_eq!(ui_dev_create(), 0x5501);
+        assert_eq!(ui_dev_destroy(), 0x5502);
+        // SETUP sizes ride the struct layouts (92 + 28 on 64-bit Linux).
+        assert_eq!(ui_dev_setup() & 0xffff, 0x5503);
+        assert_eq!(ui_abs_setup() & 0xffff, 0x5504);
+    }
+
+    #[test]
+    fn uinput_setup_is_type_b_res0_no_ff() {
+        let abs = uinput_abs_setup();
+        let get = |code: u16| abs.iter().find(|(c, _, _, _)| *c == code).unwrap();
+        assert_eq!(get(ABS_MT_SLOT), &(ABS_MT_SLOT, 0, 15, 0));
+        assert_eq!(get(ABS_MT_PRESSURE), &(ABS_MT_PRESSURE, 0, 253, 0));
+        assert!(get(ABS_MT_ORIENTATION).2 >= 3);
+        assert!(abs.iter().all(|(_, _, _, res)| *res == 0));
+        let keys = uinput_keybits();
+        for must in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_TOUCH] {
+            assert!(keys.contains(&must), "missing keybit {must}");
+        }
+        assert!(!uinput_evbits().contains(&EV_FF));
+    }
+
+    struct GatedUinput {
+        inner: FakeUinput,
+        ready: std::sync::atomic::AtomicBool,
+    }
+
+    impl GatedUinput {
+        fn new(ready: bool) -> Self {
+            Self {
+                inner: FakeUinput::new(),
+                ready: std::sync::atomic::AtomicBool::new(ready),
+            }
+        }
+    }
+
+    impl UinputSink for GatedUinput {
+        fn is_ready(&self) -> bool {
+            self.ready.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn emit(&self, ty: u16, code: u16, val: i32) {
+            self.inner.emit(ty, code, val);
+        }
+    }
+
+    #[test]
+    fn grab_waits_for_sink_ready() {
+        let grab = Arc::new(FakeGrab::ok());
+        let sink = GatedUinput::new(false);
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            sink,
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        px.set_pump_ready(true);
+        // Sink not created yet: no grab even though pump is ready.
+        px.attach(&usb_ready("/dev/hidraw1"));
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
+    }
+
+    #[test]
+    fn real_uinput_create_fails_gracefully_without_node() {
+        let u = RealUinput::new("/nonexistent-uinput-xyz");
+        assert!(!u.is_created());
+        assert!(!u.is_ready());
+        assert!(u.create().is_err());
+        assert!(!u.is_created());
     }
 
     #[test]
