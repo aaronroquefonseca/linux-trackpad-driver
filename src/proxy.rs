@@ -1167,22 +1167,59 @@ impl UinputSink for RealUinput {
     }
 }
 
-/// Host-click haptic sender: re-sends `0x21 0x01` (init-owned report) as
-/// feedback; strength/quiet carried for logging until the proprietary `0x53`
-/// actuator mapping is verified on hardware. `haptic == 0` never sends.
+/// Actuator report builder (reimplemented from observed old-service
+/// behavior + kernel RE notes, no code copied).
+///
+/// 15-byte vibration report:
+/// `[0xF2, 0x53, 0x01, pressure, amplitude, 0x02, intensity,
+///   0x24, 0x30, 0x06, 0x01, pattern, 0x18, 0x48, 0x12]`
+/// - `intensity` = click strength (`haptic`, 0 = silent, never sent).
+/// - `amplitude` = `quiet ? 0xFF : 0x78`, `pattern` = `quiet ? 0 : 6`.
+/// - `pressure` echoes the strength here.
+///
+/// UNCERTAINTY (pending owner HW verify):
+/// - Old service drove `pressure` from the press threshold (sensitivity)
+///   with up-pulse at `sensitivity*3/5`; we only emit the down pulse per
+///   press edge and echo strength as pressure. Waveform feel may differ.
+/// - Transport framing: old service sent full 15 B via hidapi feature
+///   report on BT but stripped the leading `0xF2` on USB (14 B starting
+///   `0x53`). We mirror that split over `HIDIOCSFEATURE`; whether the
+///   kernel expects feature vs output (`write`) for `0x53` on this
+///   firmware is unconfirmed — failures log + fall back to a plain
+///   `write(2)` of the stripped bytes.
+/// - Haptic node routing (USB If2 vs driver node) is set via
+///   [`RealHaptic::set_node`] by the daemon; BT uses the same node.
+pub fn vibration_report(strength: u8, quiet: bool) -> [u8; 15] {
+    let amplitude = if quiet { 0xFF } else { 0x78 };
+    let pattern = if quiet { 0x00 } else { 0x06 };
+    [
+        0xF2, 0x53, 0x01, strength, amplitude, 0x02, strength, 0x24, 0x30, 0x06, 0x01, pattern,
+        0x18, 0x48, 0x12,
+    ]
+}
+
+/// Real haptic sender: fires the `0x53` actuator report per press edge.
+/// `strength == 0` is silent (no bytes on the wire). Empty node = log-only
+/// (daemon has not attached yet); never fails attach.
 pub struct RealHaptic {
     node: Mutex<String>,
+    bt: std::sync::atomic::AtomicBool,
 }
 
 impl RealHaptic {
     pub fn new() -> Self {
         Self {
             node: Mutex::new(String::new()),
+            bt: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn set_node(&self, node: &str) {
         *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
+    }
+
+    pub fn set_bluetooth(&self, bt: bool) {
+        self.bt.store(bt, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1198,15 +1235,35 @@ impl HapticSender for RealHaptic {
             return Ok(());
         }
         let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let bt = self.bt.load(std::sync::atomic::Ordering::SeqCst);
+        let report = vibration_report(strength, quiet);
         log::info!(
-            "haptic feedback: strength={strength} quiet={quiet} (report 21 01, node={node})"
+            "haptic feedback: strength={strength} quiet={quiet} (report 53, node={node} bt={bt})"
         );
         if node.is_empty() {
             return Ok(());
         }
-        crate::init::send_feature_report_hidraw(&node, crate::init::HOST_CLICK_USB_ON)?;
+        let payload: &[u8] = if bt { &report } else { &report[1..] };
+        if let Err(e) = crate::init::send_feature_report_hidraw(&node, payload) {
+            log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
+            if let Err(e2) = plain_write(&node, payload) {
+                log::warn!("haptic write fallback failed: {e2:#}");
+            }
+        }
         Ok(())
     }
+}
+
+fn plain_write(node: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .map_err(|e| anyhow::anyhow!("opening haptic '{node}': {e}"))?;
+    f.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("haptic write to '{node}': {e}"))?;
+    Ok(())
 }
 
 /// Idle touch source for the daemon hookup: hidraw transport lands with the
@@ -1706,6 +1763,33 @@ mod tests {
         assert!(!u.is_ready());
         assert!(u.create().is_err());
         assert!(!u.is_created());
+    }
+
+    #[test]
+    fn vibration_report_pins_actuator_bytes() {
+        assert_eq!(
+            vibration_report(5, false),
+            [0xF2, 0x53, 0x01, 5, 0x78, 0x02, 5, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+        );
+        assert_eq!(
+            vibration_report(9, true),
+            [0xF2, 0x53, 0x01, 9, 0xFF, 0x02, 9, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12]
+        );
+    }
+
+    #[test]
+    fn silent_haptic_sends_nothing() {
+        let h = RealHaptic::new();
+        h.set_node("/nonexistent-haptic-xyz");
+        // strength 0: silent, Ok, no I/O attempted (would err otherwise).
+        assert!(h.click_feedback(0, false).is_ok());
+        assert!(h.click_feedback(0, true).is_ok());
+    }
+
+    #[test]
+    fn haptic_without_node_is_log_only_ok() {
+        let h = RealHaptic::new();
+        assert!(h.click_feedback(5, false).is_ok());
     }
 
     #[test]
