@@ -59,7 +59,13 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | public-hygiene | #15 | LICENSEs, gitignore, metadata, templates, SECURITY | DONE, MERGED |
 | release-prep | #16 | inert tag/nightly workflows, cliff, PKGBUILD-nightly, RELEASING.md | DONE, MERGED |
 
-Final: 16/16 PRs merged, 0 open. Main green (210+11, clippy/fmt clean, CI green).
+## Owner bug reports (old version) — verification/fix wave 2026-10-15
+
+| ID | Thread | Branch/worktree | Scope | Status |
+|----|--------|-----------------|-------|--------|
+| suspend-robust | T3 `51650f42` | `fix/suspend-robustness` @ `ltd-wt/suspend-robust` | post-resume dead-ends audit (renumber, hook timing, daemon restart, silent hook, re-enumeration) | RUNNING |
+| lo-minus | T3 `911e1a0b` | `fix/lo-minus-click` @ `ltd-wt/lo-minus` | stray '-' in LibreOffice: wire-purity tests + root-cause fix | RUNNING |
+| fkeys | T3 `4834bf4c` | `feat/f13-keys` @ `ltd-wt/fkeys` | F13–F24 + full key-table audit vs kernel header | RUNNING |
 Remaining (owner-side): hardware session per TESTING.md; public launch =
 docs/RELEASING.md 5-min checklist; full EvdevGeneric impl = future work.
 
