@@ -137,8 +137,12 @@ pub trait UinputSink: Send {
 }
 
 /// Haptic feedback sender (host-click report path).
+///
+/// `pressure` is the actuator pressure byte (the press threshold —
+/// old-service parity), `intensity` the click strength (`0` = silent,
+/// never sent); `quiet` selects the soft waveform.
 pub trait HapticSender: Send {
-    fn click_feedback(&self, strength: u8, quiet: bool) -> Result<()>;
+    fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()>;
 }
 
 /// Log-only haptic sender (default when no hardware wired).
@@ -146,11 +150,13 @@ pub trait HapticSender: Send {
 pub struct LogHaptic;
 
 impl HapticSender for LogHaptic {
-    fn click_feedback(&self, strength: u8, quiet: bool) -> Result<()> {
-        if strength == 0 {
+    fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+        if intensity == 0 {
             return Ok(());
         }
-        log::info!("haptic feedback: strength={strength} quiet={quiet} (report 21 01)");
+        log::info!(
+            "haptic feedback: pressure={pressure} intensity={intensity} quiet={quiet} (report 21 01)"
+        );
         Ok(())
     }
 }
@@ -527,7 +533,20 @@ where
     /// never propagated (the read loop must not abort on a bad frame).
     /// Gate-off, pump-unready, or passthrough short-circuits without touching
     /// hardware. Exactly one `SYN` is emitted per handled frame.
+    /// Timed with `Instant::now` (old-service 50 ms press / 30 ms release
+    /// debounce); tests needing deterministic edges use
+    /// [`ClickProxy::handle_frame_at`].
     pub fn handle_frame(&mut self, cfg: &Config) -> Result<Option<ClickEvent>> {
+        self.handle_frame_at(cfg, std::time::Instant::now())
+    }
+
+    /// [`ClickProxy::handle_frame`] with an explicit clock (deterministic
+    /// debounce in tests; production passes `Instant::now`).
+    pub fn handle_frame_at(
+        &mut self,
+        cfg: &Config,
+        now: std::time::Instant,
+    ) -> Result<Option<ClickEvent>> {
         if !self.settings.enhanced || !self.attached || self.passthrough {
             return Ok(None);
         }
@@ -558,22 +577,29 @@ where
         };
         let was_first = self.machine.active().is_some();
         let was_force = self.machine.force_active().is_some();
-        let edges = match self.machine.update(&frame.fingers, frame.clicks, cfg) {
+        let edges = match self
+            .machine
+            .update_at(&frame.fingers, frame.clicks, cfg, now)
+        {
             Ok(e) => e,
             Err(e) => {
                 log::warn!("proxy: click/force parse failed, dropping edge: {e:#}");
                 return Ok(None);
             }
         };
+        // Haptic pressure byte = the press threshold (old-service parity:
+        // `pressure=sensitivity`, `intensity=haptic`; never the strength
+        // echoed as pressure).
+        let haptic_pressure = cfg.sensitivity.clamp(1, 255) as u8;
         // Touch slots first (post-update latch is visible to buttons below).
         self.emit_touch_frame(&frame, cfg.speed);
         // Press order: first then force; reporters see force (supersedes,
         // unless force is `none` — see `FrameOutcome::primary`).
         if let Some(ref ev) = edges.first {
-            self.press_level(ev, false);
+            self.press_level(ev, false, haptic_pressure);
         }
         if let Some(ref ev) = edges.force {
-            self.press_level(ev, true);
+            self.press_level(ev, true, haptic_pressure);
         }
         if edges.first.is_some() || edges.force.is_some() {
             // Edge frames reconcile `BTN_LEFT` through the wire tracker
@@ -632,7 +658,9 @@ where
     /// one-frame jump through both levels therefore emits both pulses in
     /// press order (first then force) — identical to staged arrival. Never
     /// syncs: the caller emits buttons + a single `SYN` per frame.
-    fn press_level(&mut self, ev: &ClickEvent, force: bool) {
+    /// `pressure` is the actuator pressure byte (the press threshold,
+    /// old-service parity); the event carries the intensity + waveform.
+    fn press_level(&mut self, ev: &ClickEvent, force: bool, pressure: u8) {
         use crate::config::ActionKind;
         let name = if force { "force" } else { "click" };
         match &ev.action.kind {
@@ -640,7 +668,7 @@ where
                 log::debug!("proxy: {name}_{} = none (swallowed)", ev.finger_count);
             }
             ActionKind::Empty => {
-                self.fire_haptic(ev);
+                self.fire_haptic(ev, pressure);
             }
             ActionKind::Keys(keys) => {
                 for k in keys {
@@ -671,17 +699,17 @@ where
                         None => log::warn!("proxy: no keycode for '{k}', skipped"),
                     }
                 }
-                self.fire_haptic(ev);
+                self.fire_haptic(ev, pressure);
             }
         }
     }
 
-    fn fire_haptic(&self, ev: &ClickEvent) {
+    fn fire_haptic(&self, ev: &ClickEvent, pressure: u8) {
         if !clicks::should_emit_haptic(ev.haptic) {
             return;
         }
-        let strength = ev.haptic.min(255) as u8;
-        if let Err(e) = self.haptic.click_feedback(strength, ev.quiet) {
+        let intensity = ev.haptic.min(255) as u8;
+        if let Err(e) = self.haptic.click_feedback(pressure, intensity, ev.quiet) {
             log::warn!("proxy: haptic send failed: {e:#}");
         }
     }
@@ -1412,14 +1440,16 @@ impl UinputSink for RealUinput {
 /// 15-byte vibration report:
 /// `[0xF2, 0x53, 0x01, pressure, amplitude, 0x02, intensity,
 ///   0x24, 0x30, 0x06, 0x01, pattern, 0x18, 0x48, 0x12]`
-/// - `intensity` = click strength (`haptic`, 0 = silent, never sent).
-/// - `amplitude` = `quiet ? 0xFF : 0x78`, `pattern` = `quiet ? 0 : 6`.
-/// - `pressure` echoes the strength here.
+/// - `pressure` = the press threshold (`sensitivity`, old-service parity).
+/// - `intensity` = click strength (`haptic` / force override, 0 = silent,
+///   never sent).
+/// - `amplitude` = `quiet ? 0xFF : 0x78`, `pattern` = `quiet ? 0 : 6`
+///   (old-service parity: `120` / `6` normal, `255` / `0` quiet).
 ///
-/// UNCERTAINTY (pending owner HW verify):
-/// - Old service drove `pressure` from the press threshold (sensitivity)
-///   with up-pulse at `sensitivity*3/5`; we only emit the down pulse per
-///   press edge and echo strength as pressure. Waveform feel may differ.
+/// DEVIATION (pending owner HW verify): old service also emits an up-pulse
+/// (`vibration_up` at `sensitivity*3/5`, intensity 0) on release; we emit
+/// only the down pulse per press edge. Release waveform feel may differ —
+/// flagged for the owner feel checklist.
 /// - Transport framing: old service sent full 15 B via hidapi feature
 ///   report on BT but stripped the leading `0xF2` on USB (14 B starting
 ///   `0x53`). We mirror that split over `HIDIOCSFEATURE`; whether the
@@ -1430,17 +1460,17 @@ impl UinputSink for RealUinput {
 ///   via [`crate::evdev::haptic_node_for`] (old-service actuator
 ///   interface); BT and unknown topologies fall back to the touch node
 ///   with a loud log — If2 placement is pending owner HW verify.
-pub fn vibration_report(strength: u8, quiet: bool) -> [u8; 15] {
+pub fn vibration_report(pressure: u8, intensity: u8, quiet: bool) -> [u8; 15] {
     let amplitude = if quiet { 0xFF } else { 0x78 };
     let pattern = if quiet { 0x00 } else { 0x06 };
     [
-        0xF2, 0x53, 0x01, strength, amplitude, 0x02, strength, 0x24, 0x30, 0x06, 0x01, pattern,
+        0xF2, 0x53, 0x01, pressure, amplitude, 0x02, intensity, 0x24, 0x30, 0x06, 0x01, pattern,
         0x18, 0x48, 0x12,
     ]
 }
 
 /// Real haptic sender: fires the `0x53` actuator report per press edge.
-/// `strength == 0` is silent (no bytes on the wire). Empty node = log-only
+/// `intensity == 0` is silent (no bytes on the wire). Empty node = log-only
 /// (daemon has not attached yet); never fails attach.
 pub struct RealHaptic {
     node: Mutex<String>,
@@ -1471,15 +1501,15 @@ impl Default for RealHaptic {
 }
 
 impl HapticSender for RealHaptic {
-    fn click_feedback(&self, strength: u8, quiet: bool) -> Result<()> {
-        if strength == 0 {
+    fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+        if intensity == 0 {
             return Ok(());
         }
         let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let bt = self.bt.load(std::sync::atomic::Ordering::SeqCst);
-        let report = vibration_report(strength, quiet);
+        let report = vibration_report(pressure, intensity, quiet);
         log::info!(
-            "haptic feedback: strength={strength} quiet={quiet} (report 53, node={node} bt={bt})"
+            "haptic feedback: pressure={pressure} intensity={intensity} quiet={quiet} (report 53, node={node} bt={bt})"
         );
         if node.is_empty() {
             return Ok(());
@@ -1594,7 +1624,7 @@ mod tests {
     }
 
     struct FakeHaptic {
-        calls: Mutex<Vec<(u8, bool)>>,
+        calls: Mutex<Vec<(u8, u8, bool)>>,
     }
 
     impl FakeHaptic {
@@ -1606,8 +1636,11 @@ mod tests {
     }
 
     impl HapticSender for FakeHaptic {
-        fn click_feedback(&self, strength: u8, quiet: bool) -> Result<()> {
-            self.calls.lock().unwrap().push((strength, quiet));
+        fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((pressure, intensity, quiet));
             Ok(())
         }
     }
@@ -1887,8 +1920,8 @@ mod tests {
     struct SharedHaptic(Arc<FakeHaptic>);
 
     impl HapticSender for SharedHaptic {
-        fn click_feedback(&self, strength: u8, quiet: bool) -> Result<()> {
-            self.0.click_feedback(strength, quiet)
+        fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+            self.0.click_feedback(pressure, intensity, quiet)
         }
     }
 
@@ -1917,7 +1950,7 @@ mod tests {
         assert!(uinput.has(EV_KEY, BTN_TOUCH, 1));
         // click_1 = left → BTN_LEFT down; haptic fired (default 5).
         assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(5, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
     }
 
     #[test]
@@ -2230,13 +2263,16 @@ mod tests {
 
     #[test]
     fn vibration_report_pins_actuator_bytes() {
+        // Old-service mapping: pressure = press threshold, intensity =
+        // click strength (decoupled — never the strength echoed as
+        // pressure). Amplitude/pattern carry the quiet waveform.
         assert_eq!(
-            vibration_report(5, false),
-            [0xF2, 0x53, 0x01, 5, 0x78, 0x02, 5, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+            vibration_report(64, 5, false),
+            [0xF2, 0x53, 0x01, 64, 0x78, 0x02, 5, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
         );
         assert_eq!(
-            vibration_report(9, true),
-            [0xF2, 0x53, 0x01, 9, 0xFF, 0x02, 9, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12]
+            vibration_report(64, 9, true),
+            [0xF2, 0x53, 0x01, 64, 0xFF, 0x02, 9, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12]
         );
     }
 
@@ -2244,15 +2280,15 @@ mod tests {
     fn silent_haptic_sends_nothing() {
         let h = RealHaptic::new();
         h.set_node("/nonexistent-haptic-xyz");
-        // strength 0: silent, Ok, no I/O attempted (would err otherwise).
-        assert!(h.click_feedback(0, false).is_ok());
-        assert!(h.click_feedback(0, true).is_ok());
+        // intensity 0: silent, Ok, no I/O attempted (would err otherwise).
+        assert!(h.click_feedback(64, 0, false).is_ok());
+        assert!(h.click_feedback(64, 0, true).is_ok());
     }
 
     #[test]
     fn haptic_without_node_is_log_only_ok() {
         let h = RealHaptic::new();
-        assert!(h.click_feedback(5, false).is_ok());
+        assert!(h.click_feedback(64, 5, false).is_ok());
     }
 
     #[test]
@@ -2270,15 +2306,15 @@ mod tests {
         let h = RealHaptic::new();
         h.set_node(usb.to_str().unwrap());
         h.set_bluetooth(false);
-        assert!(h.click_feedback(5, false).is_ok());
+        assert!(h.click_feedback(64, 5, false).is_ok());
         assert_eq!(
             std::fs::read(&usb).unwrap(),
-            &vibration_report(5, false)[1..]
+            &vibration_report(64, 5, false)[1..]
         );
         h.set_node(bt.to_str().unwrap());
         h.set_bluetooth(true);
-        assert!(h.click_feedback(9, true).is_ok());
-        assert_eq!(std::fs::read(&bt).unwrap(), &vibration_report(9, true));
+        assert!(h.click_feedback(64, 9, true).is_ok());
+        assert_eq!(std::fs::read(&bt).unwrap(), &vibration_report(64, 9, true));
     }
 
     #[test]
@@ -2503,6 +2539,14 @@ mod tests {
         px.attach(&usb_ready("/dev/hidraw1"));
         assert!(px.is_attached());
         px
+    }
+
+    /// Deterministic frame clock: 60 ms steps clear both the 50 ms press
+    /// and 30 ms release debounce, so multi-frame sequences exercise edge
+    /// logic undebounced (rapid `handle_frame` calls would trip the
+    /// production debounce instead).
+    fn spaced_at(t0: std::time::Instant, i: u64) -> std::time::Instant {
+        t0 + std::time::Duration::from_millis(i * 60)
     }
 
     fn key_downs(uinput: &FakeUinput) -> Vec<(u16, u16, i32)> {
@@ -2782,7 +2826,7 @@ mod tests {
         // Force supersedes in reporting; haptic falls back to standard 5.
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(5, false), (5, false)]
+            &[(64, 5, false), (64, 5, false)]
         );
     }
 
@@ -2807,7 +2851,7 @@ mod tests {
         assert!(ev.quiet);
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(5, false), (9, true)]
+            &[(64, 5, false), (64, 9, true)]
         );
     }
 
@@ -2825,15 +2869,17 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let cfg = force_cfg();
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
+        // Spaced: the full-release frame must clear the release debounce.
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
         // Force release: forward up, left still down (BTN_LEFT re-asserted).
-        px.handle_frame(&cfg).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         assert!(uinput.has(EV_KEY, BTN_EXTRA, 0));
         assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
         // Full release: left up.
-        px.handle_frame(&cfg).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         assert!(uinput.has(EV_KEY, BTN_LEFT, 0));
     }
 
@@ -2900,11 +2946,13 @@ mod tests {
             force_1: "ctrl+v".into(),
             ..Config::default()
         };
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
+        // Spaced: the full-release frame must clear the release debounce.
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         let mark = uinput.events.lock().unwrap().len();
-        px.handle_frame(&cfg).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         let evs = uinput.events.lock().unwrap().clone();
         // ctrl (29): down once, up once, single transition — never 0 mid-hold.
         let ctrl: Vec<i32> = evs
@@ -2952,9 +3000,11 @@ mod tests {
             force_1: "left".into(),
             ..Config::default()
         };
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
+        // Spaced: the release frame must clear the release debounce.
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         let left = key_values(&uinput, BTN_LEFT);
         assert_eq!(left.first(), Some(&1));
         assert_eq!(left.last(), Some(&0));
@@ -2973,12 +3023,14 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let cfg = force_cfg();
-        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        // Spaced: the release frame must clear the release debounce.
+        let t0 = std::time::Instant::now();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
         assert!(ev.is_force());
         assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
         assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
         let mark = uinput.events.lock().unwrap().len();
-        px.handle_frame(&cfg).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         let tail = uinput.events.lock().unwrap()[mark..].to_vec();
         assert!(
             tail.contains(&(EV_KEY, BTN_LEFT, 0)),
@@ -3008,7 +3060,7 @@ mod tests {
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(ev.is_force());
         assert_eq!(ev.haptic, 0);
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(5, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
         // Keys still held on both levels despite the silent force edge.
         assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
         assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
@@ -3032,7 +3084,7 @@ mod tests {
         assert!(ev.is_force());
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(5, false), (9, true)]
+            &[(64, 5, false), (64, 9, true)]
         );
     }
 
@@ -3050,13 +3102,15 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let cfg = force_cfg();
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
+        // Spaced: the full-release frame must clear the release debounce.
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         let left = key_values(&uinput, BTN_LEFT);
         assert_eq!(left.last(), Some(&1), "first hold lost: {left:?}");
         let mark = uinput.events.lock().unwrap().len();
-        px.handle_frame(&cfg).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         let tail: Vec<(u16, u16, i32)> = uinput.events.lock().unwrap()[mark..].to_vec();
         assert!(
             tail.contains(&(EV_KEY, BTN_LEFT, 0)),
@@ -3087,8 +3141,9 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let cfg = Config::default();
-        for _ in 0..3 {
-            px.handle_frame(&cfg).unwrap();
+        let t0 = std::time::Instant::now();
+        for i in 0..3 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
         }
         let evs = wire_events(&uinput);
         let mut dump = String::new();
@@ -3159,8 +3214,9 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let cfg = Config::default();
-        px.handle_frame(&cfg).unwrap();
-        px.handle_frame(&cfg).unwrap();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         assert_eq!(key_values(&uinput, BTN_TOOL_FINGER), vec![0, 0]);
         assert_eq!(key_values(&uinput, BTN_TOOL_DOUBLETAP), vec![1, 0]);
         assert_eq!(key_values(&uinput, BTN_TOOL_TRIPLETAP), vec![0, 0]);
@@ -3171,10 +3227,33 @@ mod tests {
         let fingers: Vec<_> = (1..=5).map(|id| finger(id, 10, 0, 0)).collect();
         let frames = vec![Ok(Some(frame(fingers, 0)))];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
-        px.handle_frame(&cfg).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         assert_eq!(key_values(&uinput, BTN_TOOL_QUINTTAP), vec![1]);
         assert_eq!(key_values(&uinput, BTN_TOOL_QUADTAP), vec![0]);
     }
+
+    #[test]
+    fn rapid_release_holds_latch_per_debounce() {
+        // Production timing: back-to-back handle_frame calls land
+        // microseconds apart, inside the 30 ms release window — the latch
+        // holds and BTN_LEFT stays down (old-service quick-tap debounce).
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        assert!(px.handle_frame(&cfg).unwrap().is_some());
+        assert!(px.handle_frame(&cfg).unwrap().is_none());
+        assert_eq!(
+            key_values(&uinput, BTN_LEFT),
+            vec![1],
+            "quick release must hold BTN_LEFT down"
+        );
+    }
+
     #[test]
     fn hover_pressure_drives_slot_without_click() {
         // contact=false but pressure 50 (> touch floor 10): the slot is
@@ -3193,6 +3272,24 @@ mod tests {
         assert_eq!(key_values(&uinput, BTN_TOOL_FINGER), vec![1]);
         assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
     }
+
+    #[test]
+    fn haptic_pressure_is_threshold_not_strength() {
+        // Old-service mapping through the full proxy path: pressure byte =
+        // sensitivity (threshold), intensity = configured haptic strength.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            sensitivity: 80,
+            haptic: 7,
+            ..Config::default()
+        };
+        px.handle_frame(&cfg).unwrap();
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(80, 7, false)]);
+    }
+
     // ---- Click-emission wire-purity regression net ----
     //
     // Wire hygiene for the proxy: these tests pin the COMPLETE wire event
@@ -3304,8 +3401,11 @@ mod tests {
         let haptic = Arc::new(FakeHaptic::new());
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         // Four frames per sequence; extra `None`s are harmless no-ops.
-        for _ in 0..4 {
-            px.handle_frame(cfg).unwrap();
+        // Spaced 60 ms: release-bearing sequences must clear the
+        // production debounce (rapid calls would hold the latch).
+        let t0 = std::time::Instant::now();
+        for i in 0..4 {
+            px.handle_frame_at(cfg, spaced_at(t0, i)).unwrap();
         }
         (uinput, haptic)
     }
@@ -3440,8 +3540,11 @@ mod tests {
         px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         let cfg = Config::default();
-        for _ in 0..4 {
-            px.handle_frame(&cfg).unwrap();
+        // Spaced 60 ms so the release frame clears the production
+        // debounce (rapid calls would hold the latch instead).
+        let t0 = std::time::Instant::now();
+        for i in 0..4 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
         }
         let got = wire_events(&uinput);
         // Raw hidraw blocks carry major 10 / minor 6 (b4/b5).
@@ -3752,15 +3855,17 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let armed = force_cfg();
-        px.handle_frame(&armed).unwrap();
-        px.handle_frame(&armed).unwrap();
+        // Spaced: the full-release frame must clear the release debounce.
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&armed, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&armed, spaced_at(t0, 1)).unwrap();
         assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
         let off = Config {
             force_offset: 0,
             ..armed
         };
-        px.handle_frame(&off).unwrap();
-        px.handle_frame(&off).unwrap();
+        px.handle_frame_at(&off, spaced_at(t0, 2)).unwrap();
+        px.handle_frame_at(&off, spaced_at(t0, 3)).unwrap();
         let got = wire_events(&uinput);
         assert_wire_pure(&got, &[BTN_LEFT, BTN_EXTRA, BTN_TOUCH]);
         // Forward: exactly one down/up pair, released at disarm (frame 3),

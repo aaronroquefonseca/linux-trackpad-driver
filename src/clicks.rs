@@ -13,6 +13,10 @@
 //! - Touch presence is the device flag OR pressure past
 //!   [`TOUCH_PRESSURE_FLOOR`] (10, old-service parity): light touches
 //!   drive cursor slots without latching clicks.
+//! - Old-service debounce on the timed path ([`ClickMachine::update_at`]):
+//!   press swallowed within [`PRESS_DEBOUNCE_MS`] (50 ms) of the last
+//!   release, release held within [`RELEASE_DEBOUNCE_MS`] (30 ms) of the
+//!   press edge. The force level is undebounced (old parity).
 //! - Finger-count at the press edge selects `click_1..=click_5` via the
 //!   existing [`crate::config::parse_click_action`].
 //! - Force second level: `force_offset > 0` arms force press at
@@ -51,6 +55,8 @@
 //!   `BTN = clicks & 1` (bits 6..7 are timestamp, not buttons) OR-ed into
 //!   the click state.
 
+use std::time::Instant;
+
 use anyhow::Result;
 
 use crate::apple_parse::{FingerContact, PRESSURE_VALID_MAX};
@@ -61,6 +67,13 @@ use crate::config::{ActionKind, ClickAction, Config};
 /// click threshold this still drives cursor slots; at/above `sensitivity`
 /// it also latches clicks (old `max_pressure` semantics, per-finger here).
 pub const TOUCH_PRESSURE_FLOOR: u8 = 10;
+
+/// Press debounce: a fresh press within 50 ms of the last release is
+/// swallowed (old-service `last_release_time + 50ms` gate).
+pub const PRESS_DEBOUNCE_MS: u64 = 50;
+/// Release debounce: a release within 30 ms of the press edge is held
+/// (old-service `last_press_time + 30ms` gate).
+pub const RELEASE_DEBOUNCE_MS: u64 = 30;
 
 /// Whether a decoded contact counts as touching (device flag or pressure).
 pub fn touch_present(f: &FingerContact) -> bool {
@@ -184,6 +197,8 @@ pub struct ClickMachine {
     active: Option<ClickEvent>,
     force_pressed: std::collections::HashMap<u8, bool>,
     force_active: Option<ClickEvent>,
+    last_press_at: Option<Instant>,
+    last_release_at: Option<Instant>,
 }
 
 impl ClickMachine {
@@ -247,6 +262,11 @@ impl ClickMachine {
     /// the frame, never aborts; the next frame retries the edge instead of
     /// swallowing a half-latched click).
     ///
+    /// Timeless core: no debounce is applied and no timestamps are
+    /// recorded. Unit tests use this; the production proxy path uses
+    /// [`ClickMachine::update_at`] so the old-service 50 ms press / 30 ms
+    /// release debounce applies on hardware.
+    ///
     /// Force fires only when `force_offset > 0` and some finger's pressure
     /// (`u16`-compared, no overflow) reaches `sensitivity + force_offset`;
     /// finger-count is captured at the force edge like the first level.
@@ -269,6 +289,33 @@ impl ClickMachine {
         fingers: &[FingerContact],
         _clicks: u8,
         cfg: &Config,
+    ) -> Result<FrameOutcome> {
+        self.update_inner(fingers, cfg, None)
+    }
+
+    /// Timed feed: [`ClickMachine::update`] plus the old-service press /
+    /// release debounce. A press within [`PRESS_DEBOUNCE_MS`] of the last
+    /// release is swallowed (bits reverted so the next frame retries); a
+    /// release within [`RELEASE_DEBOUNCE_MS`] of the press edge holds the
+    /// latch. The force level is undebounced (old parity: time gates only
+    /// guard the Released↔Pressed transitions), except a suppressed
+    /// first-level press also suppresses the same-frame force edge (old
+    /// `Released` admits no `ForcePressed` directly).
+    pub fn update_at(
+        &mut self,
+        fingers: &[FingerContact],
+        _clicks: u8,
+        cfg: &Config,
+        now: Instant,
+    ) -> Result<FrameOutcome> {
+        self.update_inner(fingers, cfg, Some(now))
+    }
+
+    fn update_inner(
+        &mut self,
+        fingers: &[FingerContact],
+        cfg: &Config,
+        now: Option<Instant>,
     ) -> Result<FrameOutcome> {
         let press = press_threshold(cfg);
         let release = release_threshold(cfg);
@@ -336,12 +383,34 @@ impl ClickMachine {
             None
         };
 
+        // Debounce gates (timed path only; `None` = timeless unit-test
+        // core, never gated). Press: within 50 ms of the last release the
+        // edge is swallowed and the fresh bits reverted so the next frame
+        // retries instead of half-latching. Release: within 30 ms of the
+        // press edge the latch holds.
+        let press_suppressed = first_action.is_some()
+            && now.is_some_and(|t| {
+                self.last_release_at.is_some_and(|r| {
+                    t.saturating_duration_since(r).as_millis() < u128::from(PRESS_DEBOUNCE_MS)
+                })
+            });
+
         // Phase 3: commit bit writes.
         for (id, bit) in first_write {
             self.pressed.insert(id, bit);
         }
         for (id, bit) in force_write {
             self.force_pressed.insert(id, bit);
+        }
+        if press_suppressed {
+            // Revert the fresh bits: the swallowed press retries next frame
+            // (a committed `true` bit would never re-edge). The same-frame
+            // force edge is swallowed too (old `Released` admits no direct
+            // `ForcePressed`).
+            for id in newly_pressed.iter().chain(newly_force.iter()) {
+                self.pressed.insert(*id, false);
+                self.force_pressed.insert(*id, false);
+            }
         }
         // Fingers absent from this frame keep their bits unless the frame is
         // empty (all lifted).
@@ -363,15 +432,26 @@ impl ClickMachine {
 
         // Release latches with no remaining bits (force first so a full
         // release clears both; first-level release implies force is gone too
-        // since force release >= first release).
+        // since force release >= first release). The force level drops
+        // undebounced (old parity); the first level holds while inside the
+        // release debounce window.
         if self.force_active.is_some() && !self.force_pressed.values().any(|&p| p) {
             self.force_active = None;
         }
-        if self.active.is_some() && !self.pressed.values().any(|&p| p) {
+        let release_debounced = self.active.is_some()
+            && now.is_some_and(|t| {
+                self.last_press_at.is_some_and(|p| {
+                    t.saturating_duration_since(p).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
+                })
+            });
+        if self.active.is_some() && !self.pressed.values().any(|&p| p) && !release_debounced {
             self.active = None;
             self.force_active = None;
             for v in self.force_pressed.values_mut() {
                 *v = false;
+            }
+            if let Some(t) = now {
+                self.last_release_at = Some(t);
             }
         }
 
@@ -379,39 +459,53 @@ impl ClickMachine {
 
         // Press edge: first newly-pressed finger while idle latches.
         if let Some(action) = first_action {
-            let ev = ClickEvent {
-                finger_count: n,
-                action,
-                haptic: cfg.haptic,
-                quiet: cfg.quiet_click,
-                level: ClickLevel::First,
-            };
-            // `none` still latches (swallows the gesture); caller emits
-            // nothing and no haptic for it.
-            self.active = Some(ev.clone());
-            out.first = Some(ev);
+            if press_suppressed {
+                // Swallowed: no latch, no edge; the reverted bits retry.
+            } else {
+                let ev = ClickEvent {
+                    finger_count: n,
+                    action,
+                    haptic: cfg.haptic,
+                    quiet: cfg.quiet_click,
+                    level: ClickLevel::First,
+                };
+                // `none` still latches (swallows the gesture); caller emits
+                // nothing and no haptic for it.
+                self.active = Some(ev.clone());
+                out.first = Some(ev);
+                if let Some(t) = now {
+                    self.last_press_at = Some(t);
+                }
+            }
         }
         // Force edge: same latch shape, disabled entirely when offset is 0.
         if let Some(action) = force_action {
-            let ev = ClickEvent {
-                finger_count: n,
-                action,
-                haptic: cfg.effective_force_haptic(),
-                quiet: cfg.force_quiet_click,
-                level: ClickLevel::Force,
-            };
-            self.force_active = Some(ev.clone());
-            out.force = Some(ev);
+            if press_suppressed {
+                // Swallowed with the first-level press (see above).
+            } else {
+                let ev = ClickEvent {
+                    finger_count: n,
+                    action,
+                    haptic: cfg.effective_force_haptic(),
+                    quiet: cfg.force_quiet_click,
+                    level: ClickLevel::Force,
+                };
+                self.force_active = Some(ev.clone());
+                out.force = Some(ev);
+            }
         }
         Ok(out)
     }
 
-    /// Latch reset (detach path): clears both levels.
+    /// Latch reset (detach path): clears both levels and debounce clocks
+    /// so a re-attach starts undebounced.
     pub fn reset(&mut self) {
         self.pressed.clear();
         self.active = None;
         self.force_pressed.clear();
         self.force_active = None;
+        self.last_press_at = None;
+        self.last_release_at = None;
     }
 }
 
@@ -894,6 +988,111 @@ mod tests {
         // Retry with a fixed config fires on the same pressure.
         let out = m.update(&[finger(1, 200)], 0, &Config::default()).unwrap();
         assert!(out.first.is_some());
+    }
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + std::time::Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn press_debounce_swallows_fast_repress_then_retries() {
+        // Old 50 ms press gate: release at T, re-press at T+20 swallowed
+        // (bits reverted, no latch), re-press at T+60 fires.
+        let cfg = Config::default();
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 200)], 0, &cfg, at(t0, 0))
+            .unwrap()
+            .first
+            .is_some());
+        assert!(m
+            .update_at(&[finger(1, 0)], 0, &cfg, at(t0, 100))
+            .unwrap()
+            .is_empty());
+        assert!(m.active().is_none());
+        // 20 ms after release: swallowed, latch stays idle, bits reverted.
+        let out = m
+            .update_at(&[finger(1, 200)], 0, &cfg, at(t0, 120))
+            .unwrap();
+        assert!(out.is_empty());
+        assert!(m.active().is_none());
+        assert!(!m.finger_pressed(1));
+        // 60 ms after release: fires.
+        let out = m
+            .update_at(&[finger(1, 200)], 0, &cfg, at(t0, 160))
+            .unwrap();
+        assert!(out.first.is_some());
+    }
+
+    #[test]
+    fn release_debounce_holds_quick_tap_then_drops() {
+        // Old 30 ms release gate: press at T, pressure drop at T+10 holds
+        // the latch; drop at T+40 releases.
+        let cfg = Config::default();
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 200)], 0, &cfg, at(t0, 0))
+            .unwrap()
+            .first
+            .is_some());
+        assert!(m
+            .update_at(&[finger(1, 10)], 0, &cfg, at(t0, 10))
+            .unwrap()
+            .is_empty());
+        assert!(m.active().is_some(), "quick release must hold the latch");
+        assert!(m
+            .update_at(&[finger(1, 10)], 0, &cfg, at(t0, 40))
+            .unwrap()
+            .is_empty());
+        assert!(m.active().is_none());
+    }
+
+    #[test]
+    fn timeless_update_ignores_debounce_clocks() {
+        // The timeless core never gates: rapid press/release via update()
+        // behaves exactly as before (existing hysteresis tests rely on it).
+        let cfg = Config::default();
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 200)], 0, &cfg, t0)
+            .unwrap()
+            .first
+            .is_some());
+        // Timeless release drops immediately even inside the window.
+        assert!(m.update(&[finger(1, 10)], 0, &cfg).unwrap().is_empty());
+        assert!(m.active().is_none());
+        // Timeless press fires immediately even inside the window.
+        assert!(m
+            .update(&[finger(1, 200)], 0, &cfg)
+            .unwrap()
+            .first
+            .is_some());
+    }
+
+    #[test]
+    fn touch_floor_drives_presence_below_click_threshold() {
+        // contact=false but pressure 50 (> 10): present for slots and
+        // finger-count, still below the click threshold (no latch).
+        let cfg = Config::default();
+        let hover = FingerContact {
+            contact: false,
+            ..finger(1, 50)
+        };
+        assert!(touch_present(&hover));
+        let mut m = ClickMachine::new();
+        assert!(m.update(&[hover], 0, &cfg).unwrap().is_empty());
+        assert!(m.active().is_none());
+        // contact=false but pressure past sensitivity: old max_pressure
+        // parity — the click still latches.
+        let deep = FingerContact {
+            contact: false,
+            ..finger(1, 200)
+        };
+        let ev = m.update(&[deep], 0, &cfg).unwrap().first.unwrap();
+        assert_eq!(ev.finger_count, 1);
     }
 
     #[test]
