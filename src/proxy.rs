@@ -1063,13 +1063,109 @@ impl RealUinput {
         Ok(guard.as_ref().expect("just opened").as_raw_fd())
     }
 
-    fn ioctl(fd: std::os::unix::io::RawFd, req: u64, arg: *mut libc::c_void) -> Result<()> {
+    fn ioctl_ptr(fd: std::os::unix::io::RawFd, req: u64, arg: *mut libc::c_void) -> Result<()> {
         let ret = unsafe { libc::ioctl(fd, req as libc::c_ulong, arg) };
         if ret < 0 {
+            let io = std::io::Error::last_os_error();
             return Err(anyhow::anyhow!(
-                "uinput ioctl {req:#x}: {}",
-                std::io::Error::last_os_error()
+                "uinput ioctl {req:#x} (struct ptr): {io}{}",
+                Self::einval_hint(io.raw_os_error(), "UI_DEV_SETUP/UI_ABS_SETUP take a struct pointer; check struct size/layout vs linux/uinput.h")
             ));
+        }
+        Ok(())
+    }
+
+    /// `UI_SET_*BIT` take the bit number as an int VALUE (like the
+    /// `evdev` crate's `ioctl_write_int!`), not a pointer. Passing
+    /// `&val` makes the kernel read the pointer address as the bit
+    /// number and fail the first ioctl (`UI_SET_EVBIT`) with `EINVAL`.
+    fn ioctl_int(fd: std::os::unix::io::RawFd, req: u64, val: libc::c_int) -> Result<()> {
+        let ret = unsafe { libc::ioctl(fd, req as libc::c_ulong, val) };
+        if ret < 0 {
+            let io = std::io::Error::last_os_error();
+            return Err(anyhow::anyhow!(
+                "uinput ioctl {req:#x} (int value {val}): {io}{}",
+                Self::einval_hint(io.raw_os_error(), "UI_SET_*BIT take the bit number as int value, not a pointer; out-of-range bit or restricted /dev/uinput also give EINVAL")
+            ));
+        }
+        Ok(())
+    }
+
+    fn einval_hint(errno: Option<i32>, likely: &str) -> String {
+        if errno == Some(libc::EINVAL) {
+            format!("; likely cause: {likely}")
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// One step of the virtual-node create sequence, in order.
+/// `Bit` steps must go through the int-value ioctl; struct steps
+/// through the pointer ioctl (pinned by test).
+#[derive(Debug, PartialEq)]
+enum CreateOp {
+    Bit(u64, libc::c_int),
+    Abs(u16, i32, i32, i32),
+    DevSetup,
+    DevCreate,
+}
+
+impl RealUinput {
+    /// Ordered create plan: evbits → keybits → (absbit + abs-setup per
+    /// axis) → dev-setup → dev-create. Matches the working `evdev`
+    /// crate `VirtualDeviceBuilder` sequence (hardware-verified).
+    fn create_plan() -> Vec<CreateOp> {
+        let mut plan = Vec::new();
+        for ev in uinput_evbits() {
+            plan.push(CreateOp::Bit(ui_set_evbit(), ev as libc::c_int));
+        }
+        for key in uinput_keybits() {
+            plan.push(CreateOp::Bit(ui_set_keybit(), key as libc::c_int));
+        }
+        for (code, mn, mx, res) in uinput_abs_setup() {
+            plan.push(CreateOp::Bit(ui_set_absbit(), code as libc::c_int));
+            plan.push(CreateOp::Abs(code, mn, mx, res));
+        }
+        plan.push(CreateOp::DevSetup);
+        plan.push(CreateOp::DevCreate);
+        plan
+    }
+
+    fn run_plan(
+        fd: std::os::unix::io::RawFd,
+        plan: &[CreateOp],
+        setup: &UinputSetup,
+    ) -> Result<()> {
+        for op in plan {
+            match *op {
+                CreateOp::Bit(req, val) => Self::ioctl_int(fd, req, val)?,
+                CreateOp::Abs(code, mn, mx, res) => {
+                    let abs = UinputAbsSetup {
+                        code,
+                        filler: 0,
+                        absinfo: InputAbsinfo {
+                            value: 0,
+                            minimum: mn,
+                            maximum: mx,
+                            fuzz: 0,
+                            flat: 0,
+                            resolution: res,
+                        },
+                    };
+                    Self::ioctl_ptr(
+                        fd,
+                        ui_abs_setup(),
+                        (&abs as *const UinputAbsSetup).cast_mut().cast(),
+                    )?;
+                }
+                CreateOp::DevSetup => Self::ioctl_ptr(
+                    fd,
+                    ui_dev_setup(),
+                    (setup as *const UinputSetup).cast_mut().cast(),
+                )?,
+                CreateOp::DevCreate => Self::ioctl_ptr(fd, ui_dev_create(), std::ptr::null_mut())?,
+            }
         }
         Ok(())
     }
@@ -1101,35 +1197,6 @@ impl RealUinput {
     }
 
     fn create_on(fd: std::os::unix::io::RawFd) -> Result<()> {
-        for ev in uinput_evbits() {
-            let mut v = ev as libc::c_int;
-            Self::ioctl(fd, ui_set_evbit(), (&mut v as *mut libc::c_int).cast())?;
-        }
-        for key in uinput_keybits() {
-            let mut v = key as libc::c_int;
-            Self::ioctl(fd, ui_set_keybit(), (&mut v as *mut libc::c_int).cast())?;
-        }
-        for (code, mn, mx, res) in uinput_abs_setup() {
-            let mut v = code as libc::c_int;
-            Self::ioctl(fd, ui_set_absbit(), (&mut v as *mut libc::c_int).cast())?;
-            let setup = UinputAbsSetup {
-                code,
-                filler: 0,
-                absinfo: InputAbsinfo {
-                    value: 0,
-                    minimum: mn,
-                    maximum: mx,
-                    fuzz: 0,
-                    flat: 0,
-                    resolution: res,
-                },
-            };
-            Self::ioctl(
-                fd,
-                ui_abs_setup(),
-                (&setup as *const UinputAbsSetup).cast_mut().cast(),
-            )?;
-        }
         let mut setup = UinputSetup {
             id: InputId {
                 bustype: UINPUT_BUSTYPE,
@@ -1143,13 +1210,7 @@ impl RealUinput {
         let name = UINPUT_NAME.as_bytes();
         let n = name.len().min(79);
         setup.name[..n].copy_from_slice(&name[..n]);
-        Self::ioctl(
-            fd,
-            ui_dev_setup(),
-            (&setup as *const UinputSetup).cast_mut().cast(),
-        )?;
-        Self::ioctl(fd, ui_dev_create(), std::ptr::null_mut())?;
-        Ok(())
+        Self::run_plan(fd, &Self::create_plan(), &setup)
     }
 
     /// Flush one staged buffer in a single write loop. A short actual
@@ -1928,6 +1989,71 @@ mod tests {
         assert!(!u.is_created());
         assert!(!u.is_ready());
         assert!(u.create().is_err());
+        assert!(!u.is_created());
+    }
+
+    #[test]
+    fn uinput_create_plan_pins_working_sequence() {
+        // Hardware-verified on kernel 7.2.9-arch1-1: UI_SET_*BIT take
+        // the bit as int VALUE (evdev crate `ioctl_write_int!`); a
+        // pointer arg makes the first ioctl fail with EINVAL.
+        assert_eq!(ui_dev_setup(), 0x405c_5503); // _IOW('U',3,uinput_setup=92)
+        assert_eq!(ui_abs_setup(), 0x401c_5504); // _IOW('U',4,uinput_abs_setup=28)
+        let plan = RealUinput::create_plan();
+        let mut i = 0;
+        for ev in uinput_evbits() {
+            assert_eq!(
+                plan[i],
+                CreateOp::Bit(ui_set_evbit(), ev as libc::c_int),
+                "evbit #{i}"
+            );
+            i += 1;
+        }
+        for key in uinput_keybits() {
+            assert_eq!(
+                plan[i],
+                CreateOp::Bit(ui_set_keybit(), key as libc::c_int),
+                "keybit #{i}"
+            );
+            i += 1;
+        }
+        for (code, mn, mx, res) in uinput_abs_setup() {
+            assert_eq!(
+                plan[i],
+                CreateOp::Bit(ui_set_absbit(), code as libc::c_int),
+                "absbit #{i}"
+            );
+            i += 1;
+            assert_eq!(plan[i], CreateOp::Abs(code, mn, mx, res), "abs-setup #{i}");
+            i += 1;
+        }
+        assert_eq!(plan[i], CreateOp::DevSetup);
+        assert_eq!(plan[i + 1], CreateOp::DevCreate);
+        assert_eq!(plan.len(), i + 2);
+    }
+
+    #[test]
+    fn uinput_einval_error_names_likely_cause() {
+        let hint = RealUinput::einval_hint(Some(libc::EINVAL), "int value, not a pointer");
+        assert!(hint.contains("likely cause"), "hint was: {hint}");
+        assert!(RealUinput::einval_hint(Some(libc::ENOMEM), "x").is_empty());
+        assert!(RealUinput::einval_hint(None, "x").is_empty());
+    }
+
+    #[test]
+    fn real_uinput_create_e2e_on_hardware() {
+        // Live check: skipped (Ok) where /dev/uinput is absent (CI).
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .is_err()
+        {
+            return;
+        }
+        let u = RealUinput::new("/dev/uinput");
+        u.create().expect("create on /dev/uinput");
+        assert!(u.is_created());
+        u.destroy();
         assert!(!u.is_created());
     }
 
