@@ -2107,4 +2107,395 @@ mod tests {
         );
         assert_eq!(key_values(&uinput, BTN_LEFT).last(), Some(&0));
     }
+
+    // ---- Click-emission wire-purity regression net ----
+    //
+    // Wire hygiene for the proxy: these tests pin the COMPLETE wire event
+    // set per scenario — press+hold+release must carry ONLY the action's
+    // own codes plus `BTN_TOUCH`/`SYN` and the six MT `ABS` codes, with
+    // zero other `EV_KEY` of any value — so any future unexpected emission
+    // fails here first. This is hygiene, not a symptom fix: the owner bug
+    // (clicks typing '-' in LibreOffice, old version) stays OPEN pending
+    // a hardware capture (see TESTING.md); no causation is claimed here.
+    // (`BTN_LEFT` = 272 can never be the `KEY_MINUS` = 12 the symptom
+    // would need — that capture decides the real cause.)
+
+    /// `KEY_MINUS` (`linux/input-event-codes.h`): explicit redundant pin
+    /// for the owner-reported '-' symptom. The per-scenario `allowed_keys`
+    /// set is the primary guard (it already excludes code 12 everywhere);
+    /// this assert only names the symptom so a future failure message
+    /// points at the open bug instead of a bare code number.
+    const KEY_MINUS: u16 = 12;
+
+    /// Every `EV_ABS` code the proxy may ever emit (MT slot block only).
+    const ALLOWED_ABS: [u16; 6] = [
+        ABS_MT_SLOT,
+        ABS_MT_TRACKING_ID,
+        ABS_MT_POSITION_X,
+        ABS_MT_POSITION_Y,
+        ABS_MT_PRESSURE,
+        ABS_MT_ORIENTATION,
+    ];
+
+    fn wire_events(uinput: &FakeUinput) -> Vec<(u16, u16, i32)> {
+        uinput.events.lock().unwrap().clone()
+    }
+
+    /// Assert the COMPLETE wire stream uses only expected codes:
+    /// - `EV_SYN` is exactly `(SYN_REPORT, 0)`;
+    /// - `EV_ABS` is one of the six MT codes;
+    /// - `EV_KEY` is in `allowed_keys` with value 0/1 (this is the primary
+    ///   guard; the extra `KEY_MINUS` assert below is a redundant pin);
+    /// - no other event type exists on the wire.
+    fn assert_wire_pure(events: &[(u16, u16, i32)], allowed_keys: &[u16]) {
+        for &(ty, code, val) in events {
+            match ty {
+                EV_SYN => assert_eq!(
+                    (code, val),
+                    (SYN_REPORT, 0),
+                    "stray SYN event {ty}/{code}/{val}"
+                ),
+                EV_ABS => assert!(
+                    ALLOWED_ABS.contains(&code),
+                    "stray EV_ABS code {code}: {events:?}"
+                ),
+                EV_KEY => {
+                    assert!(
+                        val == 0 || val == 1,
+                        "key event with bad value {ty}/{code}/{val}"
+                    );
+                    assert!(
+                        allowed_keys.contains(&code),
+                        "stray EV_KEY code {code}: {events:?}"
+                    );
+                    assert_ne!(code, KEY_MINUS, "explicit KEY_MINUS pin fired: {events:?}");
+                }
+                _ => panic!("unexpected event type {ty}: {events:?}"),
+            }
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|&(t, c, _)| t == EV_KEY && c == KEY_MINUS),
+            "explicit KEY_MINUS pin fired: {events:?}"
+        );
+    }
+
+    /// Button codes on an edge-triggered wire strictly alternate (exact
+    /// down/up pairs): no stuck keys, no duplicate same-value re-asserts.
+    fn assert_strict_alternation(vals: &[i32], what: &str) {
+        assert!(
+            !vals.is_empty(),
+            "{what}: expected a down/up pair, got none"
+        );
+        assert!(
+            vals.windows(2).all(|w| w[0] != w[1]),
+            "{what}: duplicate re-assert, expected strict alternation: {vals:?}"
+        );
+    }
+
+    /// Drive press + hold + release + liftoff through a ready proxy with
+    /// `cfg`, returning the complete wire log.
+    fn drive_click_sequence(
+        frames: Vec<Result<Option<TouchFrame>>>,
+        cfg: &Config,
+    ) -> (Arc<FakeUinput>, Arc<FakeHaptic>) {
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        // Four frames per sequence; extra `None`s are harmless no-ops.
+        for _ in 0..4 {
+            px.handle_frame(cfg).unwrap();
+        }
+        (uinput, haptic)
+    }
+
+    fn press_hold_release_liftoff() -> Vec<Result<Option<TouchFrame>>> {
+        vec![
+            Ok(Some(frame(vec![finger(1, 200, 10, 20)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 15, 25)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 15, 25)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ]
+    }
+
+    #[test]
+    fn left_click_exact_wire_sequence() {
+        // Canonical 1-finger left click: press, hold (moved), release
+        // (pressure below hysteresis), liftoff. Pins the COMPLETE stream.
+        let cfg = Config::default();
+        let (uinput, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&uinput);
+        let want: Vec<(u16, u16, i32)> = vec![
+            // Press frame: touch block + BTN_TOUCH + one BTN_LEFT down + SYN.
+            // Edge-triggered: no duplicate re-assert, no stray releases.
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 10),
+            (EV_ABS, ABS_MT_POSITION_Y, 20),
+            (EV_ABS, ABS_MT_PRESSURE, 200),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_KEY, BTN_LEFT, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            // Hold frame: moved +5/+5 at 100% speed; buttons unchanged, so
+            // no BTN_LEFT traffic at all — only touch + BTN_TOUCH + SYN.
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 15),
+            (EV_ABS, ABS_MT_POSITION_Y, 25),
+            (EV_ABS, ABS_MT_PRESSURE, 200),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            // Release frame: pressure 10 <= release 59, latch drops; the
+            // contact is still present so touch stays up until liftoff.
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 15),
+            (EV_ABS, ABS_MT_POSITION_Y, 25),
+            (EV_ABS, ABS_MT_PRESSURE, 10),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_KEY, BTN_LEFT, 0),
+            (EV_SYN, SYN_REPORT, 0),
+            // Liftoff: slot terminated, BTN_TOUCH up, trailing SYN. BTN_LEFT
+            // is already up, so it stays silent (no stray release).
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_SYN, SYN_REPORT, 0),
+        ];
+        assert_eq!(got, want, "wire sequence drifted");
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        // Edge-triggered pin: exactly one down/up pair, no re-asserts.
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+    }
+
+    #[test]
+    fn right_click_wire_pure() {
+        let cfg = Config::default(); // click_2 = right
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 1, 1), finger(2, 200, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 10, 1, 1), finger(2, 10, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let (uinput, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_RIGHT, BTN_TOUCH]);
+        assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
+        // Exact down/up pair: strengthens first/last to a full pin, and
+        // strict alternation rules out duplicate re-asserts.
+        let right = key_values(&uinput, BTN_RIGHT);
+        assert_eq!(right, vec![1, 0], "{right:?}");
+        assert_strict_alternation(&right, "BTN_RIGHT");
+    }
+
+    #[test]
+    fn middle_click_wire_pure() {
+        let cfg = Config::default(); // click_3 = middle
+        let fingers = || {
+            vec![
+                finger(1, 200, 0, 0),
+                finger(2, 200, 9, 9),
+                finger(3, 200, 5, 5),
+            ]
+        };
+        let frames = vec![
+            Ok(Some(frame(fingers(), 0))),
+            Ok(Some(frame(fingers(), 0))),
+            Ok(Some(frame(
+                vec![
+                    finger(1, 10, 0, 0),
+                    finger(2, 10, 9, 9),
+                    finger(3, 10, 5, 5),
+                ],
+                0,
+            ))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let (uinput, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_MIDDLE, BTN_TOUCH]);
+        assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
+        let middle = key_values(&uinput, BTN_MIDDLE);
+        assert_eq!(middle, vec![1, 0], "{middle:?}");
+        assert_strict_alternation(&middle, "BTN_MIDDLE");
+    }
+
+    #[test]
+    fn empty_click_wire_pure() {
+        let cfg = Config {
+            click_1: "empty".into(),
+            ..Config::default()
+        };
+        let (uinput, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&uinput);
+        // Haptic only: BTN_TOUCH is the sole EV_KEY allowed on the wire.
+        assert_wire_pure(&got, &[BTN_TOUCH]);
+        assert!(!haptic.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn none_click_wire_pure() {
+        let cfg = Config {
+            click_1: "none".into(),
+            ..Config::default()
+        };
+        let (uinput, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&uinput);
+        // Swallowed gesture: BTN_TOUCH only, no haptic, no buttons.
+        assert_wire_pure(&got, &[BTN_TOUCH]);
+        assert!(haptic.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn combo_click_wire_pure() {
+        // ctrl+c: exactly the combo codes + BTN_TOUCH; each key goes
+        // down once and up once (a missing key-up would auto-repeat
+        // downstream, turning one press into a character run).
+        let cfg = Config {
+            click_1: "ctrl+c".into(),
+            ..Config::default()
+        };
+        let (uinput, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[29, 46, BTN_TOUCH]);
+        assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
+        let ctrl = key_values(&uinput, 29);
+        assert_eq!(ctrl, vec![1, 0], "{ctrl:?}");
+        assert_strict_alternation(&ctrl, "ctrl");
+        let c = key_values(&uinput, 46);
+        assert_eq!(c, vec![1, 0], "{c:?}");
+        assert_strict_alternation(&c, "c");
+    }
+
+    #[test]
+    fn physical_button_wire_pure() {
+        // No fingers, hardware button bit only: BTN_LEFT follows the
+        // `clicks & 1` bit, BTN_TOUCH mirrors it, nothing else on EV_KEY.
+        let cfg = Config::default();
+        let frames = vec![
+            Ok(Some(frame(vec![], 0x01))),
+            Ok(Some(frame(vec![], 0x01))),
+            Ok(Some(frame(vec![], 0x00))),
+            Ok(Some(frame(vec![], 0x00))),
+        ];
+        let (uinput, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+    }
+
+    #[test]
+    fn physical_hold_suppresses_latch_release_flutter() {
+        // Latch releases while the hardware button still holds: no
+        // BTN_LEFT 0-then-1 flutter in one frame, the wire simply stays
+        // down until the physical bit drops — still exactly one pair.
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0x01))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0x01))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0x00))),
+            Ok(Some(frame(vec![], 0x00))),
+        ];
+        let (uinput, _) = drive_click_sequence(frames, &Config::default());
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+    }
+
+    #[test]
+    fn force_cycle_wire_pure() {
+        // First hold (left) -> force edge (forward) -> force release back
+        // to first hold -> full release: only the two action codes plus
+        // BTN_TOUCH on EV_KEY, each paired down/up exactly once.
+        let cfg = force_cfg();
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let (uinput, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_EXTRA, BTN_TOUCH]);
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+        let extra = key_values(&uinput, BTN_EXTRA);
+        assert_eq!(extra, vec![1, 0], "{extra:?}");
+        assert_strict_alternation(&extra, "BTN_EXTRA");
+    }
+
+    #[test]
+    fn detach_mid_hold_wire_pure() {
+        // Grab released mid-hold: every held code gets exactly one key-up
+        // (no stuck keys downstream) and the wire stays pure.
+        use crate::init::{detached, Transport};
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        px.detach(&detached("/dev/hidraw1", Transport::Usb));
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        // Exactly one down/up pair: no duplicate releases, no stuck key.
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+    }
+
+    #[test]
+    fn force_disarm_mid_hold_wire_pure() {
+        // `force_offset` back to 0 mid-hold: force keys go up once, the
+        // first-level hold continues silently, full release ends at zero.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let armed = force_cfg();
+        px.handle_frame(&armed).unwrap();
+        px.handle_frame(&armed).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        let off = Config {
+            force_offset: 0,
+            ..armed
+        };
+        px.handle_frame(&off).unwrap();
+        px.handle_frame(&off).unwrap();
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_EXTRA, BTN_TOUCH]);
+        // Forward: exactly one down/up pair, released at disarm (frame 3),
+        // never re-pressed. Left: down once, up once, at full release.
+        let extra = key_values(&uinput, BTN_EXTRA);
+        assert_eq!(extra, vec![1, 0], "{extra:?}");
+        assert_strict_alternation(&extra, "BTN_EXTRA");
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+    }
 }
