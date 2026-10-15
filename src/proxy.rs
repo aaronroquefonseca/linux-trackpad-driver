@@ -14,9 +14,11 @@
 //!   Default false → zero behavior change, pure passthrough: no grab, no
 //!   uinput traffic. Grabbing without an emit path bricks the device, so
 //!   `attach` degrades to passthrough until readiness holds.
-//! - The physical evdev node is never guessed: `LTD_EVDEV_NODE` must name it
-//!   (hidraw→eventN auto-resolution belongs to the transport task). Unset →
-//!   refuse + passthrough, never `event0` roulette.
+//! - The physical evdev node is auto-resolved per hidraw node
+//!   ([`crate::evdev`]: `$LTD_EVDEV_NODE` override wins, else the sysfs
+//!   parentage walk, else a name+MT-caps scan). The name scan is UNTRUSTED
+//!   and never backs a grab; unresolvable → passthrough, never `event0`
+//!   roulette.
 //! - Proxy node: Type-B MT slots + tracking IDs, `res == 0` arbitrary
 //!   0..253 range, `BTN_LEFT`/`BTN_TOUCH` + `SYN`. NEVER advertises
 //!   `EV_FF`/`FF_HAPTIC` (no 2026 libinput/Wayland consumer).
@@ -100,6 +102,12 @@ pub trait UinputSink: Send {
     fn emit(&self, ev_type: u16, code: u16, value: i32);
     fn sync(&self) {
         self.emit(EV_SYN, SYN_REPORT, 0);
+    }
+    /// True when the uinput node exists (UI_DEV_CREATE done).
+    /// Attach refuses to grab until this holds: grabbing without an
+    /// emit path would swallow the physical device.
+    fn is_ready(&self) -> bool {
+        true
     }
 }
 
@@ -304,6 +312,11 @@ pub struct ClickProxy<G, U, H, S> {
     source: S,
     machine: ClickMachine,
     attached: bool,
+    /// Which hidraw devnode owns the live grab. A `Detached` for any other
+    /// node is ignored: without this a sibling interface detaching would
+    /// release the active grab and brick the session (grab gone,
+    /// `attached=false`, while the owner still thinks it holds the pump).
+    attached_node: Option<String>,
     passthrough: bool,
     /// Pump readiness: true only when a real `TouchSource` plus a draining
     /// pump loop plus a created uinput node exist. Until the transport task
@@ -338,6 +351,7 @@ where
             source,
             machine: ClickMachine::new(),
             attached: false,
+            attached_node: None,
             passthrough: true,
             pump_ready: false,
             held_first: Vec::new(),
@@ -357,6 +371,31 @@ where
         self.passthrough
     }
 
+    /// Borrow the touch source (manager swaps hidraw nodes per attach).
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Replace the touch source, returning the old one.
+    pub fn replace_source(&mut self, src: S) -> S {
+        std::mem::replace(&mut self.source, src)
+    }
+
+    /// Borrow the uinput sink (manager creates/destroys the node).
+    pub fn uinput(&self) -> &U {
+        &self.uinput
+    }
+
+    /// Borrow the grab handle (manager points it at the resolved evdev).
+    pub fn grab(&self) -> &G {
+        &self.grab
+    }
+
+    /// Borrow the haptic sender mutably (manager points it at the hidraw node).
+    pub fn haptic_mut(&mut self) -> &mut H {
+        &mut self.haptic
+    }
+
     /// Mark the pump path ready/unready (transport-task wiring). Clearing
     /// while attached releases the grab so the device is never swallowed
     /// without an emit path.
@@ -370,6 +409,7 @@ where
             self.machine.reset();
             self.last_pos.clear();
             self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
         }
     }
@@ -385,6 +425,7 @@ where
         if !self.settings.enhanced {
             log::debug!("proxy: gate off, passthrough for {}", event.devnode);
             self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
             return;
         }
@@ -394,6 +435,17 @@ where
                 event.devnode
             );
             self.attached = false;
+            self.attached_node = None;
+            self.passthrough = true;
+            return;
+        }
+        if !self.uinput.is_ready() {
+            log::info!(
+                "proxy: uinput not created for {} yet; passthrough (create before grab)",
+                event.devnode
+            );
+            self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
             return;
         }
@@ -401,6 +453,7 @@ where
             Ok(()) => {
                 log::info!("proxy: grabbed {} (uinput virtual node up)", event.devnode);
                 self.attached = true;
+                self.attached_node = Some(event.devnode.clone());
                 self.passthrough = false;
             }
             Err(e) => {
@@ -409,15 +462,26 @@ where
                     event.devnode
                 );
                 self.attached = false;
+                self.attached_node = None;
                 self.passthrough = true;
             }
         }
     }
 
     /// Detach on `Detached`: release grab, drop latch + held keys, trailing
-    /// `SYN` so no key-up is lost (stuck keys otherwise).
+    /// `SYN` so no key-up is lost (stuck keys otherwise). Ownership-gated:
+    /// a `Detached` for any node other than the grabbed one is ignored, so
+    /// a sibling interface vanishing can never release the live grab.
     pub fn detach(&mut self, event: &DeviceReadyEvent) {
         if event.kind != ReadyKind::Detached {
+            return;
+        }
+        if self.attached_node.as_deref() != Some(event.devnode.as_str()) {
+            log::debug!(
+                "proxy: ignoring Detached for {} (grab owned by {:?})",
+                event.devnode,
+                self.attached_node
+            );
             return;
         }
         if self.attached {
@@ -430,6 +494,7 @@ where
         self.last_pos.clear();
         self.max_slot = 0;
         self.attached = false;
+        self.attached_node = None;
         self.passthrough = true;
     }
 
@@ -445,6 +510,23 @@ where
             Ok(Some(f)) => f,
             Ok(None) => return Ok(None),
             Err(e) => {
+                // Persistent disconnect (unplug/replug reusing the same
+                // hidraw name: the fd is dead but no Detached will ever
+                // bound the errors) self-releases the session exactly
+                // once: ungrab, held keys up, trailing SYN, latch reset,
+                // back to passthrough with the pump marked unready. After
+                // the release the idle short-circuit above stops polling
+                // the dead fd, so logs stay bounded (one warn per state
+                // change, never ~500/s). Re-attach rebinds fresh fds.
+                if crate::pump::is_disconnect(&e) {
+                    if self.attached {
+                        log::warn!("proxy: disconnect detected, self-releasing: {e:#}");
+                        self.set_pump_ready(false);
+                    } else {
+                        log::debug!("proxy: disconnect poll while idle: {e:#}");
+                    }
+                    return Ok(None);
+                }
                 log::warn!("proxy: poll_frame failed, dropping frame: {e:#}");
                 return Ok(None);
             }
@@ -765,10 +847,23 @@ impl RealGrab {
         }
     }
 
-    /// Point at a (re-)resolved node. A live grab keeps its fd: re-grab
-    /// while grabbed is a no-op success, never a close+reopen (fd corrupt).
+    /// Point at a (re-)resolved node. Never retargets a live grab: if
+    /// grabbed, the grab is released first (with a log) so the old fd
+    /// can never keep swallowing the previous node after the switch.
     pub fn set_node(&self, node: &str) {
+        if self.is_grabbed() {
+            log::warn!("grab target moved to '{node}' while grabbed; releasing grab first");
+            self.ungrab();
+        }
         *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
+    }
+
+    /// Test hook: install an open fd as a live grab.
+    #[cfg(test)]
+    fn inject_open(&self, f: std::fs::File) {
+        *self.fd.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        self.grabbed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -813,60 +908,130 @@ impl GrabDevice for RealGrab {
     }
 }
 
-/// Grabber that always refuses: used when no evdev node is configured.
-/// The physical node is never guessed (`event0` roulette could swallow a
-/// keyboard), so `attach` degrades to passthrough with a log instead.
-#[derive(Debug, Default)]
-pub struct RefusingGrab;
-
-impl GrabDevice for RefusingGrab {
-    fn grab(&self) -> Result<()> {
-        anyhow::bail!(
-            "no evdev node configured (LTD_EVDEV_NODE unset); refusing to guess — passthrough"
-        )
-    }
-    fn ungrab(&self) {}
-    fn is_grabbed(&self) -> bool {
-        false
-    }
+/// uinput ioctl numbers (linux/uinput.h, `_IOW('U', nr, int)` etc).
+/// Computed here so tests pin the exact kernel layout without headers.
+pub const UINPUT_IOCTL_BASE: u8 = b'U';
+const fn iow(nr: u8, size: usize) -> u64 {
+    (1u64 << 30) | ((size as u64) << 16) | ((UINPUT_IOCTL_BASE as u64) << 8) | (nr as u64)
+}
+const fn io(nr: u8) -> u64 {
+    ((UINPUT_IOCTL_BASE as u64) << 8) | (nr as u64)
+}
+pub fn ui_set_evbit() -> u64 {
+    iow(100, 4)
+}
+pub fn ui_set_keybit() -> u64 {
+    iow(101, 4)
+}
+pub fn ui_set_absbit() -> u64 {
+    iow(103, 4)
+}
+pub fn ui_dev_setup() -> u64 {
+    iow(3, std::mem::size_of::<UinputSetup>())
+}
+pub fn ui_abs_setup() -> u64 {
+    iow(4, std::mem::size_of::<UinputAbsSetup>())
+}
+pub fn ui_dev_create() -> u64 {
+    io(1)
+}
+pub fn ui_dev_destroy() -> u64 {
+    io(2)
 }
 
-/// Daemon grabber: real node when resolved, refusing otherwise. Single type
-/// so the daemon hookup stays monomorphic.
-pub enum DaemonGrab {
-    Real(RealGrab),
-    Refusing(RefusingGrab),
+/// Virtual device identity (proxy node, not a hardware claim).
+pub const UINPUT_NAME: &str = "Linux Trackpad Driver";
+pub const UINPUT_BUSTYPE: u16 = 0x03;
+pub const UINPUT_VENDOR: u16 = 0x05ac;
+pub const UINPUT_PRODUCT: u16 = 0x0324;
+pub const UINPUT_VERSION: u16 = 1;
+
+/// Absolute axis ranges for the proxy node (`res == 0` everywhere:
+/// arbitrary units, never grams/newtons). Pressure clamps to 253
+/// (kernel `absmax`); orientation emits `-(raw)` so the range is the
+/// negated device range widened to ±32 (matches old-service tolerance).
+/// Positions use the old-service Trackpad2 dimensions.
+pub fn uinput_abs_setup() -> Vec<(u16, i32, i32, i32)> {
+    vec![
+        (ABS_MT_SLOT, 0, 15, 0),
+        (ABS_MT_TRACKING_ID, 0, 65535, 0),
+        (ABS_MT_POSITION_X, -3678, 3934, 0),
+        (ABS_MT_POSITION_Y, -2478, 2587, 0),
+        (ABS_MT_PRESSURE, 0, 253, 0),
+        (ABS_MT_ORIENTATION, -32, 32, 0),
+    ]
 }
 
-impl GrabDevice for DaemonGrab {
-    fn grab(&self) -> Result<()> {
-        match self {
-            DaemonGrab::Real(g) => g.grab(),
-            DaemonGrab::Refusing(g) => g.grab(),
+/// Key bits for the proxy node: buttons + every keyboard code the
+/// click maps can emit. `EV_FF` is never set (no 2026 consumer).
+pub fn uinput_keybits() -> Vec<u16> {
+    let mut keys: Vec<u16> = (1u16..=255).collect();
+    for extra in [
+        BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA, BTN_TOUCH, 364, 387,
+    ] {
+        if !keys.contains(&extra) {
+            keys.push(extra);
         }
     }
-    fn ungrab(&self) {
-        match self {
-            DaemonGrab::Real(g) => g.ungrab(),
-            DaemonGrab::Refusing(g) => g.ungrab(),
-        }
-    }
-    fn is_grabbed(&self) -> bool {
-        match self {
-            DaemonGrab::Real(g) => g.is_grabbed(),
-            DaemonGrab::Refusing(g) => g.is_grabbed(),
-        }
-    }
+    keys.sort_unstable();
+    keys
 }
 
-/// Best-effort uinput sink. Opens `/dev/uinput` lazily; full device setup
-/// (`UI_DEV_SETUP`, `UI_ABS_SETUP`, `UI_DEV_CREATE`) lands with hardware
-/// verification. Until then emits are logged and best-effort written as
-/// `input_event` structs when the fd is open. Never sets `EV_FF`
-/// (see [`uinput_evbits`]).
+#[repr(C)]
+struct InputId {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+
+#[repr(C)]
+pub struct UinputSetup {
+    id: InputId,
+    name: [u8; 80],
+    ff_effects_max: u32,
+}
+
+#[repr(C)]
+struct InputAbsinfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+#[repr(C)]
+pub struct UinputAbsSetup {
+    code: u16,
+    filler: u16,
+    absinfo: InputAbsinfo,
+}
+
+/// Best-effort uinput sink with real device creation (`UI_DEV_SETUP` +
+/// `UI_SET_EVBIT/KEYBIT/ABSBIT` + `UI_ABS_SETUP` + `UI_DEV_CREATE`).
+/// Created BEFORE grab; [`UinputSink::is_ready`] gates attach.
+/// Never sets `EV_FF` (see [`uinput_evbits`]). Emits are `input_event`
+/// writes once the fd exists; pre-create emits are debug-logged only.
 pub struct RealUinput {
     node: String,
     fd: Mutex<Option<std::fs::File>>,
+    created: std::sync::atomic::AtomicBool,
+    /// Staged `input_event` bytes, flushed as one `write(2)` per `sync()`
+    /// (one frame = one syscall). Pre-create emits are dropped with a
+    /// debug log, never buffered: without a node there is no consumer.
+    staging: Mutex<Vec<u8>>,
+}
+
+/// Serialize one `input_event` (zeroed timestamps). Layout pinned by
+/// test: `sec(8) usec(8) type(2) code(2) value(4)`, native-endian.
+fn encode_event(ev_type: u16, code: u16, value: i32) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[16..18].copy_from_slice(&ev_type.to_ne_bytes());
+    b[18..20].copy_from_slice(&code.to_ne_bytes());
+    b[20..24].copy_from_slice(&value.to_ne_bytes());
+    b
 }
 
 impl RealUinput {
@@ -874,86 +1039,275 @@ impl RealUinput {
         Self {
             node: node.to_string(),
             fd: Mutex::new(None),
+            created: std::sync::atomic::AtomicBool::new(false),
+            staging: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn ensure_open(&self) {
+    pub fn is_created(&self) -> bool {
+        self.created.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn open_locked(
+        guard: &mut Option<std::fs::File>,
+        node: &str,
+    ) -> Result<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        if guard.is_none() {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(node)
+                .map_err(|e| anyhow::anyhow!("opening uinput '{node}': {e}"))?;
+            *guard = Some(f);
+        }
+        Ok(guard.as_ref().expect("just opened").as_raw_fd())
+    }
+
+    fn ioctl(fd: std::os::unix::io::RawFd, req: u64, arg: *mut libc::c_void) -> Result<()> {
+        let ret = unsafe { libc::ioctl(fd, req as libc::c_ulong, arg) };
+        if ret < 0 {
+            return Err(anyhow::anyhow!(
+                "uinput ioctl {req:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create the virtual node. Idempotent; fails gracefully without
+    /// hardware/`/dev/uinput` (caller logs + stays passthrough). A
+    /// mid-sequence failure closes the fd instead of leaking a
+    /// half-configured node: the next `create()` starts clean.
+    pub fn create(&self) -> Result<()> {
+        if self.is_created() {
+            return Ok(());
+        }
         let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
+        let fd = Self::open_locked(&mut guard, &self.node)?;
+        let r = Self::create_on(fd);
+        if r.is_err() {
+            *guard = None;
+        } else {
+            self.created
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            log::info!("proxy: uinput node {} created ({UINPUT_NAME})", self.node);
+        }
+        r
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fd_open(&self) -> bool {
+        self.fd.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn create_on(fd: std::os::unix::io::RawFd) -> Result<()> {
+        for ev in uinput_evbits() {
+            let mut v = ev as libc::c_int;
+            Self::ioctl(fd, ui_set_evbit(), (&mut v as *mut libc::c_int).cast())?;
+        }
+        for key in uinput_keybits() {
+            let mut v = key as libc::c_int;
+            Self::ioctl(fd, ui_set_keybit(), (&mut v as *mut libc::c_int).cast())?;
+        }
+        for (code, mn, mx, res) in uinput_abs_setup() {
+            let mut v = code as libc::c_int;
+            Self::ioctl(fd, ui_set_absbit(), (&mut v as *mut libc::c_int).cast())?;
+            let setup = UinputAbsSetup {
+                code,
+                filler: 0,
+                absinfo: InputAbsinfo {
+                    value: 0,
+                    minimum: mn,
+                    maximum: mx,
+                    fuzz: 0,
+                    flat: 0,
+                    resolution: res,
+                },
+            };
+            Self::ioctl(
+                fd,
+                ui_abs_setup(),
+                (&setup as *const UinputAbsSetup).cast_mut().cast(),
+            )?;
+        }
+        let mut setup = UinputSetup {
+            id: InputId {
+                bustype: UINPUT_BUSTYPE,
+                vendor: UINPUT_VENDOR,
+                product: UINPUT_PRODUCT,
+                version: UINPUT_VERSION,
+            },
+            name: [0u8; 80],
+            ff_effects_max: 0,
+        };
+        let name = UINPUT_NAME.as_bytes();
+        let n = name.len().min(79);
+        setup.name[..n].copy_from_slice(&name[..n]);
+        Self::ioctl(
+            fd,
+            ui_dev_setup(),
+            (&setup as *const UinputSetup).cast_mut().cast(),
+        )?;
+        Self::ioctl(fd, ui_dev_create(), std::ptr::null_mut())?;
+        Ok(())
+    }
+
+    /// Flush one staged buffer in a single write loop. A short actual
+    /// (`ret != remaining`) without error keeps writing; any error or a
+    /// zero return drops the remainder with a loud log instead of
+    /// looping forever on a dead fd.
+    fn flush_locked(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) {
+        let mut written = 0usize;
+        while written < buf.len() {
+            let ret =
+                unsafe { libc::write(fd, buf[written..].as_ptr().cast(), buf.len() - written) };
+            if ret < 0 {
+                log::warn!(
+                    "proxy: uinput write failed after {written}/{} bytes: {}",
+                    buf.len(),
+                    std::io::Error::last_os_error()
+                );
+                break;
+            }
+            if ret == 0 {
+                log::warn!(
+                    "proxy: uinput write returned 0 with {} bytes left; dropping",
+                    buf.len() - written
+                );
+                break;
+            }
+            written += ret as usize;
+        }
+        if written != buf.len() {
+            log::warn!(
+                "proxy: uinput short write ({written}/{} bytes); remainder dropped",
+                buf.len()
+            );
+        }
+        buf.clear();
+    }
+
+    /// Lock order is always fd → staging (matches [`UinputSink::emit`]);
+    /// never the reverse.
+    fn flush(&self) {
+        let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+        let mut staging = self.staging.lock().unwrap_or_else(|e| e.into_inner());
+        if staging.is_empty() {
             return;
         }
-        match std::fs::OpenOptions::new().write(true).open(&self.node) {
-            Ok(f) => {
-                log::info!(
-                    "proxy: uinput node {} open (setup verified on hardware)",
-                    self.node
-                );
-                *guard = Some(f);
+        let Some(f) = guard.as_ref() else {
+            log::debug!("uinput flush with no fd; dropping {} bytes", staging.len());
+            staging.clear();
+            return;
+        };
+        use std::os::unix::io::AsRawFd;
+        Self::flush_locked(f.as_raw_fd(), &mut staging);
+    }
+
+    /// Destroy the virtual node (detach path). Flushes staged events
+    /// first so no key-up is lost, then releases grab-side state via caller.
+    pub fn destroy(&self) {
+        use std::os::unix::io::AsRawFd;
+        self.flush();
+        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = guard.as_ref() {
+            unsafe {
+                libc::ioctl(f.as_raw_fd(), ui_dev_destroy() as libc::c_ulong);
             }
-            Err(e) => log::warn!(
-                "proxy: uinput open {} failed: {e}; events logged only",
-                self.node
-            ),
         }
+        *guard = None;
+        self.created
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        log::info!("proxy: uinput node {} destroyed", self.node);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn staged_len(&self) -> usize {
+        self.staging.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
 impl UinputSink for RealUinput {
+    fn is_ready(&self) -> bool {
+        self.is_created()
+    }
     fn emit(&self, ev_type: u16, code: u16, value: i32) {
         log::debug!("uinput emit: type={ev_type} code={code} value={value}");
         let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = guard.as_ref() {
-            use std::os::unix::io::AsRawFd;
-            #[repr(C)]
-            struct InputEvent {
-                sec: libc::time_t,
-                usec: libc::suseconds_t,
-                ty: u16,
-                code: u16,
-                value: i32,
-            }
-            let ev = InputEvent {
-                sec: 0,
-                usec: 0,
-                ty: ev_type,
-                code,
-                value,
-            };
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    (&raw const ev).cast::<u8>(),
-                    std::mem::size_of::<InputEvent>(),
-                )
-            };
-            unsafe {
-                let ret = libc::write(f.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
-                if ret < 0 {
-                    log::warn!(
-                        "proxy: uinput write failed (type={ev_type} code={code}): {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-            }
+        if guard.is_none() {
+            log::debug!("uinput emit pre-create; dropping event");
+            return;
         }
+        drop(guard);
+        self.staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(&encode_event(ev_type, code, value));
+    }
+
+    /// Frame boundary: stage the trailing `SYN` and flush the whole
+    /// frame in one write.
+    fn sync(&self) {
+        self.emit(EV_SYN, SYN_REPORT, 0);
+        self.flush();
     }
 }
 
-/// Host-click haptic sender: re-sends `0x21 0x01` (init-owned report) as
-/// feedback; strength/quiet carried for logging until the proprietary `0x53`
-/// actuator mapping is verified on hardware. `haptic == 0` never sends.
+/// Actuator report builder (reimplemented from observed old-service
+/// behavior + kernel RE notes, no code copied).
+///
+/// 15-byte vibration report:
+/// `[0xF2, 0x53, 0x01, pressure, amplitude, 0x02, intensity,
+///   0x24, 0x30, 0x06, 0x01, pattern, 0x18, 0x48, 0x12]`
+/// - `intensity` = click strength (`haptic`, 0 = silent, never sent).
+/// - `amplitude` = `quiet ? 0xFF : 0x78`, `pattern` = `quiet ? 0 : 6`.
+/// - `pressure` echoes the strength here.
+///
+/// UNCERTAINTY (pending owner HW verify):
+/// - Old service drove `pressure` from the press threshold (sensitivity)
+///   with up-pulse at `sensitivity*3/5`; we only emit the down pulse per
+///   press edge and echo strength as pressure. Waveform feel may differ.
+/// - Transport framing: old service sent full 15 B via hidapi feature
+///   report on BT but stripped the leading `0xF2` on USB (14 B starting
+///   `0x53`). We mirror that split over `HIDIOCSFEATURE`; whether the
+///   kernel expects feature vs output (`write`) for `0x53` on this
+///   firmware is unconfirmed — failures log + fall back to a plain
+///   `write(2)` of the stripped bytes.
+/// - Haptic node routing: the daemon resolves the interface-2 sibling
+///   via [`crate::evdev::haptic_node_for`] (old-service actuator
+///   interface); BT and unknown topologies fall back to the touch node
+///   with a loud log — If2 placement is pending owner HW verify.
+pub fn vibration_report(strength: u8, quiet: bool) -> [u8; 15] {
+    let amplitude = if quiet { 0xFF } else { 0x78 };
+    let pattern = if quiet { 0x00 } else { 0x06 };
+    [
+        0xF2, 0x53, 0x01, strength, amplitude, 0x02, strength, 0x24, 0x30, 0x06, 0x01, pattern,
+        0x18, 0x48, 0x12,
+    ]
+}
+
+/// Real haptic sender: fires the `0x53` actuator report per press edge.
+/// `strength == 0` is silent (no bytes on the wire). Empty node = log-only
+/// (daemon has not attached yet); never fails attach.
 pub struct RealHaptic {
     node: Mutex<String>,
+    bt: std::sync::atomic::AtomicBool,
 }
 
 impl RealHaptic {
     pub fn new() -> Self {
         Self {
             node: Mutex::new(String::new()),
+            bt: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn set_node(&self, node: &str) {
         *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
+    }
+
+    pub fn set_bluetooth(&self, bt: bool) {
+        self.bt.store(bt, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -969,33 +1323,40 @@ impl HapticSender for RealHaptic {
             return Ok(());
         }
         let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let bt = self.bt.load(std::sync::atomic::Ordering::SeqCst);
+        let report = vibration_report(strength, quiet);
         log::info!(
-            "haptic feedback: strength={strength} quiet={quiet} (report 21 01, node={node})"
+            "haptic feedback: strength={strength} quiet={quiet} (report 53, node={node} bt={bt})"
         );
         if node.is_empty() {
             return Ok(());
         }
-        crate::init::send_feature_report_hidraw(&node, crate::init::HOST_CLICK_USB_ON)?;
+        let payload: &[u8] = if bt { &report } else { &report[1..] };
+        // Strict send: EPIPE/EIO (device NAK) must propagate so the
+        // fallback below runs. The lenient init variant would swallow
+        // the NAK as success → silent no-haptic with no fallback.
+        if let Err(e) = crate::init::send_feature_report_hidraw_strict(&node, payload) {
+            log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
+            if let Err(e2) = plain_write(&node, payload) {
+                log::error!(
+                    "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
+                );
+            }
+        }
         Ok(())
     }
 }
 
-/// Idle touch source for the daemon hookup: hidraw transport lands with the
-/// transport task, so the daemon subscribes a proxy that polls to no-op
-/// until then. Reports the same tier/units contract as the real source.
-#[derive(Debug, Default)]
-pub struct NullSource;
-
-impl TouchSource for NullSource {
-    fn tier(&self) -> crate::apple_parse::CapabilityTier {
-        crate::apple_parse::CapabilityTier::L2p
-    }
-    fn pressure_units(&self) -> crate::apple_parse::PressureUnits {
-        crate::apple_parse::PressureUnits::Arbitrary
-    }
-    fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
-        Ok(None)
-    }
+fn plain_write(node: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .map_err(|e| anyhow::anyhow!("opening haptic '{node}': {e}"))?;
+    f.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("haptic write to '{node}': {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1233,6 +1594,97 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_self_releases_once_with_bounded_polls() {
+        // Same-name replug: the fd is dead (0-byte/ENODEV) but no
+        // Detached will ever bound the errors. The proxy must release
+        // exactly once (grab, keys, SYN, latch, pump flag) and then
+        // stop polling the dead source — bounded logs, session
+        // revivable on fresh wiring.
+        use anyhow::Error as AnyhowError;
+        let grab = Arc::new(FakeGrab::ok());
+        let uinput = Arc::new(FakeUinput::new());
+        let disc = || {
+            Err::<Option<TouchFrame>, AnyhowError>(
+                crate::pump::DisconnectError("test unplug".into()).into(),
+            )
+        };
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            disc(),
+            disc(),
+            disc(),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            SharedUinput(Arc::clone(&uinput)),
+            FakeHaptic::new(),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap(); // press → BTN_LEFT down
+        assert_eq!(key_values(&uinput, BTN_LEFT), vec![1]);
+        px.handle_frame(&cfg).unwrap(); // disconnect → self-release
+        assert!(!grab.is_grabbed(), "dead fd must release the grab");
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert_eq!(
+            key_values(&uinput, BTN_LEFT),
+            vec![1, 0],
+            "held keys go up exactly once"
+        );
+        // Pump marked unready: a bare re-attach stays passthrough.
+        px.attach(&usb_ready("/dev/hidraw8"));
+        assert!(!px.is_attached());
+        // Dead source never polled again (logs bounded by construction).
+        let remaining = px.source.frames.borrow().len();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        assert_eq!(px.source.frames.borrow().len(), remaining);
+        // Fresh wiring revives the session on the same node.
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        assert!(px.is_attached());
+        assert!(grab.is_grabbed());
+    }
+
+    #[test]
+    fn sibling_detached_never_kills_live_grab() {
+        // Live session on hidraw8; a sibling interface (hidraw10) detaching
+        // must not release the grab, flip passthrough, or emit key-ups.
+        let grab = Arc::new(FakeGrab::ok());
+        let uinput = Arc::new(FakeUinput::new());
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            SharedUinput(Arc::clone(&uinput)),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        assert!(px.is_attached());
+        assert!(grab.is_grabbed());
+        let events_before = uinput.events.lock().unwrap().len();
+        px.detach(&detached("/dev/hidraw10", Transport::Usb));
+        assert!(px.is_attached(), "sibling Detached released the live grab");
+        assert!(!px.is_passthrough());
+        assert!(grab.is_grabbed(), "sibling Detached dropped the evdev grab");
+        assert_eq!(
+            uinput.events.lock().unwrap().len(),
+            events_before,
+            "sibling Detached emitted teardown traffic"
+        );
+        // The owning node detaching still tears down.
+        px.detach(&detached("/dev/hidraw8", Transport::Usb));
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
+    }
+
+    #[test]
     fn grab_failure_falls_back_to_passthrough() {
         let mut px = ClickProxy::new(
             settings(true),
@@ -1399,6 +1851,184 @@ mod tests {
     fn eviocgrab_request_pins_linux_layout() {
         // _IOW('E', 0x90, int): 1<<30 | sizeof(int)<<16 | 'E'<<8 | 0x90.
         assert_eq!(eviocgrab_request(), 0x4004_4590);
+    }
+
+    #[test]
+    fn uinput_ioctls_pin_kernel_layout() {
+        assert_eq!(ui_set_evbit(), 0x4004_5564);
+        assert_eq!(ui_set_keybit(), 0x4004_5565);
+        assert_eq!(ui_set_absbit(), 0x4004_5567);
+        assert_eq!(ui_dev_create(), 0x5501);
+        assert_eq!(ui_dev_destroy(), 0x5502);
+        // SETUP sizes ride the struct layouts (92 + 28 on 64-bit Linux).
+        assert_eq!(ui_dev_setup() & 0xffff, 0x5503);
+        assert_eq!(ui_abs_setup() & 0xffff, 0x5504);
+    }
+
+    #[test]
+    fn uinput_setup_is_type_b_res0_no_ff() {
+        let abs = uinput_abs_setup();
+        let get = |code: u16| abs.iter().find(|(c, _, _, _)| *c == code).unwrap();
+        assert_eq!(get(ABS_MT_SLOT), &(ABS_MT_SLOT, 0, 15, 0));
+        assert_eq!(get(ABS_MT_PRESSURE), &(ABS_MT_PRESSURE, 0, 253, 0));
+        assert!(get(ABS_MT_ORIENTATION).2 >= 3);
+        assert!(abs.iter().all(|(_, _, _, res)| *res == 0));
+        let keys = uinput_keybits();
+        for must in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_TOUCH] {
+            assert!(keys.contains(&must), "missing keybit {must}");
+        }
+        assert!(!uinput_evbits().contains(&EV_FF));
+    }
+
+    struct GatedUinput {
+        inner: FakeUinput,
+        ready: std::sync::atomic::AtomicBool,
+    }
+
+    impl GatedUinput {
+        fn new(ready: bool) -> Self {
+            Self {
+                inner: FakeUinput::new(),
+                ready: std::sync::atomic::AtomicBool::new(ready),
+            }
+        }
+    }
+
+    impl UinputSink for GatedUinput {
+        fn is_ready(&self) -> bool {
+            self.ready.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn emit(&self, ty: u16, code: u16, val: i32) {
+            self.inner.emit(ty, code, val);
+        }
+    }
+
+    #[test]
+    fn grab_waits_for_sink_ready() {
+        let grab = Arc::new(FakeGrab::ok());
+        let sink = GatedUinput::new(false);
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            sink,
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        px.set_pump_ready(true);
+        // Sink not created yet: no grab even though pump is ready.
+        px.attach(&usb_ready("/dev/hidraw1"));
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
+    }
+
+    #[test]
+    fn real_uinput_create_fails_gracefully_without_node() {
+        let u = RealUinput::new("/nonexistent-uinput-xyz");
+        assert!(!u.is_created());
+        assert!(!u.is_ready());
+        assert!(u.create().is_err());
+        assert!(!u.is_created());
+    }
+
+    #[test]
+    fn failed_create_leaves_no_half_configured_fd() {
+        // A regular file opens fine but NAKs the first ioctl: the fd
+        // must be closed again, not leaked as a half-configured node.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("uinput");
+        std::fs::write(&fake, []).unwrap();
+        let u = RealUinput::new(fake.to_str().unwrap());
+        assert!(u.create().is_err());
+        assert!(!u.is_created());
+        assert!(!u.fd_open());
+    }
+
+    #[test]
+    fn set_node_releases_live_grab_first() {
+        let g = RealGrab::new("/dev/null");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        g.inject_open(f);
+        assert!(g.is_grabbed());
+        g.set_node("/dev/input/event13");
+        assert!(!g.is_grabbed(), "retarget must release the old grab");
+    }
+
+    #[test]
+    fn encode_event_pins_input_event_layout() {
+        // sec(8) usec(8) type(2) code(2) value(4), native-endian.
+        let b = encode_event(EV_KEY, BTN_LEFT, 1);
+        assert_eq!(b.len(), 24);
+        assert_eq!(&b[..16], &[0u8; 16]);
+        assert_eq!(u16::from_ne_bytes([b[16], b[17]]), EV_KEY);
+        assert_eq!(u16::from_ne_bytes([b[18], b[19]]), BTN_LEFT);
+        assert_eq!(i32::from_ne_bytes([b[20], b[21], b[22], b[23]]), 1);
+    }
+
+    #[test]
+    fn pre_create_emits_are_dropped_never_buffered() {
+        let u = RealUinput::new("/nonexistent-uinput-xyz");
+        u.emit(EV_KEY, BTN_LEFT, 1);
+        u.emit(EV_ABS, ABS_MT_SLOT, 0);
+        u.sync();
+        assert_eq!(u.staged_len(), 0);
+    }
+
+    #[test]
+    fn vibration_report_pins_actuator_bytes() {
+        assert_eq!(
+            vibration_report(5, false),
+            [0xF2, 0x53, 0x01, 5, 0x78, 0x02, 5, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+        );
+        assert_eq!(
+            vibration_report(9, true),
+            [0xF2, 0x53, 0x01, 9, 0xFF, 0x02, 9, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12]
+        );
+    }
+
+    #[test]
+    fn silent_haptic_sends_nothing() {
+        let h = RealHaptic::new();
+        h.set_node("/nonexistent-haptic-xyz");
+        // strength 0: silent, Ok, no I/O attempted (would err otherwise).
+        assert!(h.click_feedback(0, false).is_ok());
+        assert!(h.click_feedback(0, true).is_ok());
+    }
+
+    #[test]
+    fn haptic_without_node_is_log_only_ok() {
+        let h = RealHaptic::new();
+        assert!(h.click_feedback(5, false).is_ok());
+    }
+
+    #[test]
+    fn haptic_nak_runs_write_fallback_with_exact_bytes() {
+        // A regular file stands in for the hidraw node: the strict
+        // feature ioctl NAKs (ENOTTY — and a strict send must NOT
+        // swallow it), so the plain-write fallback runs and lands the
+        // exact payload bytes. USB strips the leading 0xF2; BT sends
+        // the full 15 B report.
+        let dir = tempfile::tempdir().unwrap();
+        let usb = dir.path().join("haptic-usb");
+        let bt = dir.path().join("haptic-bt");
+        std::fs::write(&usb, []).unwrap();
+        std::fs::write(&bt, []).unwrap();
+        let h = RealHaptic::new();
+        h.set_node(usb.to_str().unwrap());
+        h.set_bluetooth(false);
+        assert!(h.click_feedback(5, false).is_ok());
+        assert_eq!(
+            std::fs::read(&usb).unwrap(),
+            &vibration_report(5, false)[1..]
+        );
+        h.set_node(bt.to_str().unwrap());
+        h.set_bluetooth(true);
+        assert!(h.click_feedback(9, true).is_ok());
+        assert_eq!(std::fs::read(&bt).unwrap(), &vibration_report(9, true));
     }
 
     #[test]
@@ -2346,6 +2976,84 @@ mod tests {
         let left = key_values(&uinput, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
+    }
+
+    #[test]
+    fn hidraw_bytes_to_exact_wire_sequence() {
+        // Scripted hidraw bytes → HidrawSource decode → proxy → exact
+        // uinput events. No hardware: the fd layer is the scripted reader.
+        // Block layout: x=0,y=0 (b0..b3 zero except contact bit),
+        // b8 = 0xC0|id → raw orientation 2 → emitted -2.
+        fn raw_usb(clicks: u8, blocks: &[&[u8; 9]]) -> Vec<u8> {
+            let mut r = vec![0x02, clicks, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            for b in blocks {
+                r.extend_from_slice(&**b);
+            }
+            r
+        }
+        let press = [0u8, 0, 0, 0x80, 10, 6, 8, 200, 0xC1];
+        let hold = [0u8, 0, 0, 0x80, 10, 6, 8, 200, 0xC1];
+        let release = [0u8, 0, 0, 0x80, 10, 6, 8, 10, 0xC1];
+        let reports = vec![
+            raw_usb(0, &[&press]),
+            raw_usb(0, &[&hold]),
+            raw_usb(0, &[&release]),
+            raw_usb(0, &[]),
+        ];
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let source = crate::pump::HidrawSource::new(
+            "/dev/hidraw1",
+            crate::pump::ScriptReader::bytes(reports),
+        );
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            SharedUinput(Arc::clone(&uinput)),
+            SharedHaptic(Arc::clone(&haptic)),
+            source,
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = Config::default();
+        for _ in 0..4 {
+            px.handle_frame(&cfg).unwrap();
+        }
+        let got = wire_events(&uinput);
+        let want: Vec<(u16, u16, i32)> = vec![
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 0),
+            (EV_ABS, ABS_MT_POSITION_Y, 0),
+            (EV_ABS, ABS_MT_PRESSURE, 200),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_KEY, BTN_LEFT, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 0),
+            (EV_ABS, ABS_MT_POSITION_Y, 0),
+            (EV_ABS, ABS_MT_PRESSURE, 200),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 0),
+            (EV_ABS, ABS_MT_POSITION_Y, 0),
+            (EV_ABS, ABS_MT_PRESSURE, 10),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_KEY, BTN_LEFT, 0),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_SYN, SYN_REPORT, 0),
+        ];
+        assert_eq!(got, want, "hidraw-bytes wire sequence drifted");
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
     }
 
     #[test]

@@ -4,12 +4,14 @@ pub mod clicks;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
+pub mod evdev;
 pub mod evdev_generic;
 #[cfg(test)]
 pub mod hw_mock;
 pub mod init;
 pub mod lock;
 pub mod proxy;
+pub mod pump;
 pub mod resume;
 #[cfg(test)]
 pub mod test_env;

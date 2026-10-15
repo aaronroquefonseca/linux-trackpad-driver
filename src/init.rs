@@ -139,6 +139,20 @@ pub fn hidiocsfeature_request(len: usize) -> u64 {
 /// (kernel precedent: device drops the node mid-switch; re-init on
 /// replug/resume retries). All other errors propagate.
 pub fn send_feature_report_hidraw(devnode: &str, report: &[u8]) -> Result<()> {
+    send_feature_report_hidraw_inner(devnode, report, false)
+}
+
+/// Strict variant: propagates EVERY error, including `EPIPE`/`EIO`.
+///
+/// The lenient default above is only valid for init mode-switches. The
+/// haptic actuator path MUST use this variant: a NAK there means
+/// silent no-haptic, and swallowing it as success would skip the plain
+/// write fallback forever.
+pub fn send_feature_report_hidraw_strict(devnode: &str, report: &[u8]) -> Result<()> {
+    send_feature_report_hidraw_inner(devnode, report, true)
+}
+
+fn send_feature_report_hidraw_inner(devnode: &str, report: &[u8], strict: bool) -> Result<()> {
     if report.is_empty() || report.len() > 4096 {
         anyhow::bail!("refusing feature report of length {}", report.len());
     }
@@ -159,7 +173,7 @@ pub fn send_feature_report_hidraw(devnode: &str, report: &[u8]) -> Result<()> {
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         let raw = err.raw_os_error().unwrap_or(0);
-        if raw == libc::EPIPE || raw == libc::EIO {
+        if !strict && (raw == libc::EPIPE || raw == libc::EIO) {
             log::warn!(
                 "feature report {:02X?} on {devnode} returned {} — treating as mode-switch success",
                 report,

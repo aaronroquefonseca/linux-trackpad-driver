@@ -36,38 +36,288 @@ pub fn hub() -> DeviceReadyHub {
 /// Never blocks init: callbacks do bounded attach/detach only, and grab
 /// failure degrades to passthrough with a log.
 ///
-/// Safety posture: the proxy starts pump-unready (`NullSource`, no pump
-/// loop, no created uinput node), so `attach` degrades to passthrough and
-/// never grabs. The transport task flips readiness once the emit path
-/// exists. The evdev node is never guessed: without `LTD_EVDEV_NODE` the
-/// proxy refuses and stays passthrough.
+/// Production pump: `attach` builds the real path — uinput `UI_DEV_CREATE`
+/// FIRST, then hidraw→eventN auto-resolution (`$LTD_EVDEV_NODE` override
+/// wins, else sysfs walk, else name scan), then hidraw open, then
+/// `set_pump_ready(true)` + grab. `detach` tears down in reverse
+/// (release grab, latch reset, trailing `SYN`, source to idle, node
+/// destroy). Single active node: first `Ready` wins, siblings ignored
+/// until `Detached` clears it — except a `Ready` for the active node
+/// whose session died on its own (disconnect self-release): that tears
+/// down the stale wiring and re-attaches fresh fds instead of
+/// early-returning into a dead session. A single pump thread drains the
+/// proxy for the process lifetime; frame rate is device-bounded.
+///
+/// Attach decision for a `Ready` event (see [`attach_decision`]):
+/// - no active session → adopt (full attach);
+/// - same node + live proxy → ignore (duplicate);
+/// - same node + dead proxy → teardown + full re-attach;
+/// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
-    use crate::proxy::{
-        ClickProxy, DaemonGrab, NullSource, ProxySettings, RealGrab, RealHaptic, RealUinput,
-        RefusingGrab,
-    };
-    let grab = match std::env::var("LTD_EVDEV_NODE") {
-        Ok(node) => DaemonGrab::Real(RealGrab::new(&node)),
-        Err(_) => {
-            log::warn!(
-                "proxy: LTD_EVDEV_NODE unset, refusing evdev guess (hidraw→eventN lands with transport); passthrough until configured"
-            );
-            DaemonGrab::Refusing(RefusingGrab)
+    use crate::proxy::{ClickProxy, ProxySettings, RealGrab, RealHaptic, RealUinput};
+    use crate::pump::PumpSource;
+
+    type DaemonProxy = ClickProxy<RealGrab, RealUinput, RealHaptic, PumpSource>;
+
+    struct PumpManager {
+        proxy: std::sync::Arc<std::sync::Mutex<DaemonProxy>>,
+        cfg: Config,
+        active: std::sync::Mutex<Option<String>>,
+        _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    impl PumpManager {
+        fn attach(&self, event: &crate::init::DeviceReadyEvent) {
+            use crate::init::ReadyKind;
+            if event.kind != ReadyKind::Ready {
+                return;
+            }
+            if !self.cfg.enhanced_clicks {
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .attach(event);
+                return;
+            }
+            {
+                let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                let live = self
+                    .proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_attached();
+                match attach_decision(active.as_deref(), &event.devnode, live) {
+                    AttachDecision::Adopt => {}
+                    AttachDecision::IgnoreDuplicate => return,
+                    AttachDecision::IgnoreSibling => {
+                        log::info!(
+                            "pump: {} ready but {} active; ignoring sibling",
+                            event.devnode,
+                            active.as_deref().unwrap_or("?"),
+                        );
+                        return;
+                    }
+                    AttachDecision::Reattach => {
+                        log::info!(
+                            "pump: {} known but session dead; tearing down + re-attaching",
+                            event.devnode
+                        );
+                        drop(active);
+                        self.detach(&init::detached(&event.devnode, event.transport));
+                    }
+                }
+            }
+            // 1. Create the virtual node BEFORE grab.
+            let created = {
+                let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                match px.uinput().create() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!(
+                            "pump: uinput create failed for {}: {e:#}; passthrough",
+                            event.devnode
+                        );
+                        false
+                    }
+                }
+            };
+            if !created {
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .attach(event);
+                return;
+            }
+            // 2. Resolve the physical node (env override → sysfs → name).
+            let Some((evdev, src)) = crate::evdev::resolve_evdev_node(&event.devnode) else {
+                log::warn!(
+                    "pump: no evdev for {}; destroying uinput, passthrough",
+                    event.devnode
+                );
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .uinput()
+                    .destroy();
+                return;
+            };
+            if !crate::evdev::grab_allowed(&src) {
+                // NameScan hit: untrusted for grabbing (no hidraw
+                // parentage proof — could be a foreign node). Refuse the
+                // grab, destroy the node we just created, passthrough
+                // with a LOUD log. An input-less feature interface
+                // (hidraw10/11) lands here by design; the touch
+                // interface's sysfs-backed Ready attaches separately.
+                log::error!(
+                    "pump: evdev for {} resolved via {:?} (UNTRUSTED, no grab); destroying uinput, passthrough",
+                    event.devnode,
+                    src,
+                );
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .uinput()
+                    .destroy();
+                return;
+            }
+            // 3. Open the hidraw source nonblocking.
+            let source = match crate::pump::HidrawSource::open(&event.devnode) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "pump: hidraw open {} failed: {e:#}; destroying uinput, passthrough",
+                        event.devnode
+                    );
+                    self.proxy
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .uinput()
+                        .destroy();
+                    return;
+                }
+            };
+            // 4. Wire nodes, flip ready, then grab (attach checks both gates).
+            // Haptics go to the interface-2 sibling when the USB layout
+            // exposes one (actuator interface); otherwise the touch node
+            // itself, loudly logged as pending HW verify.
+            {
+                let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                px.grab().set_node(&evdev.to_string_lossy());
+                let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
+                px.haptic_mut().set_node(&hnode);
+                log::info!(
+                    "pump: haptic node {hnode} (interface {hiface:?}) for {}",
+                    event.devnode
+                );
+                px.haptic_mut()
+                    .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
+                px.replace_source(PumpSource::Live(source));
+                px.set_pump_ready(true);
+                px.attach(event);
+                if px.is_attached() {
+                    *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(event.devnode.clone());
+                } else {
+                    // Grab refused: unwind to idle + destroy so no orphan node.
+                    px.set_pump_ready(false);
+                    px.replace_source(PumpSource::Idle);
+                    px.uinput().destroy();
+                }
+            }
         }
-    };
+
+        fn detach(&self, event: &crate::init::DeviceReadyEvent) {
+            use crate::init::ReadyKind;
+            if event.kind != ReadyKind::Detached {
+                return;
+            }
+            let owned = {
+                let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                if active.as_deref() == Some(event.devnode.as_str()) {
+                    active.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if !owned {
+                // Sibling vanishing while another node owns the pump: touch
+                // nothing. The proxy itself also ignores foreign Detached
+                // events (ownership gate in `ClickProxy::detach`), so the
+                // live grab survives even if this gate is ever bypassed.
+                log::debug!(
+                    "pump: ignoring Detached for unowned {} (active: {:?})",
+                    event.devnode,
+                    self.active.lock().unwrap_or_else(|e| e.into_inner())
+                );
+                return;
+            }
+            {
+                let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                px.detach(event);
+                px.set_pump_ready(false);
+                px.replace_source(PumpSource::Idle);
+                px.uinput().destroy();
+                log::info!("pump: {} torn down", event.devnode);
+            }
+        }
+    }
+
     let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
-    let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
+    let proxy = std::sync::Arc::new(std::sync::Mutex::new(DaemonProxy::new(
         ProxySettings::from(cfg),
-        grab,
+        RealGrab::new(""),
         RealUinput::new(&uinput_node),
         RealHaptic::new(),
-        NullSource,
+        PumpSource::Idle,
     )));
-    crate::proxy::subscribe_to_hub(ready_hub, proxy);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread = crate::pump::spawn_pump(
+        "daemon".to_string(),
+        std::sync::Arc::clone(&proxy),
+        cfg.clone(),
+        std::sync::Arc::clone(&stop),
+    );
+    let manager = std::sync::Arc::new(PumpManager {
+        proxy,
+        cfg: cfg.clone(),
+        active: std::sync::Mutex::new(None),
+        _stop: stop,
+        _thread: thread,
+    });
+    // NOTE: `PumpManager._thread` is never joined — the pump lives until
+    // process exit by design. `JoinHandle` is held (not detached) so a
+    // panic inside the pump does not silently vanish; the handle is
+    // dropped with the manager at process teardown.
+    let m = std::sync::Arc::clone(&manager);
+    ready_hub.subscribe(move |event: &crate::init::DeviceReadyEvent| {
+        use crate::init::ReadyKind;
+        match event.kind {
+            ReadyKind::Ready => m.attach(event),
+            ReadyKind::Detached => m.detach(event),
+        }
+    });
+    // Keep the manager alive for the daemon lifetime: the hub holds only
+    // the closure (which holds an Arc), so leak one Arc here. The pump
+    // thread + proxy die with the process.
+    std::mem::forget(manager);
     log::debug!(
         "click proxy subscribed (enhanced_clicks={})",
         cfg.enhanced_clicks
     );
+}
+
+/// Attach decision for a `Ready` event against manager state.
+///
+/// `Reattach` is the same-name-replug path: the node is still `active`
+/// but its session died on its own (disconnect self-release), so the
+/// caller must tear down the stale wiring and attach fresh fds instead
+/// of early-returning into a permanently dead session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachDecision {
+    Adopt,
+    IgnoreDuplicate,
+    IgnoreSibling,
+    Reattach,
+}
+
+pub(crate) fn attach_decision(
+    active: Option<&str>,
+    devnode: &str,
+    proxy_attached: bool,
+) -> AttachDecision {
+    match active {
+        None => AttachDecision::Adopt,
+        Some(cur) if cur == devnode => {
+            if proxy_attached {
+                AttachDecision::IgnoreDuplicate
+            } else {
+                AttachDecision::Reattach
+            }
+        }
+        Some(_) => AttachDecision::IgnoreSibling,
+    }
 }
 
 /// Initialize one discovered node and return its ready event.
@@ -472,8 +722,10 @@ pub enum TickAction {
 ///   spam clicks);
 /// - vanished node → `Detached` emit so clicks releases it.
 ///
-/// Hub emits happen after each node's init step, never before — clicks
-/// re-attaches without reordering init.
+/// Removal `Detached`s emit before the scan loop so a same-window
+/// renumber self-heals (stale session torn down, then the new node
+/// adopted); per-node init emits happen after each node's init step —
+/// clicks re-attaches without reordering init.
 pub struct ResumeWatch {
     known: Vec<NodeState>,
     /// Pass counter for slow-cadence work (BT re-apply).
@@ -508,16 +760,35 @@ impl ResumeWatch {
                 return Vec::new();
             }
         };
+        self.tick_with_scan(cfg, ready_hub, current)
+    }
+
+    /// One pass over an injected scan (production passes the live scan
+    /// from [`ResumeWatch::tick`]; tests inject renumbers/replugs).
+    fn tick_with_scan(
+        &mut self,
+        cfg: &Config,
+        ready_hub: &DeviceReadyHub,
+        current: Vec<DiscoveredDevice>,
+    ) -> Vec<TickAction> {
         let mut actions = Vec::new();
         // Nodes recorded Detached mid-pass (present in the scan but gone by
         // the wait) are dropped from the stored snapshot below — trusting
         // the fresher wait over the stale scan. They re-enter as added nodes
         // if they come back.
         let known_devs: Vec<DiscoveredDevice> = self.known.iter().map(|k| k.dev.clone()).collect();
-        // Renumbers (hidraw2→hidraw3) surface here as one removal plus one
-        // addition: the add path below adopts the new node, the remove path
-        // Detaches the stale name — self-heal within this tick.
+        // Removals emit BEFORE the scan loop: a same-window renumber
+        // (hidraw8→hidraw12) surfaces as one removal plus one addition,
+        // and the new node's Ready must not be rejected as a sibling of
+        // a stale session that is about to be torn down. Emit-then-adopt
+        // self-heals within this tick; the reverse order bricks the new
+        // node (Ready rejected, then Detached clears, no Ready ever).
         let (_added, removed) = resume::diff_scan(&known_devs, &current);
+        for old in &removed {
+            log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
+            ready_hub.emit(&init::detached(&old.devnode, old.transport));
+            actions.push(TickAction::Detached(old.devnode.clone()));
+        }
         let mut detached: Vec<String> = Vec::new();
         for dev in &current {
             let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
@@ -605,11 +876,6 @@ impl ResumeWatch {
                 }
             }
         }
-        for old in &removed {
-            log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
-            ready_hub.emit(&init::detached(&old.devnode, old.transport));
-            actions.push(TickAction::Detached(old.devnode.clone()));
-        }
         // Rebuild from the fresh scan, preserving streaks of survivors and
         // dropping mid-pass detachments (list-skew fix).
         self.known = current
@@ -686,6 +952,87 @@ mod tests {
         let actions = watch.tick(&cfg, &hub);
         assert!(actions.is_empty());
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn renumber_inside_one_tick_heals_on_new_node() {
+        // Same-window renumber hidraw8→hidraw12: removals must emit
+        // BEFORE the scan loop adopts the addition, so the new node's
+        // Ready is live and the stale Detached fires exactly once.
+        let hub = DeviceReadyHub::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = std::sync::Arc::clone(&seen);
+        hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
+        let mut watch = ResumeWatch::new(&[DiscoveredDevice {
+            devnode: "/dev/hidraw8".into(),
+            vendor_id: 0x05ac,
+            product_id: 0x0324,
+            transport: Transport::Usb,
+        }]);
+        let cfg = Config::default();
+        let current = vec![DiscoveredDevice {
+            devnode: "/dev/hidraw12".into(),
+            vendor_id: 0x004c,
+            product_id: 0x0324,
+            transport: Transport::Bluetooth,
+        }];
+        let actions = watch.tick_with_scan(&cfg, &hub, current);
+        // Removal first, then adoption — the order that heals.
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Detached("/dev/hidraw8".into()),
+                TickAction::Initialized("/dev/hidraw12".into()),
+            ]
+        );
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].devnode, "/dev/hidraw8");
+        assert_eq!(seen[0].kind, crate::init::ReadyKind::Detached);
+        assert_eq!(seen[1].devnode, "/dev/hidraw12");
+        assert_eq!(seen[1].kind, crate::init::ReadyKind::Ready);
+        // Snapshot rebuilt on the new node: next pass is steady state.
+        let actions = watch.tick_with_scan(
+            &cfg,
+            &hub,
+            vec![DiscoveredDevice {
+                devnode: "/dev/hidraw12".into(),
+                vendor_id: 0x004c,
+                product_id: 0x0324,
+                transport: Transport::Bluetooth,
+            }],
+        );
+        assert!(actions.is_empty());
+        assert_eq!(seen.len(), 2, "stale Detached must fire exactly once");
+    }
+
+    #[test]
+    fn attach_decision_matrix() {
+        use AttachDecision::*;
+        // Fresh: adopt.
+        assert_eq!(attach_decision(None, "/dev/hidraw8", false), Adopt);
+        assert_eq!(attach_decision(None, "/dev/hidraw8", true), Adopt);
+        // Live duplicate: ignore, never rebind a healthy session.
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw8", true),
+            IgnoreDuplicate
+        );
+        // Same name, dead session (disconnect self-release): teardown +
+        // re-attach. Early-return here would brick the node forever: no
+        // further Ready is owed for an already-known devnode.
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw8", false),
+            Reattach
+        );
+        // Sibling while another owns the pump: ignore either way.
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw10", false),
+            IgnoreSibling
+        );
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw10", true),
+            IgnoreSibling
+        );
     }
 
     #[test]

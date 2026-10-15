@@ -136,7 +136,9 @@ enhanced_clicks = false   # default OFF: pure passthrough, init only
 
 Set `true` to enable the click proxy (pressure thresholds, haptics,
 1–5 finger action maps, force second level). Proxy failure always falls back
-to passthrough; init never depends on clicks.
+to passthrough; init never depends on clicks. The proxy resolves its
+physical node itself (`INSTALL.md` → Environment overrides);
+`LTD_EVDEV_NODE` pins it explicitly, `LTD_UINPUT_NODE` overrides uinput.
 
 ## Capability tiers
 

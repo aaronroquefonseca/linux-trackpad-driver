@@ -131,3 +131,15 @@ See `docs/RESEARCH.md` §3 (`AttrPressureRange`, `AttrPalmPressureThreshold`).
     `sudo usermod -aG input $USER` then re-login.
 - `$LTD_SOCKET` lets unprivileged runs keep the socket in user-writable
   space, e.g. `LTD_SOCKET=$XDG_RUNTIME_DIR/ltd/driver.sock ltd run`.
+
+## Environment overrides (click proxy)
+
+Normally unset — the daemon resolves everything itself:
+
+- `LTD_EVDEV_NODE=/dev/input/eventN`: pin the physical evdev node for the
+  grab. Without it, each hidraw node auto-resolves via the sysfs
+  parentage walk, then a name+multitouch-caps scan. The name scan never
+  backs a grab (untrusted: no parentage proof), so input-less feature
+  interfaces stay passthrough until the touch interface attaches.
+- `LTD_UINPUT_NODE=/dev/uinput`: uinput control node for the virtual
+  device (default `/dev/uinput`).
