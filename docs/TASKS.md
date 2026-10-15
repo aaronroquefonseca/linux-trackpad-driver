@@ -64,6 +64,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
 | suspend-robust | T3 `51650f42` — PR #18 (5 dead-ends fixed, verified) | `fix/suspend-robustness` | post-resume dead-ends audit | DONE, MERGED. Owner SETTLED |
+| pump-loop | T3 `992f26b9` — PR #22 `899e004` (4 review rounds, all L1s+L2s landed, CI green) | `feat/pump-loop` | production pump + uinput + haptics + auto evdev | DONE, MERGED. Owner + 3 reviewers SETTLED |
 | lo-minus | T3 `911e1a0b` — PR #19 `eb21d9e` (hygiene; bug reported on OLD version only, presence in rewrite UNKNOWN — pending HW capture per TESTING.md row) | `fix/lo-minus-click` | preventive wire hygiene | DONE, MERGED as hygiene. Owner + 2 reviewers SETTLED (mimo silent, excluded) |
 | fkeys | T3 `4834bf4c` — PR #17 `7829c1b` (F13–F24 183–194, full table audit) | `feat/f13-keys` | F13–F24 + key audit | DONE, MERGED. Owner SETTLED |
 | key-coverage | T3 `52894d93` — PR #20 `d129225` (media/browser/app/micmute/search/calc/mail, all header-verified; FN-row deliberately excluded) | `feat/key-coverage` | complete clickable key set | DONE, MERGED. Owner SETTLED |
