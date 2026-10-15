@@ -260,6 +260,25 @@ journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
 - [ ] Grab release on stop: `sudo systemctl stop linux-trackpad-driver.service`
       → `proxy: releasing grab (...)` + `shutdown complete`; physical
       passthrough resumes, no stuck keys (type in a terminal immediately).
+- [ ] LibreOffice '-' capture (owner bug stays OPEN until this lands):
+      with the proxy attached, reproduce clicks typing '-' in any LO app
+      while recording the PROXY node (find it via `sudo libinput
+      list-devices`, match the `ltd` uinput name), then paste the
+      offending `EV_KEY` line(s):
+
+```sh
+sudo evemu-record /dev/input/eventX > /tmp/evemu-lo-minus.log 2>&1 &
+# click in Writer until '-' appears, then: sudo kill %1
+grep -E 'EV_KEY.*(value 1|pressed)' /tmp/evemu-lo-minus.log | sort | uniq -c | sort -rn | head -20
+# and/or: sudo libinput debug-events --device /dev/input/eventX > /tmp/libinput-lo-minus.log 2>&1 &
+```
+
+      Expected once fixed: no `KEY_MINUS` (code 12) or any other key
+      press attributable to a click. Until that capture names the actual
+      offending code, the cause is UNPROVEN (`BTN_LEFT` = 272 cannot
+      produce `KEY_MINUS` = 12; a wrong key-table mapping cured by the
+      F-key audit is one hypothesis, not a finding). Paste the top-20
+      table + 10 raw lines around the first '-' as the finding (§8).
 - [ ] Proxy-never-swallows rule: kill the pump path if testable, or unplug
       mid-press — held keys release, pointer returns within one tick.
 
@@ -393,6 +412,7 @@ Copy into the PR/issue reply, one row per check.
 | 4e | quiet_click | softer waveform | | |
 | 4f | force level | 2nd action + haptic, clean release | | |
 | 4g | stop releases grab | passthrough, no stuck keys | | |
+| 4h | LO '-' capture (bug OPEN) | evemu top-20 + offending EV_KEY, or clean | | |
 | 5a | `ltd resume` manual | re-init accepted, pass done | | |
 | 5b | sleep+wake MT | 2-finger scroll survives | | |
 | 5c | no log storm | single-digit re-init lines | | |
