@@ -107,7 +107,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                 return;
             }
             // 2. Resolve the physical node (env override → sysfs → name).
-            let Some((evdev, _src)) = crate::evdev::resolve_evdev_node(&event.devnode) else {
+            let Some((evdev, src)) = crate::evdev::resolve_evdev_node(&event.devnode) else {
                 log::warn!(
                     "pump: no evdev for {}; destroying uinput, passthrough",
                     event.devnode
@@ -119,6 +119,25 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     .destroy();
                 return;
             };
+            if !crate::evdev::grab_allowed(&src) {
+                // NameScan hit: untrusted for grabbing (no hidraw
+                // parentage proof — could be a foreign node). Refuse the
+                // grab, destroy the node we just created, passthrough
+                // with a LOUD log. An input-less feature interface
+                // (hidraw10/11) lands here by design; the touch
+                // interface's sysfs-backed Ready attaches separately.
+                log::error!(
+                    "pump: evdev for {} resolved via {:?} (UNTRUSTED, no grab); destroying uinput, passthrough",
+                    event.devnode,
+                    src,
+                );
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .uinput()
+                    .destroy();
+                return;
+            }
             // 3. Open the hidraw source nonblocking.
             let source = match crate::pump::HidrawSource::open(&event.devnode) {
                 Ok(s) => s,

@@ -35,6 +35,16 @@ pub enum EvdevSource {
     NameScan(PathBuf),
 }
 
+/// Whether a resolution source may back a grab. `NameScan` is UNTRUSTED:
+/// it matches by device name across the whole input subsystem with no
+/// hidraw parentage proof, so grabbing it could swallow a foreign node
+/// (e.g. a second pad's events, or worse). NameScan hits stay
+/// passthrough — the precise sysfs walk (or the env override) is the
+/// only grab-worthy proof.
+pub fn grab_allowed(source: &EvdevSource) -> bool {
+    !matches!(source, EvdevSource::NameScan(_))
+}
+
 /// Production entry: env → sysfs walk → name scan.
 pub fn resolve_evdev_node(hidraw: &str) -> Option<(PathBuf, EvdevSource)> {
     let env = std::env::var(EVDEV_ENV).ok().filter(|v| !v.is_empty());
@@ -275,6 +285,23 @@ mod tests {
         let got = resolve_with_roots("/dev/hidraw10", None, &hroot, &iroot, &dp).unwrap();
         assert_eq!(got.0, PathBuf::from(format!("{dp}/event12")));
         assert!(matches!(got.1, EvdevSource::NameScan(_)));
+    }
+
+    #[test]
+    fn namescan_resolution_never_backs_grab() {
+        // Decision pin for the daemon: only sysfs parentage proof (or
+        // the explicit env override) may back an EVIOCGRAB. A NameScan
+        // hit — e.g. an input-less hidraw10 resolving to some trackpad
+        // event node by name — must stay passthrough, never grab.
+        assert!(grab_allowed(&EvdevSource::Sysfs(
+            "/dev/input/event13".into()
+        )));
+        assert!(grab_allowed(&EvdevSource::EnvOverride(
+            "/dev/input/event13".into()
+        )));
+        assert!(!grab_allowed(&EvdevSource::NameScan(
+            "/dev/input/event13".into()
+        )));
     }
 
     #[test]
