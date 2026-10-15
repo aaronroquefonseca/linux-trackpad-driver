@@ -42,8 +42,17 @@ pub fn hub() -> DeviceReadyHub {
 /// `set_pump_ready(true)` + grab. `detach` tears down in reverse
 /// (release grab, latch reset, trailing `SYN`, source to idle, node
 /// destroy). Single active node: first `Ready` wins, siblings ignored
-/// until `Detached` clears it. A single pump thread drains the proxy for
-/// the process lifetime; frame rate is device-bounded.
+/// until `Detached` clears it — except a `Ready` for the active node
+/// whose session died on its own (disconnect self-release): that tears
+/// down the stale wiring and re-attaches fresh fds instead of
+/// early-returning into a dead session. A single pump thread drains the
+/// proxy for the process lifetime; frame rate is device-bounded.
+///
+/// Attach decision for a `Ready` event (see [`attach_decision`]):
+/// - no active session → adopt (full attach);
+/// - same node + live proxy → ignore (duplicate);
+/// - same node + dead proxy → teardown + full re-attach;
+/// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
     use crate::proxy::{ClickProxy, ProxySettings, RealGrab, RealHaptic, RealUinput};
     use crate::pump::PumpSource;
@@ -73,16 +82,30 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
             }
             {
                 let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(cur) = active.as_ref() {
-                    if cur == &event.devnode {
+                let live = self
+                    .proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_attached();
+                match attach_decision(active.as_deref(), &event.devnode, live) {
+                    AttachDecision::Adopt => {}
+                    AttachDecision::IgnoreDuplicate => return,
+                    AttachDecision::IgnoreSibling => {
+                        log::info!(
+                            "pump: {} ready but {} active; ignoring sibling",
+                            event.devnode,
+                            active.as_deref().unwrap_or("?"),
+                        );
                         return;
                     }
-                    log::info!(
-                        "pump: {} ready but {} active; ignoring sibling",
-                        event.devnode,
-                        cur
-                    );
-                    return;
+                    AttachDecision::Reattach => {
+                        log::info!(
+                            "pump: {} known but session dead; tearing down + re-attaching",
+                            event.devnode
+                        );
+                        drop(active);
+                        self.detach(&init::detached(&event.devnode, event.transport));
+                    }
                 }
             }
             // 1. Create the virtual node BEFORE grab.
@@ -263,6 +286,38 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
         "click proxy subscribed (enhanced_clicks={})",
         cfg.enhanced_clicks
     );
+}
+
+/// Attach decision for a `Ready` event against manager state.
+///
+/// `Reattach` is the same-name-replug path: the node is still `active`
+/// but its session died on its own (disconnect self-release), so the
+/// caller must tear down the stale wiring and attach fresh fds instead
+/// of early-returning into a permanently dead session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachDecision {
+    Adopt,
+    IgnoreDuplicate,
+    IgnoreSibling,
+    Reattach,
+}
+
+pub(crate) fn attach_decision(
+    active: Option<&str>,
+    devnode: &str,
+    proxy_attached: bool,
+) -> AttachDecision {
+    match active {
+        None => AttachDecision::Adopt,
+        Some(cur) if cur == devnode => {
+            if proxy_attached {
+                AttachDecision::IgnoreDuplicate
+            } else {
+                AttachDecision::Reattach
+            }
+        }
+        Some(_) => AttachDecision::IgnoreSibling,
+    }
 }
 
 /// Initialize one discovered node and return its ready event.
@@ -949,6 +1004,35 @@ mod tests {
         );
         assert!(actions.is_empty());
         assert_eq!(seen.len(), 2, "stale Detached must fire exactly once");
+    }
+
+    #[test]
+    fn attach_decision_matrix() {
+        use AttachDecision::*;
+        // Fresh: adopt.
+        assert_eq!(attach_decision(None, "/dev/hidraw8", false), Adopt);
+        assert_eq!(attach_decision(None, "/dev/hidraw8", true), Adopt);
+        // Live duplicate: ignore, never rebind a healthy session.
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw8", true),
+            IgnoreDuplicate
+        );
+        // Same name, dead session (disconnect self-release): teardown +
+        // re-attach. Early-return here would brick the node forever: no
+        // further Ready is owed for an already-known devnode.
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw8", false),
+            Reattach
+        );
+        // Sibling while another owns the pump: ignore either way.
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw10", false),
+            IgnoreSibling
+        );
+        assert_eq!(
+            attach_decision(Some("/dev/hidraw8"), "/dev/hidraw10", true),
+            IgnoreSibling
+        );
     }
 
     #[test]
