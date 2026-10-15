@@ -667,8 +667,10 @@ pub enum TickAction {
 ///   spam clicks);
 /// - vanished node → `Detached` emit so clicks releases it.
 ///
-/// Hub emits happen after each node's init step, never before — clicks
-/// re-attaches without reordering init.
+/// Removal `Detached`s emit before the scan loop so a same-window
+/// renumber self-heals (stale session torn down, then the new node
+/// adopted); per-node init emits happen after each node's init step —
+/// clicks re-attaches without reordering init.
 pub struct ResumeWatch {
     known: Vec<NodeState>,
     /// Pass counter for slow-cadence work (BT re-apply).
@@ -703,16 +705,35 @@ impl ResumeWatch {
                 return Vec::new();
             }
         };
+        self.tick_with_scan(cfg, ready_hub, current)
+    }
+
+    /// One pass over an injected scan (production passes the live scan
+    /// from [`ResumeWatch::tick`]; tests inject renumbers/replugs).
+    fn tick_with_scan(
+        &mut self,
+        cfg: &Config,
+        ready_hub: &DeviceReadyHub,
+        current: Vec<DiscoveredDevice>,
+    ) -> Vec<TickAction> {
         let mut actions = Vec::new();
         // Nodes recorded Detached mid-pass (present in the scan but gone by
         // the wait) are dropped from the stored snapshot below — trusting
         // the fresher wait over the stale scan. They re-enter as added nodes
         // if they come back.
         let known_devs: Vec<DiscoveredDevice> = self.known.iter().map(|k| k.dev.clone()).collect();
-        // Renumbers (hidraw2→hidraw3) surface here as one removal plus one
-        // addition: the add path below adopts the new node, the remove path
-        // Detaches the stale name — self-heal within this tick.
+        // Removals emit BEFORE the scan loop: a same-window renumber
+        // (hidraw8→hidraw12) surfaces as one removal plus one addition,
+        // and the new node's Ready must not be rejected as a sibling of
+        // a stale session that is about to be torn down. Emit-then-adopt
+        // self-heals within this tick; the reverse order bricks the new
+        // node (Ready rejected, then Detached clears, no Ready ever).
         let (_added, removed) = resume::diff_scan(&known_devs, &current);
+        for old in &removed {
+            log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
+            ready_hub.emit(&init::detached(&old.devnode, old.transport));
+            actions.push(TickAction::Detached(old.devnode.clone()));
+        }
         let mut detached: Vec<String> = Vec::new();
         for dev in &current {
             let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
@@ -800,11 +821,6 @@ impl ResumeWatch {
                 }
             }
         }
-        for old in &removed {
-            log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
-            ready_hub.emit(&init::detached(&old.devnode, old.transport));
-            actions.push(TickAction::Detached(old.devnode.clone()));
-        }
         // Rebuild from the fresh scan, preserving streaks of survivors and
         // dropping mid-pass detachments (list-skew fix).
         self.known = current
@@ -881,6 +897,58 @@ mod tests {
         let actions = watch.tick(&cfg, &hub);
         assert!(actions.is_empty());
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn renumber_inside_one_tick_heals_on_new_node() {
+        // Same-window renumber hidraw8→hidraw12: removals must emit
+        // BEFORE the scan loop adopts the addition, so the new node's
+        // Ready is live and the stale Detached fires exactly once.
+        let hub = DeviceReadyHub::new();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = std::sync::Arc::clone(&seen);
+        hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
+        let mut watch = ResumeWatch::new(&[DiscoveredDevice {
+            devnode: "/dev/hidraw8".into(),
+            vendor_id: 0x05ac,
+            product_id: 0x0324,
+            transport: Transport::Usb,
+        }]);
+        let cfg = Config::default();
+        let current = vec![DiscoveredDevice {
+            devnode: "/dev/hidraw12".into(),
+            vendor_id: 0x004c,
+            product_id: 0x0324,
+            transport: Transport::Bluetooth,
+        }];
+        let actions = watch.tick_with_scan(&cfg, &hub, current);
+        // Removal first, then adoption — the order that heals.
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Detached("/dev/hidraw8".into()),
+                TickAction::Initialized("/dev/hidraw12".into()),
+            ]
+        );
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].devnode, "/dev/hidraw8");
+        assert_eq!(seen[0].kind, crate::init::ReadyKind::Detached);
+        assert_eq!(seen[1].devnode, "/dev/hidraw12");
+        assert_eq!(seen[1].kind, crate::init::ReadyKind::Ready);
+        // Snapshot rebuilt on the new node: next pass is steady state.
+        let actions = watch.tick_with_scan(
+            &cfg,
+            &hub,
+            vec![DiscoveredDevice {
+                devnode: "/dev/hidraw12".into(),
+                vendor_id: 0x004c,
+                product_id: 0x0324,
+                transport: Transport::Bluetooth,
+            }],
+        );
+        assert!(actions.is_empty());
+        assert_eq!(seen.len(), 2, "stale Detached must fire exactly once");
     }
 
     #[test]
