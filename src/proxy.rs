@@ -100,10 +100,10 @@ pub const BTN_EXTRA: u16 = 276;
 /// Touchpad classification bits (old-service parity): libinput only moves
 /// the cursor from MT slots when these are advertised + emitted per count.
 pub const BTN_TOOL_FINGER: u16 = 325;
-pub const BTN_TOOL_DOUBLETAP: u16 = 326;
-pub const BTN_TOOL_TRIPLETAP: u16 = 327;
-pub const BTN_TOOL_QUADTAP: u16 = 328;
-pub const BTN_TOOL_QUINTTAP: u16 = 329;
+pub const BTN_TOOL_DOUBLETAP: u16 = 333;
+pub const BTN_TOOL_TRIPLETAP: u16 = 334;
+pub const BTN_TOOL_QUADTAP: u16 = 335;
+pub const BTN_TOOL_QUINTTAP: u16 = 328;
 pub const BTN_TOUCH: u16 = 330;
 /// `INPUT_PROP_POINTER` (`linux/input.h`): marks the virtual node as a
 /// pointer device (old-service `PropType::POINTER` parity).
@@ -3870,6 +3870,24 @@ mod tests {
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         assert_eq!(key_values(&sinks.pointer, BTN_TOOL_QUINTTAP), vec![1]);
         assert_eq!(key_values(&sinks.pointer, BTN_TOOL_QUADTAP), vec![0]);
+    }
+
+    #[test]
+    fn tool_keycodes_match_kernel_header() {
+        // Owner evtest 2026-10-16: the wire carried BTN_TOOL_MOUSE (326) /
+        // BTN_TOOL_LENS (327) on a touchpad — hand-rolled codes ran 325..=329
+        // sequentially, but the kernel header interleaves MOUSE / LENS /
+        // QUINTTAP / STYLUS3 between FINGER and DOUBLETAP. Pin exact numeric
+        // values so a wrong constant fails here first.
+        assert_eq!(BTN_TOOL_FINGER, 325); // 0x145
+        assert_eq!(BTN_TOOL_QUINTTAP, 328); // 0x148
+        assert_eq!(BTN_TOUCH, 330); // 0x14a
+        assert_eq!(BTN_TOOL_DOUBLETAP, 333); // 0x14d
+        assert_eq!(BTN_TOOL_TRIPLETAP, 334); // 0x14e
+        assert_eq!(BTN_TOOL_QUADTAP, 335); // 0x14f
+                                           // The mouse/lens codes must be nowhere near the touchpad tool row.
+        assert_ne!(BTN_TOOL_DOUBLETAP, 326);
+        assert_ne!(BTN_TOOL_TRIPLETAP, 327);
     }
 
     #[test]
