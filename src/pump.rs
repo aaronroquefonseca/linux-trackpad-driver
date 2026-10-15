@@ -38,6 +38,29 @@ pub trait HidrawReader: Send {
     fn read_report(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
 }
 
+/// Persistent device loss (unplug/replug under a live fd): a 0-byte
+/// read (node dropped the device) or `ENODEV` from `read(2)`. Transient
+/// errors (`EAGAIN` = idle, `EINTR`, short reads retried by the caller)
+/// are NOT this. The proxy classifies on this type: a disconnect
+/// self-releases the session (bounded logs, fd rebind on re-attach)
+/// instead of warning ~500×/s forever on a dead fd.
+#[derive(Debug)]
+pub struct DisconnectError(pub String);
+
+impl std::fmt::Display for DisconnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "hidraw disconnect: {}", self.0)
+    }
+}
+
+impl std::error::Error for DisconnectError {}
+
+/// True when an [`anyhow::Error`] from `poll_frame` is a persistent
+/// disconnect (see [`DisconnectError`]).
+pub fn is_disconnect(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<DisconnectError>().is_some()
+}
+
 /// Real file-backed reader.
 pub struct FileReader {
     file: std::fs::File,
@@ -168,9 +191,18 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
             return Ok(Some(f));
         }
         let n = match self.reader.read_report(&mut self.buf) {
-            Ok(0) => anyhow::bail!("hidraw {} disconnect (0-byte read)", self.devnode),
+            Ok(0) => {
+                return Err(DisconnectError(format!(
+                    "{} 0-byte read (device dropped the node)",
+                    self.devnode
+                ))
+                .into());
+            }
             Ok(n) => n,
             Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
+                return Err(DisconnectError(format!("{} read: {e}", self.devnode)).into());
+            }
             Err(e) => return Err(anyhow::anyhow!("hidraw {} read: {e}", self.devnode)),
         };
         let report = &self.buf[..n];
@@ -368,7 +400,22 @@ mod tests {
     #[test]
     fn zero_read_is_disconnect_error() {
         let mut src = HidrawSource::new("/dev/hidraw1", ScriptReader::bytes(vec![Vec::new()]));
-        assert!(src.poll_frame().is_err());
+        let err = src.poll_frame().unwrap_err();
+        assert!(is_disconnect(&err));
+    }
+
+    #[test]
+    fn enodev_is_disconnect_but_eio_is_transient() {
+        let mut gone = HidrawSource::new(
+            "/dev/hidraw1",
+            ScriptReader::new(vec![ScriptStep::IoError(libc::ENODEV)]),
+        );
+        assert!(is_disconnect(&gone.poll_frame().unwrap_err()));
+        let mut flaky = HidrawSource::new(
+            "/dev/hidraw1",
+            ScriptReader::new(vec![ScriptStep::IoError(libc::EIO)]),
+        );
+        assert!(!is_disconnect(&flaky.poll_frame().unwrap_err()));
     }
 
     #[test]

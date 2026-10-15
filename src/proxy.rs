@@ -510,6 +510,23 @@ where
             Ok(Some(f)) => f,
             Ok(None) => return Ok(None),
             Err(e) => {
+                // Persistent disconnect (unplug/replug reusing the same
+                // hidraw name: the fd is dead but no Detached will ever
+                // bound the errors) self-releases the session exactly
+                // once: ungrab, held keys up, trailing SYN, latch reset,
+                // back to passthrough with the pump marked unready. After
+                // the release the idle short-circuit above stops polling
+                // the dead fd, so logs stay bounded (one warn per state
+                // change, never ~500/s). Re-attach rebinds fresh fds.
+                if crate::pump::is_disconnect(&e) {
+                    if self.attached {
+                        log::warn!("proxy: disconnect detected, self-releasing: {e:#}");
+                        self.set_pump_ready(false);
+                    } else {
+                        log::debug!("proxy: disconnect poll while idle: {e:#}");
+                    }
+                    return Ok(None);
+                }
                 log::warn!("proxy: poll_frame failed, dropping frame: {e:#}");
                 return Ok(None);
             }
@@ -1574,6 +1591,63 @@ mod tests {
         px.detach(&detached("/dev/hidraw1", Transport::Usb));
         assert!(!px.is_attached());
         assert!(px.is_passthrough());
+    }
+
+    #[test]
+    fn disconnect_self_releases_once_with_bounded_polls() {
+        // Same-name replug: the fd is dead (0-byte/ENODEV) but no
+        // Detached will ever bound the errors. The proxy must release
+        // exactly once (grab, keys, SYN, latch, pump flag) and then
+        // stop polling the dead source — bounded logs, session
+        // revivable on fresh wiring.
+        use anyhow::Error as AnyhowError;
+        let grab = Arc::new(FakeGrab::ok());
+        let uinput = Arc::new(FakeUinput::new());
+        let disc = || {
+            Err::<Option<TouchFrame>, AnyhowError>(
+                crate::pump::DisconnectError("test unplug".into()).into(),
+            )
+        };
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            disc(),
+            disc(),
+            disc(),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            SharedUinput(Arc::clone(&uinput)),
+            FakeHaptic::new(),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        let cfg = Config::default();
+        px.handle_frame(&cfg).unwrap(); // press → BTN_LEFT down
+        assert_eq!(key_values(&uinput, BTN_LEFT), vec![1]);
+        px.handle_frame(&cfg).unwrap(); // disconnect → self-release
+        assert!(!grab.is_grabbed(), "dead fd must release the grab");
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert_eq!(
+            key_values(&uinput, BTN_LEFT),
+            vec![1, 0],
+            "held keys go up exactly once"
+        );
+        // Pump marked unready: a bare re-attach stays passthrough.
+        px.attach(&usb_ready("/dev/hidraw8"));
+        assert!(!px.is_attached());
+        // Dead source never polled again (logs bounded by construction).
+        let remaining = px.source.frames.borrow().len();
+        px.handle_frame(&cfg).unwrap();
+        px.handle_frame(&cfg).unwrap();
+        assert_eq!(px.source.frames.borrow().len(), remaining);
+        // Fresh wiring revives the session on the same node.
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        assert!(px.is_attached());
+        assert!(grab.is_grabbed());
     }
 
     #[test]
