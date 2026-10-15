@@ -9,8 +9,13 @@
 //!    event12 under `...:1.1/...000A`). Interfaces without input
 //!    children (hidraw10/11) resolve to nothing here and fall through.
 //! 3. Name scan fallback: first `/dev/input/eventN` whose sysfs
-//!    `device/name` contains `Magic Trackpad` or `Apple`. Multi-device
-//!    unsafe (first hit wins); logged loudly so a two-pad rig notices.
+//!    `device/name` contains `Magic Trackpad` or `Trackpad` (bare `Apple`
+//!    is NOT enough — that would match Apple keyboards and grabbing a
+//!    keyboard event node would swallow the keyboard behind the trackpad
+//!    opt-in) AND whose `device/capabilities/abs` bitmap carries a
+//!    multitouch bit (`ABS_MT_SLOT` 47 / `ABS_MT_PRESSURE` 58; keyboards
+//!    report `abs = 0`). Multi-device unsafe (first hit wins); logged
+//!    loudly so a two-pad rig notices.
 //! 4. `None` → caller stays passthrough with a clear log (never guesses
 //!    `event0` roulette).
 //!
@@ -107,6 +112,48 @@ fn sysfs_walk(
     hits.into_iter().next()
 }
 
+/// ABS codes proving a multitouch pad (linux/input-event-codes.h).
+/// Keyboards report `abs = 0`; the trackpad reports both bits live
+/// (owner hardware 2026-10-15: event12/13 `abs=6738…`).
+const ABS_MT_SLOT: u32 = 47;
+const ABS_MT_PRESSURE: u32 = 58;
+
+/// True when a sysfs `capabilities/abs` bitmap carries a multitouch bit.
+/// The `abs` map is tiny (`ABS_MAX = 0x3f`): one 64-bit word on 64-bit
+/// kernels, printed as bare lowercase hex. Multi-word input (32-bit
+/// kernels print two words, most-significant first) is handled
+/// generically; unparsable text is a conservative `false`.
+fn abs_has_mt(text: &str) -> bool {
+    let words: Vec<u64> = text
+        .replace(',', " ")
+        .split_whitespace()
+        .filter_map(|w| u64::from_str_radix(w.trim_start_matches("0x"), 16).ok())
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+    let has = |bit: u32| {
+        let idx = (bit / 64) as usize;
+        if words.len() == 1 {
+            // Fast path: single-word map, bit N is bit N.
+            idx == 0 && (words[0] >> (bit % 64)) & 1 == 1
+        } else {
+            // MSB-first word order (kernel bitmap_print): bit N lives in
+            // the word `len - 1 - N / 64` from the front.
+            words.len() > idx && (words[words.len() - 1 - idx] >> (bit % 64)) & 1 == 1
+        }
+    };
+    has(ABS_MT_SLOT) || has(ABS_MT_PRESSURE)
+}
+
+fn mt_capable(input_root: &str, event: &str) -> bool {
+    let caps = PathBuf::from(format!("{input_root}/{event}/device/capabilities/abs"));
+    let Ok(text) = std::fs::read_to_string(&caps) else {
+        return false;
+    };
+    abs_has_mt(&text)
+}
+
 fn name_scan(input_root: &str, dev_prefix: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(input_root).ok()?;
     let mut names: Vec<String> = Vec::new();
@@ -122,9 +169,16 @@ fn name_scan(input_root: &str, dev_prefix: &str) -> Option<PathBuf> {
         let Ok(text) = std::fs::read_to_string(&name_file) else {
             continue;
         };
-        if text.contains("Magic Trackpad") || text.contains("Apple") {
-            return Some(PathBuf::from(format!("{dev_prefix}/{name}")));
+        // Bare "Apple" excluded on purpose: Apple keyboards must never
+        // resolve here (grabbing one would swallow the keyboard).
+        if !(text.contains("Magic Trackpad") || text.contains("Trackpad")) {
+            continue;
         }
+        if !mt_capable(input_root, &name) {
+            log::warn!("evdev: name-scan candidate {name} ({text:?}) lacks MT abs bits; refusing");
+            continue;
+        }
+        return Some(PathBuf::from(format!("{dev_prefix}/{name}")));
     }
     None
 }
@@ -199,9 +253,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("hidraw/hidraw10")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&hid, dir.path().join("hidraw/hidraw10/device")).unwrap();
-        // event with Apple name elsewhere.
+        // event with Apple trackpad name elsewhere + MT abs bits (live
+        // owner value for event12).
         let other = dir.path().join("devices/other/input/input9");
         std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(other.join("capabilities")).unwrap();
         std::fs::create_dir_all(dir.path().join("input/event12")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&other, dir.path().join("input/event12/device")).unwrap();
@@ -210,9 +266,97 @@ mod tests {
             "Apple Inc. Magic Trackpad\n",
         )
         .unwrap();
+        std::fs::write(
+            dir.path().join("input/event12/device/capabilities/abs"),
+            "673800001000003\n",
+        )
+        .unwrap();
         let got = resolve_with_roots("/dev/hidraw10", None, &hroot, &iroot, &dp).unwrap();
         assert_eq!(got.0, PathBuf::from(format!("{dp}/event12")));
         assert!(matches!(got.1, EvdevSource::NameScan(_)));
+    }
+
+    #[test]
+    fn abs_bitmap_gates_mt_bits() {
+        // Live owner values (2026-10-15): both trackpad events carry
+        // bits 47 + 58; keyboards/consumer-controls carry neither.
+        assert!(abs_has_mt("673810001000003\n"));
+        assert!(abs_has_mt("673800001000003"));
+        assert!(!abs_has_mt("0"));
+        assert!(!abs_has_mt("100000000"));
+        assert!(!abs_has_mt(""));
+        assert!(!abs_has_mt("not-hex"));
+    }
+
+    #[test]
+    fn apple_keyboard_never_resolves() {
+        // An Apple keyboard (`abs = 0`, no MT bits) must be refused even
+        // though its name contains "Apple": grabbing it would swallow the
+        // keyboard behind the trackpad opt-in. Result is passthrough (None).
+        let dir = tempfile::tempdir().unwrap();
+        let (hroot, iroot) = fake_hidraw_tree(dir.path());
+        let dev = dir.path().join("devinput");
+        std::fs::create_dir_all(&dev).unwrap();
+        let dp = dev.to_str().unwrap().to_string();
+        let hid = dir.path().join("devices/hid9");
+        std::fs::create_dir_all(&hid).unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw10")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&hid, dir.path().join("hidraw/hidraw10/device")).unwrap();
+        // Keyboard: Apple name, zero abs caps.
+        let kbd = dir.path().join("devices/kbd/input/input3");
+        std::fs::create_dir_all(&kbd).unwrap();
+        std::fs::create_dir_all(kbd.join("capabilities")).unwrap();
+        std::fs::create_dir_all(dir.path().join("input/event5")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&kbd, dir.path().join("input/event5/device")).unwrap();
+        std::fs::write(
+            dir.path().join("input/event5/device/name"),
+            "Apple Inc. Magic Keyboard\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("input/event5/device/capabilities/abs"),
+            "0\n",
+        )
+        .unwrap();
+        assert!(
+            resolve_with_roots("/dev/hidraw10", None, &hroot, &iroot, &dp).is_none(),
+            "Apple keyboard must never resolve to a grab target"
+        );
+    }
+
+    #[test]
+    fn trackpad_name_without_mt_bits_refused() {
+        // Name matches but abs lacks MT (unbound node, zeroed caps):
+        // refuse rather than grab blind.
+        let dir = tempfile::tempdir().unwrap();
+        let (hroot, iroot) = fake_hidraw_tree(dir.path());
+        let dev = dir.path().join("devinput");
+        std::fs::create_dir_all(&dev).unwrap();
+        let dp = dev.to_str().unwrap().to_string();
+        let hid = dir.path().join("devices/hid9");
+        std::fs::create_dir_all(&hid).unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw10")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&hid, dir.path().join("hidraw/hidraw10/device")).unwrap();
+        let pad = dir.path().join("devices/pad/input/input9");
+        std::fs::create_dir_all(&pad).unwrap();
+        std::fs::create_dir_all(pad.join("capabilities")).unwrap();
+        std::fs::create_dir_all(dir.path().join("input/event12")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&pad, dir.path().join("input/event12/device")).unwrap();
+        std::fs::write(
+            dir.path().join("input/event12/device/name"),
+            "Apple Inc. Magic Trackpad\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("input/event12/device/capabilities/abs"),
+            "0\n",
+        )
+        .unwrap();
+        assert!(resolve_with_roots("/dev/hidraw10", None, &hroot, &iroot, &dp).is_none(),);
     }
 
     #[test]
