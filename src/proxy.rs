@@ -14,9 +14,11 @@
 //!   Default false → zero behavior change, pure passthrough: no grab, no
 //!   uinput traffic. Grabbing without an emit path bricks the device, so
 //!   `attach` degrades to passthrough until readiness holds.
-//! - The physical evdev node is never guessed: `LTD_EVDEV_NODE` must name it
-//!   (hidraw→eventN auto-resolution belongs to the transport task). Unset →
-//!   refuse + passthrough, never `event0` roulette.
+//! - The physical evdev node is auto-resolved per hidraw node
+//!   ([`crate::evdev`]: `$LTD_EVDEV_NODE` override wins, else the sysfs
+//!   parentage walk, else a name+MT-caps scan). The name scan is UNTRUSTED
+//!   and never backs a grab; unresolvable → passthrough, never `event0`
+//!   roulette.
 //! - Proxy node: Type-B MT slots + tracking IDs, `res == 0` arbitrary
 //!   0..253 range, `BTN_LEFT`/`BTN_TOUCH` + `SYN`. NEVER advertises
 //!   `EV_FF`/`FF_HAPTIC` (no 2026 libinput/Wayland consumer).
@@ -828,10 +830,23 @@ impl RealGrab {
         }
     }
 
-    /// Point at a (re-)resolved node. A live grab keeps its fd: re-grab
-    /// while grabbed is a no-op success, never a close+reopen (fd corrupt).
+    /// Point at a (re-)resolved node. Never retargets a live grab: if
+    /// grabbed, the grab is released first (with a log) so the old fd
+    /// can never keep swallowing the previous node after the switch.
     pub fn set_node(&self, node: &str) {
+        if self.is_grabbed() {
+            log::warn!("grab target moved to '{node}' while grabbed; releasing grab first");
+            self.ungrab();
+        }
         *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
+    }
+
+    /// Test hook: install an open fd as a live grab.
+    #[cfg(test)]
+    fn inject_open(&self, f: std::fs::File) {
+        *self.fd.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        self.grabbed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -873,52 +888,6 @@ impl GrabDevice for RealGrab {
 
     fn is_grabbed(&self) -> bool {
         self.grabbed.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// Grabber that always refuses: used when no evdev node is configured.
-/// The physical node is never guessed (`event0` roulette could swallow a
-/// keyboard), so `attach` degrades to passthrough with a log instead.
-#[derive(Debug, Default)]
-pub struct RefusingGrab;
-
-impl GrabDevice for RefusingGrab {
-    fn grab(&self) -> Result<()> {
-        anyhow::bail!(
-            "no evdev node configured (LTD_EVDEV_NODE unset); refusing to guess — passthrough"
-        )
-    }
-    fn ungrab(&self) {}
-    fn is_grabbed(&self) -> bool {
-        false
-    }
-}
-
-/// Daemon grabber: real node when resolved, refusing otherwise. Single type
-/// so the daemon hookup stays monomorphic.
-pub enum DaemonGrab {
-    Real(RealGrab),
-    Refusing(RefusingGrab),
-}
-
-impl GrabDevice for DaemonGrab {
-    fn grab(&self) -> Result<()> {
-        match self {
-            DaemonGrab::Real(g) => g.grab(),
-            DaemonGrab::Refusing(g) => g.grab(),
-        }
-    }
-    fn ungrab(&self) {
-        match self {
-            DaemonGrab::Real(g) => g.ungrab(),
-            DaemonGrab::Refusing(g) => g.ungrab(),
-        }
-    }
-    fn is_grabbed(&self) -> bool {
-        match self {
-            DaemonGrab::Real(g) => g.is_grabbed(),
-            DaemonGrab::Refusing(g) => g.is_grabbed(),
-        }
     }
 }
 
@@ -1032,6 +1001,20 @@ pub struct RealUinput {
     node: String,
     fd: Mutex<Option<std::fs::File>>,
     created: std::sync::atomic::AtomicBool,
+    /// Staged `input_event` bytes, flushed as one `write(2)` per `sync()`
+    /// (one frame = one syscall). Pre-create emits are dropped with a
+    /// debug log, never buffered: without a node there is no consumer.
+    staging: Mutex<Vec<u8>>,
+}
+
+/// Serialize one `input_event` (zeroed timestamps). Layout pinned by
+/// test: `sec(8) usec(8) type(2) code(2) value(4)`, native-endian.
+fn encode_event(ev_type: u16, code: u16, value: i32) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[16..18].copy_from_slice(&ev_type.to_ne_bytes());
+    b[18..20].copy_from_slice(&code.to_ne_bytes());
+    b[20..24].copy_from_slice(&value.to_ne_bytes());
+    b
 }
 
 impl RealUinput {
@@ -1040,6 +1023,7 @@ impl RealUinput {
             node: node.to_string(),
             fd: Mutex::new(None),
             created: std::sync::atomic::AtomicBool::new(false),
+            staging: Mutex::new(Vec::new()),
         }
     }
 
@@ -1074,13 +1058,32 @@ impl RealUinput {
     }
 
     /// Create the virtual node. Idempotent; fails gracefully without
-    /// hardware/`/dev/uinput` (caller logs + stays passthrough).
+    /// hardware/`/dev/uinput` (caller logs + stays passthrough). A
+    /// mid-sequence failure closes the fd instead of leaking a
+    /// half-configured node: the next `create()` starts clean.
     pub fn create(&self) -> Result<()> {
         if self.is_created() {
             return Ok(());
         }
         let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
         let fd = Self::open_locked(&mut guard, &self.node)?;
+        let r = Self::create_on(fd);
+        if r.is_err() {
+            *guard = None;
+        } else {
+            self.created
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            log::info!("proxy: uinput node {} created ({UINPUT_NAME})", self.node);
+        }
+        r
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fd_open(&self) -> bool {
+        self.fd.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn create_on(fd: std::os::unix::io::RawFd) -> Result<()> {
         for ev in uinput_evbits() {
             let mut v = ev as libc::c_int;
             Self::ioctl(fd, ui_set_evbit(), (&mut v as *mut libc::c_int).cast())?;
@@ -1129,16 +1132,66 @@ impl RealUinput {
             (&setup as *const UinputSetup).cast_mut().cast(),
         )?;
         Self::ioctl(fd, ui_dev_create(), std::ptr::null_mut())?;
-        self.created
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        log::info!("proxy: uinput node {} created ({UINPUT_NAME})", self.node);
         Ok(())
     }
 
-    /// Destroy the virtual node (detach path). Syncs first so no
-    /// key-up is lost, then releases grab-side state via caller.
+    /// Flush one staged buffer in a single write loop. A short actual
+    /// (`ret != remaining`) without error keeps writing; any error or a
+    /// zero return drops the remainder with a loud log instead of
+    /// looping forever on a dead fd.
+    fn flush_locked(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) {
+        let mut written = 0usize;
+        while written < buf.len() {
+            let ret =
+                unsafe { libc::write(fd, buf[written..].as_ptr().cast(), buf.len() - written) };
+            if ret < 0 {
+                log::warn!(
+                    "proxy: uinput write failed after {written}/{} bytes: {}",
+                    buf.len(),
+                    std::io::Error::last_os_error()
+                );
+                break;
+            }
+            if ret == 0 {
+                log::warn!(
+                    "proxy: uinput write returned 0 with {} bytes left; dropping",
+                    buf.len() - written
+                );
+                break;
+            }
+            written += ret as usize;
+        }
+        if written != buf.len() {
+            log::warn!(
+                "proxy: uinput short write ({written}/{} bytes); remainder dropped",
+                buf.len()
+            );
+        }
+        buf.clear();
+    }
+
+    /// Lock order is always fd → staging (matches [`UinputSink::emit`]);
+    /// never the reverse.
+    fn flush(&self) {
+        let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+        let mut staging = self.staging.lock().unwrap_or_else(|e| e.into_inner());
+        if staging.is_empty() {
+            return;
+        }
+        let Some(f) = guard.as_ref() else {
+            log::debug!("uinput flush with no fd; dropping {} bytes", staging.len());
+            staging.clear();
+            return;
+        };
+        use std::os::unix::io::AsRawFd;
+        Self::flush_locked(f.as_raw_fd(), &mut staging);
+    }
+
+    /// Destroy the virtual node (detach path). Flushes staged events
+    /// first so no key-up is lost, then releases grab-side state via caller.
     pub fn destroy(&self) {
         use std::os::unix::io::AsRawFd;
+        self.flush();
         let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = guard.as_ref() {
             unsafe {
@@ -1151,24 +1204,9 @@ impl RealUinput {
         log::info!("proxy: uinput node {} destroyed", self.node);
     }
 
-    pub fn ensure_open(&self) {
-        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
-            return;
-        }
-        match std::fs::OpenOptions::new().write(true).open(&self.node) {
-            Ok(f) => {
-                log::info!(
-                    "proxy: uinput node {} open (setup verified on hardware)",
-                    self.node
-                );
-                *guard = Some(f);
-            }
-            Err(e) => log::warn!(
-                "proxy: uinput open {} failed: {e}; events logged only",
-                self.node
-            ),
-        }
+    #[cfg(test)]
+    pub(crate) fn staged_len(&self) -> usize {
+        self.staging.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -1179,39 +1217,22 @@ impl UinputSink for RealUinput {
     fn emit(&self, ev_type: u16, code: u16, value: i32) {
         log::debug!("uinput emit: type={ev_type} code={code} value={value}");
         let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = guard.as_ref() {
-            use std::os::unix::io::AsRawFd;
-            #[repr(C)]
-            struct InputEvent {
-                sec: libc::time_t,
-                usec: libc::suseconds_t,
-                ty: u16,
-                code: u16,
-                value: i32,
-            }
-            let ev = InputEvent {
-                sec: 0,
-                usec: 0,
-                ty: ev_type,
-                code,
-                value,
-            };
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    (&raw const ev).cast::<u8>(),
-                    std::mem::size_of::<InputEvent>(),
-                )
-            };
-            unsafe {
-                let ret = libc::write(f.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
-                if ret < 0 {
-                    log::warn!(
-                        "proxy: uinput write failed (type={ev_type} code={code}): {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-            }
+        if guard.is_none() {
+            log::debug!("uinput emit pre-create; dropping event");
+            return;
         }
+        drop(guard);
+        self.staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(&encode_event(ev_type, code, value));
+    }
+
+    /// Frame boundary: stage the trailing `SYN` and flush the whole
+    /// frame in one write.
+    fn sync(&self) {
+        self.emit(EV_SYN, SYN_REPORT, 0);
+        self.flush();
     }
 }
 
@@ -1319,24 +1340,6 @@ fn plain_write(node: &str, bytes: &[u8]) -> Result<()> {
     f.write_all(bytes)
         .map_err(|e| anyhow::anyhow!("haptic write to '{node}': {e}"))?;
     Ok(())
-}
-
-/// Idle touch source for the daemon hookup: hidraw transport lands with the
-/// transport task, so the daemon subscribes a proxy that polls to no-op
-/// until then. Reports the same tier/units contract as the real source.
-#[derive(Debug, Default)]
-pub struct NullSource;
-
-impl TouchSource for NullSource {
-    fn tier(&self) -> crate::apple_parse::CapabilityTier {
-        crate::apple_parse::CapabilityTier::L2p
-    }
-    fn pressure_units(&self) -> crate::apple_parse::PressureUnits {
-        crate::apple_parse::PressureUnits::Arbitrary
-    }
-    fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -1852,6 +1855,53 @@ mod tests {
         assert!(!u.is_ready());
         assert!(u.create().is_err());
         assert!(!u.is_created());
+    }
+
+    #[test]
+    fn failed_create_leaves_no_half_configured_fd() {
+        // A regular file opens fine but NAKs the first ioctl: the fd
+        // must be closed again, not leaked as a half-configured node.
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("uinput");
+        std::fs::write(&fake, []).unwrap();
+        let u = RealUinput::new(fake.to_str().unwrap());
+        assert!(u.create().is_err());
+        assert!(!u.is_created());
+        assert!(!u.fd_open());
+    }
+
+    #[test]
+    fn set_node_releases_live_grab_first() {
+        let g = RealGrab::new("/dev/null");
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        g.inject_open(f);
+        assert!(g.is_grabbed());
+        g.set_node("/dev/input/event13");
+        assert!(!g.is_grabbed(), "retarget must release the old grab");
+    }
+
+    #[test]
+    fn encode_event_pins_input_event_layout() {
+        // sec(8) usec(8) type(2) code(2) value(4), native-endian.
+        let b = encode_event(EV_KEY, BTN_LEFT, 1);
+        assert_eq!(b.len(), 24);
+        assert_eq!(&b[..16], &[0u8; 16]);
+        assert_eq!(u16::from_ne_bytes([b[16], b[17]]), EV_KEY);
+        assert_eq!(u16::from_ne_bytes([b[18], b[19]]), BTN_LEFT);
+        assert_eq!(i32::from_ne_bytes([b[20], b[21], b[22], b[23]]), 1);
+    }
+
+    #[test]
+    fn pre_create_emits_are_dropped_never_buffered() {
+        let u = RealUinput::new("/nonexistent-uinput-xyz");
+        u.emit(EV_KEY, BTN_LEFT, 1);
+        u.emit(EV_ABS, ABS_MT_SLOT, 0);
+        u.sync();
+        assert_eq!(u.staged_len(), 0);
     }
 
     #[test]

@@ -5,8 +5,13 @@
 //! - 512 B buffer, one `read(2)` per poll step, report ID in `buf[0]`.
 //! - USB `0x02` = 12-byte prefix, BT `0x31` = 4-byte prefix, `0xf7` =
 //!   two back-to-back sub-reports (first length byte at offset 1).
-//! - Per-device thread, frame rate bounded by the device (no throttle;
-//!   idle steps sleep briefly to avoid a busy spin).
+//! - One pump thread per attached session ([`spawn_pump`]), frame rate
+//!   bounded by the device (no throttle; idle steps sleep briefly to
+//!   avoid a busy spin). NOTE: the daemon never flips the stop flag —
+//!   the thread lives until process exit by design. A dead pump
+//!   surfaces through the session teardown paths (grab released,
+//!   passthrough), never through the handle, which is only joined in
+//!   tests.
 //! - Malformed frames are logged + dropped per frame, never abort.
 //!
 //! Decode itself reuses [`crate::apple_parse::parse_frame`] /
@@ -203,7 +208,7 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
 }
 
 /// Manager-owned source: idle until a hidraw node attaches.
-/// Lets the daemon keep ONE proxy type (no `NullSource` in production):
+/// Lets the daemon keep ONE proxy type (idle until a node attaches):
 /// `Idle` polls to no-op, `Live` drains its hidraw node.
 pub enum PumpSource {
     Idle,
