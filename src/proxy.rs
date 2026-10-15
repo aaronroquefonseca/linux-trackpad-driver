@@ -211,12 +211,26 @@ fn keycode_letter_digit(s: &str) -> Option<(u16, u16)> {
 
 /// `KEY_F1..F10` are contiguous (`59..=68`); `F11`/`F12` jump to 87/88
 /// (`69`/`70` are `NUMLOCK`/`SCROLLLOCK` — a prior rev mapped them wrong).
+/// `KEY_F13..F24` are contiguous (`183..=194`); each value verified
+/// individually against `linux/input-event-codes.h`, never extrapolated.
 fn keycode_fn(s: &str) -> Option<(u16, u16)> {
     let n: u8 = s[1..].parse().ok()?;
     match n {
         1..=10 => Some((EV_KEY, 58 + u16::from(n))),
         11 => Some((EV_KEY, 87)),
         12 => Some((EV_KEY, 88)),
+        13 => Some((EV_KEY, 183)),
+        14 => Some((EV_KEY, 184)),
+        15 => Some((EV_KEY, 185)),
+        16 => Some((EV_KEY, 186)),
+        17 => Some((EV_KEY, 187)),
+        18 => Some((EV_KEY, 188)),
+        19 => Some((EV_KEY, 189)),
+        20 => Some((EV_KEY, 190)),
+        21 => Some((EV_KEY, 191)),
+        22 => Some((EV_KEY, 192)),
+        23 => Some((EV_KEY, 193)),
+        24 => Some((EV_KEY, 194)),
         _ => None,
     }
 }
@@ -1289,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn fn_keycodes_cover_all_twelve() {
+    fn fn_keycodes_cover_all_twenty_four() {
         let table: &[(&str, u16)] = &[
             ("f1", 59),
             ("f2", 60),
@@ -1303,12 +1317,149 @@ mod tests {
             ("f10", 68),
             ("f11", 87),
             ("f12", 88),
+            ("f13", 183),
+            ("f14", 184),
+            ("f15", 185),
+            ("f16", 186),
+            ("f17", 187),
+            ("f18", 188),
+            ("f19", 189),
+            ("f20", 190),
+            ("f21", 191),
+            ("f22", 192),
+            ("f23", 193),
+            ("f24", 194),
         ];
         for (name, code) in table {
             assert_eq!(key_token_to_code(name), Some((EV_KEY, *code)), "{name}");
         }
         assert_eq!(key_token_to_code("f0"), None);
-        assert_eq!(key_token_to_code("f13"), None);
+        assert_eq!(key_token_to_code("f25"), None);
+    }
+
+    #[test]
+    fn all_mapped_keycodes_match_kernel_header() {
+        // Full audit against linux/input-event-codes.h: every token in
+        // `key_token_to_code` pinned here so a wrong-code regression fails.
+        let table: &[(&str, u16)] = &[
+            // Mouse buttons.
+            ("left", BTN_LEFT),
+            ("right", BTN_RIGHT),
+            ("middle", BTN_MIDDLE),
+            ("back", BTN_SIDE),
+            ("forward", BTN_EXTRA),
+            // Modifiers (left + right variants).
+            ("ctrl", 29),
+            ("control", 29),
+            ("lctrl", 29),
+            ("rctrl", 97),
+            ("shift", 42),
+            ("lshift", 42),
+            ("rshift", 54),
+            ("alt", 56),
+            ("lalt", 56),
+            ("ralt", 100),
+            ("meta", 125),
+            ("super", 125),
+            ("cmd", 125),
+            ("command", 125),
+            ("win", 125),
+            ("lmeta", 125),
+            ("rmeta", 126),
+            // Navigation / editing.
+            ("esc", 1),
+            ("escape", 1),
+            ("enter", 28),
+            ("return", 28),
+            ("space", 57),
+            ("tab", 15),
+            ("backspace", 14),
+            ("delete", 111),
+            ("home", 102),
+            ("end", 107),
+            ("pageup", 104),
+            ("pgup", 104),
+            ("pagedown", 109),
+            ("pgdn", 109),
+            ("up", 103),
+            ("arrow_up", 103),
+            ("down", 108),
+            ("arrow_down", 108),
+            ("left_arrow", 105),
+            ("right_arrow", 106),
+            // Media.
+            ("volup", 115),
+            ("voldown", 114),
+            ("mute", 113),
+            ("play", 164),
+            ("pause", 119),
+            // Letters.
+            ("a", 30),
+            ("b", 48),
+            ("c", 46),
+            ("d", 32),
+            ("e", 18),
+            ("f", 33),
+            ("g", 34),
+            ("h", 35),
+            ("i", 23),
+            ("j", 36),
+            ("k", 37),
+            ("l", 38),
+            ("m", 50),
+            ("n", 49),
+            ("o", 24),
+            ("p", 25),
+            ("q", 16),
+            ("r", 19),
+            ("s", 31),
+            ("t", 20),
+            ("u", 22),
+            ("v", 47),
+            ("w", 17),
+            ("x", 45),
+            ("y", 21),
+            ("z", 44),
+            // Digits.
+            ("1", 2),
+            ("2", 3),
+            ("3", 4),
+            ("4", 5),
+            ("5", 6),
+            ("6", 7),
+            ("7", 8),
+            ("8", 9),
+            ("9", 10),
+            ("0", 11),
+            // Function row (F13..F24 = 183..=194).
+            ("f1", 59),
+            ("f2", 60),
+            ("f3", 61),
+            ("f4", 62),
+            ("f5", 63),
+            ("f6", 64),
+            ("f7", 65),
+            ("f8", 66),
+            ("f9", 67),
+            ("f10", 68),
+            ("f11", 87),
+            ("f12", 88),
+            ("f13", 183),
+            ("f14", 184),
+            ("f15", 185),
+            ("f16", 186),
+            ("f17", 187),
+            ("f18", 188),
+            ("f19", 189),
+            ("f20", 190),
+            ("f21", 191),
+            ("f22", 192),
+            ("f23", 193),
+            ("f24", 194),
+        ];
+        for (name, code) in table {
+            assert_eq!(key_token_to_code(name), Some((EV_KEY, *code)), "{name}");
+        }
     }
 
     #[test]
