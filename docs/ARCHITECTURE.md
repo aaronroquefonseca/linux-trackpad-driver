@@ -53,7 +53,8 @@ pub struct Finger {
     pub pressure: u8,      // RAW device byte (Apple: 0..=253 valid, 254/255
                            // reserved passthrough — see RESEARCH §6). NOT
                            // normalized: clicks thresholds operate on this
-                           // scale; uinput stage clamps to 253 (kernel absmax).
+                           // scale; uinput stage emits old-service
+                           // normalized 60/800/800 per down contact.
     pub contact: bool,
 }
 

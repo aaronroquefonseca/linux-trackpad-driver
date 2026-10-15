@@ -49,8 +49,9 @@
 //!   proxy sends the host-click report (`0x21 0x01`, see [`crate::init`])
 //!   with strength/quiet carried for logging. Strength byte mapping is
 //!   unverified on hardware (proprietary `0x53` actuator per RESEARCH §2).
-//! - uinput mapping: pressure MUST clamp to [`crate::apple_parse::PRESSURE_VALID_MAX`]
-//!   (253, kernel `absmax`); orientation emits `-(raw)` per the kernel
+//! - uinput mapping: every down contact emits the old-service normalized
+//!   values (pressure 60, major/minor 800 — raw bytes are arbitrary units
+//!   the classifier drops); orientation emits `-(raw)` per the kernel
 //!   `hid-magicmouse` negation; physical `clicks` byte contributes
 //!   `BTN = clicks & 1` (bits 6..7 are timestamp, not buttons) OR-ed into
 //!   the click state.
@@ -59,7 +60,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::apple_parse::{FingerContact, PRESSURE_VALID_MAX};
+use crate::apple_parse::FingerContact;
 use crate::config::{ActionKind, ClickAction, Config};
 
 /// Touch-presence pressure floor (old-service parity): a contact counts as
@@ -83,12 +84,6 @@ pub fn touch_present(f: &FingerContact) -> bool {
 /// Scale a pointer delta by `speed` percent (`100` = 1:1). Proxy path only.
 pub fn scale_delta(delta: i32, speed: u32) -> i32 {
     ((i64::from(delta) * i64::from(speed)) / 100) as i32
-}
-
-/// Clamp a raw pressure byte to the kernel `absmax` (253). Values 254..=255
-/// are reserved passthrough from the parser and must never hit the wire.
-pub fn clamp_pressure(raw: u8) -> u8 {
-    raw.min(PRESSURE_VALID_MAX)
 }
 
 /// Negate raw orientation for `ABS_MT_ORIENTATION` (kernel parity).
@@ -618,11 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp_and_negation_mapping() {
-        assert_eq!(clamp_pressure(0), 0);
-        assert_eq!(clamp_pressure(253), 253);
-        assert_eq!(clamp_pressure(254), 253);
-        assert_eq!(clamp_pressure(255), 253);
+    fn negation_mapping() {
         assert_eq!(negate_orientation(3), -3);
         assert_eq!(negate_orientation(-4), 4);
     }
