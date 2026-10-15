@@ -10,6 +10,7 @@ pub mod hw_mock;
 pub mod init;
 pub mod lock;
 pub mod proxy;
+pub mod pump;
 pub mod resume;
 #[cfg(test)]
 pub mod test_env;
