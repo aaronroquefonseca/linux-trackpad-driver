@@ -141,8 +141,13 @@ pub trait UinputSink: Send {
 /// `pressure` is the actuator pressure byte (the press threshold —
 /// old-service parity), `intensity` the click strength (`0` = silent,
 /// never sent); `quiet` selects the soft waveform.
+/// `release_feedback` is the release up-pulse (`down_pressure` = the same
+/// threshold byte the down pulse carried; the sender scales it to
+/// `threshold*3/5` with intensity 0 — old-service parity). Unlike the
+/// down pulse it always sends: intensity 0 is the payload, not silence.
 pub trait HapticSender: Send {
     fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()>;
+    fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()>;
 }
 
 /// Log-only haptic sender (default when no hardware wired).
@@ -157,6 +162,10 @@ impl HapticSender for LogHaptic {
         log::info!(
             "haptic feedback: pressure={pressure} intensity={intensity} quiet={quiet} (report 21 01)"
         );
+        Ok(())
+    }
+    fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+        log::info!("haptic release: down_pressure={down_pressure} quiet={quiet} (report 21 01)");
         Ok(())
     }
 }
@@ -364,6 +373,13 @@ pub struct ClickProxy<G, U, H, S> {
     /// `BTN_LEFT` traffic and steady holds stay silent. Pure wire
     /// hygiene; no claim about any downstream symptom.
     btn_left_down: bool,
+    /// A down pulse fired for the live first-level latch (old-service
+    /// `pressed_haptic_triggered` parity): the release edge owes the
+    /// actuator its up-pulse. Silent presses (`haptic == 0`, `none`
+    /// action) leave this false so the release stays silent too.
+    pressed_haptic: bool,
+    /// Same for the live force-level latch (`force_haptic_triggered`).
+    force_haptic: bool,
 }
 
 impl<G, U, H, S> ClickProxy<G, U, H, S>
@@ -390,6 +406,8 @@ where
             last_pos: HashMap::new(),
             max_slot: 0,
             btn_left_down: false,
+            pressed_haptic: false,
+            force_haptic: false,
         }
     }
 
@@ -438,6 +456,8 @@ where
             self.release_held(false);
             self.uinput.sync();
             self.machine.reset();
+            self.pressed_haptic = false;
+            self.force_haptic = false;
             self.last_pos.clear();
             self.attached = false;
             self.attached_node = None;
@@ -522,6 +542,8 @@ where
         self.release_held(false);
         self.uinput.sync();
         self.machine.reset();
+        self.pressed_haptic = false;
+        self.force_haptic = false;
         self.last_pos.clear();
         self.max_slot = 0;
         self.attached = false;
@@ -617,9 +639,18 @@ where
             // along so a still-held hardware button suppresses the
             // latch's left-up (no 0-then-1 flutter in one frame).
             self.release_held(ClickMachine::physical_button(frame.clicks));
+            // Old-service release snap: force up-pulse first (when its
+            // down pulse fired), then the first-level up-pulse. No 15 ms
+            // staging sleep (old inserts one between the two): the pump
+            // thread must not stall on a release frame.
+            if was_force {
+                self.fire_release(true, haptic_pressure, cfg.force_quiet_click);
+            }
+            self.fire_release(false, haptic_pressure, cfg.quiet_click);
         } else if force_gone {
             // Back to the first-level hold: force keys up, first keys stay.
             self.release_force_held();
+            self.fire_release(true, haptic_pressure, cfg.force_quiet_click);
         }
         self.emit_btn_left(frame.clicks);
         self.uinput.sync();
@@ -668,7 +699,12 @@ where
                 log::debug!("proxy: {name}_{} = none (swallowed)", ev.finger_count);
             }
             ActionKind::Empty => {
-                self.fire_haptic(ev, pressure);
+                let fired = self.fire_haptic(ev, pressure);
+                if force {
+                    self.force_haptic = fired;
+                } else {
+                    self.pressed_haptic = fired;
+                }
             }
             ActionKind::Keys(keys) => {
                 for k in keys {
@@ -699,18 +735,43 @@ where
                         None => log::warn!("proxy: no keycode for '{k}', skipped"),
                     }
                 }
-                self.fire_haptic(ev, pressure);
+                let fired = self.fire_haptic(ev, pressure);
+                if force {
+                    self.force_haptic = fired;
+                } else {
+                    self.pressed_haptic = fired;
+                }
             }
         }
     }
 
-    fn fire_haptic(&self, ev: &ClickEvent, pressure: u8) {
+    /// Down pulse for one level's press edge. Returns whether the pulse
+    /// fired (false = silent config, so the release owes no up-pulse).
+    fn fire_haptic(&self, ev: &ClickEvent, pressure: u8) -> bool {
         if !clicks::should_emit_haptic(ev.haptic) {
-            return;
+            return false;
         }
         let intensity = ev.haptic.min(255) as u8;
         if let Err(e) = self.haptic.click_feedback(pressure, intensity, ev.quiet) {
             log::warn!("proxy: haptic send failed: {e:#}");
+        }
+        true
+    }
+
+    /// Release up-pulse for one level (old-service `vibration_up`
+    /// parity). Fires only when that level's down pulse fired; clears
+    /// the flag either way so a release never snaps twice.
+    fn fire_release(&mut self, force: bool, down_pressure: u8, quiet: bool) {
+        let fired = if force {
+            std::mem::replace(&mut self.force_haptic, false)
+        } else {
+            std::mem::replace(&mut self.pressed_haptic, false)
+        };
+        if !fired {
+            return;
+        }
+        if let Err(e) = self.haptic.release_feedback(down_pressure, quiet) {
+            log::warn!("proxy: haptic release send failed: {e:#}");
         }
     }
 
@@ -1445,11 +1506,11 @@ impl UinputSink for RealUinput {
 ///   never sent).
 /// - `amplitude` = `quiet ? 0xFF : 0x78`, `pattern` = `quiet ? 0 : 6`
 ///   (old-service parity: `120` / `6` normal, `255` / `0` quiet).
+/// - Release up-pulse ([`vibration_up_report`]): same template at
+///   `pressure = sensitivity*3/5`, `intensity = 0`, emitted on every
+///   release whose down pulse fired (old-service parity: the actuator
+///   needs the down+up pair for the click snap).
 ///
-/// DEVIATION (pending owner HW verify): old service also emits an up-pulse
-/// (`vibration_up` at `sensitivity*3/5`, intensity 0) on release; we emit
-/// only the down pulse per press edge. Release waveform feel may differ —
-/// flagged for the owner feel checklist.
 /// - Transport framing: old service sent full 15 B via hidapi feature
 ///   report on BT but stripped the leading `0xF2` on USB (14 B starting
 ///   `0x53`). We mirror that split over `HIDIOCSFEATURE`; whether the
@@ -1469,9 +1530,25 @@ pub fn vibration_report(pressure: u8, intensity: u8, quiet: bool) -> [u8; 15] {
     ]
 }
 
-/// Real haptic sender: fires the `0x53` actuator report per press edge.
-/// `intensity == 0` is silent (no bytes on the wire). Empty node = log-only
-/// (daemon has not attached yet); never fails attach.
+/// Release up-pulse pressure (old-service parity): the down-pulse
+/// threshold byte scaled lighter (`sensitivity*3/5`, `u16` math, no
+/// overflow). Intensity is always 0 in the up report.
+pub fn up_pressure(down_pressure: u8) -> u8 {
+    (u16::from(down_pressure) * 3 / 5) as u8
+}
+
+/// Release up-pulse report (old-service `vibration_up` parity):
+/// same template at `pressure = down*3/5`, `intensity = 0`, waveform
+/// from `quiet` exactly like the down pulse.
+pub fn vibration_up_report(down_pressure: u8, quiet: bool) -> [u8; 15] {
+    vibration_report(up_pressure(down_pressure), 0, quiet)
+}
+
+/// Real haptic sender: fires the `0x53` actuator report per press edge
+/// plus the release up-pulse per release edge (old-service down+up
+/// pair). Down `intensity == 0` is silent (no bytes on the wire); the
+/// up-pulse always sends (intensity 0 is its payload, not silence).
+/// Empty node = log-only (daemon has not attached yet); never fails attach.
 pub struct RealHaptic {
     node: Mutex<String>,
     bt: std::sync::atomic::AtomicBool,
@@ -1514,19 +1591,38 @@ impl HapticSender for RealHaptic {
         if node.is_empty() {
             return Ok(());
         }
-        let payload: &[u8] = if bt { &report } else { &report[1..] };
+        self.send_report(&node, bt, &report);
+        Ok(())
+    }
+    fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+        let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let bt = self.bt.load(std::sync::atomic::Ordering::SeqCst);
+        let report = vibration_up_report(down_pressure, quiet);
+        log::info!(
+            "haptic release: down_pressure={down_pressure} quiet={quiet} (report 53, node={node} bt={bt})"
+        );
+        if node.is_empty() {
+            return Ok(());
+        }
+        self.send_report(&node, bt, &report);
+        Ok(())
+    }
+}
+
+impl RealHaptic {
+    fn send_report(&self, node: &str, bt: bool, report: &[u8; 15]) {
+        let payload: &[u8] = if bt { &report[..] } else { &report[1..] };
         // Strict send: EPIPE/EIO (device NAK) must propagate so the
         // fallback below runs. The lenient init variant would swallow
         // the NAK as success → silent no-haptic with no fallback.
-        if let Err(e) = crate::init::send_feature_report_hidraw_strict(&node, payload) {
+        if let Err(e) = crate::init::send_feature_report_hidraw_strict(node, payload) {
             log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
-            if let Err(e2) = plain_write(&node, payload) {
+            if let Err(e2) = plain_write(node, payload) {
                 log::error!(
                     "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
                 );
             }
         }
-        Ok(())
     }
 }
 
@@ -1625,12 +1721,14 @@ mod tests {
 
     struct FakeHaptic {
         calls: Mutex<Vec<(u8, u8, bool)>>,
+        releases: Mutex<Vec<(u8, bool)>>,
     }
 
     impl FakeHaptic {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                releases: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1641,6 +1739,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((pressure, intensity, quiet));
+            Ok(())
+        }
+        fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+            self.releases.lock().unwrap().push((down_pressure, quiet));
             Ok(())
         }
     }
@@ -1922,6 +2024,9 @@ mod tests {
     impl HapticSender for SharedHaptic {
         fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
             self.0.click_feedback(pressure, intensity, quiet)
+        }
+        fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+            self.0.release_feedback(down_pressure, quiet)
         }
     }
 
@@ -2315,6 +2420,14 @@ mod tests {
         h.set_bluetooth(true);
         assert!(h.click_feedback(64, 9, true).is_ok());
         assert_eq!(std::fs::read(&bt).unwrap(), &vibration_report(64, 9, true));
+        // The up-pulse rides the same transport: USB strips F2, BT keeps it.
+        h.set_node(usb.to_str().unwrap());
+        h.set_bluetooth(false);
+        assert!(h.release_feedback(64, false).is_ok());
+        assert_eq!(
+            std::fs::read(&usb).unwrap(),
+            &vibration_up_report(64, false)[1..]
+        );
     }
 
     #[test]
@@ -3288,6 +3401,66 @@ mod tests {
         };
         px.handle_frame(&cfg).unwrap();
         assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(80, 7, false)]);
+    }
+
+    #[test]
+    fn haptic_down_up_pair_matches_old_service_bytes() {
+        // Hardware-proven regression (owner MT2 USB-C 2026-10-15): the
+        // actuator needs the old-service down+up pair — DOWN at
+        // pressure=sensitivity with intensity=haptic, UP at
+        // pressure=sensitivity*3/5 with intensity 0 (both edges). A
+        // down-only stream leaves the click feel dead.
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        assert_eq!(haptic.releases.lock().unwrap().as_slice(), &[(64, false)]);
+        // Byte-exact pair on the wire (15 B template, USB strips F2).
+        assert_eq!(
+            vibration_report(64, 5, false),
+            [0xF2, 0x53, 0x01, 64, 0x78, 0x02, 5, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+        );
+        assert_eq!(up_pressure(64), 38);
+        assert_eq!(
+            vibration_up_report(64, false),
+            [0xF2, 0x53, 0x01, 38, 0x78, 0x02, 0, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+        );
+        assert_eq!(
+            vibration_up_report(64, true),
+            [0xF2, 0x53, 0x01, 38, 0xFF, 0x02, 0, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12]
+        );
+    }
+
+    #[test]
+    fn silent_haptic_sends_no_down_or_up() {
+        // haptic=0: no down pulse, so no release up-pulse either
+        // (old-service triggered-flag parity — a silent press leaves
+        // nothing for the release to snap back from).
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let cfg = Config {
+            haptic: 0,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(haptic.calls.lock().unwrap().is_empty());
+        assert!(haptic.releases.lock().unwrap().is_empty());
     }
 
     // ---- Click-emission wire-purity regression net ----
