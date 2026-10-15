@@ -240,6 +240,19 @@ journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
 
 - [ ] Attach line present: `proxy: grabbed /dev/hidrawN (uinput virtual node up)`.
       A new uinput node appears in `sudo libinput list-devices`.
+- [ ] Two-node classification (owner hardware gate — merges wait on this):
+      find both virtual nodes (`Linux Trackpad Driver` + `Linux Trackpad
+      Driver Extras`) via `sudo libinput list-devices`, then check each
+      node's `Handlers=` line in
+      `/proc/bus/input/devices`:
+      - pointer node (`Linux Trackpad Driver`): `Handlers=` shows
+        `mouseN eventM` with NO `kbd` — this is the regression pin
+        (a `kbd` there means keyboard codes leaked back onto the pointer
+        node and the cursor will stay dead);
+      - extras node (`Linux Trackpad Driver Extras`): keyboard outlet,
+        `kbd` there is expected and harmless.
+      Then: cursor moves on finger motion (pointer node), and a mapped
+      combo (e.g. `click_1 = "ctrl+c"`) still types (extras node).
 - [ ] Gate-off fallback (sanity): set gate back to `false`, restart —
       expect `proxy: gate off, passthrough for /dev/hidrawN`, no grab,
       pointer works.

@@ -19,15 +19,24 @@
 //!   parentage walk, else a name+MT-caps scan). The name scan is UNTRUSTED
 //!   and never backs a grab; unresolvable → passthrough, never `event0`
 //!   roulette.
-//! - Proxy node: Type-B MT slots + tracking IDs, `BTN_LEFT`/`BTN_TOUCH` /
-//!   `BTN_TOOL_FINGER..QUINTTAP` + `SYN`, `INPUT_PROP_POINTER`. Positions
-//!   carry the old-service physical density (`ABS_MT_POSITION_X/Y`
-//!   resolution 48/44); pressure stays `res == 0` arbitrary 0..253.
-//!   NEVER advertises `EV_FF`/`FF_HAPTIC` (no 2026 libinput/Wayland
-//!   consumer). The `BTN_TOOL_*` + `TOUCH_MAJOR/MINOR` + `POINTER` +
-//!   nonzero-resolution set is what libinput needs to classify the node
-//!   as a touchpad and move the cursor from slot motion (hardware-proven
-//!   against the old driver; without them the pointer stays dead).
+//! - TWO virtual nodes (old-service parity, hardware-proven 2026-10-16):
+//!   a single node advertising keys `1..=255` is classified KEYBOARD by
+//!   the kernel (`Handlers=sysrq kbd eventN`) and libinput never drives a
+//!   pointer from it. So the pointer node carries EXACTLY the 9
+//!   touchpad key bits (`BTN_LEFT/RIGHT/MIDDLE/TOUCH/TOOL_FINGER..QUINTTAP`)
+//!   with `SYN`/`ABS` plus `INPUT_PROP_POINTER` and the 8 Type-B MT axes,
+//!   while a separate `Extras` node carries the keyboard click-map codes
+//!   (`SYN`/`KEY` only, no `ABS`, no pointer prop). Touch frames,
+//!   `BTN_LEFT`, and mouse buttons route to the pointer node; key-combo
+//!   codes route to extras ([`DualSink`] owns the split).
+//! - Pointer-node positions carry the old-service physical density
+//!   (`ABS_MT_POSITION_X/Y` resolution 48/44); pressure stays `res == 0`
+//!   arbitrary 0..253. NEVER advertises `EV_FF`/`FF_HAPTIC` (no 2026
+//!   libinput/Wayland consumer). The `BTN_TOOL_*` + `TOUCH_MAJOR/MINOR` +
+//!   `POINTER` + nonzero-resolution set is what libinput needs to classify
+//!   the node as a touchpad and move the cursor from slot motion
+//!   (hardware-proven against the old driver; without them — or with
+//!   keyboard codes polluting the node — the pointer stays dead).
 //! - `BTN_LEFT` derives from held codes (present only when the latched action
 //!   contains `left`) OR-ed with the physical `clicks & 1` bit — never from
 //!   latch state alone (a right/combo/empty hold must not chord left).
@@ -105,12 +114,18 @@ pub fn eviocgrab_request() -> u64 {
     (1u64 << 30) | ((4u64) << 16) | ((u64::from(b'E')) << 8) | 0x90
 }
 
-/// Event-bit disposition for the virtual node (honest: the setup ioctls
-/// `UI_SET_EVBIT`/`UI_ABS_SETUP`/`UI_DEV_CREATE` land with the transport
-/// task, which must set exactly these bits). `EV_FF` must never appear —
-/// no 2026 libinput/Wayland consumer (RESEARCH §6). Pinned by test.
-pub fn uinput_evbits() -> Vec<u16> {
+/// Event-bit disposition for the POINTER virtual node (honest: the setup
+/// ioctls `UI_SET_EVBIT`/`UI_ABS_SETUP`/`UI_DEV_CREATE` land with the
+/// transport task, which must set exactly these bits). `EV_FF` must never
+/// appear — no 2026 libinput/Wayland consumer (RESEARCH §6). Pinned by test.
+pub fn pointer_evbits() -> Vec<u16> {
     vec![EV_SYN, EV_KEY, EV_ABS]
+}
+
+/// Event bits for the EXTRAS virtual node: keyboard codes only — no `ABS`
+/// (it carries no axes), no pointer prop. `EV_FF` never set either.
+pub fn extras_evbits() -> Vec<u16> {
+    vec![EV_SYN, EV_KEY]
 }
 
 // ---- injectable hardware traits (mocks behind these in tests) ----
@@ -122,7 +137,7 @@ pub trait GrabDevice: Send {
     fn is_grabbed(&self) -> bool;
 }
 
-/// Emit handle for the VIRTUAL uinput node.
+/// Emit handle for a VIRTUAL uinput node.
 pub trait UinputSink: Send {
     fn emit(&self, ev_type: u16, code: u16, value: i32);
     fn sync(&self) {
@@ -134,6 +149,10 @@ pub trait UinputSink: Send {
     fn is_ready(&self) -> bool {
         true
     }
+    /// Destroy the virtual node (detach path). Idempotent: safe on a
+    /// never-created node. [`DualSink`] overrides this to destroy BOTH
+    /// nodes so teardown never leaks the sibling.
+    fn destroy(&self) {}
 }
 
 /// Haptic feedback sender (host-click report path).
@@ -1093,12 +1112,24 @@ pub fn ui_dev_destroy() -> u64 {
     io(2)
 }
 
-/// Virtual device identity (proxy node, not a hardware claim).
+/// Virtual device identities (proxy nodes, not hardware claims). The
+/// pointer node keeps the established name; extras rides alongside it
+/// (old-service `Magic Trackpad Extras` parity).
 pub const UINPUT_NAME: &str = "Linux Trackpad Driver";
+pub const UINPUT_EXTRAS_NAME: &str = "Linux Trackpad Driver Extras";
 pub const UINPUT_BUSTYPE: u16 = 0x03;
 pub const UINPUT_VENDOR: u16 = 0x05ac;
 pub const UINPUT_PRODUCT: u16 = 0x0324;
 pub const UINPUT_VERSION: u16 = 1;
+
+/// Which of the two virtual nodes a [`RealUinput`] drives. The pointer
+/// node is the touchpad (MT axes + 9 key bits + `POINTER` prop); extras
+/// is the keyboard outlet (combo codes only, no axes, no prop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UinputRole {
+    Pointer,
+    Extras,
+}
 
 /// Absolute axis ranges for the proxy node. Pressure stays `res == 0`
 /// (arbitrary units, never grams/newtons) and clamps to 253 (kernel
@@ -1124,26 +1155,115 @@ pub fn uinput_abs_setup() -> Vec<(u16, i32, i32, i32)> {
     ]
 }
 
-/// Key bits for the proxy node: buttons + touchpad classification bits +
-/// every keyboard code the click maps can emit. `EV_FF` is never set
-/// (no 2026 consumer).
-pub fn uinput_keybits() -> Vec<u16> {
+/// Which virtual node an event belongs on. [`split_route`] is the single
+/// routing decision for the two-node layout (old-service parity: mouse
+/// buttons ride the pointer node, keyboard codes ride extras).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitRoute {
+    Pointer,
+    Extras,
+    Both,
+}
+
+/// Key codes emitted on the POINTER node: exactly the old-service 9
+/// (buttons + touch classification). No keyboard code may ever appear
+/// here — the kernel classifies a node advertising `1..=255` as KEYBOARD
+/// and libinput never drives a pointer from it (owner hardware 2026-10-16).
+/// Pinned exact by test, including the regression pin (no `KEY_A..Z`).
+pub const POINTER_KEYBITS: [u16; 9] = [
+    BTN_LEFT,
+    BTN_RIGHT,
+    BTN_MIDDLE,
+    BTN_TOOL_FINGER,
+    BTN_TOOL_DOUBLETAP,
+    BTN_TOOL_TRIPLETAP,
+    BTN_TOOL_QUADTAP,
+    BTN_TOOL_QUINTTAP,
+    BTN_TOUCH,
+];
+
+/// Route one event to its node: `ABS` axes + the 9 pointer key codes go to
+/// the pointer node, every other `KEY` code (combos, `back`/`forward`,
+/// media, app keys) goes to extras, `SYN` fans out to both (each node is
+/// independently framed). Event types other than these three are never
+/// emitted; they default to extras.
+pub fn split_route(ev_type: u16, code: u16) -> SplitRoute {
+    match ev_type {
+        EV_SYN => SplitRoute::Both,
+        EV_ABS => SplitRoute::Pointer,
+        EV_KEY if POINTER_KEYBITS.contains(&code) => SplitRoute::Pointer,
+        _ => SplitRoute::Extras,
+    }
+}
+
+/// Two-node emit handle: owns the pointer sink plus the extras sink and
+/// routes every event via [`split_route`]. `is_ready` reflects the POINTER
+/// node only — the touch path is the emit path grab safety depends on; an
+/// extras-only failure degrades combos (dropped with a log at create time)
+/// while motion/buttons keep working. `destroy` tears down BOTH nodes.
+pub struct DualSink<P, E> {
+    pointer: P,
+    extras: E,
+}
+
+impl<P, E> DualSink<P, E> {
+    pub fn new(pointer: P, extras: E) -> Self {
+        Self { pointer, extras }
+    }
+
+    pub fn pointer(&self) -> &P {
+        &self.pointer
+    }
+
+    pub fn extras(&self) -> &E {
+        &self.extras
+    }
+}
+
+impl<P: UinputSink, E: UinputSink> UinputSink for DualSink<P, E> {
+    fn is_ready(&self) -> bool {
+        self.pointer.is_ready()
+    }
+
+    fn emit(&self, ev_type: u16, code: u16, value: i32) {
+        match split_route(ev_type, code) {
+            SplitRoute::Pointer => self.pointer.emit(ev_type, code, value),
+            SplitRoute::Extras => self.extras.emit(ev_type, code, value),
+            SplitRoute::Both => {
+                self.pointer.emit(ev_type, code, value);
+                self.extras.emit(ev_type, code, value);
+            }
+        }
+    }
+
+    fn sync(&self) {
+        self.pointer.sync();
+        self.extras.sync();
+    }
+
+    fn destroy(&self) {
+        self.pointer.destroy();
+        self.extras.destroy();
+    }
+}
+
+/// Key bits for the POINTER node: exactly the 9 classification-safe codes
+/// ([`POINTER_KEYBITS`], sorted). Pinned exact by test.
+pub fn pointer_keybits() -> Vec<u16> {
+    let mut keys = POINTER_KEYBITS.to_vec();
+    keys.sort_unstable();
+    keys
+}
+
+/// Key bits for the EXTRAS node: every keyboard code the click maps can
+/// emit (`1..=255` covers letters/digits/modifiers/nav/media/app/F-keys;
+/// the four above-255 codes cover `back`/`forward`/`favorites`/`player`).
+/// Pointer-routed buttons (`BTN_LEFT/RIGHT/MIDDLE`) and the touch
+/// classification bits are deliberately absent — extras carries no
+/// pointer traffic. `EV_FF` is never set (no 2026 consumer).
+pub fn extras_keybits() -> Vec<u16> {
     let mut keys: Vec<u16> = (1u16..=255).collect();
-    for extra in [
-        BTN_LEFT,
-        BTN_RIGHT,
-        BTN_MIDDLE,
-        BTN_SIDE,
-        BTN_EXTRA,
-        BTN_TOOL_FINGER,
-        BTN_TOOL_DOUBLETAP,
-        BTN_TOOL_TRIPLETAP,
-        BTN_TOOL_QUADTAP,
-        BTN_TOOL_QUINTTAP,
-        BTN_TOUCH,
-        364,
-        387,
-    ] {
+    for extra in [BTN_SIDE, BTN_EXTRA, 364, 387] {
         if !keys.contains(&extra) {
             keys.push(extra);
         }
@@ -1186,11 +1306,15 @@ pub struct UinputAbsSetup {
 
 /// Best-effort uinput sink with real device creation (`UI_DEV_SETUP` +
 /// `UI_SET_EVBIT/KEYBIT/ABSBIT` + `UI_ABS_SETUP` + `UI_DEV_CREATE`).
-/// Created BEFORE grab; [`UinputSink::is_ready`] gates attach.
-/// Never sets `EV_FF` (see [`uinput_evbits`]). Emits are `input_event`
-/// writes once the fd exists; pre-create emits are debug-logged only.
+/// One instance drives ONE virtual node ([`UinputRole`]); the daemon owns
+/// a pointer instance plus an extras instance (see [`DualSink`]).
+/// The pointer instance is created BEFORE grab; [`UinputSink::is_ready`]
+/// gates attach on it. Never sets `EV_FF` (see [`pointer_evbits`]).
+/// Emits are `input_event` writes once the fd exists; pre-create emits
+/// are debug-logged only.
 pub struct RealUinput {
     node: String,
+    role: UinputRole,
     fd: Mutex<Option<std::fs::File>>,
     created: std::sync::atomic::AtomicBool,
     /// Staged `input_event` bytes, flushed as one `write(2)` per `sync()`
@@ -1211,12 +1335,27 @@ fn encode_event(ev_type: u16, code: u16, value: i32) -> [u8; 24] {
 
 impl RealUinput {
     pub fn new(node: &str) -> Self {
+        Self::with_role(node, UinputRole::Pointer)
+    }
+
+    /// Extras-node instance: keyboard outlet, no axes, no pointer prop.
+    /// Shares the `/dev/uinput` path (one fd per virtual node).
+    pub fn new_extras(node: &str) -> Self {
+        Self::with_role(node, UinputRole::Extras)
+    }
+
+    fn with_role(node: &str, role: UinputRole) -> Self {
         Self {
             node: node.to_string(),
+            role,
             fd: Mutex::new(None),
             created: std::sync::atomic::AtomicBool::new(false),
             staging: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn role(&self) -> UinputRole {
+        self.role
     }
 
     pub fn is_created(&self) -> bool {
@@ -1287,27 +1426,41 @@ enum CreateOp {
 }
 
 impl RealUinput {
-    /// Ordered create plan: evbits → keybits → (absbit + abs-setup per
-    /// axis) → propbits → dev-setup → dev-create. Matches the working
-    /// `evdev` crate `VirtualDeviceBuilder` sequence (hardware-verified),
-    /// plus `UI_SET_PROPBIT(INPUT_PROP_POINTER)` for the old-service
-    /// pointer classification.
-    fn create_plan() -> Vec<CreateOp> {
+    /// Ordered create plan per role. Pointer: evbits → keybits →
+    /// (absbit + abs-setup per axis) → propbit → dev-setup → dev-create.
+    /// Matches the working `evdev` crate `VirtualDeviceBuilder` sequence
+    /// (hardware-verified), plus `UI_SET_PROPBIT(INPUT_PROP_POINTER)` for
+    /// the old-service pointer classification. Extras: evbits → keybits →
+    /// dev-setup → dev-create (no axes, no prop — a pure keyboard outlet).
+    /// A single-node failure must not break the other: the daemon creates
+    /// each role independently and continues pointer-only when extras
+    /// fails (and vice versa on teardown, where both destroys always run).
+    fn create_plan_for(role: UinputRole) -> Vec<CreateOp> {
         let mut plan = Vec::new();
-        for ev in uinput_evbits() {
+        let evbits = match role {
+            UinputRole::Pointer => pointer_evbits(),
+            UinputRole::Extras => extras_evbits(),
+        };
+        for ev in evbits {
             plan.push(CreateOp::Bit(ui_set_evbit(), ev as libc::c_int));
         }
-        for key in uinput_keybits() {
+        let keybits = match role {
+            UinputRole::Pointer => pointer_keybits(),
+            UinputRole::Extras => extras_keybits(),
+        };
+        for key in keybits {
             plan.push(CreateOp::Bit(ui_set_keybit(), key as libc::c_int));
         }
-        for (code, mn, mx, res) in uinput_abs_setup() {
-            plan.push(CreateOp::Bit(ui_set_absbit(), code as libc::c_int));
-            plan.push(CreateOp::Abs(code, mn, mx, res));
+        if role == UinputRole::Pointer {
+            for (code, mn, mx, res) in uinput_abs_setup() {
+                plan.push(CreateOp::Bit(ui_set_absbit(), code as libc::c_int));
+                plan.push(CreateOp::Abs(code, mn, mx, res));
+            }
+            plan.push(CreateOp::Bit(
+                ui_set_propbit(),
+                INPUT_PROP_POINTER as libc::c_int,
+            ));
         }
-        plan.push(CreateOp::Bit(
-            ui_set_propbit(),
-            INPUT_PROP_POINTER as libc::c_int,
-        ));
         plan.push(CreateOp::DevSetup);
         plan.push(CreateOp::DevCreate);
         plan
@@ -1361,13 +1514,17 @@ impl RealUinput {
         }
         let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
         let fd = Self::open_locked(&mut guard, &self.node)?;
-        let r = Self::create_on(fd);
+        let r = Self::create_on(fd, self.role);
         if r.is_err() {
             *guard = None;
         } else {
             self.created
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            log::info!("proxy: uinput node {} created ({UINPUT_NAME})", self.node);
+            let dev_name = match self.role {
+                UinputRole::Pointer => UINPUT_NAME,
+                UinputRole::Extras => UINPUT_EXTRAS_NAME,
+            };
+            log::info!("proxy: uinput node {} created ({dev_name})", self.node);
         }
         r
     }
@@ -1377,7 +1534,7 @@ impl RealUinput {
         self.fd.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
-    fn create_on(fd: std::os::unix::io::RawFd) -> Result<()> {
+    fn create_on(fd: std::os::unix::io::RawFd, role: UinputRole) -> Result<()> {
         let mut setup = UinputSetup {
             id: InputId {
                 bustype: UINPUT_BUSTYPE,
@@ -1388,10 +1545,14 @@ impl RealUinput {
             name: [0u8; 80],
             ff_effects_max: 0,
         };
-        let name = UINPUT_NAME.as_bytes();
+        let dev_name = match role {
+            UinputRole::Pointer => UINPUT_NAME,
+            UinputRole::Extras => UINPUT_EXTRAS_NAME,
+        };
+        let name = dev_name.as_bytes();
         let n = name.len().min(79);
         setup.name[..n].copy_from_slice(&name[..n]);
-        Self::run_plan(fd, &Self::create_plan(), &setup)
+        Self::run_plan(fd, &Self::create_plan_for(role), &setup)
     }
 
     /// Flush one staged buffer in a single write loop. A short actual
@@ -1473,6 +1634,9 @@ impl UinputSink for RealUinput {
     fn is_ready(&self) -> bool {
         self.is_created()
     }
+    fn destroy(&self) {
+        RealUinput::destroy(self);
+    }
     fn emit(&self, ev_type: u16, code: u16, value: i32) {
         log::debug!("uinput emit: type={ev_type} code={code} value={value}");
         let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
@@ -1492,6 +1656,20 @@ impl UinputSink for RealUinput {
     fn sync(&self) {
         self.emit(EV_SYN, SYN_REPORT, 0);
         self.flush();
+    }
+}
+
+/// Daemon-side create helpers for the two real nodes behind a
+/// [`DualSink`]: each role is created (and may fail) independently, so a
+/// single-node failure never breaks the other — the caller continues
+/// pointer-only when extras fails, and teardown destroys both.
+impl DualSink<RealUinput, RealUinput> {
+    pub fn create_pointer(&self) -> Result<()> {
+        self.pointer.create()
+    }
+
+    pub fn create_extras(&self) -> Result<()> {
+        self.extras.create()
     }
 }
 
@@ -1700,22 +1878,30 @@ mod tests {
 
     struct FakeUinput {
         events: Mutex<Vec<(u16, u16, i32)>>,
+        destroyed: Mutex<bool>,
     }
 
     impl FakeUinput {
         fn new() -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
+                destroyed: Mutex::new(false),
             }
         }
         fn has(&self, ty: u16, code: u16, val: i32) -> bool {
             self.events.lock().unwrap().contains(&(ty, code, val))
+        }
+        fn was_destroyed(&self) -> bool {
+            *self.destroyed.lock().unwrap()
         }
     }
 
     impl UinputSink for FakeUinput {
         fn emit(&self, ev_type: u16, code: u16, value: i32) {
             self.events.lock().unwrap().push((ev_type, code, value));
+        }
+        fn destroy(&self) {
+            *self.destroyed.lock().unwrap() = true;
         }
     }
 
@@ -1890,7 +2076,7 @@ mod tests {
         // revivable on fresh wiring.
         use anyhow::Error as AnyhowError;
         let grab = Arc::new(FakeGrab::ok());
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let disc = || {
             Err::<Option<TouchFrame>, AnyhowError>(
                 crate::pump::DisconnectError("test unplug".into()).into(),
@@ -1905,7 +2091,7 @@ mod tests {
         let mut px = ClickProxy::new(
             settings(true),
             SharedGrab(Arc::clone(&grab)),
-            SharedUinput(Arc::clone(&uinput)),
+            sinks.dual(),
             FakeHaptic::new(),
             ScriptSource::new(frames),
         );
@@ -1913,13 +2099,13 @@ mod tests {
         px.attach(&usb_ready("/dev/hidraw8"));
         let cfg = Config::default();
         px.handle_frame(&cfg).unwrap(); // press → BTN_LEFT down
-        assert_eq!(key_values(&uinput, BTN_LEFT), vec![1]);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
         px.handle_frame(&cfg).unwrap(); // disconnect → self-release
         assert!(!grab.is_grabbed(), "dead fd must release the grab");
         assert!(!px.is_attached());
         assert!(px.is_passthrough());
         assert_eq!(
-            key_values(&uinput, BTN_LEFT),
+            key_values(&sinks.pointer, BTN_LEFT),
             vec![1, 0],
             "held keys go up exactly once"
         );
@@ -1943,11 +2129,11 @@ mod tests {
         // Live session on hidraw8; a sibling interface (hidraw10) detaching
         // must not release the grab, flip passthrough, or emit key-ups.
         let grab = Arc::new(FakeGrab::ok());
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let mut px = ClickProxy::new(
             settings(true),
             SharedGrab(Arc::clone(&grab)),
-            SharedUinput(Arc::clone(&uinput)),
+            sinks.dual(),
             FakeHaptic::new(),
             ScriptSource::new(vec![]),
         );
@@ -1955,13 +2141,14 @@ mod tests {
         px.attach(&usb_ready("/dev/hidraw8"));
         assert!(px.is_attached());
         assert!(grab.is_grabbed());
-        let events_before = uinput.events.lock().unwrap().len();
+        let events_before =
+            sinks.pointer.events.lock().unwrap().len() + sinks.extras.events.lock().unwrap().len();
         px.detach(&detached("/dev/hidraw10", Transport::Usb));
         assert!(px.is_attached(), "sibling Detached released the live grab");
         assert!(!px.is_passthrough());
         assert!(grab.is_grabbed(), "sibling Detached dropped the evdev grab");
         assert_eq!(
-            uinput.events.lock().unwrap().len(),
+            sinks.pointer.events.lock().unwrap().len() + sinks.extras.events.lock().unwrap().len(),
             events_before,
             "sibling Detached emitted teardown traffic"
         );
@@ -2017,6 +2204,9 @@ mod tests {
         fn emit(&self, ev_type: u16, code: u16, value: i32) {
             self.0.emit(ev_type, code, value);
         }
+        fn destroy(&self) {
+            self.0.destroy();
+        }
     }
 
     struct SharedHaptic(Arc<FakeHaptic>);
@@ -2033,45 +2223,29 @@ mod tests {
     #[test]
     fn clamp_negation_and_buttons_on_wire() {
         assert_eq!(crate::apple_parse::PRESSURE_VALID_MAX, 253);
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let src = ScriptSource::new(vec![Ok(Some(frame(vec![finger(5, 255, 10, 20)], 0)))]);
-        let mut px = ClickProxy::new(
-            settings(true),
-            FakeGrab::ok(),
-            SharedUinput(Arc::clone(&uinput)),
-            SharedHaptic(Arc::clone(&haptic)),
-            src,
-        );
-        px.set_pump_ready(true);
-        px.attach(&usb_ready("/dev/hidraw1"));
+        let frames = vec![Ok(Some(frame(vec![finger(5, 255, 10, 20)], 0)))];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert_eq!(ev.finger_count, 1);
         // 255 clamps to 253; raw orientation 2 negates to -2.
-        assert!(uinput.has(EV_ABS, ABS_MT_PRESSURE, 253));
-        assert!(uinput.has(EV_ABS, ABS_MT_ORIENTATION, -2));
-        assert!(uinput.has(EV_ABS, ABS_MT_TRACKING_ID, 5));
-        assert!(uinput.has(EV_KEY, BTN_TOUCH, 1));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_PRESSURE, 253));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_ORIENTATION, -2));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TRACKING_ID, 5));
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
         // click_1 = left → BTN_LEFT down; haptic fired (default 5).
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
     }
 
     #[test]
     fn silent_haptic_sends_no_feedback() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let src = ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]);
-        let mut px = ClickProxy::new(
-            settings(true),
-            FakeGrab::ok(),
-            SharedUinput(Arc::clone(&uinput)),
-            SharedHaptic(Arc::clone(&haptic)),
-            src,
-        );
-        px.set_pump_ready(true);
-        px.attach(&usb_ready("/dev/hidraw1"));
+        let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             haptic: 0,
             ..Config::default()
@@ -2079,23 +2253,15 @@ mod tests {
         px.handle_frame(&cfg).unwrap();
         assert!(haptic.calls.lock().unwrap().is_empty());
         // Button still emits; only the haptic is silent.
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
     }
 
     #[test]
     fn none_action_no_haptic_no_extra_keys() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let src = ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]);
-        let mut px = ClickProxy::new(
-            settings(true),
-            FakeGrab::ok(),
-            SharedUinput(Arc::clone(&uinput)),
-            SharedHaptic(Arc::clone(&haptic)),
-            src,
-        );
-        px.set_pump_ready(true);
-        px.attach(&usb_ready("/dev/hidraw1"));
+        let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             click_1: "none".into(),
             ..Config::default()
@@ -2107,21 +2273,13 @@ mod tests {
 
     #[test]
     fn speed_scales_motion_deltas() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let src = ScriptSource::new(vec![
+        let frames = vec![
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 100, 0)], 0))),
-        ]);
-        let mut px = ClickProxy::new(
-            settings(true),
-            FakeGrab::ok(),
-            SharedUinput(Arc::clone(&uinput)),
-            SharedHaptic(Arc::clone(&haptic)),
-            src,
-        );
-        px.set_pump_ready(true);
-        px.attach(&usb_ready("/dev/hidraw1"));
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         // Speed is a single source: the per-frame Config, not a snapshot.
         let cfg = Config {
             speed: 200,
@@ -2130,12 +2288,13 @@ mod tests {
         px.handle_frame(&cfg).unwrap();
         px.handle_frame(&cfg).unwrap();
         // Second frame: dx=100 @200% → emitted x=200.
-        assert!(uinput.has(EV_ABS, ABS_MT_POSITION_X, 200));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_POSITION_X, 200));
     }
 
     #[test]
     fn no_ff_in_capabilities() {
-        assert!(!uinput_evbits().contains(&EV_FF));
+        assert!(!pointer_evbits().contains(&EV_FF));
+        assert!(!extras_evbits().contains(&EV_FF));
     }
 
     #[test]
@@ -2178,8 +2337,10 @@ mod tests {
             &(ABS_MT_POSITION_Y, -2478, 2587, POSITION_RES_Y)
         );
         assert!(get(ABS_MT_ORIENTATION).2 >= 3);
-        let keys = uinput_keybits();
-        for must in [
+        // Pointer node: EXACTLY the 9 classification-safe key bits
+        // (old-service parity). Any keyboard code here reclassifies the
+        // node as KEYBOARD and kills the cursor (owner hardware 2026-10-16).
+        let mut want = vec![
             BTN_LEFT,
             BTN_RIGHT,
             BTN_MIDDLE,
@@ -2189,10 +2350,89 @@ mod tests {
             BTN_TOOL_TRIPLETAP,
             BTN_TOOL_QUADTAP,
             BTN_TOOL_QUINTTAP,
-        ] {
-            assert!(keys.contains(&must), "missing keybit {must}");
+        ];
+        want.sort_unstable();
+        assert_eq!(pointer_keybits(), want);
+        // Regression pin: no keyboard-range code on the pointer node —
+        // not letters, not digits, not modifiers, not the `back`/`forward`
+        // mouse buttons (those ride extras like the old driver).
+        for code in 0u16..=255 {
+            assert!(
+                !pointer_keybits().contains(&code),
+                "keyboard code {code} on pointer node (KEYBOARD reclassification)"
+            );
         }
-        assert!(!uinput_evbits().contains(&EV_FF));
+        for spot in [
+            KEY_A, KEY_Z, KEY_0, KEY_SPACE, KEY_ENTER, BTN_SIDE, BTN_EXTRA,
+        ] {
+            assert!(
+                !pointer_keybits().contains(&spot),
+                "code {spot} must not be on the pointer node"
+            );
+        }
+        assert!(!pointer_evbits().contains(&EV_FF));
+        // Extras node: keyboard outlet — SYN/KEY only, no ABS evbit, and
+        // its key set carries every combo code while excluding the pointer
+        // node's touch classification bits.
+        assert_eq!(extras_evbits(), vec![EV_SYN, EV_KEY]);
+        let extras = extras_keybits();
+        for code in [BTN_TOUCH, BTN_TOOL_FINGER, BTN_TOOL_QUINTTAP] {
+            assert!(
+                !extras.contains(&code),
+                "pointer code {code} must not be on the extras node"
+            );
+        }
+        for code in [BTN_SIDE, BTN_EXTRA, 364, 387] {
+            assert!(extras.contains(&code), "missing extras keybit {code}");
+        }
+    }
+
+    /// Spot key codes for the regression pin above (linux/input-event-codes.h).
+    const KEY_A: u16 = 30;
+    const KEY_Z: u16 = 44;
+    const KEY_0: u16 = 11;
+    const KEY_SPACE: u16 = 57;
+    const KEY_ENTER: u16 = 28;
+
+    #[test]
+    fn extras_keybits_cover_every_combo_code() {
+        // Every code `key_token_to_code` can produce must be advertisable
+        // on exactly one node: pointer-routed buttons on the pointer node,
+        // everything else on extras. Candidate universe mirrors the KEYS.md
+        // drift test (config tokens + printable singles + f0..=f99) so a
+        // newly mapped token breaks here until its node covers it.
+        const CONFIG_SRC: &str = include_str!("config.rs");
+        let marker = "fn is_known_key";
+        let start = CONFIG_SRC.find(marker).expect("is_known_key missing");
+        let tail = &CONFIG_SRC[start..];
+        let end = tail.find("\n}\n").expect("is_known_key end missing");
+        let mut candidates: Vec<String> = Vec::new();
+        for chunk in tail[..end].split('"').skip(1).step_by(2) {
+            if !chunk.is_empty() {
+                candidates.push(chunk.to_string());
+            }
+        }
+        for b in 0x20u8..=0x7Eu8 {
+            candidates.push((b as char).to_string());
+        }
+        for n in 0..=99 {
+            candidates.push(format!("f{n}"));
+        }
+        let pointer = pointer_keybits();
+        let extras = extras_keybits();
+        let mut covered = 0;
+        for cand in &candidates {
+            let Some((ty, code)) = key_token_to_code(cand) else {
+                continue;
+            };
+            assert_eq!(ty, EV_KEY, "non-EV_KEY mapping for '{cand}'");
+            assert!(
+                pointer.contains(&code) || extras.contains(&code),
+                "token '{cand}' maps to {code}, advertised on neither node"
+            );
+            covered += 1;
+        }
+        assert!(covered > 100, "sweep too small to mean anything: {covered}");
     }
 
     struct GatedUinput {
@@ -2253,9 +2493,9 @@ mod tests {
         // pointer arg makes the first ioctl fail with EINVAL.
         assert_eq!(ui_dev_setup(), 0x405c_5503); // _IOW('U',3,uinput_setup=92)
         assert_eq!(ui_abs_setup(), 0x401c_5504); // _IOW('U',4,uinput_abs_setup=28)
-        let plan = RealUinput::create_plan();
+        let plan = RealUinput::create_plan_for(UinputRole::Pointer);
         let mut i = 0;
-        for ev in uinput_evbits() {
+        for ev in pointer_evbits() {
             assert_eq!(
                 plan[i],
                 CreateOp::Bit(ui_set_evbit(), ev as libc::c_int),
@@ -2263,7 +2503,7 @@ mod tests {
             );
             i += 1;
         }
-        for key in uinput_keybits() {
+        for key in pointer_keybits() {
             assert_eq!(
                 plan[i],
                 CreateOp::Bit(ui_set_keybit(), key as libc::c_int),
@@ -2292,6 +2532,149 @@ mod tests {
         assert_eq!(plan[i], CreateOp::DevSetup);
         assert_eq!(plan[i + 1], CreateOp::DevCreate);
         assert_eq!(plan.len(), i + 2);
+    }
+
+    #[test]
+    fn extras_create_plan_has_no_abs_no_prop() {
+        // The extras node is a pure keyboard outlet: evbits → keybits →
+        // dev-setup → dev-create. No ABS bit/setup ops (it has no axes)
+        // and no pointer propbit — pinned so a future axis/prop addition
+        // fails here first.
+        let plan = RealUinput::create_plan_for(UinputRole::Extras);
+        let mut i = 0;
+        for ev in extras_evbits() {
+            assert_eq!(
+                plan[i],
+                CreateOp::Bit(ui_set_evbit(), ev as libc::c_int),
+                "evbit #{i}"
+            );
+            i += 1;
+        }
+        for key in extras_keybits() {
+            assert_eq!(
+                plan[i],
+                CreateOp::Bit(ui_set_keybit(), key as libc::c_int),
+                "keybit #{i}"
+            );
+            i += 1;
+        }
+        assert_eq!(plan[i], CreateOp::DevSetup, "extras must skip ABS setup");
+        assert_eq!(plan[i + 1], CreateOp::DevCreate);
+        assert_eq!(plan.len(), i + 2);
+        assert!(
+            !plan.iter().any(|op| matches!(op, CreateOp::Abs(..)))
+                && !plan.iter().any(|op| matches!(
+                    op,
+                    CreateOp::Bit(req, _) if *req == ui_set_absbit() || *req == ui_set_propbit()
+                )),
+            "extras plan must contain no ABS/prop ops: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn split_route_pins_node_assignment() {
+        // MT axes + the 9 pointer codes → pointer node; SYN → both;
+        // every other KEY (letters, modifiers, media, back/forward, app
+        // keys) → extras node.
+        assert_eq!(split_route(EV_ABS, ABS_MT_SLOT), SplitRoute::Pointer);
+        assert_eq!(split_route(EV_ABS, ABS_MT_POSITION_X), SplitRoute::Pointer);
+        assert_eq!(split_route(EV_ABS, ABS_MT_TRACKING_ID), SplitRoute::Pointer);
+        for code in POINTER_KEYBITS {
+            assert_eq!(
+                split_route(EV_KEY, code),
+                SplitRoute::Pointer,
+                "code {code}"
+            );
+        }
+        assert_eq!(split_route(EV_SYN, SYN_REPORT), SplitRoute::Both);
+        for code in [
+            30u16, // KEY_A
+            46,    // KEY_C
+            29,    // KEY_LEFTCTRL
+            125,   // KEY_LEFTMETA
+            158, 159, // browser back/forward
+            163, 173, // media/refresh
+            275, 276, // back/forward mouse buttons (old-driver parity: extras)
+            364, 387, // favorites/player
+        ] {
+            assert_eq!(split_route(EV_KEY, code), SplitRoute::Extras, "code {code}");
+        }
+    }
+
+    #[test]
+    fn dual_sink_fans_out_per_node() {
+        let ptr = Arc::new(FakeUinput::new());
+        let ext = Arc::new(FakeUinput::new());
+        let sink = DualSink::new(
+            SharedUinput(Arc::clone(&ptr)),
+            SharedUinput(Arc::clone(&ext)),
+        );
+        // Touch axis + button → pointer only; combo key → extras only.
+        sink.emit(EV_ABS, ABS_MT_SLOT, 0);
+        sink.emit(EV_ABS, ABS_MT_TRACKING_ID, 1);
+        sink.emit(EV_KEY, BTN_LEFT, 1);
+        sink.emit(EV_KEY, 46, 1); // KEY_C
+        sink.emit(EV_KEY, 29, 1); // KEY_LEFTCTRL
+        sink.sync(); // trailing SYN lands on BOTH nodes (each framed)
+        let p = ptr.events.lock().unwrap().clone();
+        let e = ext.events.lock().unwrap().clone();
+        assert_eq!(
+            p,
+            vec![
+                (EV_ABS, ABS_MT_SLOT, 0),
+                (EV_ABS, ABS_MT_TRACKING_ID, 1),
+                (EV_KEY, BTN_LEFT, 1),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+            "pointer stream"
+        );
+        assert_eq!(
+            e,
+            vec![(EV_KEY, 46, 1), (EV_KEY, 29, 1), (EV_SYN, SYN_REPORT, 0),],
+            "extras stream"
+        );
+        // Extras never carries axes or touch classification bits.
+        assert!(!e.iter().any(|&(t, _, _)| t == EV_ABS), "{e:?}");
+        for tool in [
+            BTN_TOUCH,
+            BTN_TOOL_FINGER,
+            BTN_TOOL_DOUBLETAP,
+            BTN_TOOL_TRIPLETAP,
+            BTN_TOOL_QUADTAP,
+            BTN_TOOL_QUINTTAP,
+        ] {
+            assert!(
+                !e.contains(&(EV_KEY, tool, 0)) && !e.contains(&(EV_KEY, tool, 1)),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_sink_teardown_destroys_both() {
+        // Teardown must destroy BOTH nodes (no leaks): even the sibling
+        // of a failed create is always attempted (destroy is idempotent).
+        let ptr = Arc::new(FakeUinput::new());
+        let ext = Arc::new(FakeUinput::new());
+        let sink = DualSink::new(
+            SharedUinput(Arc::clone(&ptr)),
+            SharedUinput(Arc::clone(&ext)),
+        );
+        sink.destroy();
+        assert!(ptr.was_destroyed(), "pointer node leaked");
+        assert!(ext.was_destroyed(), "extras node leaked");
+    }
+
+    #[test]
+    fn dual_sink_ready_reflects_pointer_only() {
+        // Grab safety depends on the touch emit path: pointer-unready
+        // blocks attach even with extras ready; extras-unready never
+        // blocks a working pointer session (single-node failure isolation).
+        let gated_off = GatedUinput::new(false);
+        let sink = DualSink::new(gated_off, FakeUinput::new());
+        assert!(!sink.is_ready());
+        let sink = DualSink::new(GatedUinput::new(true), GatedUinput::new(false));
+        assert!(sink.is_ready());
     }
 
     #[test]
@@ -2637,14 +3020,14 @@ mod tests {
     }
 
     fn drive_ready_proxy(
-        uinput: &Arc<FakeUinput>,
+        sinks: &TestSinks,
         haptic: &Arc<FakeHaptic>,
         frames: Vec<Result<Option<TouchFrame>>>,
-    ) -> ClickProxy<SharedGrab, SharedUinput, SharedHaptic, ScriptSource> {
+    ) -> DualTestProxy {
         let mut px = ClickProxy::new(
             settings(true),
             SharedGrab(Arc::new(FakeGrab::ok())),
-            SharedUinput(Arc::clone(uinput)),
+            sinks.dual(),
             SharedHaptic(Arc::clone(haptic)),
             ScriptSource::new(frames),
         );
@@ -2653,6 +3036,35 @@ mod tests {
         assert!(px.is_attached());
         px
     }
+
+    /// Both wire logs behind the production two-node split: touch frames
+    /// and buttons land on `pointer`, key-combo codes on `extras`
+    /// ([`DualSink`] routing). Tests assert per node.
+    struct TestSinks {
+        pointer: Arc<FakeUinput>,
+        extras: Arc<FakeUinput>,
+    }
+
+    impl TestSinks {
+        fn new() -> Self {
+            Self {
+                pointer: Arc::new(FakeUinput::new()),
+                extras: Arc::new(FakeUinput::new()),
+            }
+        }
+
+        fn dual(&self) -> DualSink<SharedUinput, SharedUinput> {
+            DualSink::new(
+                SharedUinput(Arc::clone(&self.pointer)),
+                SharedUinput(Arc::clone(&self.extras)),
+            )
+        }
+    }
+
+    /// Ready proxy type behind the production split (touch/buttons on the
+    /// pointer sink, combos on extras).
+    type DualTestProxy =
+        ClickProxy<SharedGrab, DualSink<SharedUinput, SharedUinput>, SharedHaptic, ScriptSource>;
 
     /// Deterministic frame clock: 60 ms steps clear both the 50 ms press
     /// and 30 ms release debounce, so multi-frame sequences exercise edge
@@ -2696,27 +3108,30 @@ mod tests {
     fn combo_hold_emits_no_btn_left() {
         // click_1 = ctrl+c must not chord a phantom BTN_LEFT — press frame
         // AND the 2nd hold frame (single-frame tests masked the hold path).
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             click_1: "ctrl+c".into(),
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
         px.handle_frame(&cfg).unwrap();
-        assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(uinput.has(EV_KEY, 29, 1)); // ctrl down
-        assert!(uinput.has(EV_KEY, 46, 1)); // c down
+        assert!(!sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        // Combo codes ride the extras node, never the pointer node.
+        assert!(sinks.extras.has(EV_KEY, 29, 1)); // ctrl down
+        assert!(sinks.extras.has(EV_KEY, 46, 1)); // c down
+        assert!(!sinks.pointer.has(EV_KEY, 29, 1));
+        assert!(!sinks.pointer.has(EV_KEY, 46, 1));
     }
 
     #[test]
     fn right_hold_emits_no_btn_left() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(
@@ -2728,7 +3143,7 @@ mod tests {
                 0,
             ))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             click_2: "right".into(),
             ..Config::default()
@@ -2736,19 +3151,19 @@ mod tests {
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert_eq!(ev.finger_count, 2);
         px.handle_frame(&cfg).unwrap();
-        assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(uinput.has(EV_KEY, BTN_RIGHT, 1));
+        assert!(!sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_RIGHT, 1));
     }
 
     #[test]
     fn empty_hold_emits_no_key_downs() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             click_1: "empty".into(),
             ..Config::default()
@@ -2758,13 +3173,25 @@ mod tests {
         // Only BTN_TOUCH=1 plus the BTN_TOOL_FINGER=1 classification bit
         // may be down (once per frame each); no buttons, no keys, no
         // BTN_LEFT.
-        let downs = key_downs(&uinput);
+        let downs = key_downs(&sinks.pointer);
         assert_eq!(downs.len(), 4, "{downs:?}");
         assert!(
             downs
                 .iter()
                 .all(|&e| e == (EV_KEY, BTN_TOUCH, 1) || e == (EV_KEY, BTN_TOOL_FINGER, 1)),
             "{downs:?}"
+        );
+        // Extras node carries framing only: zero KEY events there.
+        assert!(
+            sinks
+                .extras
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|&(t, _, _)| t != EV_KEY),
+            "{:?}",
+            sinks.extras.events.lock().unwrap()
         );
         assert!(!haptic.calls.lock().unwrap().is_empty());
     }
@@ -2773,7 +3200,7 @@ mod tests {
     fn ghost_slot_terminated_on_contact_drop() {
         // 2 contacts then 1: slot 1 must get TRACKING_ID=-1, or libinput
         // keeps a ghost contact alive.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(
@@ -2782,11 +3209,11 @@ mod tests {
             ))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         px.handle_frame(&cfg).unwrap();
         px.handle_frame(&cfg).unwrap();
-        let evs = uinput.events.lock().unwrap().clone();
+        let evs = sinks.pointer.events.lock().unwrap().clone();
         let term1 = evs
             .windows(2)
             .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 1) && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1));
@@ -2797,7 +3224,7 @@ mod tests {
     fn id_reuse_after_lift_has_no_jump() {
         // Lift id 7 at x=100, then a NEW id-7 contact at x=0: without
         // eviction the scaler would emit prev + delta (a jump).
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let mut lift = finger(7, 0, 100, 0);
         lift.contact = false;
@@ -2806,13 +3233,14 @@ mod tests {
             Ok(Some(frame(vec![lift], 0))),
             Ok(Some(frame(vec![finger(7, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         px.handle_frame(&cfg).unwrap();
         px.handle_frame(&cfg).unwrap();
         px.handle_frame(&cfg).unwrap();
         // Fresh anchor: emitted x == raw x on first sighting.
-        let xs: Vec<i32> = uinput
+        let xs: Vec<i32> = sinks
+            .pointer
             .events
             .lock()
             .unwrap()
@@ -2829,14 +3257,14 @@ mod tests {
     fn clicks_high_bits_are_timestamp_not_buttons() {
         // bits 6..7 are device-timestamp bits: 0xC0 must stay quiet, while
         // 0xC1 still shows the button.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![], 0xC0))), Ok(Some(frame(vec![], 0xC1)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         px.handle_frame(&cfg).unwrap();
         px.handle_frame(&cfg).unwrap();
-        let evs = uinput.events.lock().unwrap().clone();
+        let evs = sinks.pointer.events.lock().unwrap().clone();
         let left_ones = evs
             .iter()
             .filter(|&&(t, c, v)| t == EV_KEY && c == BTN_LEFT && v == 1)
@@ -2851,17 +3279,17 @@ mod tests {
 
     #[test]
     fn detach_releases_held_keys_with_sync() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         px.handle_frame(&cfg).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         px.detach(&detached("/dev/hidraw1", Transport::Usb));
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 0));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
         // Trailing SYN flushes the key-up; without it keys stick.
-        let evs = uinput.events.lock().unwrap().clone();
+        let evs = sinks.pointer.events.lock().unwrap().clone();
         let up_at = evs
             .iter()
             .position(|&e| e == (EV_KEY, BTN_LEFT, 0))
@@ -2905,28 +3333,28 @@ mod tests {
 
     #[test]
     fn force_disabled_no_behavior_change() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default(); // force_offset = 0
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(!ev.is_force());
         assert_eq!(ev.finger_count, 1);
         // First-level keys only; no forward key from the force map.
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(!uinput.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        assert!(!sinks.pointer.has(EV_KEY, BTN_EXTRA, 1));
     }
 
     #[test]
     fn force_edge_holds_both_key_sets() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = force_cfg();
         let first = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(!first.is_force());
@@ -2934,8 +3362,11 @@ mod tests {
         assert!(second.is_force());
         assert_eq!(second.finger_count, 1);
         // Coexist: left (first) still down, forward (force) now down too.
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        // `forward` (BTN_EXTRA) rides the extras node (old-driver parity:
+        // only LEFT/RIGHT/MIDDLE are pointer buttons).
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(!sinks.pointer.has(EV_KEY, BTN_EXTRA, 1));
         // Force supersedes in reporting; haptic falls back to standard 5.
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
@@ -2945,13 +3376,13 @@ mod tests {
 
     #[test]
     fn force_haptic_override_and_quiet_waveform() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             force_haptic: Some(9),
             force_quiet_click: true,
@@ -2970,7 +3401,7 @@ mod tests {
 
     #[test]
     fn force_release_returns_to_first_hold_then_full_release() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         // 70 = first hold; 100 = past force press (84); 70 = below force
         // release (79) but above first release (59); 10 = below all.
@@ -2980,25 +3411,25 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = force_cfg();
         // Spaced: the full-release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
         // Force release: forward up, left still down (BTN_LEFT re-asserted).
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_EXTRA, 0));
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 0));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         // Full release: left up.
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 0));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
     }
 
     #[test]
     fn force_two_finger_map_selects_force_2() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
@@ -3007,7 +3438,7 @@ mod tests {
                 0,
             ))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             force_2: "right".into(),
             ..force_cfg()
@@ -3016,15 +3447,15 @@ mod tests {
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(ev.is_force());
         assert_eq!(ev.finger_count, 2);
-        assert!(uinput.has(EV_KEY, BTN_RIGHT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_RIGHT, 1));
     }
 
     #[test]
     fn force_never_fires_past_u8_range() {
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 255, 0, 0)], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             sensitivity: 255,
             margin: 5,
@@ -3034,15 +3465,17 @@ mod tests {
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(!ev.is_force());
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(!uinput.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        // Force never fired: no forward key on EITHER node.
+        assert!(!sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(!sinks.pointer.has(EV_KEY, BTN_EXTRA, 1));
     }
 
     #[test]
     fn shared_modifier_survives_force_release() {
         // `ctrl` in both chords: force release must not drop it mid-hold.
         // Tail-asserted: the single ctrl up lands in the full-release frame.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
@@ -3050,7 +3483,7 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             sensitivity: 64,
             margin: 5,
@@ -3064,9 +3497,11 @@ mod tests {
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
-        let mark = uinput.events.lock().unwrap().len();
+        // Combo codes ride the extras node: pin the shared-modifier
+        // accounting there (pointer carries no combo traffic at all).
+        let mark = sinks.extras.events.lock().unwrap().len();
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
-        let evs = uinput.events.lock().unwrap().clone();
+        let evs = sinks.extras.events.lock().unwrap().clone();
         // ctrl (29): down once, up once, single transition — never 0 mid-hold.
         let ctrl: Vec<i32> = evs
             .iter()
@@ -3098,14 +3533,14 @@ mod tests {
     #[test]
     fn shared_left_has_no_phantom_release() {
         // click_1 == force_1 == left: one down, one up, no 0 while held.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             sensitivity: 64,
             margin: 5,
@@ -3118,7 +3553,7 @@ mod tests {
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left.first(), Some(&1));
         assert_eq!(left.last(), Some(&0));
         assert_eq!(transitions(&left), 1, "phantom BTN_LEFT release: {left:?}");
@@ -3128,43 +3563,45 @@ mod tests {
     fn same_frame_both_edges_hold_then_release() {
         // One-frame jump latches both: both key sets down, force reported;
         // dropping below all thresholds releases both.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = force_cfg();
         // Spaced: the release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
         let ev = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
         assert!(ev.is_force());
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
-        let mark = uinput.events.lock().unwrap().len();
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        let emark = sinks.extras.events.lock().unwrap().len();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
-        let tail = uinput.events.lock().unwrap()[mark..].to_vec();
+        let tail = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
         assert!(
             tail.contains(&(EV_KEY, BTN_LEFT, 0)),
             "left never released: {tail:?}"
         );
+        let etail = sinks.extras.events.lock().unwrap()[emark..].to_vec();
         assert!(
-            tail.contains(&(EV_KEY, BTN_EXTRA, 0)),
-            "forward never released: {tail:?}"
+            etail.contains(&(EV_KEY, BTN_EXTRA, 0)),
+            "forward never released: {etail:?}"
         );
     }
 
     #[test]
     fn force_silent_override_emits_no_force_haptic() {
         // force_haptic = Some(0): force edge silent, first-level pulse kept.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             force_haptic: Some(0),
             ..force_cfg()
@@ -3175,8 +3612,8 @@ mod tests {
         assert_eq!(ev.haptic, 0);
         assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
         // Keys still held on both levels despite the silent force edge.
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
-        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
     }
 
     #[test]
@@ -3184,10 +3621,10 @@ mod tests {
         // Pins the single-vs-double decision: one frame through both levels
         // emits both pulses in press order (first then force), identical to
         // staged arrival.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             force_haptic: Some(9),
             force_quiet_click: true,
@@ -3205,7 +3642,7 @@ mod tests {
     fn btn_left_reasserted_after_force_release() {
         // click left + force forward: the force-release frame tail still
         // carries BTN_LEFT=1 (first hold); the full-release tail ends at 0.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
@@ -3213,23 +3650,23 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = force_cfg();
         // Spaced: the full-release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left.last(), Some(&1), "first hold lost: {left:?}");
-        let mark = uinput.events.lock().unwrap().len();
+        let mark = sinks.pointer.events.lock().unwrap().len();
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
-        let tail: Vec<(u16, u16, i32)> = uinput.events.lock().unwrap()[mark..].to_vec();
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
         assert!(
             tail.contains(&(EV_KEY, BTN_LEFT, 0)),
             "left never released: {tail:?}"
         );
-        assert_eq!(key_values(&uinput, BTN_LEFT).last(), Some(&0));
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT).last(), Some(&0));
     }
 
     // ---- Cursor-motion + feel-parity contract ----
@@ -3245,20 +3682,20 @@ mod tests {
         // + SYN — the evtest-visible motion stream libinput turns into
         // cursor motion. Owner check: `sudo evtest` on the virtual node
         // shows the same `Event: type 3 (EV_ABS)` rows dumped below.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 10, 100, 100)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 110, 105)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 125, 112)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         let t0 = std::time::Instant::now();
         for i in 0..3 {
             px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
         }
-        let evs = wire_events(&uinput);
+        let evs = wire_events(&sinks.pointer);
         let mut dump = String::new();
         for &(ty, code, val) in &evs {
             if ty == EV_ABS && (code == ABS_MT_POSITION_X || code == ABS_MT_POSITION_Y) {
@@ -3296,27 +3733,32 @@ mod tests {
         }
         // Classification rows ride every contact frame (cursor lives here).
         assert_eq!(
-            key_values(&uinput, BTN_TOOL_FINGER),
+            key_values(&sinks.pointer, BTN_TOOL_FINGER),
             vec![1, 1, 1],
             "BTN_TOOL_FINGER must mark every contact frame"
         );
-        assert!(uinput.has(EV_ABS, ABS_MT_TOUCH_MAJOR, 8));
-        assert!(uinput.has(EV_ABS, ABS_MT_TOUCH_MINOR, 6));
-        assert!(uinput.has(EV_KEY, BTN_TOUCH, 1));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TOUCH_MAJOR, 8));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TOUCH_MINOR, 6));
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
         // Light touch (pressure 10 < sensitivity): motion, no click.
-        assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
-        // One SYN per handled frame.
+        assert!(!sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        // One SYN per handled frame on EACH node (both independently framed).
         let syns = evs
             .iter()
             .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
             .count();
         assert_eq!(syns, 3, "exactly one SYN per frame: {evs:?}");
+        let xsyns = wire_events(&sinks.extras)
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
+            .count();
+        assert_eq!(xsyns, 3, "extras must frame every handled frame");
     }
 
     #[test]
     fn tool_bits_follow_finger_count() {
         // 2 fingers → DOUBLETAP down (FINGER up); liftoff clears all.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(
@@ -3325,24 +3767,24 @@ mod tests {
             ))),
             Ok(Some(frame(vec![], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
-        assert_eq!(key_values(&uinput, BTN_TOOL_FINGER), vec![0, 0]);
-        assert_eq!(key_values(&uinput, BTN_TOOL_DOUBLETAP), vec![1, 0]);
-        assert_eq!(key_values(&uinput, BTN_TOOL_TRIPLETAP), vec![0, 0]);
-        assert_eq!(key_values(&uinput, BTN_TOOL_QUINTTAP), vec![0, 0]);
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_FINGER), vec![0, 0]);
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_DOUBLETAP), vec![1, 0]);
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_TRIPLETAP), vec![0, 0]);
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_QUINTTAP), vec![0, 0]);
         // Five fingers → QUINTTAP.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let fingers: Vec<_> = (1..=5).map(|id| finger(id, 10, 0, 0)).collect();
         let frames = vec![Ok(Some(frame(fingers, 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
-        assert_eq!(key_values(&uinput, BTN_TOOL_QUINTTAP), vec![1]);
-        assert_eq!(key_values(&uinput, BTN_TOOL_QUADTAP), vec![0]);
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_QUINTTAP), vec![1]);
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_QUADTAP), vec![0]);
     }
 
     #[test]
@@ -3350,18 +3792,18 @@ mod tests {
         // Production timing: back-to-back handle_frame calls land
         // microseconds apart, inside the 30 ms release window — the latch
         // holds and BTN_LEFT stays down (old-service quick-tap debounce).
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         assert!(px.handle_frame(&cfg).unwrap().is_some());
         assert!(px.handle_frame(&cfg).unwrap().is_none());
         assert_eq!(
-            key_values(&uinput, BTN_LEFT),
+            key_values(&sinks.pointer, BTN_LEFT),
             vec![1],
             "quick release must hold BTN_LEFT down"
         );
@@ -3371,29 +3813,29 @@ mod tests {
     fn hover_pressure_drives_slot_without_click() {
         // contact=false but pressure 50 (> touch floor 10): the slot is
         // emitted (cursor tracks) while the click latch stays idle.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let mut hover = finger(1, 50, 30, 40);
         hover.contact = false;
         let frames = vec![Ok(Some(frame(vec![hover], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         assert!(px.handle_frame(&cfg).unwrap().is_none());
-        assert!(uinput.has(EV_ABS, ABS_MT_TRACKING_ID, 1));
-        assert!(uinput.has(EV_ABS, ABS_MT_POSITION_X, 30));
-        assert!(uinput.has(EV_KEY, BTN_TOUCH, 1));
-        assert_eq!(key_values(&uinput, BTN_TOOL_FINGER), vec![1]);
-        assert!(!uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TRACKING_ID, 1));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_POSITION_X, 30));
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
+        assert_eq!(key_values(&sinks.pointer, BTN_TOOL_FINGER), vec![1]);
+        assert!(!sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
     }
 
     #[test]
     fn haptic_pressure_is_threshold_not_strength() {
         // Old-service mapping through the full proxy path: pressure byte =
         // sensitivity (threshold), intensity = configured haptic strength.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             sensitivity: 80,
             haptic: 7,
@@ -3410,13 +3852,13 @@ mod tests {
         // pressure=sensitivity with intensity=haptic, UP at
         // pressure=sensitivity*3/5 with intensity 0 (both edges). A
         // down-only stream leaves the click feel dead.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
@@ -3444,13 +3886,13 @@ mod tests {
         // haptic=0: no down pulse, so no release up-pulse either
         // (old-service triggered-flag parity — a silent press leaves
         // nothing for the release to snap back from).
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             haptic: 0,
             ..Config::default()
@@ -3458,7 +3900,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(haptic.calls.lock().unwrap().is_empty());
         assert!(haptic.releases.lock().unwrap().is_empty());
     }
@@ -3565,14 +4007,14 @@ mod tests {
     }
 
     /// Drive press + hold + release + liftoff through a ready proxy with
-    /// `cfg`, returning the complete wire log.
+    /// `cfg`, returning the per-node wire logs (pointer + extras).
     fn drive_click_sequence(
         frames: Vec<Result<Option<TouchFrame>>>,
         cfg: &Config,
-    ) -> (Arc<FakeUinput>, Arc<FakeHaptic>) {
-        let uinput = Arc::new(FakeUinput::new());
+    ) -> (TestSinks, Arc<FakeHaptic>) {
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         // Four frames per sequence; extra `None`s are harmless no-ops.
         // Spaced 60 ms: release-bearing sequences must clear the
         // production debounce (rapid calls would hold the latch).
@@ -3580,7 +4022,7 @@ mod tests {
         for i in 0..4 {
             px.handle_frame_at(cfg, spaced_at(t0, i)).unwrap();
         }
-        (uinput, haptic)
+        (sinks, haptic)
     }
 
     fn press_hold_release_liftoff() -> Vec<Result<Option<TouchFrame>>> {
@@ -3597,8 +4039,8 @@ mod tests {
         // Canonical 1-finger left click: press, hold (moved), release
         // (pressure below hysteresis), liftoff. Pins the COMPLETE stream.
         let cfg = Config::default();
-        let (uinput, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
-        let got = wire_events(&uinput);
+        let (sinks, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&sinks.pointer);
         let want: Vec<(u16, u16, i32)> = vec![
             // Press frame: touch block + BTN_TOUCH + TOOL row (1 finger) +
             // one BTN_LEFT down + SYN. Edge-triggered: no duplicate
@@ -3670,9 +4112,16 @@ mod tests {
         assert_eq!(got, want, "wire sequence drifted");
         assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
         // Edge-triggered pin: exactly one down/up pair, no re-asserts.
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        let xgot = wire_events(&sinks.extras);
+        assert_eq!(
+            xgot,
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
@@ -3697,7 +4146,7 @@ mod tests {
             raw_usb(0, &[&release]),
             raw_usb(0, &[]),
         ];
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let source = crate::pump::HidrawSource::new(
             "/dev/hidraw1",
@@ -3706,7 +4155,7 @@ mod tests {
         let mut px = ClickProxy::new(
             settings(true),
             FakeGrab::ok(),
-            SharedUinput(Arc::clone(&uinput)),
+            sinks.dual(),
             SharedHaptic(Arc::clone(&haptic)),
             source,
         );
@@ -3719,7 +4168,7 @@ mod tests {
         for i in 0..4 {
             px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
         }
-        let got = wire_events(&uinput);
+        let got = wire_events(&sinks.pointer);
         // Raw hidraw blocks carry major 10 / minor 6 (b4/b5).
         let want: Vec<(u16, u16, i32)> = vec![
             (EV_ABS, ABS_MT_SLOT, 0),
@@ -3781,6 +4230,13 @@ mod tests {
         ];
         assert_eq!(got, want, "hidraw-bytes wire sequence drifted");
         assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        let xgot = wire_events(&sinks.extras);
+        assert_eq!(
+            xgot,
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
@@ -3801,15 +4257,21 @@ mod tests {
             ))),
             Ok(Some(frame(vec![], 0))),
         ];
-        let (uinput, _) = drive_click_sequence(frames, &cfg);
-        let got = wire_events(&uinput);
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_RIGHT, BTN_TOUCH]);
         assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
         // Exact down/up pair: strengthens first/last to a full pin, and
         // strict alternation rules out duplicate re-asserts.
-        let right = key_values(&uinput, BTN_RIGHT);
+        let right = key_values(&sinks.pointer, BTN_RIGHT);
         assert_eq!(right, vec![1, 0], "{right:?}");
         assert_strict_alternation(&right, "BTN_RIGHT");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
@@ -3835,13 +4297,19 @@ mod tests {
             ))),
             Ok(Some(frame(vec![], 0))),
         ];
-        let (uinput, _) = drive_click_sequence(frames, &cfg);
-        let got = wire_events(&uinput);
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_MIDDLE, BTN_TOUCH]);
         assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
-        let middle = key_values(&uinput, BTN_MIDDLE);
+        let middle = key_values(&sinks.pointer, BTN_MIDDLE);
         assert_eq!(middle, vec![1, 0], "{middle:?}");
         assert_strict_alternation(&middle, "BTN_MIDDLE");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
@@ -3850,11 +4318,17 @@ mod tests {
             click_1: "empty".into(),
             ..Config::default()
         };
-        let (uinput, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
-        let got = wire_events(&uinput);
+        let (sinks, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&sinks.pointer);
         // Haptic only: BTN_TOUCH is the sole EV_KEY allowed on the wire.
         assert_wire_pure(&got, &[BTN_TOUCH]);
         assert!(!haptic.calls.lock().unwrap().is_empty());
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
@@ -3863,30 +4337,58 @@ mod tests {
             click_1: "none".into(),
             ..Config::default()
         };
-        let (uinput, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
-        let got = wire_events(&uinput);
+        let (sinks, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&sinks.pointer);
         // Swallowed gesture: BTN_TOUCH only, no haptic, no buttons.
         assert_wire_pure(&got, &[BTN_TOUCH]);
         assert!(haptic.calls.lock().unwrap().is_empty());
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
     fn combo_click_wire_pure() {
-        // ctrl+c: exactly the combo codes + BTN_TOUCH; each key goes
-        // down once and up once (a missing key-up would auto-repeat
-        // downstream, turning one press into a character run).
+        // ctrl+c: the combo codes ride the EXTRAS node (each down once
+        // and up once — a missing key-up would auto-repeat downstream,
+        // turning one press into a character run) while the pointer node
+        // carries touch framing only, never the combo codes.
         let cfg = Config {
             click_1: "ctrl+c".into(),
             ..Config::default()
         };
-        let (uinput, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
-        let got = wire_events(&uinput);
-        assert_wire_pure(&got, &[29, 46, BTN_TOUCH]);
+        let (sinks, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&sinks.pointer);
+        assert_wire_pure(&got, &[BTN_TOUCH]);
         assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
-        let ctrl = key_values(&uinput, 29);
+        assert!(
+            !got.iter()
+                .any(|&(t, c, _)| t == EV_KEY && (c == 29 || c == 46)),
+            "combo codes leaked onto the pointer node: {got:?}"
+        );
+        let xgot = wire_events(&sinks.extras);
+        assert_eq!(
+            xgot,
+            vec![
+                (EV_KEY, 29, 1),
+                (EV_KEY, 46, 1),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_KEY, 29, 0),
+                (EV_KEY, 46, 0),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+            "extras combo sequence drifted"
+        );
+        assert_wire_pure(&xgot, &[29, 46]);
+        let ctrl = key_values(&sinks.extras, 29);
         assert_eq!(ctrl, vec![1, 0], "{ctrl:?}");
         assert_strict_alternation(&ctrl, "ctrl");
-        let c = key_values(&uinput, 46);
+        let c = key_values(&sinks.extras, 46);
         assert_eq!(c, vec![1, 0], "{c:?}");
         assert_strict_alternation(&c, "c");
     }
@@ -3894,19 +4396,22 @@ mod tests {
     #[test]
     fn new_keys_work_in_combos_wire_pure() {
         // `+` combos accept the new keys too: ctrl+refresh emits exactly
-        // the combo codes + BTN_TOUCH, each paired down/up once.
+        // the combo codes on extras (+ touch framing on the pointer node),
+        // each paired down/up once.
         let cfg = Config {
             click_1: "ctrl+refresh".into(),
             ..Config::default()
         };
-        let (uinput, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
-        let got = wire_events(&uinput);
-        assert_wire_pure(&got, &[29, 173, BTN_TOUCH]);
+        let (sinks, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&sinks.pointer);
+        assert_wire_pure(&got, &[BTN_TOUCH]);
         assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
-        let ctrl = key_values(&uinput, 29);
+        let xgot = wire_events(&sinks.extras);
+        assert_wire_pure(&xgot, &[29, 173]);
+        let ctrl = key_values(&sinks.extras, 29);
         assert_eq!(ctrl, vec![1, 0], "{ctrl:?}");
         assert_strict_alternation(&ctrl, "ctrl");
-        let refresh = key_values(&uinput, 173);
+        let refresh = key_values(&sinks.extras, 173);
         assert_eq!(refresh, vec![1, 0], "{refresh:?}");
         assert_strict_alternation(&refresh, "refresh");
     }
@@ -3943,12 +4448,18 @@ mod tests {
             Ok(Some(frame(vec![], 0x00))),
             Ok(Some(frame(vec![], 0x00))),
         ];
-        let (uinput, _) = drive_click_sequence(frames, &cfg);
-        let got = wire_events(&uinput);
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
@@ -3962,19 +4473,25 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0x00))),
             Ok(Some(frame(vec![], 0x00))),
         ];
-        let (uinput, _) = drive_click_sequence(frames, &Config::default());
-        let got = wire_events(&uinput);
+        let (sinks, _) = drive_click_sequence(frames, &Config::default());
+        let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
     }
 
     #[test]
     fn force_cycle_wire_pure() {
         // First hold (left) -> force edge (forward) -> force release back
-        // to first hold -> full release: only the two action codes plus
-        // BTN_TOUCH on EV_KEY, each paired down/up exactly once.
+        // to first hold -> full release: BTN_LEFT rides the pointer node,
+        // BTN_EXTRA the extras node, each paired down/up exactly once.
         let cfg = force_cfg();
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
@@ -3982,13 +4499,27 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let (uinput, _) = drive_click_sequence(frames, &cfg);
-        let got = wire_events(&uinput);
-        assert_wire_pure(&got, &[BTN_LEFT, BTN_EXTRA, BTN_TOUCH]);
-        let left = key_values(&uinput, BTN_LEFT);
+        let (sinks, _) = drive_click_sequence(frames, &cfg);
+        let got = wire_events(&sinks.pointer);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
-        let extra = key_values(&uinput, BTN_EXTRA);
+        let xgot = wire_events(&sinks.extras);
+        assert_eq!(
+            xgot,
+            vec![
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_KEY, BTN_EXTRA, 1),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_KEY, BTN_EXTRA, 0),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+            "extras force sequence drifted"
+        );
+        assert_wire_pure(&xgot, &[BTN_EXTRA]);
+        let extra = key_values(&sinks.extras, BTN_EXTRA);
         assert_eq!(extra, vec![1, 0], "{extra:?}");
         assert_strict_alternation(&extra, "BTN_EXTRA");
     }
@@ -3998,27 +4529,35 @@ mod tests {
         // Grab released mid-hold: every held code gets exactly one key-up
         // (no stuck keys downstream) and the wire stays pure.
         use crate::init::{detached, Transport};
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         px.handle_frame(&cfg).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         px.detach(&detached("/dev/hidraw1", Transport::Usb));
-        let got = wire_events(&uinput);
+        let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
         // Exactly one down/up pair: no duplicate releases, no stuck key.
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
+        // Teardown hits BOTH nodes: extras gets the trailing SYN too, with
+        // zero keys (teardown must never leak the sibling node).
+        let xgot = wire_events(&sinks.extras);
+        assert_eq!(
+            xgot,
+            vec![(EV_SYN, SYN_REPORT, 0); 2],
+            "extras teardown drifted"
+        );
     }
 
     #[test]
     fn force_disarm_mid_hold_wire_pure() {
         // `force_offset` back to 0 mid-hold: force keys go up once, the
         // first-level hold continues silently, full release ends at zero.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
@@ -4026,27 +4565,28 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let armed = force_cfg();
         // Spaced: the full-release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&armed, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&armed, spaced_at(t0, 1)).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_EXTRA, 1));
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
         let off = Config {
             force_offset: 0,
             ..armed
         };
         px.handle_frame_at(&off, spaced_at(t0, 2)).unwrap();
         px.handle_frame_at(&off, spaced_at(t0, 3)).unwrap();
-        let got = wire_events(&uinput);
-        assert_wire_pure(&got, &[BTN_LEFT, BTN_EXTRA, BTN_TOUCH]);
-        // Forward: exactly one down/up pair, released at disarm (frame 3),
-        // never re-pressed. Left: down once, up once, at full release.
-        let extra = key_values(&uinput, BTN_EXTRA);
+        let got = wire_events(&sinks.pointer);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        // Forward: exactly one down/up pair on extras, released at disarm
+        // (frame 3), never re-pressed. Left: down once, up once, at full
+        // release on the pointer node.
+        let extra = key_values(&sinks.extras, BTN_EXTRA);
         assert_eq!(extra, vec![1, 0], "{extra:?}");
         assert_strict_alternation(&extra, "BTN_EXTRA");
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
     }

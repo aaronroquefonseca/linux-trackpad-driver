@@ -36,17 +36,24 @@ pub fn hub() -> DeviceReadyHub {
 /// Never blocks init: callbacks do bounded attach/detach only, and grab
 /// failure degrades to passthrough with a log.
 ///
-/// Production pump: `attach` builds the real path — uinput `UI_DEV_CREATE`
-/// FIRST, then hidraw→eventN auto-resolution (`$LTD_EVDEV_NODE` override
-/// wins, else sysfs walk, else name scan), then hidraw open, then
-/// `set_pump_ready(true)` + grab. `detach` tears down in reverse
-/// (release grab, latch reset, trailing `SYN`, source to idle, node
-/// destroy). Single active node: first `Ready` wins, siblings ignored
-/// until `Detached` clears it — except a `Ready` for the active node
-/// whose session died on its own (disconnect self-release): that tears
-/// down the stale wiring and re-attaches fresh fds instead of
-/// early-returning into a dead session. A single pump thread drains the
-/// proxy for the process lifetime; frame rate is device-bounded.
+/// Production pump: `attach` builds the real path — BOTH uinput nodes
+/// (`UI_DEV_CREATE` pointer FIRST, then extras), hidraw→eventN
+/// auto-resolution (`$LTD_EVDEV_NODE` override wins, else sysfs walk, else
+/// name scan), then hidraw open, then `set_pump_ready(true)` + grab.
+/// `detach` tears down in reverse (release grab, latch reset, trailing
+/// `SYN` on both nodes, source to idle, BOTH nodes destroyed). Single
+/// active node: first `Ready` wins, siblings ignored until `Detached`
+/// clears it — except a `Ready` for the active node whose session died on
+/// its own (disconnect self-release): that tears down the stale wiring
+/// and re-attaches fresh fds instead of early-returning into a dead
+/// session. A single pump thread drains the proxy for the process
+/// lifetime; frame rate is device-bounded.
+///
+/// Two-node failure isolation: pointer-create failure → passthrough (no
+/// touch emit path, so no grab — same as the old single node). Extras-
+/// create failure is NON-fatal: the session continues pointer-only
+/// (motion/buttons live, combos dropped) with a loud log, and teardown
+/// always destroys both nodes so no sibling leaks.
 ///
 /// Attach decision for a `Ready` event (see [`attach_decision`]):
 /// - no active session → adopt (full attach);
@@ -54,10 +61,13 @@ pub fn hub() -> DeviceReadyHub {
 /// - same node + dead proxy → teardown + full re-attach;
 /// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
-    use crate::proxy::{ClickProxy, ProxySettings, RealGrab, RealHaptic, RealUinput};
+    use crate::proxy::{
+        ClickProxy, DualSink, ProxySettings, RealGrab, RealHaptic, RealUinput, UinputSink,
+    };
     use crate::pump::PumpSource;
 
-    type DaemonProxy = ClickProxy<RealGrab, RealUinput, RealHaptic, PumpSource>;
+    type DaemonProxy =
+        ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, RealHaptic, PumpSource>;
 
     struct PumpManager {
         proxy: std::sync::Arc<std::sync::Mutex<DaemonProxy>>,
@@ -123,14 +133,17 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     reason,
                 );
             }
-            // 1. Create the virtual node BEFORE grab.
+            // 1. Create the virtual nodes BEFORE grab: pointer first (the
+            // touch emit path grab safety depends on), then extras. A
+            // pointer failure stays passthrough; an extras failure only
+            // drops combos (pointer-only session, loud log).
             let created = {
                 let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
-                match px.uinput().create() {
+                match px.uinput().create_pointer() {
                     Ok(()) => true,
                     Err(e) => {
                         log::warn!(
-                            "pump: uinput create failed for {}: {e:#}; passthrough",
+                            "pump: pointer uinput create failed for {}: {e:#}; passthrough",
                             event.devnode
                         );
                         false
@@ -144,10 +157,19 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     .attach(event);
                 return;
             }
+            {
+                let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = px.uinput().create_extras() {
+                    log::warn!(
+                        "pump: extras uinput create failed for {}: {e:#}; continuing pointer-only (combos dropped)",
+                        event.devnode
+                    );
+                }
+            }
             // 2. Resolve the physical node (env override → sysfs → name).
             let Some((evdev, src)) = crate::evdev::resolve_evdev_node(&event.devnode) else {
                 log::warn!(
-                    "pump: no evdev for {}; destroying uinput, passthrough",
+                    "pump: no evdev for {}; destroying uinput nodes, passthrough",
                     event.devnode
                 );
                 self.proxy
@@ -165,7 +187,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                 // (hidraw10/11) lands here by design; the touch
                 // interface's sysfs-backed Ready attaches separately.
                 log::error!(
-                    "pump: evdev for {} resolved via {:?} (UNTRUSTED, no grab); destroying uinput, passthrough",
+                    "pump: evdev for {} resolved via {:?} (UNTRUSTED, no grab); destroying uinput nodes, passthrough",
                     event.devnode,
                     src,
                 );
@@ -181,7 +203,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                 Ok(s) => s,
                 Err(e) => {
                     log::warn!(
-                        "pump: hidraw open {} failed: {e:#}; destroying uinput, passthrough",
+                        "pump: hidraw open {} failed: {e:#}; destroying uinput nodes, passthrough",
                         event.devnode
                     );
                     self.proxy
@@ -220,7 +242,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(event.devnode.clone());
                 } else {
-                    // Grab refused: unwind to idle + destroy so no orphan node.
+                    // Grab refused: unwind to idle + destroy both so no orphan nodes.
                     px.set_pump_ready(false);
                     px.replace_source(PumpSource::Idle);
                     px.uinput().destroy();
@@ -269,7 +291,10 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
     let proxy = std::sync::Arc::new(std::sync::Mutex::new(DaemonProxy::new(
         ProxySettings::from(cfg),
         RealGrab::new(""),
-        RealUinput::new(&uinput_node),
+        DualSink::new(
+            RealUinput::new(&uinput_node),
+            RealUinput::new_extras(&uinput_node),
+        ),
         RealHaptic::new(),
         PumpSource::Idle,
     )));
