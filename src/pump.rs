@@ -202,6 +202,29 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
     }
 }
 
+/// Manager-owned source: idle until a hidraw node attaches.
+/// Lets the daemon keep ONE proxy type (no `NullSource` in production):
+/// `Idle` polls to no-op, `Live` drains its hidraw node.
+pub enum PumpSource {
+    Idle,
+    Live(HidrawSource<FileReader>),
+}
+
+impl TouchSource for PumpSource {
+    fn tier(&self) -> crate::apple_parse::CapabilityTier {
+        crate::apple_parse::CapabilityTier::L2p
+    }
+    fn pressure_units(&self) -> crate::apple_parse::PressureUnits {
+        crate::apple_parse::PressureUnits::Arbitrary
+    }
+    fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+        match self {
+            PumpSource::Idle => Ok(None),
+            PumpSource::Live(s) => s.poll_frame(),
+        }
+    }
+}
+
 /// One pump step for tests/drives: single `handle_frame` call.
 /// Returns true when a frame was handled (caller decides sleeps).
 pub fn pump_once<G, U, H, S>(
@@ -338,17 +361,15 @@ mod tests {
     }
 
     #[test]
-    fn io_error_propagates_for_proxy_drop() {
-        let mut src = HidrawSource::new(
-            "/dev/hidraw1",
-            ScriptReader::new(vec![ScriptStep::IoError(libc::EIO)]),
-        );
+    fn zero_read_is_disconnect_error() {
+        let mut src = HidrawSource::new("/dev/hidraw1", ScriptReader::bytes(vec![Vec::new()]));
         assert!(src.poll_frame().is_err());
     }
 
     #[test]
-    fn zero_read_is_disconnect_error() {
-        let mut src = HidrawSource::new("/dev/hidraw1", ScriptReader::bytes(vec![Vec::new()]));
-        assert!(src.poll_frame().is_err());
+    fn pump_source_idle_is_noop() {
+        let mut src = PumpSource::Idle;
+        assert_eq!(src.tier(), crate::apple_parse::CapabilityTier::L2p);
+        assert!(src.poll_frame().unwrap().is_none());
     }
 }

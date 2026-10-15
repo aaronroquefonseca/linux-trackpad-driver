@@ -363,6 +363,26 @@ where
         self.passthrough
     }
 
+    /// Borrow the touch source (manager swaps hidraw nodes per attach).
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Replace the touch source, returning the old one.
+    pub fn replace_source(&mut self, src: S) -> S {
+        std::mem::replace(&mut self.source, src)
+    }
+
+    /// Borrow the uinput sink (manager creates/destroys the node).
+    pub fn uinput(&self) -> &U {
+        &self.uinput
+    }
+
+    /// Borrow the grab handle (manager points it at the resolved evdev).
+    pub fn grab(&self) -> &G {
+        &self.grab
+    }
+
     /// Mark the pump path ready/unready (transport-task wiring). Clearing
     /// while attached releases the grab so the device is never swallowed
     /// without an emit path.
@@ -2737,6 +2757,84 @@ mod tests {
         let left = key_values(&uinput, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
+    }
+
+    #[test]
+    fn hidraw_bytes_to_exact_wire_sequence() {
+        // Scripted hidraw bytes → HidrawSource decode → proxy → exact
+        // uinput events. No hardware: the fd layer is the scripted reader.
+        // Block layout: x=0,y=0 (b0..b3 zero except contact bit),
+        // b8 = 0xC0|id → raw orientation 2 → emitted -2.
+        fn raw_usb(clicks: u8, blocks: &[&[u8; 9]]) -> Vec<u8> {
+            let mut r = vec![0x02, clicks, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            for b in blocks {
+                r.extend_from_slice(&**b);
+            }
+            r
+        }
+        let press = [0u8, 0, 0, 0x80, 10, 6, 8, 200, 0xC1];
+        let hold = [0u8, 0, 0, 0x80, 10, 6, 8, 200, 0xC1];
+        let release = [0u8, 0, 0, 0x80, 10, 6, 8, 10, 0xC1];
+        let reports = vec![
+            raw_usb(0, &[&press]),
+            raw_usb(0, &[&hold]),
+            raw_usb(0, &[&release]),
+            raw_usb(0, &[]),
+        ];
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let source = crate::pump::HidrawSource::new(
+            "/dev/hidraw1",
+            crate::pump::ScriptReader::bytes(reports),
+        );
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            SharedUinput(Arc::clone(&uinput)),
+            SharedHaptic(Arc::clone(&haptic)),
+            source,
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = Config::default();
+        for _ in 0..4 {
+            px.handle_frame(&cfg).unwrap();
+        }
+        let got = wire_events(&uinput);
+        let want: Vec<(u16, u16, i32)> = vec![
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 0),
+            (EV_ABS, ABS_MT_POSITION_Y, 0),
+            (EV_ABS, ABS_MT_PRESSURE, 200),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_KEY, BTN_LEFT, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 0),
+            (EV_ABS, ABS_MT_POSITION_Y, 0),
+            (EV_ABS, ABS_MT_PRESSURE, 200),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, 1),
+            (EV_ABS, ABS_MT_POSITION_X, 0),
+            (EV_ABS, ABS_MT_POSITION_Y, 0),
+            (EV_ABS, ABS_MT_PRESSURE, 10),
+            (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_KEY, BTN_TOUCH, 1),
+            (EV_KEY, BTN_LEFT, 0),
+            (EV_SYN, SYN_REPORT, 0),
+            (EV_ABS, ABS_MT_SLOT, 0),
+            (EV_ABS, ABS_MT_TRACKING_ID, -1),
+            (EV_KEY, BTN_TOUCH, 0),
+            (EV_SYN, SYN_REPORT, 0),
+        ];
+        assert_eq!(got, want, "hidraw-bytes wire sequence drifted");
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
     }
 
     #[test]
