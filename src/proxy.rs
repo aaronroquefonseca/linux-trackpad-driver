@@ -4410,6 +4410,138 @@ mod tests {
         assert_eq!(syns, 4, "exactly one SYN per frame: {got:?}");
     }
 
+    /// 2 s press+move at device cadence (220 frames × 9 ms ≈ 110 Hz):
+    /// firm press, continuous +2 px deltas, then liftoff.
+    fn two_second_drag_frames() -> Vec<Result<Option<TouchFrame>>> {
+        let mut frames: Vec<Result<Option<TouchFrame>>> = (0..220)
+            .map(|i| Ok(Some(frame(vec![finger(1, 200, i * 2, 0)], 0))))
+            .collect();
+        frames.push(Ok(Some(frame(vec![finger(1, 10, 440, 0)], 0))));
+        frames.push(Ok(Some(frame(vec![], 0))));
+        frames
+    }
+
+    #[test]
+    fn press_and_move_two_seconds_uninterrupted() {
+        // BUG-2 contract: a firm 2 s press+drag must stream motion on every
+        // frame with exactly one BTN_LEFT 1→0 pair (down at press, up at
+        // liftoff) — no stalls, no spurious release/re-press pairs — plus
+        // exactly one SYN per handled frame.
+        let cfg = Config::default();
+        let frames = two_second_drag_frames();
+        let n_frames = frames.len();
+        let uinput = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        // Device cadence: 9 ms logical steps (≈110 Hz), no wall sleeps.
+        let t0 = std::time::Instant::now();
+        for i in 0..n_frames as u64 {
+            px.handle_frame_at(&cfg, t0 + std::time::Duration::from_millis(i * 9))
+                .unwrap();
+        }
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
+        let left = key_values(&uinput, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "{left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+        let xs: Vec<i32> = got
+            .iter()
+            .copied()
+            .filter(|&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(xs.len(), 221, "motion stalled mid-drag: {xs:?}");
+        for w in xs.windows(2) {
+            assert_eq!(w[1] - w[0], 2, "motion gap/jump mid-drag: {xs:?}");
+        }
+        let syns = got
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
+            .count();
+        assert_eq!(syns, n_frames, "exactly one SYN per frame: {got:?}");
+    }
+
+    /// Haptic sender with a blocking actuator round-trip per edge (slow
+    /// firmware / wrong-interface NAK + fallback, ~10 ms each).
+    struct SlowHaptic {
+        calls: Mutex<Vec<(u8, u8, bool)>>,
+        releases: Mutex<Vec<(u8, bool)>>,
+    }
+
+    impl HapticSender for SlowHaptic {
+        fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((pressure, intensity, quiet));
+            Ok(())
+        }
+        fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.releases.lock().unwrap().push((down_pressure, quiet));
+            Ok(())
+        }
+    }
+
+    /// Hovering pressure profile: firm press decaying into a hover around
+    /// the release point with dips below it (noisy slide). Per the
+    /// threshold spec each dip IS a release, so the wire carries
+    /// release/re-press pairs — but motion must never stall on them, even
+    /// when every actuator round-trip blocks.
+    fn hover_drag_frames() -> Vec<Result<Option<TouchFrame>>> {
+        (0..220)
+            .map(|i| {
+                let p = if i < 30 {
+                    200 - (i as u8) * 4
+                } else {
+                    [66u8, 62, 68, 58, 64, 60, 66, 57, 63, 61][i % 10]
+                };
+                Ok(Some(frame(vec![finger(1, p, (i as i32) * 2, 0)], 0)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slow_actuator_never_stalls_motion_frames() {
+        // BUG-2 stall: with a 10 ms blocking actuator round-trip per edge,
+        // a 2 s hover-drag (~38 edges) must still retire all 220 motion
+        // frames promptly. Synchronous haptic on the pump thread costs
+        // ~380 ms here and stalls motion in bursts (owner: 150-800 ms
+        // freezes).
+        let cfg = Config::default();
+        let uinput = Arc::new(FakeUinput::new());
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            SharedUinput(Arc::clone(&uinput)),
+            SlowHaptic {
+                calls: Mutex::new(Vec::new()),
+                releases: Mutex::new(Vec::new()),
+            },
+            ScriptSource::new(hover_drag_frames()),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let t0 = std::time::Instant::now();
+        for i in 0..220u64 {
+            px.handle_frame_at(&cfg, t0 + std::time::Duration::from_millis(i * 9))
+                .unwrap();
+        }
+        let elapsed = t0.elapsed();
+        let xs: Vec<i32> = wire_events(&uinput)
+            .iter()
+            .copied()
+            .filter(|&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(xs.len(), 220, "motion stalled mid-drag");
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "pump stalled on actuator I/O: {elapsed:?} for 220 frames"
+        );
+    }
+
     #[test]
     fn middle_click_wire_pure() {
         let cfg = Config::default(); // click_3 = middle
