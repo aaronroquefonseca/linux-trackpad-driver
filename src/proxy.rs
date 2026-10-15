@@ -3852,13 +3852,13 @@ mod tests {
         // pressure=sensitivity with intensity=haptic, UP at
         // pressure=sensitivity*3/5 with intensity 0 (both edges). A
         // down-only stream leaves the click feel dead.
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config::default();
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
@@ -3886,13 +3886,13 @@ mod tests {
         // haptic=0: no down pulse, so no release up-pulse either
         // (old-service triggered-flag parity — a silent press leaves
         // nothing for the release to snap back from).
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             haptic: 0,
             ..Config::default()
@@ -3900,7 +3900,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
-        assert!(uinput.has(EV_KEY, BTN_LEFT, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(haptic.calls.lock().unwrap().is_empty());
         assert!(haptic.releases.lock().unwrap().is_empty());
     }
