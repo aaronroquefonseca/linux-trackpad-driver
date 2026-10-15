@@ -1829,6 +1829,134 @@ fn plain_write(node: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// One actuator command for the haptic worker queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HapticCmd {
+    Down {
+        pressure: u8,
+        intensity: u8,
+        quiet: bool,
+    },
+    Up {
+        down_pressure: u8,
+        quiet: bool,
+    },
+}
+
+/// Async actuator sender: the pump thread enqueues down/up pulses and
+/// never waits for the firmware round-trip.
+///
+/// Why: every [`HapticSender`] call opens the hidraw node and issues a
+/// blocking `HIDIOCSFEATURE` (+ a fallback open+write on NAK). On the
+/// pump thread that steals frame time per click edge; during
+/// release/re-press chatter (noisy pressure hovering at the release
+/// point mid-drag) dozens of edges × ~10 ms round-trips stall motion in
+/// 150-800 ms bursts. The worker drains a FIFO channel instead, so input
+/// latency never depends on actuator timing. Order is preserved
+/// (down/up pairs stay paired); bytes, node selection, and silent rules
+/// are unchanged (the inner sender is untouched).
+pub struct AsyncHaptic<H> {
+    inner: std::sync::Arc<H>,
+    tx: Option<std::sync::mpsc::Sender<HapticCmd>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl<H> AsyncHaptic<H>
+where
+    H: HapticSender + Send + Sync + 'static,
+{
+    pub fn new(inner: H) -> Self {
+        let inner = std::sync::Arc::new(inner);
+        let (tx, rx) = std::sync::mpsc::channel::<HapticCmd>();
+        let worker_inner = std::sync::Arc::clone(&inner);
+        let worker = std::thread::Builder::new()
+            .name("ltd-haptic".into())
+            .spawn(move || {
+                for cmd in rx {
+                    match cmd {
+                        HapticCmd::Down {
+                            pressure,
+                            intensity,
+                            quiet,
+                        } => {
+                            if let Err(e) = worker_inner.click_feedback(pressure, intensity, quiet)
+                            {
+                                log::warn!("proxy: async haptic down failed: {e:#}");
+                            }
+                        }
+                        HapticCmd::Up {
+                            down_pressure,
+                            quiet,
+                        } => {
+                            if let Err(e) = worker_inner.release_feedback(down_pressure, quiet) {
+                                log::warn!("proxy: async haptic up failed: {e:#}");
+                            }
+                        }
+                    }
+                }
+                log::debug!("proxy: haptic worker drained, exiting");
+            })
+            .expect("haptic worker thread spawn");
+        Self {
+            inner,
+            tx: Some(tx),
+            worker: Some(worker),
+        }
+    }
+
+    /// Borrow the inner sender (daemon points [`RealHaptic`] at its node).
+    pub fn inner(&self) -> &H {
+        &self.inner
+    }
+}
+
+impl<H> Drop for AsyncHaptic<H> {
+    fn drop(&mut self) {
+        // Disconnect first so the worker drains the queued trailing
+        // up-pulses, then join (bounded: the queue only holds click edges).
+        self.tx.take();
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+impl<H> HapticSender for AsyncHaptic<H>
+where
+    H: HapticSender + Send + Sync,
+{
+    fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+        let cmd = HapticCmd::Down {
+            pressure,
+            intensity,
+            quiet,
+        };
+        match self.tx.as_ref().map(|tx| tx.send(cmd)) {
+            Some(Ok(())) => Ok(()),
+            _ => {
+                // Worker gone (only via a failed spawn, which already
+                // panicked, or drop racing a call): degrade to a direct
+                // synchronous send rather than losing the pulse.
+                log::warn!("proxy: haptic worker gone, sending directly");
+                self.inner.click_feedback(pressure, intensity, quiet)
+            }
+        }
+    }
+    fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+        let cmd = HapticCmd::Up {
+            down_pressure,
+            quiet,
+        };
+        match self.tx.as_ref().map(|tx| tx.send(cmd)) {
+            Some(Ok(())) => Ok(()),
+            _ => {
+                log::warn!("proxy: haptic worker gone, sending directly");
+                self.inner.release_feedback(down_pressure, quiet)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4372,7 +4500,7 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 10, 8, 8)], 0))),
             Ok(Some(frame(vec![], 0))),
         ];
-        let uinput = Arc::new(FakeUinput::new());
+        let uinput = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let mut px = drive_ready_proxy(&uinput, &haptic, frames);
         let t0 = std::time::Instant::now();
@@ -4381,16 +4509,23 @@ mod tests {
         // Release lands on the pressure-drop frame, BEFORE the motion and
         // liftoff frames: no stale hold across motion.
         assert_eq!(
-            key_values(&uinput, BTN_RIGHT),
+            key_values(&uinput.pointer, BTN_RIGHT),
             vec![1, 0],
             "BTN_RIGHT up delayed past the lift (stale hold across motion)"
         );
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
-        let got = wire_events(&uinput);
+        let got = wire_events(&uinput.pointer);
         assert_wire_pure(&got, &[BTN_RIGHT, BTN_TOUCH]);
-        let right = key_values(&uinput, BTN_RIGHT);
+        let right = key_values(&uinput.pointer, BTN_RIGHT);
         assert_eq!(right, vec![1, 0], "{right:?}");
+        assert_strict_alternation(&right, "BTN_RIGHT");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&uinput.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); 4],
+            "extras framing drifted"
+        );
         assert_strict_alternation(&right, "BTN_RIGHT");
         // Motion flowed (cursor tracked the sliding finger) across the
         // partial-lift frames: press frame carries both fingers (0 and 9),
@@ -4402,7 +4537,8 @@ mod tests {
             .map(|(_, _, v)| v)
             .collect();
         assert_eq!(xs, vec![0, 9, 4, 8], "motion stalled across lift: {xs:?}");
-        // Trailing SYN after the key-up: exactly one SYN per handled frame.
+        // Trailing SYN after the key-up: exactly one SYN per handled frame
+        // on the pointer node.
         let syns = got
             .iter()
             .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
@@ -4430,18 +4566,18 @@ mod tests {
         let cfg = Config::default();
         let frames = two_second_drag_frames();
         let n_frames = frames.len();
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let mut px = drive_ready_proxy(&uinput, &haptic, frames);
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         // Device cadence: 9 ms logical steps (≈110 Hz), no wall sleeps.
         let t0 = std::time::Instant::now();
         for i in 0..n_frames as u64 {
             px.handle_frame_at(&cfg, t0 + std::time::Duration::from_millis(i * 9))
                 .unwrap();
         }
-        let got = wire_events(&uinput);
+        let got = wire_events(&sinks.pointer);
         assert_wire_pure(&got, &[BTN_LEFT, BTN_TOUCH]);
-        let left = key_values(&uinput, BTN_LEFT);
+        let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0], "{left:?}");
         assert_strict_alternation(&left, "BTN_LEFT");
         let xs: Vec<i32> = got
@@ -4459,13 +4595,21 @@ mod tests {
             .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
             .count();
         assert_eq!(syns, n_frames, "exactly one SYN per frame: {got:?}");
+        // Extras node: framing only (one SYN per handled frame), zero keys.
+        assert_eq!(
+            wire_events(&sinks.extras),
+            vec![(EV_SYN, SYN_REPORT, 0); n_frames],
+            "extras framing drifted"
+        );
     }
 
     /// Haptic sender with a blocking actuator round-trip per edge (slow
-    /// firmware / wrong-interface NAK + fallback, ~10 ms each).
+    /// firmware / wrong-interface NAK + fallback, ~10 ms each). Buffers
+    /// are shared so tests can read the stream after the async worker
+    /// drains (drop joins the worker).
     struct SlowHaptic {
-        calls: Mutex<Vec<(u8, u8, bool)>>,
-        releases: Mutex<Vec<(u8, bool)>>,
+        calls: Arc<Mutex<Vec<(u8, u8, bool)>>>,
+        releases: Arc<Mutex<Vec<(u8, bool)>>>,
     }
 
     impl HapticSender for SlowHaptic {
@@ -4508,17 +4652,18 @@ mod tests {
         // a 2 s hover-drag (~38 edges) must still retire all 220 motion
         // frames promptly. Synchronous haptic on the pump thread costs
         // ~380 ms here and stalls motion in bursts (owner: 150-800 ms
-        // freezes).
+        // freezes); the async actuator path must stay far under budget.
         let cfg = Config::default();
-        let uinput = Arc::new(FakeUinput::new());
+        let sinks = TestSinks::new();
+        let slow = SlowHaptic {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            releases: Arc::new(Mutex::new(Vec::new())),
+        };
         let mut px = ClickProxy::new(
             settings(true),
             FakeGrab::ok(),
-            SharedUinput(Arc::clone(&uinput)),
-            SlowHaptic {
-                calls: Mutex::new(Vec::new()),
-                releases: Mutex::new(Vec::new()),
-            },
+            sinks.dual(),
+            AsyncHaptic::new(slow),
             ScriptSource::new(hover_drag_frames()),
         );
         px.set_pump_ready(true);
@@ -4529,7 +4674,7 @@ mod tests {
                 .unwrap();
         }
         let elapsed = t0.elapsed();
-        let xs: Vec<i32> = wire_events(&uinput)
+        let xs: Vec<i32> = wire_events(&sinks.pointer)
             .iter()
             .copied()
             .filter(|&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
@@ -4540,6 +4685,55 @@ mod tests {
             elapsed < std::time::Duration::from_millis(250),
             "pump stalled on actuator I/O: {elapsed:?} for 220 frames"
         );
+        // The worker still fires every pulse, in order, off the hot path
+        // (drop joins the drain; assertions below see the full stream).
+    }
+
+    #[test]
+    fn async_haptic_preserves_down_up_order() {
+        // FIFO: the worker must fire pulses in enqueue order so down/up
+        // pairs stay paired even though the pump never waits.
+        let rec = Arc::new(FakeHaptic::new());
+        let ah = AsyncHaptic::new(SharedHaptic(Arc::clone(&rec)));
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        ah.click_feedback(64, 5, true).unwrap();
+        ah.release_feedback(64, true).unwrap();
+        drop(ah); // join: queue fully drained before return
+        assert_eq!(
+            rec.calls.lock().unwrap().as_slice(),
+            &[(64, 5, false), (64, 5, true)]
+        );
+        assert_eq!(
+            rec.releases.lock().unwrap().as_slice(),
+            &[(64, false), (64, true)]
+        );
+    }
+
+    #[test]
+    fn async_haptic_enqueue_never_waits() {
+        // Even with the worker stuck inside a 10 ms round-trip, enqueueing
+        // four pulses must return ~instantly (a synchronous sender would
+        // cost 40 ms here).
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let ah = AsyncHaptic::new(SlowHaptic {
+            calls: Arc::clone(&calls),
+            releases: Arc::clone(&releases),
+        });
+        let t0 = std::time::Instant::now();
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(5),
+            "enqueue blocked on actuator I/O: {:?}",
+            t0.elapsed()
+        );
+        drop(ah); // drain + join before asserting the full stream landed
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(releases.lock().unwrap().len(), 2);
     }
 
     #[test]
