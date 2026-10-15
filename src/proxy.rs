@@ -310,6 +310,11 @@ pub struct ClickProxy<G, U, H, S> {
     source: S,
     machine: ClickMachine,
     attached: bool,
+    /// Which hidraw devnode owns the live grab. A `Detached` for any other
+    /// node is ignored: without this a sibling interface detaching would
+    /// release the active grab and brick the session (grab gone,
+    /// `attached=false`, while the owner still thinks it holds the pump).
+    attached_node: Option<String>,
     passthrough: bool,
     /// Pump readiness: true only when a real `TouchSource` plus a draining
     /// pump loop plus a created uinput node exist. Until the transport task
@@ -344,6 +349,7 @@ where
             source,
             machine: ClickMachine::new(),
             attached: false,
+            attached_node: None,
             passthrough: true,
             pump_ready: false,
             held_first: Vec::new(),
@@ -401,6 +407,7 @@ where
             self.machine.reset();
             self.last_pos.clear();
             self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
         }
     }
@@ -416,6 +423,7 @@ where
         if !self.settings.enhanced {
             log::debug!("proxy: gate off, passthrough for {}", event.devnode);
             self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
             return;
         }
@@ -425,6 +433,7 @@ where
                 event.devnode
             );
             self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
             return;
         }
@@ -434,6 +443,7 @@ where
                 event.devnode
             );
             self.attached = false;
+            self.attached_node = None;
             self.passthrough = true;
             return;
         }
@@ -441,6 +451,7 @@ where
             Ok(()) => {
                 log::info!("proxy: grabbed {} (uinput virtual node up)", event.devnode);
                 self.attached = true;
+                self.attached_node = Some(event.devnode.clone());
                 self.passthrough = false;
             }
             Err(e) => {
@@ -449,15 +460,26 @@ where
                     event.devnode
                 );
                 self.attached = false;
+                self.attached_node = None;
                 self.passthrough = true;
             }
         }
     }
 
     /// Detach on `Detached`: release grab, drop latch + held keys, trailing
-    /// `SYN` so no key-up is lost (stuck keys otherwise).
+    /// `SYN` so no key-up is lost (stuck keys otherwise). Ownership-gated:
+    /// a `Detached` for any node other than the grabbed one is ignored, so
+    /// a sibling interface vanishing can never release the live grab.
     pub fn detach(&mut self, event: &DeviceReadyEvent) {
         if event.kind != ReadyKind::Detached {
+            return;
+        }
+        if self.attached_node.as_deref() != Some(event.devnode.as_str()) {
+            log::debug!(
+                "proxy: ignoring Detached for {} (grab owned by {:?})",
+                event.devnode,
+                self.attached_node
+            );
             return;
         }
         if self.attached {
@@ -470,6 +492,7 @@ where
         self.last_pos.clear();
         self.max_slot = 0;
         self.attached = false;
+        self.attached_node = None;
         self.passthrough = true;
     }
 
@@ -1541,6 +1564,40 @@ mod tests {
         px.detach(&detached("/dev/hidraw1", Transport::Usb));
         assert!(!px.is_attached());
         assert!(px.is_passthrough());
+    }
+
+    #[test]
+    fn sibling_detached_never_kills_live_grab() {
+        // Live session on hidraw8; a sibling interface (hidraw10) detaching
+        // must not release the grab, flip passthrough, or emit key-ups.
+        let grab = Arc::new(FakeGrab::ok());
+        let uinput = Arc::new(FakeUinput::new());
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            SharedUinput(Arc::clone(&uinput)),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        assert!(px.is_attached());
+        assert!(grab.is_grabbed());
+        let events_before = uinput.events.lock().unwrap().len();
+        px.detach(&detached("/dev/hidraw10", Transport::Usb));
+        assert!(px.is_attached(), "sibling Detached released the live grab");
+        assert!(!px.is_passthrough());
+        assert!(grab.is_grabbed(), "sibling Detached dropped the evdev grab");
+        assert_eq!(
+            uinput.events.lock().unwrap().len(),
+            events_before,
+            "sibling Detached emitted teardown traffic"
+        );
+        // The owning node detaching still tears down.
+        px.detach(&detached("/dev/hidraw8", Transport::Usb));
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
     }
 
     #[test]

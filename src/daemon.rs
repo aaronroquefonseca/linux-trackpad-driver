@@ -171,18 +171,25 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     false
                 }
             };
-            // Always let the proxy release keys/sync (idempotent), but only
-            // destroy the node when this detach owns the active session —
-            // a sibling vanishing must not kill the live pump.
+            if !owned {
+                // Sibling vanishing while another node owns the pump: touch
+                // nothing. The proxy itself also ignores foreign Detached
+                // events (ownership gate in `ClickProxy::detach`), so the
+                // live grab survives even if this gate is ever bypassed.
+                log::debug!(
+                    "pump: ignoring Detached for unowned {} (active: {:?})",
+                    event.devnode,
+                    self.active.lock().unwrap_or_else(|e| e.into_inner())
+                );
+                return;
+            }
             {
                 let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
                 px.detach(event);
-                if owned {
-                    px.set_pump_ready(false);
-                    px.replace_source(PumpSource::Idle);
-                    px.uinput().destroy();
-                    log::info!("pump: {} torn down", event.devnode);
-                }
+                px.set_pump_ready(false);
+                px.replace_source(PumpSource::Idle);
+                px.uinput().destroy();
+                log::info!("pump: {} torn down", event.devnode);
             }
         }
     }
