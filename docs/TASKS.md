@@ -64,6 +64,8 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
 | suspend-robust | T3 `51650f42` — PR #18 (5 dead-ends fixed, verified) | `fix/suspend-robustness` | post-resume dead-ends audit | DONE, MERGED. Owner SETTLED |
+| drag-release | T3 `ad79ee73` — PR #30 (stale-bit eviction + AsyncHaptic; HW: drag consistent) | `fix/drag-release` | right-click stick + drag freeze | DONE, MERGED. Owner SETTLED |
+| multifinger | T3 `eb0eeb23` — PR #31 `bcf248c` (no LEFT chords + DOUBLETAP/TRIPLETAP; HW: all clicks work) | `fix/multifinger-purity` | pure 2/3-finger frames | DONE, MERGED. Owner SETTLED |
 | pump-loop | T3 `992f26b9` — PR #22 `899e004` (4 review rounds, all L1s+L2s landed, CI green) | `feat/pump-loop` | production pump + uinput + haptics + auto evdev | DONE, MERGED. Owner + 3 reviewers SETTLED |
 | uinput-einval | T3 `77e11d52` — PR #23 `48387e9` (pointer-vs-int root cause, HW-proven) | `fix/uinput-einval` | int-value ioctl args | DONE, MERGED. Owner SETTLED |
 | pump-iface | T3 `51057b5a` — PR #24 `8a2fbaa` (MT-proven ranking; hidraw9 streams, hidraw8 silent on owner HW) | `fix/pump-iface` | touch-interface selection | DONE, MERGED. Owner SETTLED |
