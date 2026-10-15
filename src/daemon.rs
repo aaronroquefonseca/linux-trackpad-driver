@@ -155,10 +155,18 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                 }
             };
             // 4. Wire nodes, flip ready, then grab (attach checks both gates).
+            // Haptics go to the interface-2 sibling when the USB layout
+            // exposes one (actuator interface); otherwise the touch node
+            // itself, loudly logged as pending HW verify.
             {
                 let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
                 px.grab().set_node(&evdev.to_string_lossy());
-                px.haptic_mut().set_node(&event.devnode);
+                let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
+                px.haptic_mut().set_node(&hnode);
+                log::info!(
+                    "pump: haptic node {hnode} (interface {hiface:?}) for {}",
+                    event.devnode
+                );
                 px.haptic_mut()
                     .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
                 px.replace_source(PumpSource::Live(source));

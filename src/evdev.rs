@@ -96,6 +96,102 @@ fn hid_device_dir(hidraw: &str, hidraw_root: &str) -> Option<PathBuf> {
     std::fs::canonicalize(&link).ok()
 }
 
+/// Read a `bInterfaceNumber` attribute walking up from `dir` (the HID
+/// device itself carries none; the USB interface parent does). Mirrors
+/// [`crate::discovery::interface_number_for_node`] without its fixed
+/// sysfs root so tests can inject a fake tree.
+fn iface_number_from_tree(mut dir: PathBuf) -> Option<u8> {
+    for _ in 0..4 {
+        if let Ok(text) = std::fs::read_to_string(dir.join("bInterfaceNumber")) {
+            if let Some(n) = crate::discovery::parse_interface_number(&text) {
+                return Some(n);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+    None
+}
+
+/// USB device dir owning a hidraw node: the parent of the interface dir
+/// (the first ancestor carrying `bInterfaceNumber`). `None` for
+/// Bluetooth / unknown topologies (no interface layout to route by).
+fn usb_device_dir(hidraw: &str, hidraw_root: &str) -> Option<PathBuf> {
+    let mut dir = hid_device_dir(hidraw, hidraw_root)?;
+    for _ in 0..4 {
+        if dir.join("bInterfaceNumber").exists() {
+            return dir.parent().map(|p| p.to_path_buf());
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Resolve the haptic actuator node for a touch hidraw node: the sibling
+/// hidraw interface with number 2 under the same USB device (the
+/// old-service host-click/actuator interface). Returns the node plus its
+/// interface number, or the input node itself with `None` when no
+/// interface layout exists — with a loud log that If2 routing is
+/// pending HW verify (an actuator on another interface would otherwise
+/// stay silent, the NAK swallowed).
+pub fn resolve_haptic_node(
+    hidraw: &str,
+    hidraw_root: &str,
+    dev_prefix: &str,
+) -> (String, Option<u8>) {
+    let own = hidraw.to_string();
+    let Some(usb_dev) = usb_device_dir(hidraw, hidraw_root) else {
+        log::warn!(
+            "haptic: no USB interface layout for {hidraw}; using touch node (If2 routing pending HW verify)"
+        );
+        return (own, None);
+    };
+    let entries = match std::fs::read_dir(hidraw_root) {
+        Ok(e) => e,
+        Err(_) => return (own, None),
+    };
+    let mut if2: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let base = entry.file_name().to_string_lossy().into_owned();
+        if !base.starts_with("hidraw") {
+            continue;
+        }
+        let link = PathBuf::from(format!("{hidraw_root}/{base}/device"));
+        let Ok(canon) = std::fs::canonicalize(&link) else {
+            continue;
+        };
+        if !canon.starts_with(&usb_dev) {
+            continue;
+        }
+        if iface_number_from_tree(canon) == Some(2) {
+            if2.push(base);
+        }
+    }
+    if2.sort();
+    match if2.into_iter().next() {
+        Some(base) => {
+            let node = format!("{dev_prefix}/{base}");
+            log::info!("haptic: {hidraw} actuator → {node} (interface 2)");
+            (node, Some(2))
+        }
+        None => {
+            log::warn!(
+                "haptic: no interface-2 sibling for {hidraw}; using touch node (If2 routing pending HW verify)"
+            );
+            let own_iface = hid_device_dir(hidraw, hidraw_root).and_then(iface_number_from_tree);
+            (own, own_iface)
+        }
+    }
+}
+
+/// Production haptic-node entry (`/sys/class/hidraw`, `/dev`).
+pub fn haptic_node_for(hidraw: &str) -> (String, Option<u8>) {
+    resolve_haptic_node(hidraw, "/sys/class/hidraw", "/dev")
+}
+
 fn sysfs_walk(
     hidraw: &str,
     hidraw_root: &str,
@@ -302,6 +398,54 @@ mod tests {
         assert!(!grab_allowed(&EvdevSource::NameScan(
             "/dev/input/event13".into()
         )));
+    }
+
+    #[test]
+    fn haptic_prefers_interface_2_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw8")).unwrap();
+        std::fs::create_dir_all(dir.path().join("hidraw/hidraw9")).unwrap();
+        let if1 = dir.path().join("devices/usb/if1");
+        let if2 = dir.path().join("devices/usb/if2");
+        std::fs::create_dir_all(if1.join("hid0")).unwrap();
+        std::fs::create_dir_all(if2.join("hid2")).unwrap();
+        std::fs::write(if1.join("bInterfaceNumber"), "01\n").unwrap();
+        std::fs::write(if2.join("bInterfaceNumber"), "02\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(if1.join("hid0"), dir.path().join("hidraw/hidraw8/device"))
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(if2.join("hid2"), dir.path().join("hidraw/hidraw9/device"))
+            .unwrap();
+        let hroot = dir.path().join("hidraw").to_str().unwrap().to_string();
+        let dp = "/dev";
+        // From the If1 touch node → If2 sibling.
+        assert_eq!(
+            resolve_haptic_node("/dev/hidraw8", &hroot, dp),
+            ("/dev/hidraw9".to_string(), Some(2))
+        );
+        // Already If2 → itself.
+        assert_eq!(
+            resolve_haptic_node("/dev/hidraw9", &hroot, dp),
+            ("/dev/hidraw9".to_string(), Some(2))
+        );
+    }
+
+    #[test]
+    fn haptic_falls_back_to_touch_node_without_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let hroot = dir.path().join("hidraw");
+        std::fs::create_dir_all(hroot.join("hidraw0")).unwrap();
+        let plain = dir.path().join("devices/plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&plain, hroot.join("hidraw0/device")).unwrap();
+        let hr = hroot.to_str().unwrap();
+        // No bInterfaceNumber anywhere (BT-like): own node, loud log.
+        assert_eq!(
+            resolve_haptic_node("/dev/hidraw0", hr, "/dev"),
+            ("/dev/hidraw0".to_string(), None)
+        );
     }
 
     #[test]

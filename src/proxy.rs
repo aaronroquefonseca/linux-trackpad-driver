@@ -1235,8 +1235,10 @@ impl UinputSink for RealUinput {
 ///   kernel expects feature vs output (`write`) for `0x53` on this
 ///   firmware is unconfirmed — failures log + fall back to a plain
 ///   `write(2)` of the stripped bytes.
-/// - Haptic node routing (USB If2 vs driver node) is set via
-///   [`RealHaptic::set_node`] by the daemon; BT uses the same node.
+/// - Haptic node routing: the daemon resolves the interface-2 sibling
+///   via [`crate::evdev::haptic_node_for`] (old-service actuator
+///   interface); BT and unknown topologies fall back to the touch node
+///   with a loud log — If2 placement is pending owner HW verify.
 pub fn vibration_report(strength: u8, quiet: bool) -> [u8; 15] {
     let amplitude = if quiet { 0xFF } else { 0x78 };
     let pattern = if quiet { 0x00 } else { 0x06 };
@@ -1292,10 +1294,15 @@ impl HapticSender for RealHaptic {
             return Ok(());
         }
         let payload: &[u8] = if bt { &report } else { &report[1..] };
-        if let Err(e) = crate::init::send_feature_report_hidraw(&node, payload) {
+        // Strict send: EPIPE/EIO (device NAK) must propagate so the
+        // fallback below runs. The lenient init variant would swallow
+        // the NAK as success → silent no-haptic with no fallback.
+        if let Err(e) = crate::init::send_feature_report_hidraw_strict(&node, payload) {
             log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
             if let Err(e2) = plain_write(&node, payload) {
-                log::warn!("haptic write fallback failed: {e2:#}");
+                log::error!(
+                    "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
+                );
             }
         }
         Ok(())
@@ -1872,6 +1879,32 @@ mod tests {
     fn haptic_without_node_is_log_only_ok() {
         let h = RealHaptic::new();
         assert!(h.click_feedback(5, false).is_ok());
+    }
+
+    #[test]
+    fn haptic_nak_runs_write_fallback_with_exact_bytes() {
+        // A regular file stands in for the hidraw node: the strict
+        // feature ioctl NAKs (ENOTTY — and a strict send must NOT
+        // swallow it), so the plain-write fallback runs and lands the
+        // exact payload bytes. USB strips the leading 0xF2; BT sends
+        // the full 15 B report.
+        let dir = tempfile::tempdir().unwrap();
+        let usb = dir.path().join("haptic-usb");
+        let bt = dir.path().join("haptic-bt");
+        std::fs::write(&usb, []).unwrap();
+        std::fs::write(&bt, []).unwrap();
+        let h = RealHaptic::new();
+        h.set_node(usb.to_str().unwrap());
+        h.set_bluetooth(false);
+        assert!(h.click_feedback(5, false).is_ok());
+        assert_eq!(
+            std::fs::read(&usb).unwrap(),
+            &vibration_report(5, false)[1..]
+        );
+        h.set_node(bt.to_str().unwrap());
+        h.set_bluetooth(true);
+        assert!(h.click_feedback(9, true).is_ok());
+        assert_eq!(std::fs::read(&bt).unwrap(), &vibration_report(9, true));
     }
 
     #[test]
