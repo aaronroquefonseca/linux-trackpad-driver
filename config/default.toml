@@ -12,6 +12,8 @@ log_level = "info"
 # Values above 110 are rejected here; the init layer additionally clamps
 # any runtime override, so X >= 0x23 is always what hits the wire.
 # (Higher device modes are unverified — X < 35 may be NAKed/ignored.)
+# DEVIATION from old driver (intentional, KEEP): old defaults to 500 Hz;
+# no 500 Hz mode is verified on hardware, so 110 Hz stays the cap.
 polling_rate = 110
 
 # Opt-in gate for the entire clicks pipeline. Default OFF: the device
@@ -20,12 +22,36 @@ enhanced_clicks = false
 
 # -------------------------------------------------------------------------
 # Click pipeline tuning (parsed always, acted on only when enhanced_clicks)
+#
+# Old-driver feel parity (hardware-tuned, adopted vs deviated per key):
+# - sensitivity 64 / margin 5 / haptic 5 / quiet false / speed 100:
+#   ADOPTED (numeric defaults match old exactly).
+# - Press detection: ADOPTED — a touch counts when the device flag says
+#   so OR pressure > 10 (light touches move the cursor without
+#   clicking); press swallowed within 50 ms of the last release,
+#   release held within 30 ms of the press edge (old debounce).
+# - Haptic mapping: ADOPTED — actuator pressure byte = sensitivity
+#   (threshold), intensity = haptic; amplitude 120 / pattern 6 normal,
+#   255 / 0 quiet. DEVIATION: old also fires a release up-pulse
+#   (pressure sensitivity*3/5); only the down pulse is emitted here
+#   (owner feel-checklist item).
+# - Pointer speed: ADOPTED linear curve (old expresses it as axis
+#   resolution 48*100/speed; here resolution stays at the physical
+#   48/44 density and speed scales deltas in software — same 1:1 feel
+#   at 100, single application, no double-scaling).
+# - Pressure on the wire: DEVIATION — raw pressure clamped to 253
+#   (kernel absmax); old normalizes every contact to a fixed 60.
+# - Tracking IDs: DEVIATION — the device id per slot; old mints
+#   monotonic ids per slot. Both are valid Type-B; cursor motion is
+#   unaffected.
 # -------------------------------------------------------------------------
 
 # Pressure sensitivity threshold (1-255). Lower = more sensitive.
 sensitivity = 64
 
 # Release hysteresis: release fires at (sensitivity - margin). 0-255.
+# DEVIATION: saturates at 0 (pressure 0 = no touch releases); old
+# floors the release point at 1. Feel-identical outside extremes.
 margin = 5
 
 # Haptic feedback strength (0-255). 0 = silent.
@@ -38,7 +64,8 @@ quiet_click = false
 speed = 100
 
 # -------------------------------------------------------------------------
-# Click actions (standard level)
+# Click actions (standard level). ADOPTED: left/right/middle/none/none
+# match the old-driver defaults exactly.
 # left|right|middle|back|forward|none|empty, or '+'-joined key combos
 # (e.g. "ctrl+c"). 'none' = no action, no haptic. 'empty' = no keys,
 # but haptic still fires.
