@@ -108,6 +108,20 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     }
                 }
             }
+            // Proven-selection log (INFO): which node, which USB interface,
+            // and WHY it sorts first (MT abs bits vs bare input vs bare).
+            // Owner 2026-10-15: silent hidraw8 won on position alone while
+            // hidraw9 streamed — this line is the journal proof of the fix.
+            {
+                let iface = discovery::interface_number_for_node(&event.devnode);
+                let reason = discovery::selection_reason_for_node(&event.devnode);
+                log::info!(
+                    "pump: attaching {} (interface {:?}, {})",
+                    event.devnode,
+                    iface,
+                    reason,
+                );
+            }
             // 1. Create the virtual node BEFORE grab.
             let created = {
                 let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
@@ -177,6 +191,12 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                     return;
                 }
             };
+            // 3b. Attach-time stream verify: nonblocking poll of the chosen
+            // node + siblings with a short timeout. Chosen silent while a
+            // sibling streams = the 2026-10-15 misbind (silent hidraw8 vs
+            // live hidraw9): loud-warn naming both nodes + hint. All
+            // silent = finger-off idle, debug only (no false alarm).
+            verify_attach_stream(&event.devnode);
             // 4. Wire nodes, flip ready, then grab (attach checks both gates).
             // Haptics go to the interface-2 sibling when the USB layout
             // exposes one (actuator interface); otherwise the touch node
@@ -317,6 +337,51 @@ pub(crate) fn attach_decision(
             }
         }
         Some(_) => AttachDecision::IgnoreSibling,
+    }
+}
+
+/// Per-node probe budget for [`verify_attach_stream`] (short: hub
+/// callbacks must stay bounded; 4 interfaces × 40 ms ≈ 160 ms worst).
+const ATTACH_PROBE_MS_PER_NODE: u64 = 40;
+
+/// Attach-time stream verify (see call site): poll the chosen node plus
+/// live scan siblings nonblocking; loud-warn on silent-chosen-while-
+/// sibling-streams, debug otherwise. Pure decision via
+/// [`discovery::check_stream_health`]; this wrapper does the I/O + log.
+fn verify_attach_stream(chosen: &str) {
+    let siblings: Vec<String> = discovery::scan_trackpads()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.devnode)
+        .collect();
+    // Probe chosen first so a live chosen short-circuits to Healthy
+    // without waiting on silent siblings; then each sibling.
+    let mut ordered = vec![chosen.to_string()];
+    for s in siblings {
+        if s != chosen {
+            ordered.push(s);
+        }
+    }
+    let mut streaming = Vec::new();
+    for node in &ordered {
+        if discovery::poll_has_report(node, ATTACH_PROBE_MS_PER_NODE) {
+            streaming.push(node.clone());
+        }
+    }
+    match discovery::check_stream_health(chosen, &streaming) {
+        discovery::StreamHealth::Healthy => {
+            log::debug!("pump: attach verify: {chosen} streaming");
+        }
+        discovery::StreamHealth::SilentWhileSiblingStreams { streaming: live } => {
+            log::warn!(
+                "pump: chosen {chosen} silent while sibling {live} streams; \
+                 hidraw numbers shift across enumeration — check MT-proven selection (prefer abs-MT node), \
+                 consider LTD_EVDEV_NODE pin or re-attach to {live}",
+            );
+        }
+        discovery::StreamHealth::IdleNoTraffic => {
+            log::debug!("pump: attach verify: no touch traffic (idle, finger off)");
+        }
     }
 }
 

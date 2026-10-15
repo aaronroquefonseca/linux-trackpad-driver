@@ -230,7 +230,10 @@ const ABS_MT_PRESSURE: u32 = 58;
 /// kernels, printed as bare lowercase hex. Multi-word input (32-bit
 /// kernels print two words, most-significant first) is handled
 /// generically; unparsable text is a conservative `false`.
-fn abs_has_mt(text: &str) -> bool {
+///
+/// `pub(crate)` so discovery can apply the same MT proof at SELECTION
+/// time (hidraw ranking), not just at grab time.
+pub(crate) fn abs_has_mt(text: &str) -> bool {
     let words: Vec<u64> = text
         .replace(',', " ")
         .split_whitespace()
