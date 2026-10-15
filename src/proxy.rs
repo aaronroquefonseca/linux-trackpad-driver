@@ -275,6 +275,11 @@ pub struct ClickProxy<G, U, H, S> {
     last_pos: HashMap<u8, (i32, i32)>,
     /// Highest slot index written so far; vacated slots are terminated.
     max_slot: usize,
+    /// Last `BTN_LEFT` value on the wire. `BTN_LEFT` is edge-triggered:
+    /// it emits only on state change, so non-left clicks carry zero
+    /// `BTN_LEFT` traffic and steady holds stay silent. Pure wire
+    /// hygiene; no claim about any downstream symptom.
+    btn_left_down: bool,
 }
 
 impl<G, U, H, S> ClickProxy<G, U, H, S>
@@ -299,6 +304,7 @@ where
             held_force: Vec::new(),
             last_pos: HashMap::new(),
             max_slot: 0,
+            btn_left_down: false,
         }
     }
 
@@ -319,7 +325,7 @@ where
         if !ready && self.attached {
             log::info!("proxy: pump lost, releasing grab (passthrough)");
             self.grab.ungrab();
-            self.release_held();
+            self.release_held(false);
             self.uinput.sync();
             self.machine.reset();
             self.last_pos.clear();
@@ -378,7 +384,7 @@ where
             log::info!("proxy: releasing grab ({})", event.devnode);
             self.grab.ungrab();
         }
-        self.release_held();
+        self.release_held(false);
         self.uinput.sync();
         self.machine.reset();
         self.last_pos.clear();
@@ -423,10 +429,10 @@ where
             self.press_level(ev, true);
         }
         if edges.first.is_some() || edges.force.is_some() {
-            // Edge frames carry the same button state as hold frames
-            // (re-assert from held sets; same-value re-emits are idempotent
-            // downstream). Exactly one SYN per handled frame either way:
-            // `press_level` never syncs itself.
+            // Edge frames reconcile `BTN_LEFT` through the wire tracker
+            // (emits only on change — `press_level` already put fresh
+            // downs on the wire). Exactly one SYN per handled frame
+            // either way: `press_level` never syncs itself.
             self.emit_btn_left(frame.clicks);
             self.uinput.sync();
             return Ok(edges.primary());
@@ -434,8 +440,10 @@ where
         let first_gone = was_first && self.machine.active().is_none();
         let force_gone = was_force && self.machine.force_active().is_none();
         if first_gone {
-            // Full release clears both levels.
-            self.release_held();
+            // Full release clears both levels. The physical bit rides
+            // along so a still-held hardware button suppresses the
+            // latch's left-up (no 0-then-1 flutter in one frame).
+            self.release_held(ClickMachine::physical_button(frame.clicks));
         } else if force_gone {
             // Back to the first-level hold: force keys up, first keys stay.
             self.release_force_held();
@@ -447,18 +455,21 @@ where
 
     /// `BTN_LEFT` from held codes only (either latched action contains `left`)
     /// or the physical button bit — never from latch state alone, so a
-    /// right/middle/combo/empty hold cannot chord a phantom left.
-    fn emit_btn_left(&self, clicks: u8) {
+    /// right/middle/combo/empty hold cannot chord a phantom left. Edge
+    /// triggered: emits only on state change, so frames where left is and
+    /// was down stay silent (no `BTN_LEFT=0` releases for buttons never
+    /// pressed, no duplicate re-asserts).
+    fn emit_btn_left(&mut self, clicks: u8) {
         let held_left = self
             .held_first
             .iter()
             .chain(self.held_force.iter())
             .any(|&(ty, code)| ty == EV_KEY && code == BTN_LEFT);
-        self.uinput.emit(
-            EV_KEY,
-            BTN_LEFT,
-            i32::from(held_left || ClickMachine::physical_button(clicks)),
-        );
+        let down = held_left || ClickMachine::physical_button(clicks);
+        if down != self.btn_left_down {
+            self.uinput.emit(EV_KEY, BTN_LEFT, i32::from(down));
+            self.btn_left_down = down;
+        }
     }
 
     /// True when `(ty, code)` is already down on the wire (held by either
@@ -492,8 +503,16 @@ where
                             // Skip the re-emit when the other level already
                             // holds the code down, but still record it in
                             // this level's set so release accounting stays
-                            // per-level.
-                            if !self.is_down(pair) {
+                            // per-level. `BTN_LEFT` goes through the wire
+                            // tracker instead: it is already down when the
+                            // physical bit holds it, and a duplicate down is
+                            // redundant traffic the tracker exists to remove.
+                            if pair == (EV_KEY, BTN_LEFT) {
+                                if !self.btn_left_down {
+                                    self.uinput.emit(ty, code, 1);
+                                    self.btn_left_down = true;
+                                }
+                            } else if !self.is_down(pair) {
                                 self.uinput.emit(ty, code, 1);
                             }
                             if force {
@@ -520,27 +539,67 @@ where
         }
     }
 
-    fn release_held(&mut self) {
+    /// Full release: every latched code goes up on the wire, except
+    /// `BTN_LEFT` while the physical button still holds it (`phys_down`) —
+    /// emitting 0-then-1 in the same frame would flutter a phantom extra
+    /// click. The caller reconciles via [`ClickProxy::emit_btn_left`]
+    /// right after, so the wire stays at exactly one down/up pair.
+    /// Detach/pump-loss pass `false` (no frame in hand): every up is
+    /// forced there so no key-up is ever lost.
+    fn release_held(&mut self, phys_down: bool) {
         let first = std::mem::take(&mut self.held_first);
+        let mut left_up = false;
         for &(ty, code) in &first {
+            if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
+                continue; // physical still holds it; wire stays down
+            }
             self.uinput.emit(ty, code, 0);
+            if (ty, code) == (EV_KEY, BTN_LEFT) {
+                left_up = true;
+            }
         }
         for (ty, code) in self.held_force.drain(..) {
             if first.contains(&(ty, code)) {
                 continue; // already released above; one up per code
             }
+            if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
+                continue; // physical still holds it; wire stays down
+            }
             self.uinput.emit(ty, code, 0);
+            if (ty, code) == (EV_KEY, BTN_LEFT) {
+                left_up = true;
+            }
         }
+        // Full release: every latched code is up on the wire. If `BTN_LEFT`
+        // was wire-down from the physical bit alone (no latch held it, e.g.
+        // a bare hardware click), no loop above emitted its key-up — do it
+        // here so no consumer ever sees a stuck left (a missing key-up
+        // would auto-repeat downstream). Skipped while physical still
+        // holds: the wire correctly stays down.
+        if self.btn_left_down && !left_up && !phys_down {
+            self.uinput.emit(EV_KEY, BTN_LEFT, 0);
+        }
+        self.btn_left_down = phys_down && self.btn_left_down;
     }
 
     /// Release force-held keys, retaining codes the first level still holds
     /// (no up-emit for those — the wire stays down until full release).
     fn release_force_held(&mut self) {
+        let mut dropped_left = false;
         for (ty, code) in self.held_force.drain(..) {
             if self.held_first.contains(&(ty, code)) {
                 continue;
             }
             self.uinput.emit(ty, code, 0);
+            if (ty, code) == (EV_KEY, BTN_LEFT) {
+                dropped_left = true;
+            }
+        }
+        // The caller reconciles a still-held physical bit via
+        // `emit_btn_left` right after; only a force-only left actually
+        // went up on the wire here.
+        if dropped_left {
+            self.btn_left_down = false;
         }
     }
 
