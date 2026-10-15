@@ -178,9 +178,15 @@ pub enum ActionKind {
 /// Parse a `click_*`/`force_*` value: `left|right|middle|back|forward|none`
 /// `|empty` or `+`-joined key names (e.g. `ctrl+c`). Case-insensitive;
 /// surrounding whitespace is ignored. Key names cover modifiers
-/// (incl. right variants), nav/edit keys, media keys, `a`-`z`, `0`-`9`,
-/// and `f1`-`f24` (see [`crate::proxy::key_token_to_code`] for codes).
-/// Returns a descriptive error naming
+/// (incl. right variants), nav/edit keys (`insert`, `print`, ...), media
+/// keys (`playpause`/`playcd`/`pausecd`/`stop`/`next`/`prev`/`mute`/
+/// `volumeup`/`volumedown`/`micmute`), browser keys (`browserback` /
+/// `browserforward` — `back`/`forward` stay mouse buttons — plus `refresh`,
+/// `homepage`, `search`, `favorites`, `bookmarks`, `www`), app keys
+/// (`calc`, `mail`, `computer`, `player`, `screenlock`/`lock`), `a`-`z`,
+/// `0`-`9`, and `f1`-`f24` (see [`crate::proxy::key_token_to_code`] for
+/// codes and the deliberately-excluded list). Combos accept every known
+/// key (e.g. `ctrl+refresh`). Returns a descriptive error naming
 /// the offending key segment on failure.
 pub fn parse_click_action(s: &str) -> std::result::Result<ClickAction, String> {
     let lowered = s.trim().to_lowercase();
@@ -233,12 +239,21 @@ fn is_known_key(name: &str) -> bool {
         | "meta" | "super" | "cmd" | "command" | "win" | "lmeta" | "rmeta"
         // Navigation / editing.
         | "esc" | "escape" | "enter" | "return" | "space" | "tab"
-        | "backspace" | "delete" | "home" | "end"
+        | "backspace" | "delete" | "insert" | "print" | "home" | "end"
         | "pageup" | "pgup" | "pagedown" | "pgdn"
         | "up" | "arrow_up" | "down" | "arrow_down"
         | "left_arrow" | "right_arrow"
-        // Media.
-        | "volup" | "voldown" | "mute" | "play" | "pause"
+        // Media (codes in crate::proxy; each header-verified).
+        | "volup" | "volumeup" | "voldown" | "volumedown" | "mute" | "micmute"
+        | "play" | "playpause" | "playcd" | "pausecd" | "pause"
+        | "stop" | "stopcd" | "next" | "nextsong"
+        | "prev" | "previous" | "previoussong"
+        // Browser (`back`/`forward` stay mouse buttons; browser variants
+        // carry the AC Back/Forward codes 158/159).
+        | "browserback" | "browser_back" | "browserforward" | "browser_forward"
+        | "refresh" | "homepage" | "search" | "favorites" | "bookmarks" | "www"
+        // App launchers / system.
+        | "calc" | "mail" | "computer" | "player" | "screenlock" | "lock"
         // Letters.
         | "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k"
         | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v"
@@ -574,6 +589,39 @@ mod tests {
             "f13",
             "f24",
             "meta+space",
+            "insert",
+            "print",
+            "volumeup",
+            "volumedown",
+            "micmute",
+            "playpause",
+            "playcd",
+            "pausecd",
+            "stop",
+            "stopcd",
+            "next",
+            "nextsong",
+            "prev",
+            "previoussong",
+            "browserback",
+            "browser_back",
+            "browserforward",
+            "browser_forward",
+            "refresh",
+            "homepage",
+            "search",
+            "favorites",
+            "bookmarks",
+            "www",
+            "calc",
+            "mail",
+            "computer",
+            "player",
+            "screenlock",
+            "lock",
+            "ctrl+refresh",
+            "ctrl+playpause",
+            "shift+browserback",
         ] {
             let ok = Config {
                 click_4: good.into(),

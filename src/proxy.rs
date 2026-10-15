@@ -125,6 +125,25 @@ impl HapticSender for LogHaptic {
 /// Map a config key/button token (lowercased) to `(ev_type, code)`.
 /// Mouse buttons map to `BTN_*`; keyboard tokens to `EV_KEY` codes.
 /// Returns `None` for unmapped tokens (caller logs + skips).
+///
+/// Every code below was verified individually against
+/// `/usr/include/linux/input-event-codes.h`, never extrapolated.
+///
+/// Token collisions: `back`/`forward` stay mouse buttons (`BTN_SIDE` /
+/// `BTN_EXTRA`, the long-standing mapping `click_4`/`click_5` rely on), so
+/// the browser AC Back/Forward keys live under `browserback` /
+/// `browserforward` (plus `_`-spelled aliases). `play` stays an alias of
+/// `KEY_PLAYPAUSE` (164); the CD-specific variants have their own tokens.
+///
+/// Deliberately excluded (would confuse consumers on a uinput trackpad):
+/// - `KEY_FN` (464): the Fn modifier itself — no standalone meaning.
+/// - `KEY_FN_ESC` (465), `KEY_FN_F1..F12` (466..477), `KEY_FN_1/2/D/E/F/S/B`
+///   (478..484), `KEY_FN_RIGHT_SHIFT` (485): driver-internal Fn-row reports
+///   consumed inside keyboard firmware/drivers, not meaningful output keys.
+/// - `KEY_PLAY` (207), `KEY_STOP` (128, AC Stop), `KEY_PROPS` (130),
+///   `KEY_STOP_RECORD`/`KEY_PAUSE_RECORD` (609/610): obscure duplicates of
+///   covered keys (`playpause`/`stopcd`) or record-specific keys no
+///   gesture user plausibly wants; emitting them risks confusing mappings.
 pub fn key_token_to_code(token: &str) -> Option<(u16, u16)> {
     match token {
         "left" => Some((EV_KEY, BTN_LEFT)),
@@ -146,6 +165,8 @@ pub fn key_token_to_code(token: &str) -> Option<(u16, u16)> {
         "tab" => Some((EV_KEY, 15)),
         "backspace" => Some((EV_KEY, 14)),
         "delete" => Some((EV_KEY, 111)),
+        "insert" => Some((EV_KEY, 110)),
+        "print" => Some((EV_KEY, 210)),
         "home" => Some((EV_KEY, 102)),
         "end" => Some((EV_KEY, 107)),
         "pageup" | "pgup" => Some((EV_KEY, 104)),
@@ -154,11 +175,30 @@ pub fn key_token_to_code(token: &str) -> Option<(u16, u16)> {
         "down" | "arrow_down" => Some((EV_KEY, 108)),
         "left_arrow" => Some((EV_KEY, 105)),
         "right_arrow" => Some((EV_KEY, 106)),
-        "volup" => Some((EV_KEY, 115)),
-        "voldown" => Some((EV_KEY, 114)),
+        "volup" | "volumeup" => Some((EV_KEY, 115)),
+        "voldown" | "volumedown" => Some((EV_KEY, 114)),
         "mute" => Some((EV_KEY, 113)),
-        "play" => Some((EV_KEY, 164)),
+        "micmute" => Some((EV_KEY, 248)),
+        "play" | "playpause" => Some((EV_KEY, 164)),
+        "playcd" => Some((EV_KEY, 200)),
+        "pausecd" => Some((EV_KEY, 201)),
+        "stop" | "stopcd" => Some((EV_KEY, 166)),
+        "next" | "nextsong" => Some((EV_KEY, 163)),
+        "prev" | "previous" | "previoussong" => Some((EV_KEY, 165)),
         "pause" => Some((EV_KEY, 119)),
+        "browserback" | "browser_back" => Some((EV_KEY, 158)),
+        "browserforward" | "browser_forward" => Some((EV_KEY, 159)),
+        "refresh" => Some((EV_KEY, 173)),
+        "homepage" => Some((EV_KEY, 172)),
+        "search" => Some((EV_KEY, 217)),
+        "favorites" => Some((EV_KEY, 364)),
+        "bookmarks" => Some((EV_KEY, 156)),
+        "www" => Some((EV_KEY, 150)),
+        "calc" => Some((EV_KEY, 140)),
+        "mail" => Some((EV_KEY, 155)),
+        "computer" => Some((EV_KEY, 157)),
+        "player" => Some((EV_KEY, 387)),
+        "screenlock" | "lock" => Some((EV_KEY, 152)),
         s if s.len() == 1 => keycode_letter_digit(s),
         s if s.starts_with('f') => keycode_fn(s),
         _ => None,
@@ -1448,10 +1488,44 @@ mod tests {
             ("right_arrow", 106),
             // Media.
             ("volup", 115),
+            ("volumeup", 115),
             ("voldown", 114),
+            ("volumedown", 114),
             ("mute", 113),
+            ("micmute", 248),
             ("play", 164),
+            ("playpause", 164),
+            ("playcd", 200),
+            ("pausecd", 201),
+            ("stop", 166),
+            ("stopcd", 166),
+            ("next", 163),
+            ("nextsong", 163),
+            ("prev", 165),
+            ("previous", 165),
+            ("previoussong", 165),
             ("pause", 119),
+            // Browser (back/forward stay mouse buttons above).
+            ("browserback", 158),
+            ("browser_back", 158),
+            ("browserforward", 159),
+            ("browser_forward", 159),
+            ("refresh", 173),
+            ("homepage", 172),
+            ("search", 217),
+            ("favorites", 364),
+            ("bookmarks", 156),
+            ("www", 150),
+            // App launchers / system.
+            ("calc", 140),
+            ("mail", 155),
+            ("computer", 157),
+            ("player", 387),
+            ("screenlock", 152),
+            ("lock", 152),
+            // Basics audit: insert/print were missing; pause already mapped.
+            ("insert", 110),
+            ("print", 210),
             // Letters.
             ("a", 30),
             ("b", 48),
@@ -2380,6 +2454,47 @@ mod tests {
         let c = key_values(&uinput, 46);
         assert_eq!(c, vec![1, 0], "{c:?}");
         assert_strict_alternation(&c, "c");
+    }
+
+    #[test]
+    fn new_keys_work_in_combos_wire_pure() {
+        // `+` combos accept the new keys too: ctrl+refresh emits exactly
+        // the combo codes + BTN_TOUCH, each paired down/up once.
+        let cfg = Config {
+            click_1: "ctrl+refresh".into(),
+            ..Config::default()
+        };
+        let (uinput, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
+        let got = wire_events(&uinput);
+        assert_wire_pure(&got, &[29, 173, BTN_TOUCH]);
+        assert!(!got.contains(&(EV_KEY, BTN_LEFT, 1)), "{got:?}");
+        let ctrl = key_values(&uinput, 29);
+        assert_eq!(ctrl, vec![1, 0], "{ctrl:?}");
+        assert_strict_alternation(&ctrl, "ctrl");
+        let refresh = key_values(&uinput, 173);
+        assert_eq!(refresh, vec![1, 0], "{refresh:?}");
+        assert_strict_alternation(&refresh, "refresh");
+    }
+
+    #[test]
+    fn excluded_fn_and_obscure_keys_stay_unmapped() {
+        // Driver-internal / confusing keys must not emit (see
+        // `key_token_to_code` docs for reasons).
+        for tok in [
+            "fn",
+            "fn_esc",
+            "fn_f1",
+            "fn_f12",
+            "fn_1",
+            "fn_right_shift",
+            "acstop",
+            "props",
+        ] {
+            assert_eq!(key_token_to_code(tok), None, "{tok}");
+        }
+        // `back`/`forward` stay mouse buttons, never browser AC codes.
+        assert_eq!(key_token_to_code("back"), Some((EV_KEY, BTN_SIDE)));
+        assert_eq!(key_token_to_code("forward"), Some((EV_KEY, BTN_EXTRA)));
     }
 
     #[test]
