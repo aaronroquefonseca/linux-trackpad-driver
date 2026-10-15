@@ -109,9 +109,10 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
                 }
             }
             // Proven-selection log (INFO): which node, which USB interface,
-            // and WHY it sorts first (MT abs bits vs bare input vs bare).
-            // Owner 2026-10-15: silent hidraw8 won on position alone while
-            // hidraw9 streamed — this line is the journal proof of the fix.
+            // and WHY it sorts first (If1 pump rule preferred, MT abs bits
+            // tiebreak only). Owner 2026-10-15: silent hidraw8=If0 won on
+            // position/MT-rank alone while hidraw9=If1 streamed — this line
+            // is the journal proof of the fix.
             {
                 let iface = discovery::interface_number_for_node(&event.devnode);
                 let reason = discovery::selection_reason_for_node(&event.devnode);
