@@ -177,7 +177,10 @@ pub enum ActionKind {
 
 /// Parse a `click_*`/`force_*` value: `left|right|middle|back|forward|none`
 /// `|empty` or `+`-joined key names (e.g. `ctrl+c`). Case-insensitive;
-/// surrounding whitespace is ignored. Returns a descriptive error naming
+/// surrounding whitespace is ignored. Key names cover modifiers
+/// (incl. right variants), nav/edit keys, media keys, `a`-`z`, `0`-`9`,
+/// and `f1`-`f24` (see [`crate::proxy::key_token_to_code`] for codes).
+/// Returns a descriptive error naming
 /// the offending key segment on failure.
 pub fn parse_click_action(s: &str) -> std::result::Result<ClickAction, String> {
     let lowered = s.trim().to_lowercase();
@@ -242,9 +245,11 @@ fn is_known_key(name: &str) -> bool {
         | "w" | "x" | "y" | "z"
         // Digits.
         | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-        // Function row.
+        // Function row (codes in crate::proxy; F13..F24 = 183..=194).
         | "f1" | "f2" | "f3" | "f4" | "f5" | "f6"
         | "f7" | "f8" | "f9" | "f10" | "f11" | "f12"
+        | "f13" | "f14" | "f15" | "f16" | "f17" | "f18"
+        | "f19" | "f20" | "f21" | "f22" | "f23" | "f24"
     )
 }
 
@@ -565,6 +570,9 @@ mod tests {
             "LEFT",
             "ctrl+c",
             "Shift + F5",
+            "Shift + F15",
+            "f13",
+            "f24",
             "meta+space",
         ] {
             let ok = Config {
@@ -580,6 +588,16 @@ mod tests {
         );
         assert_eq!(parse_click_action("none").unwrap().kind, ActionKind::None);
         assert_eq!(parse_click_action("EMPTY").unwrap().kind, ActionKind::Empty);
+    }
+
+    #[test]
+    fn accepts_f13_through_f24_and_rejects_f25() {
+        for n in 13..=24 {
+            let name = format!("f{n}");
+            assert!(parse_click_action(&name).is_ok(), "{name} must be accepted");
+        }
+        assert!(parse_click_action("f25").is_err());
+        assert!(parse_click_action("f0").is_err());
     }
 
     #[test]

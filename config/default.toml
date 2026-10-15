@@ -42,6 +42,12 @@ speed = 100
 # left|right|middle|back|forward|none|empty, or '+'-joined key combos
 # (e.g. "ctrl+c"). 'none' = no action, no haptic. 'empty' = no keys,
 # but haptic still fires.
+# Key names: modifiers (ctrl/control/lctrl/rctrl, shift/lshift/rshift,
+# alt/lalt/ralt, meta/super/cmd/command/win/lmeta/rmeta), nav/edit
+# (esc/escape, enter/return, space, tab, backspace, delete, home, end,
+# pageup/pgup, pagedown/pgdn, up/arrow_up, down/arrow_down, left_arrow,
+# right_arrow), media (volup, voldown, mute, play, pause), letters a-z,
+# digits 0-9, function keys f1-f24.
 # -------------------------------------------------------------------------
 click_1 = "left"
 click_2 = "right"
