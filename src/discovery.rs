@@ -15,6 +15,11 @@
 //! for diagnostics. The reference routes multitouch+polling to If1 and
 //! host-click to If2; until sibling discovery lands, we send the full sequence
 //! to the given node (device ignores what is not for it) and log the iface.
+//!
+//! Scan ordering (load-bearing for the pump): input-having interfaces
+//! first, then numeric trailing index. The daemon binds the first `Ready`
+//! permanently, so a lexicographic sort would hand the pump to hidraw10 —
+//! an input-less feature interface with no touch reports.
 
 use anyhow::Result;
 
@@ -116,8 +121,67 @@ fn scan_sysfs(class_dir: &str) -> Result<Vec<DiscoveredDevice>> {
             transport: transport_for(vid, bus),
         });
     }
-    out.sort_by(|a, b| a.devnode.cmp(&b.devnode));
+    // Order matters: the daemon inits (and the pump binds) in scan order,
+    // so the multitouch interface must come first. Lexicographic sort
+    // puts hidraw10 before hidraw8 (and event10 before event2) — and
+    // hidraw10/11 are input-less feature interfaces that would bind the
+    // pump to a node with no touch reports. Input-having nodes first,
+    // then numeric trailing index, then full string as tiebreak.
+    out.sort_by_cached_key(|d| {
+        (
+            !has_input_children(&d.devnode, class_dir),
+            trailing_int(&d.devnode).unwrap_or(u64::MAX),
+            d.devnode.clone(),
+        )
+    });
     Ok(out)
+}
+
+/// Trailing decimal integer of a device path (`/dev/hidraw10` → 10).
+/// Paths without one sort after numbered ones (as `u64::MAX`).
+fn trailing_int(path: &str) -> Option<u64> {
+    let digits: String = path
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().rev().collect::<String>().parse().ok()
+}
+
+/// Sort device paths numerically by trailing integer
+/// (`event2 < event10`; lexicographic would invert them), then
+/// lexicographically as tiebreak. Shared with the evdev eventN hits.
+pub(crate) fn sort_numerically(v: &mut [String]) {
+    v.sort_by(|a, b| {
+        trailing_int(a)
+            .unwrap_or(u64::MAX)
+            .cmp(&trailing_int(b).unwrap_or(u64::MAX))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+/// True when the hidraw node's HID device dir has `input/` children —
+/// i.e. this interface actually feeds the input subsystem (the
+/// multitouch interface). Feature-only USB interfaces (owner hardware:
+/// hidraw10/11) have none and must sort after the touch interface.
+fn has_input_children(devnode: &str, class_root: &str) -> bool {
+    let Some(base) = hidraw_name(devnode) else {
+        return false;
+    };
+    let link = std::path::PathBuf::from(format!("{class_root}/{base}/device"));
+    let Ok(canon) = std::fs::canonicalize(&link) else {
+        return false;
+    };
+    std::fs::read_dir(&canon)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("input"))
+        })
+        .unwrap_or(false)
 }
 
 /// Wait for a devnode path to appear (probe/bind race), polling every
@@ -357,6 +421,73 @@ mod tests {
             interface_number_with_root("/dev/hidraw8", root.to_str().unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn trailing_int_parses_or_abstains() {
+        assert_eq!(trailing_int("/dev/hidraw10"), Some(10));
+        assert_eq!(trailing_int("/dev/input/event2"), Some(2));
+        assert_eq!(trailing_int("/dev/hidraw"), None);
+        assert_eq!(trailing_int(""), None);
+    }
+
+    #[test]
+    fn sort_numerically_fixes_lexicographic_trap() {
+        let mut v = vec![
+            "/dev/input/event13".to_string(),
+            "/dev/input/event2".to_string(),
+            "/dev/input/event10".to_string(),
+        ];
+        sort_numerically(&mut v);
+        assert_eq!(
+            v,
+            vec![
+                "/dev/input/event2",
+                "/dev/input/event10",
+                "/dev/input/event13"
+            ]
+        );
+    }
+
+    fn fake_trackpad_node(
+        root: &std::path::Path,
+        base: &str,
+        hid_dir: &std::path::Path,
+        with_input: bool,
+    ) {
+        std::fs::create_dir_all(root.join(base)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(hid_dir, root.join(base).join("device")).unwrap();
+        std::fs::write(
+            root.join(base).join("device/uevent"),
+            "HID_ID=0003:000005AC:00000324\nHID_NAME=Apple Inc. Magic Trackpad\n",
+        )
+        .unwrap();
+        if with_input {
+            std::fs::create_dir_all(hid_dir.join("input/input15")).unwrap();
+        }
+    }
+
+    #[test]
+    fn scan_prefers_input_having_node_numerically() {
+        // Lexicographic order would be hidraw10, hidraw2, hidraw8: the
+        // input-less feature interface first. The pump binds the first
+        // Ready permanently, so the touch interfaces must win, numerically.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(&root).unwrap();
+        let hid_plain = dir.path().join("devices/plain");
+        let hid_touch_a = dir.path().join("devices/touch-a");
+        let hid_touch_b = dir.path().join("devices/touch-b");
+        for d in [&hid_plain, &hid_touch_a, &hid_touch_b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        fake_trackpad_node(&root, "hidraw10", &hid_plain, false);
+        fake_trackpad_node(&root, "hidraw8", &hid_touch_a, true);
+        fake_trackpad_node(&root, "hidraw2", &hid_touch_b, true);
+        let devs = scan_sysfs(root.to_str().unwrap()).unwrap();
+        let nodes: Vec<&str> = devs.iter().map(|d| d.devnode.as_str()).collect();
+        assert_eq!(nodes, vec!["/dev/hidraw2", "/dev/hidraw8", "/dev/hidraw10"]);
     }
 
     #[test]

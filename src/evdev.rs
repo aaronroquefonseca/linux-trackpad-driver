@@ -94,7 +94,7 @@ fn sysfs_walk(
 ) -> Option<PathBuf> {
     let hid_dir = hid_device_dir(hidraw, hidraw_root)?;
     let entries = std::fs::read_dir(input_root).ok()?;
-    let mut hits: Vec<PathBuf> = Vec::new();
+    let mut hits: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with("event") {
@@ -105,11 +105,12 @@ fn sysfs_walk(
             continue;
         };
         if canon.starts_with(&hid_dir) {
-            hits.push(PathBuf::from(format!("{dev_prefix}/{name}")));
+            hits.push(format!("{dev_prefix}/{name}"));
         }
     }
-    hits.sort();
-    hits.into_iter().next()
+    // Numeric order (event2 < event10); lexicographic would invert them.
+    crate::discovery::sort_numerically(&mut hits);
+    hits.into_iter().next().map(PathBuf::from)
 }
 
 /// ABS codes proving a multitouch pad (linux/input-event-codes.h).
@@ -163,7 +164,7 @@ fn name_scan(input_root: &str, dev_prefix: &str) -> Option<PathBuf> {
             names.push(name);
         }
     }
-    names.sort();
+    crate::discovery::sort_numerically(&mut names);
     for name in names {
         let name_file = PathBuf::from(format!("{input_root}/{name}/device/name"));
         let Ok(text) = std::fs::read_to_string(&name_file) else {
