@@ -36,34 +36,195 @@ pub fn hub() -> DeviceReadyHub {
 /// Never blocks init: callbacks do bounded attach/detach only, and grab
 /// failure degrades to passthrough with a log.
 ///
-/// Safety posture: the proxy starts pump-unready (`NullSource`, no pump
-/// loop, no created uinput node), so `attach` degrades to passthrough and
-/// never grabs. The transport task flips readiness once the emit path
-/// exists. The evdev node is never guessed: without `LTD_EVDEV_NODE` the
-/// proxy refuses and stays passthrough.
+/// Production pump: `attach` builds the real path — uinput `UI_DEV_CREATE`
+/// FIRST, then hidraw→eventN auto-resolution (`$LTD_EVDEV_NODE` override
+/// wins, else sysfs walk, else name scan), then hidraw open, then
+/// `set_pump_ready(true)` + grab. `detach` tears down in reverse
+/// (release grab, latch reset, trailing `SYN`, source to idle, node
+/// destroy). Single active node: first `Ready` wins, siblings ignored
+/// until `Detached` clears it. A single pump thread drains the proxy for
+/// the process lifetime; frame rate is device-bounded.
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
-    use crate::proxy::{
-        ClickProxy, DaemonGrab, NullSource, ProxySettings, RealGrab, RealHaptic, RealUinput,
-        RefusingGrab,
-    };
-    let grab = match std::env::var("LTD_EVDEV_NODE") {
-        Ok(node) => DaemonGrab::Real(RealGrab::new(&node)),
-        Err(_) => {
-            log::warn!(
-                "proxy: LTD_EVDEV_NODE unset, refusing evdev guess (hidraw→eventN lands with transport); passthrough until configured"
-            );
-            DaemonGrab::Refusing(RefusingGrab)
+    use crate::proxy::{ClickProxy, ProxySettings, RealGrab, RealHaptic, RealUinput};
+    use crate::pump::PumpSource;
+
+    type DaemonProxy = ClickProxy<RealGrab, RealUinput, RealHaptic, PumpSource>;
+
+    struct PumpManager {
+        proxy: std::sync::Arc<std::sync::Mutex<DaemonProxy>>,
+        cfg: Config,
+        active: std::sync::Mutex<Option<String>>,
+        _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    impl PumpManager {
+        fn attach(&self, event: &crate::init::DeviceReadyEvent) {
+            use crate::init::ReadyKind;
+            if event.kind != ReadyKind::Ready {
+                return;
+            }
+            if !self.cfg.enhanced_clicks {
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .attach(event);
+                return;
+            }
+            {
+                let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(cur) = active.as_ref() {
+                    if cur == &event.devnode {
+                        return;
+                    }
+                    log::info!(
+                        "pump: {} ready but {} active; ignoring sibling",
+                        event.devnode,
+                        cur
+                    );
+                    return;
+                }
+            }
+            // 1. Create the virtual node BEFORE grab.
+            let created = {
+                let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                match px.uinput().create() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!(
+                            "pump: uinput create failed for {}: {e:#}; passthrough",
+                            event.devnode
+                        );
+                        false
+                    }
+                }
+            };
+            if !created {
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .attach(event);
+                return;
+            }
+            // 2. Resolve the physical node (env override → sysfs → name).
+            let Some((evdev, _src)) = crate::evdev::resolve_evdev_node(&event.devnode) else {
+                log::warn!(
+                    "pump: no evdev for {}; destroying uinput, passthrough",
+                    event.devnode
+                );
+                self.proxy
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .uinput()
+                    .destroy();
+                return;
+            };
+            // 3. Open the hidraw source nonblocking.
+            let source = match crate::pump::HidrawSource::open(&event.devnode) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "pump: hidraw open {} failed: {e:#}; destroying uinput, passthrough",
+                        event.devnode
+                    );
+                    self.proxy
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .uinput()
+                        .destroy();
+                    return;
+                }
+            };
+            // 4. Wire nodes, flip ready, then grab (attach checks both gates).
+            {
+                let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                px.grab().set_node(&evdev.to_string_lossy());
+                px.haptic_mut().set_node(&event.devnode);
+                px.haptic_mut()
+                    .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
+                px.replace_source(PumpSource::Live(source));
+                px.set_pump_ready(true);
+                px.attach(event);
+                if px.is_attached() {
+                    *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(event.devnode.clone());
+                } else {
+                    // Grab refused: unwind to idle + destroy so no orphan node.
+                    px.set_pump_ready(false);
+                    px.replace_source(PumpSource::Idle);
+                    px.uinput().destroy();
+                }
+            }
         }
-    };
+
+        fn detach(&self, event: &crate::init::DeviceReadyEvent) {
+            use crate::init::ReadyKind;
+            if event.kind != ReadyKind::Detached {
+                return;
+            }
+            let owned = {
+                let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                if active.as_deref() == Some(event.devnode.as_str()) {
+                    active.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            // Always let the proxy release keys/sync (idempotent), but only
+            // destroy the node when this detach owns the active session —
+            // a sibling vanishing must not kill the live pump.
+            {
+                let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                px.detach(event);
+                if owned {
+                    px.set_pump_ready(false);
+                    px.replace_source(PumpSource::Idle);
+                    px.uinput().destroy();
+                    log::info!("pump: {} torn down", event.devnode);
+                }
+            }
+        }
+    }
+
     let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
-    let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
+    let proxy = std::sync::Arc::new(std::sync::Mutex::new(DaemonProxy::new(
         ProxySettings::from(cfg),
-        grab,
+        RealGrab::new(""),
         RealUinput::new(&uinput_node),
         RealHaptic::new(),
-        NullSource,
+        PumpSource::Idle,
     )));
-    crate::proxy::subscribe_to_hub(ready_hub, proxy);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread = crate::pump::spawn_pump(
+        "daemon".to_string(),
+        std::sync::Arc::clone(&proxy),
+        cfg.clone(),
+        std::sync::Arc::clone(&stop),
+    );
+    let manager = std::sync::Arc::new(PumpManager {
+        proxy,
+        cfg: cfg.clone(),
+        active: std::sync::Mutex::new(None),
+        _stop: stop,
+        _thread: thread,
+    });
+    // NOTE: `PumpManager._thread` is never joined — the pump lives until
+    // process exit by design. `JoinHandle` is held (not detached) so a
+    // panic inside the pump does not silently vanish; the handle is
+    // dropped with the manager at process teardown.
+    let m = std::sync::Arc::clone(&manager);
+    ready_hub.subscribe(move |event: &crate::init::DeviceReadyEvent| {
+        use crate::init::ReadyKind;
+        match event.kind {
+            ReadyKind::Ready => m.attach(event),
+            ReadyKind::Detached => m.detach(event),
+        }
+    });
+    // Keep the manager alive for the daemon lifetime: the hub holds only
+    // the closure (which holds an Arc), so leak one Arc here. The pump
+    // thread + proxy die with the process.
+    std::mem::forget(manager);
     log::debug!(
         "click proxy subscribed (enhanced_clicks={})",
         cfg.enhanced_clicks

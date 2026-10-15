@@ -383,6 +383,11 @@ where
         &self.grab
     }
 
+    /// Borrow the haptic sender mutably (manager points it at the hidraw node).
+    pub fn haptic_mut(&mut self) -> &mut H {
+        &mut self.haptic
+    }
+
     /// Mark the pump path ready/unready (transport-task wiring). Clearing
     /// while attached releases the grab so the device is never swallowed
     /// without an emit path.
