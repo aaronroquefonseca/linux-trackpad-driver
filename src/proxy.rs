@@ -30,8 +30,11 @@
 //!   `BTN_LEFT`, and mouse buttons route to the pointer node; key-combo
 //!   codes route to extras ([`DualSink`] owns the split).
 //! - Pointer-node positions carry the old-service physical density
-//!   (`ABS_MT_POSITION_X/Y` resolution 48/44); pressure stays `res == 0`
-//!   arbitrary 0..253. NEVER advertises `EV_FF`/`FF_HAPTIC` (no 2026
+//!   (`ABS_MT_POSITION_X/Y` resolution 48/44); every down contact carries
+//!   the old-service normalized values (`ABS_MT_PRESSURE` 60,
+//!   `TOUCH_MAJOR/MINOR` 800) — raw bytes are arbitrary units the
+//!   classifier drops (cursor stays dead on light slides otherwise).
+//!   NEVER advertises `EV_FF`/`FF_HAPTIC` (no 2026
 //!   libinput/Wayland consumer). The `BTN_TOOL_*` + `TOUCH_MAJOR/MINOR` +
 //!   `POINTER` + nonzero-resolution set is what libinput needs to classify
 //!   the node as a touchpad and move the cursor from slot motion
@@ -42,7 +45,9 @@
 //!   latch state alone (a right/combo/empty hold must not chord left).
 //! - Slots are positional per frame (see [`ClickProxy::emit_touch_frame`]
 //!   slot-map docs); vacated slots are terminated with `TRACKING_ID=-1`.
-//! - Orientation emits `-(raw)`; pressure clamps to 253 (kernel `absmax`).
+//! - Orientation emits `-(raw)`; pressure/major/minor emit the
+//!   old-service normalized 60/800/800 (raw bytes are arbitrary units
+//!   the classifier drops).
 //! - `poll_frame` errors → log + drop that frame, never abort the loop.
 //! - Grab failure → log + passthrough continues. Clicks NEVER blocks init:
 //!   hub callbacks do bounded work only (no loops), and panics are already
@@ -108,6 +113,13 @@ pub const INPUT_PROP_POINTER: u16 = 0;
 /// truthful while speed still scales motion exactly once.
 pub const POSITION_RES_X: i32 = 48;
 pub const POSITION_RES_Y: i32 = 44;
+/// Normalized per-contact values (old-service parity, hardware-proven):
+/// every down contact emits `PRESSURE = 60` + `MAJOR/MINOR = 800`
+/// (`200 << 2`). Raw bytes are arbitrary units (`res == 0`); small
+/// light-slide values get dropped by the downstream classifier (owner
+/// MT2 2026-10-15: real frames flowing, cursor dead until normalized).
+pub const TOUCH_PRESSURE_NORM: i32 = 60;
+pub const TOUCH_SIZE_NORM: i32 = 800;
 
 /// `EVIOCGRAB` = `_IOW('E', 0x90, int)`.
 pub fn eviocgrab_request() -> u64 {
@@ -874,9 +886,11 @@ where
     /// mirrors the old driver (slot, id, x, y, pressure, major, minor,
     /// orientation); the trailing `BTN_TOOL_*` row carries the touching
     /// count (1/2/3/4/5+, exactly like old) so libinput classifies the
-    /// node as a touchpad and moves the cursor. Touch major/minor emit
-    /// the parsed per-contact values (old emits a fixed 800; raw values
-    /// are honest and stay inside the 0..1020 axis range).
+    /// node as a touchpad and moves the cursor. Pressure/major/minor emit
+    /// the old-service normalized values (60/800/800): raw bytes are
+    /// arbitrary units (`res == 0`) and small light-slide values get
+    /// dropped by the classifier (cursor dead); the fixed values sit
+    /// inside the 0..253 / 0..1020 axis ranges.
     fn emit_touch_frame(&mut self, frame: &TouchFrame, speed: u32) {
         use std::collections::HashSet;
         let present_count = frame
@@ -894,15 +908,12 @@ where
                 let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, speed);
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx);
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy);
-                self.uinput.emit(
-                    EV_ABS,
-                    ABS_MT_PRESSURE,
-                    i32::from(clicks::clamp_pressure(f.pressure)),
-                );
                 self.uinput
-                    .emit(EV_ABS, ABS_MT_TOUCH_MAJOR, i32::from(f.touch_major));
+                    .emit(EV_ABS, ABS_MT_PRESSURE, TOUCH_PRESSURE_NORM);
                 self.uinput
-                    .emit(EV_ABS, ABS_MT_TOUCH_MINOR, i32::from(f.touch_minor));
+                    .emit(EV_ABS, ABS_MT_TOUCH_MAJOR, TOUCH_SIZE_NORM);
+                self.uinput
+                    .emit(EV_ABS, ABS_MT_TOUCH_MINOR, TOUCH_SIZE_NORM);
                 self.uinput.emit(
                     EV_ABS,
                     ABS_MT_ORIENTATION,
@@ -1131,10 +1142,12 @@ pub enum UinputRole {
     Extras,
 }
 
-/// Absolute axis ranges for the proxy node. Pressure stays `res == 0`
-/// (arbitrary units, never grams/newtons) and clamps to 253 (kernel
-/// `absmax`); orientation emits `-(raw)` so the range is the negated
-/// device range widened to ±32 (matches old-service tolerance).
+/// Absolute axis ranges for the pointer node. Pressure/major/minor carry
+/// the old-service normalized per-contact values (60/800/800, see
+/// [`TOUCH_PRESSURE_NORM`]/[`TOUCH_SIZE_NORM`]) with `res == 0`
+/// (arbitrary units, never grams/newtons); orientation emits `-(raw)`
+/// so the range is the negated device range widened to ±32 (matches
+/// old-service tolerance).
 /// Positions use the old-service Trackpad2 dimensions WITH the
 /// old-service physical density ([`POSITION_RES_X`]/[`POSITION_RES_Y`]):
 /// libinput needs nonzero resolution to scale slot motion into cursor
@@ -2221,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp_negation_and_buttons_on_wire() {
+    fn pressure_normalized_orientation_negated_on_wire() {
         assert_eq!(crate::apple_parse::PRESSURE_VALID_MAX, 253);
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
@@ -2230,8 +2243,9 @@ mod tests {
         let cfg = Config::default();
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert_eq!(ev.finger_count, 1);
-        // 255 clamps to 253; raw orientation 2 negates to -2.
-        assert!(sinks.pointer.has(EV_ABS, ABS_MT_PRESSURE, 253));
+        // Raw 255 still wires old-parity 60 (normalized, never raw);
+        // raw orientation 2 negates to -2.
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_PRESSURE, 60));
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_ORIENTATION, -2));
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_TRACKING_ID, 5));
         assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
@@ -3737,12 +3751,78 @@ mod tests {
             vec![1, 1, 1],
             "BTN_TOOL_FINGER must mark every contact frame"
         );
-        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TOUCH_MAJOR, 8));
-        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TOUCH_MINOR, 6));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TOUCH_MAJOR, 800));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TOUCH_MINOR, 800));
         assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
         // Light touch (pressure 10 < sensitivity): motion, no click.
         assert!(!sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         // One SYN per handled frame on EACH node (both independently framed).
+        let syns = evs
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
+            .count();
+        assert_eq!(syns, 3, "exactly one SYN per frame: {evs:?}");
+        let xsyns = wire_events(&sinks.extras)
+            .iter()
+            .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
+            .count();
+        assert_eq!(xsyns, 3, "extras must frame every handled frame");
+    }
+
+    #[test]
+    fn light_slide_emits_old_parity_motion_values() {
+        // Hardware failure mode (owner MT2 USB-C, 2026-10-15): real frames
+        // flowing, cursor dead on our node. Frame-by-frame diff against the
+        // old emit path (trackpad_handler.rs:193-236) shows one
+        // motion-relevant divergence: old normalizes every down contact to
+        // PRESSURE=60 + MAJOR/MINOR=800 (`200 << 2`); we put the raw
+        // arbitrary-unit bytes on the wire (small for a light slide), which
+        // the downstream classifier drops. Slots/TOOL/SYN/resolution already
+        // match, so this test pins the normalized values per contact frame.
+        fn raw_slide(id: u8, pressure: u8, x: i32, y: i32) -> FingerContact {
+            let mut f = finger(id, pressure, x, y);
+            f.touch_major = 30;
+            f.touch_minor = 20;
+            f
+        }
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![raw_slide(3, 20, 100, 100)], 0))),
+            Ok(Some(frame(vec![raw_slide(3, 22, 110, 105)], 0))),
+            Ok(Some(frame(vec![raw_slide(3, 19, 125, 112)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        for i in 0..3 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        let evs = wire_events(&sinks.pointer);
+        let axis = |code: u16| {
+            evs.iter()
+                .copied()
+                .filter(|&(t, c, _)| t == EV_ABS && c == code)
+                .map(|(_, _, v)| v)
+                .collect::<Vec<i32>>()
+        };
+        // Raw bytes (20/30/20) must never reach the wire: old-parity
+        // normalized values on every contact frame.
+        assert_eq!(axis(ABS_MT_PRESSURE), vec![60, 60, 60]);
+        assert_eq!(axis(ABS_MT_TOUCH_MAJOR), vec![800, 800, 800]);
+        assert_eq!(axis(ABS_MT_TOUCH_MINOR), vec![800, 800, 800]);
+        // Motion itself still tracks 1:1 at default speed.
+        assert_eq!(axis(ABS_MT_POSITION_X), vec![100, 110, 125]);
+        assert_eq!(axis(ABS_MT_POSITION_Y), vec![100, 105, 112]);
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_TOOL_FINGER),
+            vec![1, 1, 1],
+            "BTN_TOOL_FINGER must mark every contact frame"
+        );
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
+        // Light slide: motion, no click, no haptic.
+        assert!(!sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        assert!(haptic.calls.lock().unwrap().is_empty());
         let syns = evs
             .iter()
             .filter(|&&(t, c, v)| t == EV_SYN && c == SYN_REPORT && v == 0)
@@ -4049,9 +4129,9 @@ mod tests {
             (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 10),
             (EV_ABS, ABS_MT_POSITION_Y, 20),
-            (EV_ABS, ABS_MT_PRESSURE, 200),
-            (EV_ABS, ABS_MT_TOUCH_MAJOR, 8),
-            (EV_ABS, ABS_MT_TOUCH_MINOR, 6),
+            (EV_ABS, ABS_MT_PRESSURE, 60),
+            (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+            (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
@@ -4067,9 +4147,9 @@ mod tests {
             (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 15),
             (EV_ABS, ABS_MT_POSITION_Y, 25),
-            (EV_ABS, ABS_MT_PRESSURE, 200),
-            (EV_ABS, ABS_MT_TOUCH_MAJOR, 8),
-            (EV_ABS, ABS_MT_TOUCH_MINOR, 6),
+            (EV_ABS, ABS_MT_PRESSURE, 60),
+            (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+            (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
@@ -4084,9 +4164,9 @@ mod tests {
             (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 15),
             (EV_ABS, ABS_MT_POSITION_Y, 25),
-            (EV_ABS, ABS_MT_PRESSURE, 10),
-            (EV_ABS, ABS_MT_TOUCH_MAJOR, 8),
-            (EV_ABS, ABS_MT_TOUCH_MINOR, 6),
+            (EV_ABS, ABS_MT_PRESSURE, 60),
+            (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+            (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
@@ -4169,15 +4249,16 @@ mod tests {
             px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
         }
         let got = wire_events(&sinks.pointer);
-        // Raw hidraw blocks carry major 10 / minor 6 (b4/b5).
+        // Raw hidraw blocks normalize on the wire (pressure 60,
+        // major/minor 800 — old-service parity, never the raw bytes).
         let want: Vec<(u16, u16, i32)> = vec![
             (EV_ABS, ABS_MT_SLOT, 0),
             (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 0),
             (EV_ABS, ABS_MT_POSITION_Y, 0),
-            (EV_ABS, ABS_MT_PRESSURE, 200),
-            (EV_ABS, ABS_MT_TOUCH_MAJOR, 10),
-            (EV_ABS, ABS_MT_TOUCH_MINOR, 6),
+            (EV_ABS, ABS_MT_PRESSURE, 60),
+            (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+            (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
@@ -4191,9 +4272,9 @@ mod tests {
             (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 0),
             (EV_ABS, ABS_MT_POSITION_Y, 0),
-            (EV_ABS, ABS_MT_PRESSURE, 200),
-            (EV_ABS, ABS_MT_TOUCH_MAJOR, 10),
-            (EV_ABS, ABS_MT_TOUCH_MINOR, 6),
+            (EV_ABS, ABS_MT_PRESSURE, 60),
+            (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+            (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
@@ -4206,9 +4287,9 @@ mod tests {
             (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 0),
             (EV_ABS, ABS_MT_POSITION_Y, 0),
-            (EV_ABS, ABS_MT_PRESSURE, 10),
-            (EV_ABS, ABS_MT_TOUCH_MAJOR, 10),
-            (EV_ABS, ABS_MT_TOUCH_MINOR, 6),
+            (EV_ABS, ABS_MT_PRESSURE, 60),
+            (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
+            (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
