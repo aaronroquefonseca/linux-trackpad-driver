@@ -480,6 +480,24 @@ impl Config {
         parse_click_action(raw).map_err(|e| anyhow::anyhow!("invalid force_{n} '{raw}': {e}"))
     }
 
+    /// True when at least one `slide_N` maps an action (string-level
+    /// check, no parse: anything but `none` — modulo case/whitespace —
+    /// counts, including values that would fail validation, so an invalid
+    /// value still reaches the parse path and errors instead of being
+    /// silently skipped). The click machine uses this to skip slide
+    /// selection entirely in the common all-`none` case.
+    pub fn any_slide_mapped(&self) -> bool {
+        [
+            &self.slide_1,
+            &self.slide_2,
+            &self.slide_3,
+            &self.slide_4,
+            &self.slide_5,
+        ]
+        .iter()
+        .any(|s| !s.trim().eq_ignore_ascii_case("none"))
+    }
+
     /// Slide-level action for finger count `n` (`1..=5`).
     pub fn slide_action(&self, n: u8) -> Result<ClickAction> {
         let raw = match n {
@@ -898,6 +916,47 @@ mod tests {
         assert_eq!(ok.slide_action(4).unwrap().kind, ActionKind::None);
         assert!(ok.slide_action(0).is_err());
         assert!(ok.slide_action(6).is_err());
+    }
+
+    #[test]
+    fn any_slide_mapped_short_circuits_all_none() {
+        assert!(!Config::default().any_slide_mapped());
+        let mapped = Config {
+            slide_3: "middle".into(),
+            ..Config::default()
+        };
+        assert!(mapped.any_slide_mapped());
+        // Case/whitespace variants of none still count as unmapped…
+        let noneish = Config {
+            slide_1: " NONE ".into(),
+            ..Config::default()
+        };
+        assert!(!noneish.any_slide_mapped());
+        // …while invalid values count as mapped so the parse path still
+        // errors instead of silently skipping them.
+        let bad = Config {
+            slide_1: "bogus-key".into(),
+            ..Config::default()
+        };
+        assert!(bad.any_slide_mapped());
+        let mut m = crate::clicks::ClickMachine::new();
+        assert!(m
+            .update(
+                &[crate::apple_parse::FingerContact {
+                    id: 1,
+                    x: 0,
+                    y: 0,
+                    size: 10,
+                    orientation: 0,
+                    touch_major: 8,
+                    touch_minor: 6,
+                    pressure: 20,
+                    contact: true,
+                }],
+                0,
+                &bad
+            )
+            .is_err());
     }
 
     #[test]

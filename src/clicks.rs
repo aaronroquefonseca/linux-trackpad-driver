@@ -516,7 +516,8 @@ impl ClickMachine {
         // touching pressure at/below release (the hysteresis band is a
         // dead zone: no slide, no press); a held slide sticks without
         // re-parsing so noisy slides never flap.
-        let slide_wanted = self.active.is_none()
+        let slide_wanted = cfg.any_slide_mapped()
+            && self.active.is_none()
             && self.force_active.is_none()
             && first_action.is_none()
             && force_action.is_none()

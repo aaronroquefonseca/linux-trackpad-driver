@@ -68,7 +68,11 @@
 //!   level-1/slide wire keys first (with SYN) then presses the force combo
 //!   fresh, so shared codes show up+SYN+down; easing back below the force
 //!   release re-presses the still-latched level-1 keys (one SYN frame, so
-//!   the restart reads as up/down pairs, never a stuck key).
+//!   the restart reads as up/down pairs, never a stuck key). Skipped for
+//!   `none`/`empty` force actions, when nothing is held, while the
+//!   physical button holds `BTN_LEFT` (wire stays down, no 0-then-1
+//!   flutter), and when the edge absorbed a slide handoff (seamless
+//!   merge wins for that frame).
 //! - Slide level (`slide_1..=slide_5`, default `none`): the proxy holds a
 //!   third key set while fingers slide below the press threshold. A press
 //!   edge hands off: identical slide/press key sets merge with no wire
@@ -681,7 +685,7 @@ where
         // the new count presses. A lone slide edge just presses.
         if let Some(ref ev) = edges.slide {
             if was_slide.is_some() {
-                self.release_slide_held();
+                self.release_slide_held(ClickMachine::physical_button(frame.clicks));
                 self.fire_release(clicks::ClickLevel::Slide, haptic_pressure, cfg.quiet_click);
             }
             self.press_level(ev, haptic_pressure, false);
@@ -693,7 +697,13 @@ where
         // absorbed level skips its own down-pulse: the slide's pulse is
         // adopted as its haptic debt (one down / one up per session).
         let absorbed = if edges.first.is_some() || edges.force.is_some() {
-            self.handoff_slide(&edges, was_slide.clone(), haptic_pressure, cfg.quiet_click)
+            self.handoff_slide(
+                &edges,
+                was_slide.clone(),
+                haptic_pressure,
+                cfg.quiet_click,
+                ClickMachine::physical_button(frame.clicks),
+            )
         } else {
             None
         };
@@ -705,15 +715,19 @@ where
             // SYN), then press the force combo fresh — shared codes show
             // up+SYN+down instead of staying held. Skipped for `none` /
             // `empty` (no keys to restart into: releasing the hold for a
-            // haptic-only pulse would flutter) and when nothing is held.
+            // haptic-only pulse would flutter), when nothing is held, and
+            // when this frame absorbed a slide (the seamless handoff just
+            // merged those keys: cutting them would reintroduce the
+            // flutter the handoff avoided).
             if cfg.is_cut_transition()
                 && !ev.is_none()
                 && !ev.is_empty()
                 && !self.held_first.is_empty()
+                && absorbed.is_none()
             {
                 // No-op after a handoff (slide already absorbed/released),
                 // belt-and-braces so cut never leaves a slide hold behind.
-                self.release_slide_held();
+                self.release_slide_held(ClickMachine::physical_button(frame.clicks));
                 self.cut_first_wire(ClickMachine::physical_button(frame.clicks));
                 self.uinput.sync();
             }
@@ -773,7 +787,7 @@ where
                 }
             }
         } else if slide_gone {
-            self.release_slide_held();
+            self.release_slide_held(ClickMachine::physical_button(frame.clicks));
             self.fire_release(clicks::ClickLevel::Slide, haptic_pressure, cfg.quiet_click);
         }
         self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
@@ -930,6 +944,7 @@ where
         was_slide: Option<ClickEvent>,
         pressure: u8,
         quiet: bool,
+        phys_down: bool,
     ) -> Option<ClickLevel> {
         let slide = was_slide?;
         let first_kind = edges.first.as_ref().map(|e| &e.action.kind);
@@ -942,7 +957,7 @@ where
             self.absorb_slide_into(ClickLevel::First);
             Some(ClickLevel::First)
         } else {
-            self.release_slide_held();
+            self.release_slide_held(phys_down);
             self.fire_release(ClickLevel::Slide, pressure, quiet);
             None
         }
@@ -1065,20 +1080,25 @@ where
 
     /// Release slide-held keys, retaining codes another level still holds
     /// (no up-emit for those — the wire stays down until full release).
-    fn release_slide_held(&mut self) {
+    /// Like [`ClickProxy::release_held`], `BTN_LEFT` stays down while the
+    /// physical button holds it (`phys_down`): emitting 0-then-1 in the
+    /// same frame would flutter a phantom extra click. The caller
+    /// reconciles via [`ClickProxy::emit_btn_left`] right after.
+    fn release_slide_held(&mut self, phys_down: bool) {
         let mut dropped_left = false;
         for (ty, code) in self.held_slide.drain(..) {
             if self.held_first.contains(&(ty, code)) || self.held_force.contains(&(ty, code)) {
                 continue;
+            }
+            if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
+                continue; // physical still holds it; wire stays down
             }
             self.uinput.emit(ty, code, 0);
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 dropped_left = true;
             }
         }
-        // The caller reconciles a still-held physical bit via
-        // `emit_btn_left` right after; only a slide-only left actually
-        // went up on the wire here.
+        // Only a slide-only left actually went up on the wire here.
         if dropped_left {
             self.btn_left_down = false;
         }
@@ -1150,6 +1170,7 @@ where
     /// `spoof_slide_*`) via [`clicks::spoof_contacts`]. All maps default
     /// to passthrough, so the frame below is the real one unless opted in.
     fn emit_touch_frame(&mut self, frame: &TouchFrame, cfg: &Config) {
+        use std::borrow::Cow;
         use std::collections::HashSet;
         let real_touching = frame
             .fingers
@@ -1164,12 +1185,13 @@ where
             "slide"
         };
         let mapped = cfg.spoofed_count(status, real_touching.min(255) as u8);
-        // Passthrough (or an unindexed real count > 5) emits the real
-        // fingers untouched: no synthetic jitter, no dropped slots.
-        let fingers: Vec<FingerContact> = if mapped == real_touching.min(255) as u8 {
-            frame.fingers.clone()
+        // Passthrough (or an unindexed real count > 5) borrows the real
+        // fingers untouched: no per-frame clone, no synthetic jitter, no
+        // dropped slots. Only a live spoof allocates.
+        let fingers: Cow<'_, [FingerContact]> = if mapped == real_touching.min(255) as u8 {
+            Cow::Borrowed(&frame.fingers)
         } else {
-            clicks::spoof_contacts(&frame.fingers, mapped)
+            Cow::Owned(clicks::spoof_contacts(&frame.fingers, mapped))
         };
         let present_count = fingers.iter().filter(|f| clicks::touch_present(f)).count();
         let any_touch = present_count > 0;
@@ -5776,6 +5798,37 @@ mod tests {
             .is_none());
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
         assert_eq!(haptic.releases.lock().unwrap().as_slice(), &[(64, false)]);
+    }
+
+    #[test]
+    fn slide_release_holds_left_under_physical_button() {
+        // T15 shape: slide holds left, fingers lift while the hardware
+        // button stays down (`clicks & 1`). The slide release must NOT
+        // emit left-up (no phantom 0-then-1 in one frame); the wire stays
+        // down until the physical bit itself releases.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 1))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = slide_cfg();
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 1))
+            .unwrap()
+            .is_none());
+        let left = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(left, vec![1], "no left-up under physical hold: {left:?}");
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
     }
 
     #[test]
