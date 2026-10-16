@@ -427,7 +427,8 @@ impl ClickMachine {
     /// release debounce. A press within [`PRESS_DEBOUNCE_MS`] of the last
     /// release is swallowed (bits reverted so the next frame retries); a
     /// release within [`RELEASE_DEBOUNCE_MS`] of the press edge holds the
-    /// latch. The force level is undebounced (old parity: time gates only
+    /// latch (first level only: a force-held frame releases immediately,
+    /// old parity). The force level is undebounced (old parity: time gates only
     /// guard the Released↔Pressed transitions), except a suppressed
     /// first-level press also suppresses the same-frame force edge (old
     /// `Released` admits no `ForcePressed` directly). Likewise a
@@ -454,6 +455,10 @@ impl ClickMachine {
         let force_press = Self::force_threshold(cfg);
         let force_release = Self::force_release_threshold(cfg);
         let armed = force_press.is_some();
+        // Entry force latch: the old service debounces the release hold
+        // only out of Pressed. Out of ForcePressed a full release drops
+        // immediately, so a force-held frame never takes the 30 ms hold.
+        let force_latched_at_entry = self.force_active.is_some();
 
         // Phase 1 (read-only): decide per-finger bit writes. Nothing mutates
         // here so a parse failure below leaves state untouched.
@@ -620,11 +625,13 @@ impl ClickMachine {
         // release clears both; first-level release implies force is gone too
         // since force release >= first release). The force level drops
         // undebounced (old parity); the first level holds while inside the
-        // release debounce window.
+        // release debounce window, unless force was latched at entry (old
+        // releases ForcePressed immediately, no 30 ms hold).
         if self.force_active.is_some() && !self.force_pressed.values().any(|&p| p) {
             self.force_active = None;
         }
-        let release_debounced = self.active.is_some()
+        let release_debounced = !force_latched_at_entry
+            && self.active.is_some()
             && now.is_some_and(|t| {
                 self.last_press_at.is_some_and(|p| {
                     t.saturating_duration_since(p).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
@@ -1374,6 +1381,38 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(m.active().is_none());
+    }
+
+    #[test]
+    fn force_held_release_ignores_release_debounce() {
+        // Old releases ForcePressed immediately (no 30 ms hold): staged
+        // latch (first at T, force at T+10), full liftoff at T+20 still
+        // drops both latches on that frame.
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "forward".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 70)], 0, &cfg, at(t0, 0))
+            .unwrap()
+            .first
+            .is_some());
+        assert!(m
+            .update_at(&[finger(1, 100)], 0, &cfg, at(t0, 10))
+            .unwrap()
+            .force
+            .is_some());
+        assert!(m.update_at(&[], 0, &cfg, at(t0, 20)).unwrap().is_empty());
+        assert!(
+            m.active().is_none(),
+            "force-held release must not debounce-hold the latch"
+        );
+        assert!(m.force_active().is_none());
     }
 
     #[test]
