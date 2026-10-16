@@ -3988,9 +3988,13 @@ mod tests {
     #[test]
     fn shared_left_has_no_phantom_release() {
         // click_1 == force_1 == left: one down, one up, no 0 while held.
+        // Staged frames (250, 250): first latches frame one, force frame
+        // two — the second 250 proves the force path latches (without it
+        // the deferred edge never re-fires and the test is dead).
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
@@ -4008,10 +4012,16 @@ mod tests {
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left.first(), Some(&1));
         assert_eq!(left.last(), Some(&0));
         assert_eq!(transitions(&left), 1, "phantom BTN_LEFT release: {left:?}");
+        // Both levels pulsed: first DOWN then force DOWN (force path live).
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(64, 5, false), (64, 5, false)]
+        );
     }
 
     #[test]
@@ -4026,7 +4036,12 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
-        let cfg = force_cfg();
+        // Split waveforms: force UP loud, first UP quiet — pins both the
+        // release order (force UP before first UP) and each level's flag.
+        let cfg = Config {
+            quiet_click: true,
+            ..force_cfg()
+        };
         // Spaced: the release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
         let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
@@ -4047,6 +4062,11 @@ mod tests {
         assert!(
             etail.contains(&(EV_KEY, BTN_EXTRA, 0)),
             "forward never released: {etail:?}"
+        );
+        // UP order + waveforms: force UP (loud) before first UP (quiet).
+        assert_eq!(
+            haptic.releases.lock().unwrap().as_slice(),
+            &[(64, false), (64, true)]
         );
     }
 
