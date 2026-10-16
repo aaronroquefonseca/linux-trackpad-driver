@@ -31,16 +31,17 @@
 //!   subtraction preserves ordering: force release >= first release, so the
 //!   force level always drops at or before the first level.
 //! - Coexistence ordering: first and force latches are independent and can
-//!   both be held. Edges fire in press order (first then force) when both
-//!   latch on the same frame; reporters surface the force edge (it
-//!   supersedes while held past threshold). Pressure falling below the force
-//!   release returns to the first-level hold; falling below the first-level
+//!   both be held. Edges fire in press order (first then force), staged
+//!   across frames old-exact: a deep jump from idle latches first this
+//!   frame, force follows on the next frame while held deep; reporters
+//!   surface the force edge (it supersedes while held past threshold).
+//!   Pressure falling below the force release returns to the first-level hold; falling below the first-level
 //!   release (`sensitivity - margin`) releases all.
 //! - Force haptic: [`crate::config::Config::effective_force_haptic`] (explicit
 //!   `force_haptic` override, else standard `haptic`; `Some(0)` is silent);
-//!   waveform from `force_quiet_click`. Each edge fires its own pulse: a
-//!   one-frame jump through both levels emits both (first then force),
-//!   identical to staged arrival.
+//!   waveform from `force_quiet_click`. Each edge fires its own pulse on
+//!   its own frame, so a deep stab feels like staged arrival (first snap,
+//!   then the force snap a report later).
 //! - Reporters surface [`FrameOutcome::primary`]: force while held past
 //!   threshold, except a force `none` never supersedes (it emits nothing).
 //! - `click_N`/`force_N` parse before any latch bit mutates: a bad action
@@ -248,11 +249,11 @@ impl ClickEvent {
     }
 }
 
-/// Per-frame press edges, in press order (first then force).
+/// Per-frame press edges, in press order (first then force, staged across
+/// frames old-exact: a frame carries at most one fresh edge from idle).
 ///
-/// When a deep press latches both levels on the same frame both are `Some`;
-/// reporters surface `force` (it supersedes while held past threshold) while
-/// holding both key sets. `slide` fires only when neither press level edges
+/// Reporters surface `force` (it supersedes while held past threshold)
+/// while holding both key sets. `slide` fires only when neither press level edges
 /// (see [`ClickMachine`] handoff): reporters surface it when no press edge
 /// fired.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -394,6 +395,11 @@ impl ClickMachine {
     /// Force fires only when `force_offset > 0` and some finger's pressure
     /// (`u16`-compared, no overflow) reaches `sensitivity + force_offset`;
     /// finger-count is captured at the force edge like the first level.
+    /// Old-exact staging: a deep jump from idle latches the first level
+    /// this frame and force follows on the next frame while held deep
+    /// (the old service makes one transition per report: Released admits
+    /// Pressed only). An already-latched first level takes the force edge
+    /// immediately.
     /// Releases use hysteresis: force drops when no force bit remains (every
     /// deep finger fell to/below `sensitivity + force_offset - margin` or
     /// lifted) while the first-level hold continues; the first level drops
@@ -421,10 +427,13 @@ impl ClickMachine {
     /// release debounce. A press within [`PRESS_DEBOUNCE_MS`] of the last
     /// release is swallowed (bits reverted so the next frame retries); a
     /// release within [`RELEASE_DEBOUNCE_MS`] of the press edge holds the
-    /// latch. The force level is undebounced (old parity: time gates only
+    /// latch (first level only: a force-held frame releases immediately,
+    /// old parity). The force level is undebounced (old parity: time gates only
     /// guard the Released↔Pressed transitions), except a suppressed
     /// first-level press also suppresses the same-frame force edge (old
-    /// `Released` admits no `ForcePressed` directly).
+    /// `Released` admits no `ForcePressed` directly). Likewise a
+    /// same-frame force edge behind a fresh first-level edge defers one
+    /// frame (old-exact staging, no time gate involved).
     pub fn update_at(
         &mut self,
         fingers: &[FingerContact],
@@ -446,6 +455,10 @@ impl ClickMachine {
         let force_press = Self::force_threshold(cfg);
         let force_release = Self::force_release_threshold(cfg);
         let armed = force_press.is_some();
+        // Entry force latch: the old service debounces the release hold
+        // only out of Pressed. Out of ForcePressed a full release drops
+        // immediately, so a force-held frame never takes the 30 ms hold.
+        let force_latched_at_entry = self.force_active.is_some();
 
         // Phase 1 (read-only): decide per-finger bit writes. Nothing mutates
         // here so a parse failure below leaves state untouched.
@@ -567,6 +580,20 @@ impl ClickMachine {
                 self.force_pressed.insert(*id, false);
             }
         }
+        // Old-exact staging: the old service makes one transition per
+        // report, so Released admits Pressed only — a deep stab lands the
+        // first level this frame and force follows on the next report.
+        // When this frame fires the first-level edge from idle, defer a
+        // same-frame force edge: revert its fresh bits so the next frame
+        // re-edges (identical to staged arrival). An already-latched
+        // first level still takes the force edge immediately.
+        let first_fired = first_action.is_some() && !press_suppressed;
+        let force_deferred = first_fired && force_action.is_some();
+        if force_deferred {
+            for id in newly_force.iter() {
+                self.force_pressed.insert(*id, false);
+            }
+        }
         // Evict ids absent from this frame (a lifted finger reports no
         // block): without this a lifted finger's bit stays set and holds
         // the latch while a remaining finger moves lightly (stale hold →
@@ -598,11 +625,13 @@ impl ClickMachine {
         // release clears both; first-level release implies force is gone too
         // since force release >= first release). The force level drops
         // undebounced (old parity); the first level holds while inside the
-        // release debounce window.
+        // release debounce window, unless force was latched at entry (old
+        // releases ForcePressed immediately, no 30 ms hold).
         if self.force_active.is_some() && !self.force_pressed.values().any(|&p| p) {
             self.force_active = None;
         }
-        let release_debounced = self.active.is_some()
+        let release_debounced = !force_latched_at_entry
+            && self.active.is_some()
             && now.is_some_and(|t| {
                 self.last_press_at.is_some_and(|p| {
                     t.saturating_duration_since(p).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
@@ -655,8 +684,10 @@ impl ClickMachine {
         }
         // Force edge: same latch shape, disabled entirely when offset is 0.
         if let Some(action) = force_action {
-            if press_suppressed {
-                // Swallowed with the first-level press (see above).
+            if press_suppressed || force_deferred {
+                // Swallowed with the first-level press (see above), or
+                // deferred a frame for old-exact staging (bits reverted
+                // above, so the next frame re-edges while held deep).
             } else {
                 let ev = ClickEvent {
                     finger_count: force_select,
@@ -1007,7 +1038,10 @@ mod tests {
     }
 
     #[test]
-    fn force_coexistence_ordering_same_frame() {
+    fn force_stages_behind_first_edge() {
+        // Old-exact: a deep jump from idle latches first this frame; force
+        // follows on the next frame while held deep (Released admits
+        // Pressed only). Reporters see first, then force supersedes.
         let cfg = Config {
             sensitivity: 64,
             margin: 5,
@@ -1016,9 +1050,14 @@ mod tests {
             ..Config::default()
         };
         let mut m = ClickMachine::new();
-        // One-frame jump latches both in press order; force supersedes.
         let out = m.update(&[finger(1, 250)], 0, &cfg).unwrap();
         assert!(out.first.is_some());
+        assert!(out.force.is_none());
+        assert!(!out.primary().unwrap().is_force());
+        assert!(m.active().is_some());
+        assert!(m.force_active().is_none());
+        let out = m.update(&[finger(1, 250)], 0, &cfg).unwrap();
+        assert!(out.first.is_none());
         assert!(out.force.is_some());
         let primary = out.primary().unwrap();
         assert!(primary.is_force());
@@ -1056,14 +1095,19 @@ mod tests {
             ..Config::default()
         };
         let mut m = ClickMachine::new();
+        // Staged: first edge frame one, force `none` frame two.
         let out = m.update(&[finger(1, 250)], 0, &cfg).unwrap();
         assert!(out.first.is_some());
+        assert!(out.force.is_none());
+        let out = m.update(&[finger(1, 250)], 0, &cfg).unwrap();
+        assert!(out.first.is_none());
         let force = out.force.as_ref().unwrap();
         assert!(force.is_force() && force.is_none());
-        // Force still latches (swallows), but reporters see the first edge.
+        // Force still latches (swallows), but reporters see nothing new:
+        // the force `none` emits no keys/haptic and the first edge already
+        // reported on its own frame.
         assert!(m.force_active().is_some());
-        let primary = out.primary().unwrap();
-        assert!(!primary.is_force());
+        assert!(out.primary().is_none());
     }
 
     #[test]
@@ -1104,8 +1148,11 @@ mod tests {
         };
         let mut m = ClickMachine::new();
         let fingers: Vec<FingerContact> = (1..=6).map(|id| finger(id, 250)).collect();
+        // Staged: frame one latches first (count 5), frame two force.
         let out = m.update(&fingers, 0, &cfg).unwrap();
         assert_eq!(out.first.as_ref().unwrap().finger_count, 5);
+        assert!(out.force.is_none());
+        let out = m.update(&fingers, 0, &cfg).unwrap();
         assert_eq!(out.force.as_ref().unwrap().finger_count, 5);
     }
 
@@ -1160,9 +1207,12 @@ mod tests {
             ..Config::default()
         };
         let mut m = ClickMachine::new();
-        // A deep + B medium: both levels latch with count 2.
+        // A deep + B medium: first latches frame one (count 2), force
+        // follows frame two while A stays deep (old-exact staging).
         let out = m.update(&[finger(1, 100), finger(2, 70)], 0, &cfg).unwrap();
-        assert!(out.first.is_some() && out.force.is_some());
+        assert!(out.first.is_some() && out.force.is_none());
+        let out = m.update(&[finger(1, 100), finger(2, 70)], 0, &cfg).unwrap();
+        assert!(out.first.is_none() && out.force.is_some());
         // A lifts, B stays medium: force drops (no deep finger left), first
         // holds on B.
         let out = m.update(&[lifted(1), finger(2, 70)], 0, &cfg).unwrap();
@@ -1188,6 +1238,94 @@ mod tests {
 
     fn at(base: Instant, ms: u64) -> Instant {
         base + std::time::Duration::from_millis(ms)
+    }
+
+    /// Owner's tune (6 months on old driver): sensitivity 30, haptic 2
+    /// quiet, force_offset 130, force_haptic 1. Margin/defaults otherwise.
+    fn owner_cfg() -> Config {
+        Config {
+            sensitivity: 30,
+            margin: 5,
+            haptic: 2,
+            quiet_click: true,
+            force_offset: 130,
+            force_haptic: Some(1),
+            force_quiet_click: false,
+            force_1: "forward".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn owner_tune_thresholds_match_old() {
+        // Old: force press at 30 + 130 = 160, force release at 160 - 5.
+        let cfg = owner_cfg();
+        assert_eq!(press_threshold(&cfg), 30);
+        assert_eq!(release_threshold(&cfg), 25);
+        assert_eq!(ClickMachine::force_threshold(&cfg), Some(160));
+        assert_eq!(ClickMachine::force_release_threshold(&cfg), Some(155));
+    }
+
+    #[test]
+    fn owner_tune_staged_edges_carry_old_haptic_bytes() {
+        // Staged arrival: medium press latches first (intensity 2, quiet),
+        // deepening past 160 latches force (intensity 1, loud).
+        let cfg = owner_cfg();
+        let mut m = ClickMachine::new();
+        let out = m.update(&[finger(1, 50)], 0, &cfg).unwrap();
+        let first = out.first.unwrap();
+        assert!(!first.is_force());
+        assert_eq!(first.haptic, 2);
+        assert!(first.quiet);
+        assert!(out.force.is_none());
+        let out = m.update(&[finger(1, 200)], 0, &cfg).unwrap();
+        assert!(out.first.is_none());
+        let force = out.force.unwrap();
+        assert!(force.is_force());
+        assert_eq!(force.haptic, 1);
+        assert!(!force.quiet);
+    }
+
+    #[test]
+    fn owner_tune_deep_jump_stages_force_one_frame_later() {
+        // Old-exact: Released admits Pressed only (one transition per
+        // report), so a deep stab latches first this frame and force
+        // follows on the next report — never both on the same frame.
+        let cfg = owner_cfg();
+        let mut m = ClickMachine::new();
+        let out = m.update(&[finger(1, 200)], 0, &cfg).unwrap();
+        assert!(out.first.is_some());
+        assert!(
+            out.force.is_none(),
+            "old stages force a frame later, no same-frame double edge"
+        );
+        assert!(m.force_active().is_none());
+        assert_eq!(out.primary().unwrap().level, ClickLevel::First);
+        // Still deep next frame: force edge arrives with old-exact bytes.
+        let out = m.update(&[finger(1, 200)], 0, &cfg).unwrap();
+        assert!(out.first.is_none());
+        assert!(out.primary().unwrap().is_force());
+        let force = out.force.unwrap();
+        assert!(force.is_force());
+        assert_eq!(force.haptic, 1);
+        assert!(!force.quiet);
+    }
+
+    #[test]
+    fn owner_tune_force_release_returns_to_first_hold() {
+        // 100 < 155 (force release) but > 25 (first release): force drops,
+        // first holds. 10 drops all.
+        let cfg = owner_cfg();
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 50)], 0, &cfg).unwrap();
+        m.update(&[finger(1, 200)], 0, &cfg).unwrap();
+        assert!(m.force_active().is_some());
+        assert!(m.update(&[finger(1, 100)], 0, &cfg).unwrap().is_empty());
+        assert!(m.force_active().is_none());
+        assert!(m.active().is_some());
+        assert!(m.update(&[finger(1, 10)], 0, &cfg).unwrap().is_empty());
+        assert!(m.active().is_none());
+        assert!(m.force_active().is_none());
     }
 
     #[test]
@@ -1243,6 +1381,38 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(m.active().is_none());
+    }
+
+    #[test]
+    fn force_held_release_ignores_release_debounce() {
+        // Old releases ForcePressed immediately (no 30 ms hold): staged
+        // latch (first at T, force at T+10), full liftoff at T+20 still
+        // drops both latches on that frame.
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            force_1: "forward".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 70)], 0, &cfg, at(t0, 0))
+            .unwrap()
+            .first
+            .is_some());
+        assert!(m
+            .update_at(&[finger(1, 100)], 0, &cfg, at(t0, 10))
+            .unwrap()
+            .force
+            .is_some());
+        assert!(m.update_at(&[], 0, &cfg, at(t0, 20)).unwrap().is_empty());
+        assert!(
+            m.active().is_none(),
+            "force-held release must not debounce-hold the latch"
+        );
+        assert!(m.force_active().is_none());
     }
 
     #[test]
@@ -1335,8 +1505,11 @@ mod tests {
             force_1: "forward".into(),
             ..bad
         };
+        // Staged retry: frame one latches first only, frame two force.
         let out = m.update(&[finger(1, 250)], 0, &good).unwrap();
-        assert!(out.first.is_some() && out.force.is_some());
+        assert!(out.first.is_some() && out.force.is_none());
+        let out = m.update(&[finger(1, 250)], 0, &good).unwrap();
+        assert!(out.first.is_none() && out.force.is_some());
     }
 
     fn light(id: u8, pressure: u8) -> FingerContact {
