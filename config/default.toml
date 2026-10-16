@@ -111,8 +111,10 @@ force_5 = "none"
 # (= no action, current behavior: slides only move the cursor).
 # Handoff: a press edge releases the slide action first, UNLESS the slide
 # and click actions are identical (same keys) — then the hold continues
-# with no release/re-press flutter. Slide fires the standard haptic pulse
-# (haptic/quiet_click) iff its action is keys/empty; "none" stays silent.
+# with no release/re-press flutter. Touch is silent: slide never fires a
+# haptic pulse (down or release), not even for keys/empty — only the
+# button levels (click/force) buzz. slide_* = empty is valid-but-silent
+# (keys-nothing + haptic-nothing; prefer "none"; old configs keep working).
 # -------------------------------------------------------------------------
 slide_1 = "none"
 slide_2 = "none"
