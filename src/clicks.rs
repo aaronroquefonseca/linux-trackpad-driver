@@ -321,6 +321,10 @@ pub struct ClickMachine {
     slide_real: Option<u8>,
     last_press_at: Option<Instant>,
     last_release_at: Option<Instant>,
+    /// Last frame clock that still held any force bit. A bit-less frame
+    /// inside [`RELEASE_DEBOUNCE_MS`] of this stamp keeps the force latch
+    /// (hold hysteresis: pressure noise must not end an intentional hold).
+    last_force_hold_at: Option<Instant>,
 }
 
 impl ClickMachine {
@@ -622,14 +626,36 @@ impl ClickMachine {
                 *v = false;
             }
         }
+        // Hold anchor AFTER every bit mutation above (commits, suppress and
+        // staging reverts, eviction, disarm): only a frame that truly still
+        // holds force refreshes the hysteresis window.
+        if self.force_pressed.values().any(|&p| p) {
+            if let Some(t) = now {
+                self.last_force_hold_at = Some(t);
+            }
+        }
 
         // Release latches with no remaining bits (force first so a full
         // release clears both; first-level release implies force is gone too
-        // since force release >= first release). The force level drops
-        // undebounced (old parity); the first level holds while inside the
-        // release debounce window, unless force was latched at entry (old
-        // releases ForcePressed immediately, no 30 ms hold).
-        if self.force_active.is_some() && !self.force_pressed.values().any(|&p| p) {
+        // since force release >= first release). The first level holds
+        // while inside the release debounce window, unless force was
+        // latched at entry (old releases ForcePressed immediately, no
+        // 30 ms hold). The force level holds inside the same window anchored
+        // at its last held frame instead (DEVIATION: old drops it
+        // undebounced — a single noisy frame then ends an intentional hold
+        // and its emitted keys, e.g. super in a drag chord, flap; clean
+        // liftoff still releases outright).
+        let force_hold_debounced = self.force_active.is_some()
+            && !self.force_pressed.values().any(|&p| p)
+            && now.is_some_and(|t| {
+                self.last_force_hold_at.is_some_and(|h| {
+                    t.saturating_duration_since(h).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
+                })
+            });
+        if self.force_active.is_some()
+            && !self.force_pressed.values().any(|&p| p)
+            && !force_hold_debounced
+        {
             self.force_active = None;
         }
         let release_debounced = !force_latched_at_entry
@@ -739,6 +765,7 @@ impl ClickMachine {
         self.slide_real = None;
         self.last_press_at = None;
         self.last_release_at = None;
+        self.last_force_hold_at = None;
     }
 }
 
@@ -1328,6 +1355,70 @@ mod tests {
         assert!(m.update(&[finger(1, 10)], 0, &cfg).unwrap().is_empty());
         assert!(m.active().is_none());
         assert!(m.force_active().is_none());
+    }
+
+    #[test]
+    fn force_hold_hysteresis_survives_dip_then_liftoff_releases() {
+        // Tune 130/30/5: press 130, force 160, force-release 155. A dip to
+        // 150 (noise just under release, still firmly pressed) holds the
+        // latch inside the 30 ms hold window; past the window it drops;
+        // liftoff always drops. (Old parity dropped undebounced.)
+        let cfg = Config {
+            sensitivity: 130,
+            force_offset: 30,
+            margin: 5,
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 140)], 0, &cfg, at(t0, 0))
+            .unwrap()
+            .first
+            .is_some());
+        // Deep stab: first already latched, force edges immediately.
+        let t1 = at(t0, 60);
+        assert!(m
+            .update_at(&[finger(1, 175)], 0, &cfg, t1)
+            .unwrap()
+            .force
+            .is_some());
+        let t2 = at(t1, 60);
+        assert!(m
+            .update_at(&[finger(1, 175)], 0, &cfg, t2)
+            .unwrap()
+            .is_empty());
+        assert!(m.force_active().is_some());
+        // Dip 10 ms after the last held frame: no edge, latch holds.
+        let t3 = at(t2, 10);
+        assert!(m
+            .update_at(&[finger(1, 150)], 0, &cfg, t3)
+            .unwrap()
+            .is_empty());
+        assert!(m.force_active().is_some(), "dip holds the latch");
+        // Back deep, then a dip 40 ms after the last held frame: drops.
+        let t4 = at(t3, 10);
+        assert!(m
+            .update_at(&[finger(1, 175)], 0, &cfg, t4)
+            .unwrap()
+            .is_empty());
+        let t5 = at(t4, 40);
+        assert!(m
+            .update_at(&[finger(1, 150)], 0, &cfg, t5)
+            .unwrap()
+            .is_empty());
+        assert!(m.force_active().is_none(), "window expiry drops");
+        // Latch re-edges on the next deep frame (not stuck released).
+        let t6 = at(t5, 60);
+        assert!(m
+            .update_at(&[finger(1, 175)], 0, &cfg, t6)
+            .unwrap()
+            .force
+            .is_some());
+        // Clean liftoff releases everything.
+        assert!(m.update_at(&[], 0, &cfg, at(t6, 60)).unwrap().is_empty());
+        assert!(m.force_active().is_none());
+        assert!(m.active().is_none());
     }
 
     #[test]
