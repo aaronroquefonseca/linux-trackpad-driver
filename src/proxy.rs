@@ -72,8 +72,13 @@
 //!   `none`/`empty` force actions, when nothing is held, and when the
 //!   edge absorbed a slide handoff (seamless merge wins for that frame).
 //!   Cut ALWAYS emits the release — even under a physically-held
-//!   `BTN_LEFT` (the visible up+SYN+down break is the entire point of
-//!   cut; the physical carve-out stays continuous-only). Continuous
+//!   `BTN_LEFT` (the visible break is the entire point of cut; the
+//!   physical carve-out stays continuous-only). The release lands on the
+//!   edge frame and the fresh press on a later frame once a 5 ms floor
+//!   elapses (clock-gated, not frame-counted): a same-frame up+SYN+down
+//!   reads as one gesture downstream and the drag never restarts (owner
+//!   HW). A force latch that vanishes before the press lands drops the
+//!   pending press cleanly. Continuous
 //!   skips the cut while the physical button holds `BTN_LEFT` (wire
 //!   stays down, no 0-then-1 flutter).
 //! - Slide level (`slide_1..=slide_5`, default `none`): the proxy holds a
@@ -402,6 +407,14 @@ impl From<&Config> for ProxySettings {
     }
 }
 
+/// Minimum gap between a cut-mode release SYN and the deferred fresh press
+/// (see [`ClickProxy::pending_force`]). Owner HW: an 11 us-apart up+down
+/// coalesces into the still-running drag (Mutter never starts drag #2);
+/// 5 ms is imperceptible and safely two gestures. Enforced on the
+/// monotonic frame clock, not frame counts — a fast next frame must not
+/// collapse the gap.
+const CUT_REPRESS_GAP: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// evdev-grab + uinput click proxy. Generic over injectable backends so unit
 /// tests run without hardware.
 pub struct ClickProxy<G, U, H, S> {
@@ -442,6 +455,27 @@ pub struct ClickProxy<G, U, H, S> {
     /// Same for the live force-level latch (`force_haptic_triggered`).
     /// The slide level never pulses (touch is silent): no flag, no debt.
     force_haptic: bool,
+    force_haptic: bool,
+    /// Cut-mode deferred force press: the force edge (frame N) emits the
+    /// level-1/slide release + SYN, and the fresh force-combo press lands on
+    /// a later frame once `now - released_at >= CUT_REPRESS_GAP` (5 ms floor
+    /// on the monotonic clock, not frame counts). The release and press must
+    /// read as distinct gestures downstream (Mutter merges an 11 us-apart
+    /// up+down into the still-running drag). If the force latch vanishes
+    /// before the press lands (liftoff/ease-off), the pending press is
+    /// dropped: its keys never went down, so there is nothing to release
+    /// and nothing dangles.
+    pending_force: Option<PendingForcePress>,
+}
+
+/// A cut-mode force press waiting for its gap-gated frame (see
+/// [`ClickProxy::pending_force`]). `released_at` is the edge frame's clock:
+/// the press lands once `now - released_at >= CUT_REPRESS_GAP`.
+#[derive(Debug, Clone)]
+struct PendingForcePress {
+    ev: ClickEvent,
+    released_at: std::time::Instant,
+}
 }
 
 impl<G, U, H, S> ClickProxy<G, U, H, S>
@@ -471,6 +505,7 @@ where
             btn_left_down: false,
             pressed_haptic: false,
             force_haptic: false,
+            pending_force: None,
         }
     }
 
@@ -521,6 +556,7 @@ where
             self.machine.reset();
             self.pressed_haptic = false;
             self.force_haptic = false;
+            self.pending_force = None;
             self.last_pos.clear();
             self.attached = false;
             self.attached_node = None;
@@ -607,6 +643,7 @@ where
         self.machine.reset();
         self.pressed_haptic = false;
         self.force_haptic = false;
+        self.pending_force = None;
         self.last_pos.clear();
         self.max_slot = 0;
         self.attached = false;
@@ -712,13 +749,40 @@ where
         } else {
             None
         };
+        // Cut-mode deferred press: last frame's force edge released the wire;
+        // the fresh combo lands once the 5 ms floor has elapsed (clock-gated,
+        // not frame-counted: a fast next frame must not collapse the gap).
+        // Dropped when the force latch already vanished (liftoff/ease-off
+        // before the press lands): its keys never went down, so there is
+        // nothing to release. Lands before this frame's own presses
+        // (chronological: the deferred edge is older).
+        if self.pending_force.is_some() {
+            if self.machine.force_active().is_none() {
+                self.pending_force = None;
+            } else if now.saturating_duration_since(
+                self.pending_force
+                    .as_ref()
+                    .expect("pending checked above")
+                    .released_at,
+            ) >= CUT_REPRESS_GAP
+            {
+                let pending = self.pending_force.take().expect("pending checked above");
+                self.press_level(&pending.ev, haptic_pressure);
+            }
+        }
         if let Some(ref ev) = edges.first {
             self.press_level(ev, haptic_pressure);
         }
         if let Some(ref ev) = edges.force {
             // Cut mode: release ALL level-1/slide wire keys first (with
-            // SYN), then press the force combo fresh — shared codes show
-            // up+SYN+down instead of staying held. Skipped for `none` /
+            // SYN) on the edge frame, then press the force combo fresh once
+            // the 5 ms floor elapses — shared codes show up+SYN in frame N
+            // and downs in a later frame. The split is the point: a
+            // same-frame up+SYN+down lands ~11 us apart and the compositor
+            // merges it into the still-running drag (owner HW: overview
+            // opens, drag never starts). ~One frame of added latency; if the
+            // force latch vanishes before the press lands, the pending press
+            // drops cleanly (its keys never went down). Skipped for `none` /
             // `empty` (no keys to restart into: releasing the hold for a
             // haptic-only pulse would flutter), when nothing is held, and
             // when this frame absorbed a slide (the seamless handoff just
@@ -733,21 +797,29 @@ where
                 // No-op after a handoff (slide already absorbed/released),
                 // belt-and-braces so cut never leaves a slide hold behind.
                 // Cut bypasses the physical carve-out (`false`): the visible
-                // up+SYN+down break is the entire point of cut, and the user
+                // break is the entire point of cut, and the user
                 // physically holds the click essentially always.
                 self.release_slide_held(false);
                 self.cut_first_wire();
                 self.uinput.sync();
+                self.pending_force = Some(PendingForcePress {
+                    ev: ev.clone(),
+                    released_at: now,
+                });
+            } else {
+                self.press_level(ev, haptic_pressure);
             }
-            self.press_level(ev, haptic_pressure);
+        }
         }
         if edges.first.is_some() || edges.force.is_some() || edges.slide.is_some() {
             // Edge frames reconcile `BTN_LEFT` through the wire tracker
-            // (emits only on change — `press_level` already put fresh
-            // downs on the wire). Exactly one SYN per handled frame
-            // either way — except cut-mode force edges, which already
-            // synced once between the level-1 release and the fresh
-            // force press: `press_level` never syncs itself.
+            // (emits only on change — fresh downs already went out above,
+            // except a cut-mode force edge whose press is deferred to the
+            // next frame: the release went out with its SYN, and the
+            // reconcile below is a no-op, never a flutter).
+            // `press_level` never syncs itself; exactly one trailing SYN
+            // per handled frame — except a cut-mode force edge, which
+            // already synced once after the level-1 release.
             self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
             self.uinput.sync();
             return Ok(edges.primary());
@@ -6277,13 +6349,16 @@ mod tests {
 
     #[test]
     fn transition_cut_restarts_force_combo() {
-        // Cut mode: the force edge releases left first (with SYN), then
-        // presses left+super fresh — up+SYN+down on the shared code.
+        // Cut mode, split frames: the force edge (frame N) releases left
+        // (up+SYN); the fresh left+super press lands on a later frame once
+        // the 5 ms floor elapses. The split is the point: a same-frame
+        // up+down merges into the running drag downstream.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
@@ -6298,6 +6373,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        // Edge frame: release only, press deferred.
         let mark = sinks.pointer.events.lock().unwrap().len();
         let emark = sinks.extras.events.lock().unwrap().len();
         let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
@@ -6309,21 +6385,46 @@ mod tests {
             .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
             .map(|(_, _, v)| v)
             .collect();
-        assert_eq!(lefts, vec![0, 1], "cut restarts shared left: {tail:?}");
-        let syns = tail
-            .iter()
-            .filter(|&&(ty, c, _)| ty == EV_SYN && c == SYN_REPORT)
-            .count();
-        assert!(syns >= 1, "cut separates release/press with SYN: {tail:?}");
-        // Super joins on the extras node.
+        assert_eq!(lefts, vec![0], "edge frame releases only: {tail:?}");
+        assert!(
+            tail.contains(&(EV_SYN, SYN_REPORT, 0)),
+            "release carries SYN: {tail:?}"
+        );
         let etail: Vec<(u16, u16, i32)> = sinks.extras.events.lock().unwrap()[emark..].to_vec();
-        assert!(etail.contains(&(EV_KEY, 125, 1)));
+        assert!(
+            !etail.contains(&(EV_KEY, 125, 1)),
+            "press deferred past the edge frame: {etail:?}"
+        );
+        // Next steady frame (60 ms later, gap elapsed): fresh press lands.
+        let mark2 = sinks.pointer.events.lock().unwrap().len();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 2))
+            .unwrap()
+            .is_none());
+        let tail2: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark2..].to_vec();
+        let lefts2: Vec<i32> = tail2
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(
+            lefts2,
+            vec![1],
+            "deferred press lands next frame: {tail2:?}"
+        );
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        // Overall: exactly down/up/down, strict.
+        let all = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(all, vec![1, 0, 1], "split-frame cut: {all:?}");
+        assert_strict_alternation(&all, "BTN_LEFT");
     }
 
     #[test]
     fn transition_cut_represses_first_on_force_release() {
-        // Easing back below the force release re-presses the still-latched
-        // level-1 keys; the full release then owns the final key-ups.
+        // Easing back below the force release before the deferred press
+        // lands drops it (its keys never went down); the still-latched
+        // level-1 keys re-press and the full release owns the final key-ups.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
@@ -6346,25 +6447,135 @@ mod tests {
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         // Cut dropped left at the force edge; force release re-presses it.
+        // The dropped force combo never touches the wire at all.
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0, 1], "cut, re-press on return: {left:?}");
-        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 0));
+        assert!(
+            key_values(&sinks.extras, BTN_EXTRA).is_empty(),
+            "dropped press leaves no forward traffic: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1, 0]);
     }
 
     #[test]
+    fn transition_cut_liftoff_before_press_drops_cleanly() {
+        // Liftoff before the deferred press lands: the pending press drops,
+        // the wire ends at exactly one down/up pair, no force keys ever
+        // appear, and the force haptic never fires (nothing to release).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        let left = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "clean drop, no dangling: {left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+        assert!(
+            sinks
+                .extras
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|&(t, _, _)| t != EV_KEY),
+            "force combo never hits the wire: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1, "first press only");
+        assert_eq!(
+            haptic.releases.lock().unwrap().len(),
+            1,
+            "first release only"
+        );
+    }
+
+    #[test]
+    fn transition_cut_press_waits_for_gap_floor() {
+        // The 5 ms floor is clock-gated, not frame-counted: a next frame 2 ms
+        // after the release holds the pending press; it lands once 5 ms have
+        // elapsed. Controlled timestamps pin the gap.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let t1 = spaced_at(t0, 1);
+        let ev = px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        // +2 ms: gap not elapsed — press held, wire silent.
+        px.handle_frame_at(&cfg, t1 + std::time::Duration::from_millis(2))
+            .unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "gap floor holds the press"
+        );
+        assert!(
+            !sinks.extras.has(EV_KEY, 125, 1),
+            "super waits for the gap too"
+        );
+        assert!(
+            px.pending_force.is_some(),
+            "pending survives the fast frame"
+        );
+        // +5 ms: floor elapsed — press lands.
+        px.handle_frame_at(&cfg, t1 + std::time::Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        assert!(px.pending_force.is_none(), "press flushed");
+    }
+
+    #[test]
     fn transition_cut_breaks_wire_under_physical_hold() {
         // Owner hardware: transition_mode=cut with force_1=super+left must
-        // show up+SYN+down even while the user physically holds the click
-        // (`clicks & 1`). The cut bypasses the physical carve-out; the
-        // edge-frame reconcile must not re-flutter in the same frame.
+        // break the wire even while the user physically holds the click
+        // (`clicks & 1`). The cut bypasses the physical carve-out; release
+        // lands on the edge frame, the fresh press on a later frame (5 ms
+        // floor), with no same-frame re-flutter.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 1))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
@@ -6379,6 +6590,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        // Edge frame: release only, even under hold.
         let mark = sinks.pointer.events.lock().unwrap().len();
         let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
         assert!(ev.is_force());
@@ -6389,13 +6601,17 @@ mod tests {
             .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
             .map(|(_, _, v)| v)
             .collect();
-        assert_eq!(lefts, vec![0, 1], "cut must break under hold: {tail:?}");
-        let syns = tail
-            .iter()
-            .filter(|&&(ty, c, _)| ty == EV_SYN && c == SYN_REPORT)
-            .count();
-        assert!(syns >= 1, "cut separates release/press with SYN: {tail:?}");
-        // No same-frame re-flutter: exactly down/up/down so far, strict.
+        assert_eq!(lefts, vec![0], "cut must break under hold: {tail:?}");
+        assert!(
+            tail.contains(&(EV_SYN, SYN_REPORT, 0)),
+            "release carries SYN: {tail:?}"
+        );
+        // Next steady frame (gap elapsed): fresh press lands.
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 2))
+            .unwrap()
+            .is_none());
+        // No same-frame re-flutter: exactly down/up/down, strict.
         let all = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(all, vec![1, 0, 1], "no extra flutter: {all:?}");
         assert_strict_alternation(&all, "BTN_LEFT");
@@ -6447,6 +6663,7 @@ mod tests {
             let frames = vec![
                 Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
                 Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
             ];
             let mut px = drive_ready_proxy(&sinks, &haptic, frames);
             let cfg = Config {
@@ -6461,6 +6678,9 @@ mod tests {
             let t0 = std::time::Instant::now();
             px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
             px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+            // Deferred: nothing held yet on the edge frame.
+            assert!(px.held_force.is_empty(), "press deferred: {force:?}");
+            px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
             assert_eq!(
                 px.held_force,
                 vec![(EV_KEY, 125), (EV_KEY, BTN_LEFT)],
