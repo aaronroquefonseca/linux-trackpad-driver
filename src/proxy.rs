@@ -762,7 +762,17 @@ where
         // (chronological: the deferred edge is older).
         if self.pending_force.is_some() {
             if self.machine.force_active().is_none() {
-                self.pending_force = None;
+                // Latch gone before the press landed: dropped (keys never
+                // went down). Traced at debug with the survived time — a
+                // press that never survives the floor shows here, which
+                // distinguishes hold-instability from node/routing loss.
+                if let Some(pending) = self.pending_force.take() {
+                    log::debug!(
+                        "proxy: cut pending force press dropped (latch gone after {}ms, floor {}ms)",
+                        now.saturating_duration_since(pending.released_at).as_millis(),
+                        CUT_REPRESS_GAP.as_millis()
+                    );
+                }
             } else if now.saturating_duration_since(
                 self.pending_force
                     .as_ref()
@@ -6692,6 +6702,79 @@ mod tests {
             lefts,
             vec![1],
             "only the physical re-press itself; tap adds nothing: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn extras_key_down_up_each_syn_closed_like_pointer() {
+        // Owner NIRI: a super-down that lands WITHOUT its SYN is held by
+        // libinput and flushed with its up as a tap (overview) instead of a
+        // hold (drag modifier). Every extras key down/up must be SYN-closed
+        // in its own frame batch, exactly the pointer discipline (one shared
+        // fan-out sync — pinned here so any emit-without-sync regresses).
+        // Drive press / cut-edge / flush / ease / liftoff.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        for i in 0..5 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        // Extras: super down alone in the flush frame, up alone in the ease
+        // frame — each immediately SYN-closed (a hold, never a batched tap).
+        let x: Vec<(u16, u16, i32)> = sinks.extras.events.lock().unwrap().clone();
+        let down = x
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 1))
+            .expect("super down lands");
+        assert_eq!(
+            x[down + 1],
+            (EV_SYN, SYN_REPORT, 0),
+            "super-down SYN-closed: {x:?}"
+        );
+        let up = x
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 0))
+            .expect("super up lands");
+        assert!(up > down, "up after down (a hold span, not a batch): {x:?}");
+        assert_eq!(
+            x[up + 1],
+            (EV_SYN, SYN_REPORT, 0),
+            "super-up SYN-closed: {x:?}"
+        );
+        // Pointer discipline, same bar: the flush-frame left re-press is
+        // SYN-closed, and the whole log ends batch-closed.
+        let p: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap().clone();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1, 0, 1, 0],
+            "left cycle: {p:?}"
+        );
+        assert_eq!(
+            p.last(),
+            Some(&(EV_SYN, SYN_REPORT, 0)),
+            "pointer log batch-closed: {p:?}"
+        );
+        assert_eq!(
+            x.last(),
+            Some(&(EV_SYN, SYN_REPORT, 0)),
+            "extras log batch-closed: {x:?}"
         );
     }
 
