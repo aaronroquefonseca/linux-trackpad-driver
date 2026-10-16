@@ -6699,8 +6699,8 @@ mod tests {
 
     #[test]
     fn transition_cut_noisy_dip_holds_super_clean_liftoff_releases() {
-        // Owner NIRI (tune 130/30/5: press 130, force 160, first-release
-        // 125, force-release 155): a hold dipping to 150 (just under force
+        // Owner NIRI (tune 30/130/5: press 30, force 190, first-release
+        // 25, force-release 155): a hold dipping to 150 (just under force
         // release, still firmly pressed) must keep super down — otherwise
         // niri sees super-tap (overview on release) plus a separate click,
         // never the chord, and no drag starts. Only a clean liftoff
@@ -6709,20 +6709,20 @@ mod tests {
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
-            Ok(Some(frame(vec![finger(1, 140, 0, 0)], 0))),
-            Ok(Some(frame(vec![finger(1, 175, 0, 0)], 0))),
-            Ok(Some(frame(vec![finger(1, 175, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 40, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
             Ok(Some(frame(vec![finger(1, 150, 5, 5)], 0))),
-            Ok(Some(frame(vec![finger(1, 175, 9, 9)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 9, 9)], 0))),
             Ok(Some(frame(vec![], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             click_1: "left".into(),
             force_1: "left+super".into(),
-            sensitivity: 130,
+            sensitivity: 30,
             margin: 5,
-            force_offset: 30,
+            force_offset: 130,
             transition_mode: "cut".into(),
             combo_stagger_ms: 0,
             ..Config::default()
@@ -7053,6 +7053,120 @@ mod tests {
             x.last(),
             Some(&(EV_SYN, SYN_REPORT, 0)),
             "extras log batch-closed: {x:?}"
+        );
+    }
+
+    #[test]
+    fn full_release_goes_up_buttons_first() {
+        // Owner NIRI: super-up before left-up reads as a tap end while the
+        // button is still down (overview opens after a super+drag). A full
+        // release must put buttons up first, SYN-framed. Single sink pins
+        // global order. Continuous hold: press / force / liftoff.
+        let wire = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::new(FakeGrab::ok())),
+            SharedUinput(Arc::clone(&wire)),
+            SharedHaptic(Arc::clone(&haptic)),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            ..Config::default()
+        };
+        assert!(!cfg.is_cut_transition());
+        let t0 = std::time::Instant::now();
+        for i in 0..4 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        let evs = wire.events.lock().unwrap().clone();
+        let left_up = evs
+            .iter()
+            .rposition(|&e| e == (EV_KEY, BTN_LEFT, 0))
+            .expect("left must go up");
+        let super_up = evs
+            .iter()
+            .rposition(|&e| e == (EV_KEY, 125, 0))
+            .expect("super must go up");
+        assert!(left_up < super_up, "buttons up before modifiers: {evs:?}");
+        assert!(
+            evs[left_up..=super_up].contains(&(EV_SYN, SYN_REPORT, 0)),
+            "a SYN must frame the button-up before super-up: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn force_release_goes_up_buttons_first() {
+        // Same rule on the cut force-release path: easing off with
+        // super+left held puts left-up (SYN-framed) before super-up, then
+        // re-presses left. Single sink pins global order.
+        let wire = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::new(FakeGrab::ok())),
+            SharedUinput(Arc::clone(&wire)),
+            SharedHaptic(Arc::clone(&haptic)),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            combo_stagger_ms: 0,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        for i in 0..4 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        let evs = wire.events.lock().unwrap().clone();
+        // Ease frame: left-up (release) ... super-up ... left-down (repress).
+        let left_up = evs
+            .iter()
+            .position(|&e| e == (EV_KEY, BTN_LEFT, 0))
+            .expect("cut released left at the edge or ease");
+        // The ease release is the SECOND left-up (first was the cut edge).
+        let left_up2 = evs
+            .iter()
+            .enumerate()
+            .filter(|&(_, &e)| e == (EV_KEY, BTN_LEFT, 0))
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("ease must release left");
+        let super_up = evs
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 0))
+            .expect("ease must release super");
+        let _ = left_up;
+        assert!(left_up2 < super_up, "ease puts buttons up first: {evs:?}");
+        assert!(
+            evs[left_up2..=super_up].contains(&(EV_SYN, SYN_REPORT, 0)),
+            "a SYN must frame the button-up before super-up: {evs:?}"
         );
     }
 
