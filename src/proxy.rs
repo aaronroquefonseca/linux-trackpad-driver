@@ -684,28 +684,40 @@ where
                 self.release_slide_held();
                 self.fire_release(clicks::ClickLevel::Slide, haptic_pressure, cfg.quiet_click);
             }
-            self.press_level(ev, haptic_pressure);
+            self.press_level(ev, haptic_pressure, false);
         }
         // Press order: first then force; reporters see force (supersedes,
         // unless force is `none` — see `FrameOutcome::primary`). A press
         // edge hands off a held slide: identical key sets merge with no
-        // wire flutter, differing sets release slide keys first.
-        if edges.first.is_some() || edges.force.is_some() {
-            self.handoff_slide(&edges, was_slide.clone(), haptic_pressure, cfg.quiet_click);
-        }
+        // wire flutter, differing sets release slide keys first. An
+        // absorbed level skips its own down-pulse: the slide's pulse is
+        // adopted as its haptic debt (one down / one up per session).
+        let absorbed = if edges.first.is_some() || edges.force.is_some() {
+            self.handoff_slide(&edges, was_slide.clone(), haptic_pressure, cfg.quiet_click)
+        } else {
+            None
+        };
         if let Some(ref ev) = edges.first {
-            self.press_level(ev, haptic_pressure);
+            self.press_level(ev, haptic_pressure, absorbed == Some(ClickLevel::First));
         }
         if let Some(ref ev) = edges.force {
-            // Cut mode: release ALL level-1 wire keys first (with SYN),
-            // then press the force combo fresh — shared codes show
-            // up+SYN+down instead of staying held. Skipped for `none`
-            // (nothing to restart into) and when nothing is held.
-            if cfg.is_cut_transition() && !ev.is_none() && !self.held_first.is_empty() {
+            // Cut mode: release ALL level-1/slide wire keys first (with
+            // SYN), then press the force combo fresh — shared codes show
+            // up+SYN+down instead of staying held. Skipped for `none` /
+            // `empty` (no keys to restart into: releasing the hold for a
+            // haptic-only pulse would flutter) and when nothing is held.
+            if cfg.is_cut_transition()
+                && !ev.is_none()
+                && !ev.is_empty()
+                && !self.held_first.is_empty()
+            {
+                // No-op after a handoff (slide already absorbed/released),
+                // belt-and-braces so cut never leaves a slide hold behind.
+                self.release_slide_held();
                 self.cut_first_wire(ClickMachine::physical_button(frame.clicks));
                 self.uinput.sync();
             }
-            self.press_level(ev, haptic_pressure);
+            self.press_level(ev, haptic_pressure, absorbed == Some(ClickLevel::Force));
         }
         if edges.first.is_some() || edges.force.is_some() || edges.slide.is_some() {
             // Edge frames reconcile `BTN_LEFT` through the wire tracker
@@ -803,13 +815,16 @@ where
     }
 
     /// Press one level's edge: keys down (deduplicated across levels, see
-    /// [`ClickProxy::is_down`]) plus that level's own haptic pulse. A
-    /// one-frame jump through both levels therefore emits both pulses in
-    /// press order (first then force) — identical to staged arrival. Never
-    /// syncs: the caller emits buttons + a single `SYN` per frame.
-    /// `pressure` is the actuator pressure byte (the press threshold,
-    /// old-service parity); the event carries the intensity + waveform.
-    fn press_level(&mut self, ev: &ClickEvent, pressure: u8) {
+    /// [`ClickProxy::is_down`]) plus that level's own haptic pulse — unless
+    /// `adopted` (a slide handoff merged into this level): then the slide's
+    /// down-pulse is adopted as this level's haptic debt instead of firing
+    /// a second pulse, keeping one down / one up per session. A one-frame
+    /// jump through both levels therefore emits both pulses in press order
+    /// (first then force) — identical to staged arrival. Never syncs: the
+    /// caller emits buttons + a single `SYN` per frame. `pressure` is the
+    /// actuator pressure byte (the press threshold, old-service parity);
+    /// the event carries the intensity + waveform.
+    fn press_level(&mut self, ev: &ClickEvent, pressure: u8, adopted: bool) {
         use crate::config::ActionKind;
         let name = match ev.level {
             ClickLevel::First => "click",
@@ -821,13 +836,17 @@ where
                 log::debug!("proxy: {name}_{} = none (swallowed)", ev.finger_count);
             }
             ActionKind::Empty => {
-                let fired = self.fire_haptic(ev, pressure);
-                self.set_haptic_flag(ev.level, fired);
+                if !adopted {
+                    let fired = self.fire_haptic(ev, pressure);
+                    self.set_haptic_flag(ev.level, fired);
+                }
             }
             ActionKind::Keys(keys) => {
                 self.down_keys(keys, ev.level);
-                let fired = self.fire_haptic(ev, pressure);
-                self.set_haptic_flag(ev.level, fired);
+                if !adopted {
+                    let fired = self.fire_haptic(ev, pressure);
+                    self.set_haptic_flag(ev.level, fired);
+                }
             }
         }
     }
@@ -896,48 +915,65 @@ where
 
     /// Slide handoff on a press edge: identical slide/press key sets merge
     /// (slide wire keys move into the firing level with no ups — the hold
-    /// continues seamlessly), differing sets release slide keys first
-    /// (plus the slide up-pulse when its down pulse fired). `was_slide`
-    /// is the pre-update latch (the machine already dropped it on
-    /// handoff); callers pass it because post-update state cannot tell a
-    /// handoff from a liftoff. `pressure`/`quiet` carry the slide
-    /// up-pulse parameters.
+    /// continues seamlessly, and the slide's haptic debt transfers to that
+    /// level so its press skips a second down-pulse), differing sets
+    /// release slide keys first (plus the slide up-pulse when its down
+    /// pulse fired). Force is checked before first: when both edges fire on
+    /// one frame the superseding force level owns the merge. Returns the
+    /// absorb target, if any. `was_slide` is the pre-update latch (the
+    /// machine already dropped it on handoff); callers pass it because
+    /// post-update state cannot tell a handoff from a liftoff.
+    /// `pressure`/`quiet` carry the slide up-pulse parameters.
     fn handoff_slide(
         &mut self,
         edges: &FrameOutcome,
         was_slide: Option<ClickEvent>,
         pressure: u8,
         quiet: bool,
-    ) {
-        let Some(slide) = was_slide else {
-            return;
-        };
+    ) -> Option<ClickLevel> {
+        let slide = was_slide?;
         let first_kind = edges.first.as_ref().map(|e| &e.action.kind);
         let force_kind = edges.force.as_ref().map(|e| &e.action.kind);
         let slide_kind = &slide.action.kind;
-        if first_kind == Some(slide_kind) {
-            self.absorb_slide_into(ClickLevel::First);
-        } else if force_kind == Some(slide_kind) {
+        if force_kind == Some(slide_kind) {
             self.absorb_slide_into(ClickLevel::Force);
+            Some(ClickLevel::Force)
+        } else if first_kind == Some(slide_kind) {
+            self.absorb_slide_into(ClickLevel::First);
+            Some(ClickLevel::First)
         } else {
             self.release_slide_held();
             self.fire_release(ClickLevel::Slide, pressure, quiet);
+            None
         }
     }
 
     /// Merge held slide wire keys into the firing level with no wire
     /// traffic (same-action handoff): codes the target already recorded
-    /// are dropped to keep release accounting duplicate-free.
+    /// are dropped to keep release accounting duplicate-free. The slide's
+    /// haptic debt transfers too (OR-ed: the release owes its up-pulse
+    /// when either session pulsed), so the firing press skips its own
+    /// down-pulse — one down / one up per session, never a stale flag.
     fn absorb_slide_into(&mut self, level: ClickLevel) {
+        if matches!(level, ClickLevel::Slide) {
+            return;
+        }
+        let debt = std::mem::replace(&mut self.slide_haptic, false);
+        let moving: Vec<(u16, u16)> = std::mem::take(&mut self.held_slide);
         let target = match level {
             ClickLevel::First => &mut self.held_first,
             ClickLevel::Force => &mut self.held_force,
-            ClickLevel::Slide => return,
+            ClickLevel::Slide => unreachable!("absorb target is First/Force (guarded above)"),
         };
-        for pair in self.held_slide.drain(..) {
+        for pair in moving {
             if !target.contains(&pair) {
                 target.push(pair);
             }
+        }
+        match level {
+            ClickLevel::First => self.pressed_haptic |= debt,
+            ClickLevel::Force => self.force_haptic |= debt,
+            ClickLevel::Slide => unreachable!("absorb target is First/Force (guarded above)"),
         }
     }
 
@@ -5834,6 +5870,99 @@ mod tests {
             "seamless handoff: single pair, got {left:?}"
         );
         assert_eq!(transitions(&left), 1);
+        // One down-pulse (slide edge) / one up-pulse (full release): the
+        // absorbed press adopts the slide's debt instead of pulsing again.
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        assert_eq!(haptic.releases.lock().unwrap().as_slice(), &[(64, false)]);
+    }
+
+    #[test]
+    fn slide_handoff_force_first_absorbs_superseding_level() {
+        // Both edges on one frame, slide == force: the merge owns force
+        // (checked before first), left never ups, right presses alongside.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            slide_1: "left".into(),
+            click_1: "right".into(),
+            force_1: "left".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force(), "force supersedes in reporting");
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert!(
+            lefts.iter().all(|&v| v == 1),
+            "no left up mid-hold: {tail:?}"
+        );
+        assert!(sinks.pointer.has(EV_KEY, BTN_RIGHT, 1));
+        // Two downs (slide adopted into force + first) / two ups.
+        assert_eq!(haptic.calls.lock().unwrap().len(), 2);
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(haptic.releases.lock().unwrap().len(), 2);
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
+        assert!(sinks.pointer.has(EV_KEY, BTN_RIGHT, 0));
+    }
+
+    #[test]
+    fn transition_cut_skips_empty_force() {
+        // force_1 = empty in cut mode: haptic-only pulse must not release
+        // the held level-1 keys (nothing to restart into) and must not
+        // re-press later — no flutter.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "empty".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force() && ev.is_empty());
+        // Left never ups at the force edge; the empty pulse still fires.
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(64, 5, false), (64, 5, false)]
+        );
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
     }
 
     #[test]

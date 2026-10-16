@@ -666,12 +666,13 @@ impl ClickMachine {
         // Slide edge: unlike `none` clicks (which latch to swallow), a
         // slide `none` — the default — latches nothing and emits nothing
         // (zero behavior change unless opted in). A re-select onto an
-        // unmapped count releases the old hold with no edge; the proxy
+        // unmapped count remembers the count silently (`slide_real` set,
+        // latch empty) so later frames hold without re-parsing; the proxy
         // sees the `slide_active` transition and releases keys.
         if let Some(action) = slide_action {
             if matches!(action.kind, ActionKind::None) {
                 self.slide_active = None;
-                self.slide_real = None;
+                self.slide_real = Some(n);
             } else {
                 let ev = ClickEvent {
                     finger_count: slide_select,
@@ -1412,7 +1413,8 @@ mod tests {
         let sev = out.slide.unwrap();
         assert_eq!(sev.finger_count, 2);
         assert_eq!(sev.action.kind, ActionKind::Keys(vec!["right".to_string()]));
-        // Re-select onto an unmapped count releases silently.
+        // Re-select onto an unmapped count releases silently and remembers
+        // the count: later same-count frames hold without re-parsing.
         let cfg = Config {
             slide_1: "left".into(),
             ..Config::default()
@@ -1421,6 +1423,9 @@ mod tests {
         m.update(&[light(1, 20)], 0, &cfg).unwrap();
         let out = m.update(&[light(1, 20), light(2, 20)], 0, &cfg).unwrap();
         assert!(out.is_empty());
+        assert!(m.slide_active().is_none());
+        let out = m.update(&[light(1, 20), light(2, 20)], 0, &cfg).unwrap();
+        assert!(out.is_empty(), "remembered unmapped count never re-fires");
         assert!(m.slide_active().is_none());
     }
 

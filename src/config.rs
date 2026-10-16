@@ -495,6 +495,9 @@ impl Config {
 
     /// Raw spoof cell for (`status`, real count `n`): `0` = passthrough.
     /// `status` is `slide`/`click`/`force`; anything else returns `0`.
+    /// Values above 5 can only come from an unvalidated `Config` (validation
+    /// rejects them): debug builds assert, release falls back to `0`
+    /// (passthrough) rather than emitting a bogus count.
     pub fn spoof_cell(&self, status: &str, n: u8) -> u16 {
         let cell = match (status, n) {
             ("slide", 1) => self.spoof_slide_1,
@@ -515,6 +518,10 @@ impl Config {
             _ => 0,
         };
         if cell > 5 {
+            debug_assert!(
+                false,
+                "spoof cell {cell} out of range (validate() must reject 6..)"
+            );
             0
         } else {
             cell
