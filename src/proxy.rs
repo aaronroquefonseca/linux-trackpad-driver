@@ -681,14 +681,22 @@ where
         // Touch slots first (post-update latch is visible to buttons below;
         // the spoof map follows the live status: force > first > slide).
         self.emit_touch_frame(&frame, cfg);
-        // Slide re-select: the old session ends (keys up + up-pulse) before
-        // the new count presses. A lone slide edge just presses.
+        // Slide re-select: a count change onto a different action ends the
+        // old session (keys up + up-pulse) before the new count presses.
+        // An identical key set merges instead (latch already swapped by
+        // the machine; wire and haptic debt carry over untouched — no
+        // mid-slide flutter). A lone slide edge just presses.
         if let Some(ref ev) = edges.slide {
-            if was_slide.is_some() {
-                self.release_slide_held(ClickMachine::physical_button(frame.clicks));
-                self.fire_release(clicks::ClickLevel::Slide, haptic_pressure, cfg.quiet_click);
+            let merged = was_slide
+                .as_ref()
+                .is_some_and(|old| old.action.kind.is_same_action(&ev.action.kind));
+            if !merged {
+                if was_slide.is_some() {
+                    self.release_slide_held(ClickMachine::physical_button(frame.clicks));
+                    self.fire_release(clicks::ClickLevel::Slide, haptic_pressure, cfg.quiet_click);
+                }
+                self.press_level(ev, haptic_pressure, false);
             }
-            self.press_level(ev, haptic_pressure, false);
         }
         // Press order: first then force; reporters see force (supersedes,
         // unless force is `none` — see `FrameOutcome::primary`). A press
@@ -947,13 +955,21 @@ where
         phys_down: bool,
     ) -> Option<ClickLevel> {
         let slide = was_slide?;
-        let first_kind = edges.first.as_ref().map(|e| &e.action.kind);
-        let force_kind = edges.force.as_ref().map(|e| &e.action.kind);
         let slide_kind = &slide.action.kind;
-        if force_kind == Some(slide_kind) {
+        // Set compare (order-/dup-insensitive wire identity): `ctrl+left`
+        // merges a `left+ctrl` hold with no flutter.
+        let force_same = edges
+            .force
+            .as_ref()
+            .is_some_and(|e| e.action.kind.is_same_action(slide_kind));
+        let first_same = edges
+            .first
+            .as_ref()
+            .is_some_and(|e| e.action.kind.is_same_action(slide_kind));
+        if force_same {
             self.absorb_slide_into(ClickLevel::Force);
             Some(ClickLevel::Force)
-        } else if first_kind == Some(slide_kind) {
+        } else if first_same {
             self.absorb_slide_into(ClickLevel::First);
             Some(ClickLevel::First)
         } else {
@@ -5927,6 +5943,77 @@ mod tests {
         // absorbed press adopts the slide's debt instead of pulsing again.
         assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
         assert_eq!(haptic.releases.lock().unwrap().as_slice(), &[(64, false)]);
+    }
+
+    #[test]
+    fn slide_reselect_identical_keyset_merges() {
+        // slide_1 = slide_2 = left: a count change mid-slide keeps the
+        // wire down (latch swaps to the new count, no release-then-press).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(
+                vec![finger(1, 20, 0, 0), finger(2, 20, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            slide_1: "left".into(),
+            slide_2: "left".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(first.is_slide() && first.finger_count == 1);
+        let second = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(second.is_slide() && second.finger_count == 2);
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "identical re-select must not flutter"
+        );
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1);
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(haptic.releases.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn slide_handoff_order_swapped_keyset_merges() {
+        // slide_1 = left+ctrl, click_1 = ctrl+left: same set, different
+        // order — seamless merge, single pair per code.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            slide_1: "left+ctrl".into(),
+            click_1: "ctrl+left".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        assert!(!px
+            .handle_frame_at(&cfg, spaced_at(t0, 1))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 29), vec![1, 0]);
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1);
+        assert_eq!(haptic.releases.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -512,21 +512,26 @@ impl ClickMachine {
             None
         };
         // Slide entry/re-select: idle, no press edge this frame, someone
-        // touching, and not already holding this count. Entry needs every
-        // touching pressure at/below release (the hysteresis band is a
-        // dead zone: no slide, no press); a held slide sticks without
-        // re-parsing so noisy slides never flap.
-        let slide_wanted = cfg.any_slide_mapped()
-            && self.active.is_none()
+        // touching, and not already holding this count. Initial entry
+        // needs every touching pressure at/below release (the hysteresis
+        // band is a dead zone: no slide, no press); a held slide sticks
+        // without re-parsing so noisy slides never flap. Re-select (count
+        // change while a slide holds) skips the entry predicate: a new
+        // finger landing in the band re-selects instead of keeping a stale
+        // action (a press edge still hands off — band only, never a press).
+        let idle_no_edge = self.active.is_none()
             && self.force_active.is_none()
             && first_action.is_none()
             && force_action.is_none()
             && contacting > 0
-            && self.slide_real != Some(n)
+            && self.slide_real != Some(n);
+        let slide_entry = self.slide_active.is_none()
             && fingers
                 .iter()
                 .filter(|f| touch_present(f))
                 .all(|f| f.pressure <= release);
+        let slide_wanted =
+            cfg.any_slide_mapped() && idle_no_edge && (self.slide_active.is_some() || slide_entry);
         let slide_action = if slide_wanted {
             Some(cfg.slide_action(slide_select)?)
         } else {
@@ -1428,6 +1433,32 @@ mod tests {
         let out = m.update(&[light(1, 20), light(2, 20)], 0, &cfg).unwrap();
         assert!(out.is_empty(), "remembered unmapped count never re-fires");
         assert!(m.slide_active().is_none());
+    }
+
+    #[test]
+    fn slide_reselect_skips_band_predicate() {
+        // sensitivity 64 / margin 5: band is 60..=63. A held slide whose
+        // new finger lands in the band re-selects (no stale action); the
+        // band still blocks *initial* entry (dead zone, no press either).
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            slide_1: "left".into(),
+            slide_2: "right".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        let out = m.update(&[light(1, 20), light(2, 62)], 0, &cfg).unwrap();
+        let sev = out
+            .slide
+            .expect("band finger must re-select, not hold stale");
+        assert_eq!(sev.finger_count, 2);
+        // Fresh entry with a band finger: neither slide nor press.
+        let mut m = ClickMachine::new();
+        assert!(m.update(&[light(1, 62)], 0, &cfg).unwrap().is_empty());
+        assert!(m.slide_active().is_none());
+        assert!(m.active().is_none());
     }
 
     #[test]

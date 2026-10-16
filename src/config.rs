@@ -265,6 +265,26 @@ pub enum ActionKind {
     Keys(Vec<String>),
 }
 
+impl ActionKind {
+    /// Wire-identity compare: key sets match as sets (order- and
+    /// duplicate-insensitive, mirroring `down_keys` same-level dedup:
+    /// `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one `left`
+    /// and one `ctrl`). `Empty == Empty`; `None` only equals `None`
+    /// (a latched slide is never `None`, so handoffs only merge real
+    /// holds).
+    pub fn is_same_action(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ActionKind::None, ActionKind::None) => true,
+            (ActionKind::Empty, ActionKind::Empty) => true,
+            (ActionKind::Keys(a), ActionKind::Keys(b)) => {
+                a.iter().collect::<std::collections::HashSet<_>>()
+                    == b.iter().collect::<std::collections::HashSet<_>>()
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Parse a `click_*`/`force_*` value: `left|right|middle|back|forward|none`
 /// `|empty` or `+`-joined key names (e.g. `ctrl+c`). Case-insensitive;
 /// surrounding whitespace is ignored. Key names cover modifiers
@@ -874,6 +894,18 @@ mod tests {
         );
         assert_eq!(parse_click_action("none").unwrap().kind, ActionKind::None);
         assert_eq!(parse_click_action("EMPTY").unwrap().kind, ActionKind::Empty);
+    }
+
+    #[test]
+    fn same_action_compares_wire_identity() {
+        let keys = |s: &str| parse_click_action(s).unwrap().kind;
+        assert!(keys("left+ctrl").is_same_action(&keys("ctrl+left")));
+        assert!(keys("left+left+ctrl").is_same_action(&keys("ctrl+left")));
+        assert!(!keys("left+ctrl").is_same_action(&keys("left+shift")));
+        assert!(!keys("left").is_same_action(&keys("left+ctrl")));
+        assert!(keys("empty").is_same_action(&keys("EMPTY")));
+        assert!(!keys("empty").is_same_action(&keys("left")));
+        assert!(!keys("none").is_same_action(&keys("empty")));
     }
 
     #[test]
