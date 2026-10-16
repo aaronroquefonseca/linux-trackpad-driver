@@ -101,3 +101,56 @@ force_2 = "none"
 force_3 = "none"
 force_4 = "none"
 force_5 = "none"
+
+# -------------------------------------------------------------------------
+# Slide status (third mappable status: touch-but-not-pressed)
+#
+# A slide_N action fires/holds while exactly N fingers touch with every
+# pressure at/below the release threshold (sensitivity - margin) — i.e.
+# sliding/dragging fingers around without pressing. Defaults all "none"
+# (= no action, current behavior: slides only move the cursor).
+# Handoff: a press edge releases the slide action first, UNLESS the slide
+# and click actions are identical (same keys) — then the hold continues
+# with no release/re-press flutter. Slide fires the standard haptic pulse
+# (haptic/quiet_click) iff its action is keys/empty; "none" stays silent.
+# -------------------------------------------------------------------------
+slide_1 = "none"
+slide_2 = "none"
+slide_3 = "none"
+slide_4 = "none"
+slide_5 = "none"
+
+# -------------------------------------------------------------------------
+# Finger-count spoofing (what the COMPUTER sees)
+#
+# Each spoof_<status>_<N> overrides the reported finger count when the
+# real touching count is N under that status: 0 = passthrough (default,
+# report real), 1..=5 = report that many virtual contacts instead. The
+# virtual contacts keep the real centroid (midpoint) with the requested
+# number of contacts projected on a tiny fixed pattern around it (1 at
+# center; 2 split ±18 units on x; 3+ evenly spaced on a 24-unit-radius
+# circle — sub-millimeter at the 48/44 units/mm density, inside axis
+# ranges; template copies the first real contact's size/orientation).
+# The uinput touch stream (slots, BTN_TOOL_*) always uses the spoofed
+# count. Action selection keeps using the REAL count unless
+# spoof_select = true (then click_N/force_N/slide_N select on the
+# spoofed count too).
+# -------------------------------------------------------------------------
+# spoof_click_2 = 3
+# spoof_slide_1 = 2
+# spoof_force_1 = 1
+spoof_select = false
+
+# -------------------------------------------------------------------------
+# Level-transition mode (force edge over an active click)
+#
+# "continuous" (default, current behavior): level-1 keys stay held, force
+# keys join (shared codes go down once, up once). "cut": release ALL
+# level-1/slide keys first (with SYN), then press the force combo fresh —
+# so force_1 = left+super starts a window drag instead of extending a
+# held left. Tradeoff: continuous keeps drags alive across the force
+# edge (good for pressure-augmented clicks); cut restarts the gesture
+# (good for mode-switch combos, at the cost of a up+SYN+down flutter on
+# shared codes that dumb consumers may read as click-release-click).
+# -------------------------------------------------------------------------
+transition_mode = "continuous"
