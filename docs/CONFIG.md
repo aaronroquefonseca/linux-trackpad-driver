@@ -50,7 +50,7 @@ restart.
 | `force_3` | action string | see Action values | `"none"` | 3-finger force-level action. |
 | `force_4` | action string | see Action values | `"none"` | 4-finger force-level action. |
 | `force_5` | action string | see Action values | `"none"` | 5-finger force-level action. |
-| `slide_1` | action string | see Action values | `"none"` | 1-finger slide action (touch-but-not-pressed: contact present, every pressure at/below `sensitivity - margin`). Fires/holds while sliding; releases on liftoff, count change (re-selects when the new count maps an action), or press-edge handoff (identical slide/press key sets merge seamlessly, else slide keys release first, one SYN). Haptic: standard `haptic`/`quiet_click` pulse iff keys/`empty`; `none` (default) never latches, never pulses. Arming delay: the release frame of a click never arms slide (the latch is still held at selection time) — slide fires on the next light frame while fingers stay down. |
+| `slide_1` | action string | see Action values | `"none"` | 1-finger slide action (touch-but-not-pressed: contact present, every pressure at/below `sensitivity - margin`). Fires/holds while sliding; releases on liftoff, count change (re-selects when the new count maps an action), or press-edge handoff (identical slide/press key sets merge seamlessly, else slide keys release first, one SYN). Haptic: never — slide is just touching, so no down-pulse and no release up-pulse, not even for keys/`empty` (`slide_* = empty` is valid-but-silent: keys-nothing + haptic-nothing; prefer `none`; old configs keep working silently). Only the button levels (`click_*`, `force_*`) buzz. Arming delay: the release frame of a click never arms slide (the latch is still held at selection time) — slide fires on the next light frame while fingers stay down. |
 | `slide_2` | action string | see Action values | `"none"` | 2-finger slide action (same handoff/release semantics as `slide_1`). |
 | `slide_3` | action string | see Action values | `"none"` | 3-finger slide action (same handoff/release semantics as `slide_1`). |
 | `slide_4` | action string | see Action values | `"none"` | 4-finger slide action (same handoff/release semantics as `slide_1`). |
@@ -89,7 +89,7 @@ restart.
 
 ## Action values (`click_*`, `force_*`, `slide_*`)
 
-- `none`: no action, no haptic. `empty`: no keys, but haptic still fires.
+- `none`: no action, no haptic. `empty`: no keys, but haptic still fires on the button levels (`click_*`, `force_*`); `slide_* = empty` stays silent (valid-but-silent — prefer `none`).
 - `left | right | middle | back | forward`: mouse buttons (`back`/`forward`
   = `BTN_SIDE`/`BTN_EXTRA`, the long-standing `click_4`/`click_5` mapping).
 - Anything else: `+`-joined key combo (e.g. `ctrl+c`, `ctrl+refresh`).
