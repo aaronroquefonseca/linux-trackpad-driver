@@ -94,6 +94,71 @@ pub struct Config {
     pub force_4: String,
     #[serde(default = "default_action_none")]
     pub force_5: String,
+    /// Slide-level finger-count actions (touch-but-not-pressed: contact
+    /// present, every pressure at/below the release threshold). Defaults
+    /// all `none` (= no action, current behavior: sliding only moves the
+    /// cursor). See [`crate::clicks::ClickMachine`] for handoff semantics.
+    #[serde(default = "default_action_none")]
+    pub slide_1: String,
+    #[serde(default = "default_action_none")]
+    pub slide_2: String,
+    #[serde(default = "default_action_none")]
+    pub slide_3: String,
+    #[serde(default = "default_action_none")]
+    pub slide_4: String,
+    #[serde(default = "default_action_none")]
+    pub slide_5: String,
+    /// Finger-count spoofing: virtual count reported to the computer when
+    /// the real touching count is N under a status (`0` = passthrough,
+    /// report the real count; `1..=5` = spoof). Fifteen keys cover
+    /// slide/click/force × 1..5 (e.g. `spoof_click_2 = 3`: a real
+    /// two-finger press reports three contacts). The uinput touch stream
+    /// (slots, `BTN_TOOL_*`) always uses the spoofed count; action
+    /// selection uses the real count unless [`Config::spoof_select`].
+    /// All default `0` (passthrough: zero behavior change).
+    #[serde(default)]
+    pub spoof_slide_1: u16,
+    #[serde(default)]
+    pub spoof_slide_2: u16,
+    #[serde(default)]
+    pub spoof_slide_3: u16,
+    #[serde(default)]
+    pub spoof_slide_4: u16,
+    #[serde(default)]
+    pub spoof_slide_5: u16,
+    #[serde(default)]
+    pub spoof_click_1: u16,
+    #[serde(default)]
+    pub spoof_click_2: u16,
+    #[serde(default)]
+    pub spoof_click_3: u16,
+    #[serde(default)]
+    pub spoof_click_4: u16,
+    #[serde(default)]
+    pub spoof_click_5: u16,
+    #[serde(default)]
+    pub spoof_force_1: u16,
+    #[serde(default)]
+    pub spoof_force_2: u16,
+    #[serde(default)]
+    pub spoof_force_3: u16,
+    #[serde(default)]
+    pub spoof_force_4: u16,
+    #[serde(default)]
+    pub spoof_force_5: u16,
+    /// When true, `click_N`/`force_N`/`slide_N` selection uses the spoofed
+    /// count instead of the real one. Default false: spoofing only changes
+    /// what the computer sees, never which action fires.
+    #[serde(default)]
+    pub spoof_select: bool,
+    /// Level-transition mode on a force edge over an active click:
+    /// `"continuous"` (default, current behavior: level-1 keys stay held,
+    /// force keys join) or `"cut"` (release ALL level-1/slide keys first
+    /// with a SYN, then press the force combo fresh — so
+    /// `force_1 = left+super` starts a window drag instead of extending a
+    /// held left). Global single key; see [`crate::clicks::ClickMachine`].
+    #[serde(default = "default_transition_mode")]
+    pub transition_mode: String,
 }
 
 fn default_log_level() -> String {
@@ -126,6 +191,9 @@ fn default_click_3() -> String {
 fn default_action_none() -> String {
     "none".to_string()
 }
+fn default_transition_mode() -> String {
+    "continuous".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -151,6 +219,28 @@ impl Default for Config {
             force_3: default_action_none(),
             force_4: default_action_none(),
             force_5: default_action_none(),
+            slide_1: default_action_none(),
+            slide_2: default_action_none(),
+            slide_3: default_action_none(),
+            slide_4: default_action_none(),
+            slide_5: default_action_none(),
+            spoof_slide_1: 0,
+            spoof_slide_2: 0,
+            spoof_slide_3: 0,
+            spoof_slide_4: 0,
+            spoof_slide_5: 0,
+            spoof_click_1: 0,
+            spoof_click_2: 0,
+            spoof_click_3: 0,
+            spoof_click_4: 0,
+            spoof_click_5: 0,
+            spoof_force_1: 0,
+            spoof_force_2: 0,
+            spoof_force_3: 0,
+            spoof_force_4: 0,
+            spoof_force_5: 0,
+            spoof_select: false,
+            transition_mode: default_transition_mode(),
         }
     }
 }
@@ -173,6 +263,26 @@ pub enum ActionKind {
     Empty,
     /// One or more `+`-joined key/button names (lowercased, trimmed).
     Keys(Vec<String>),
+}
+
+impl ActionKind {
+    /// Wire-identity compare: key sets match as sets (order- and
+    /// duplicate-insensitive, mirroring `down_keys` same-level dedup:
+    /// `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one `left`
+    /// and one `ctrl`). `Empty == Empty`; `None` only equals `None`
+    /// (a latched slide is never `None`, so handoffs only merge real
+    /// holds).
+    pub fn is_same_action(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ActionKind::None, ActionKind::None) => true,
+            (ActionKind::Empty, ActionKind::Empty) => true,
+            (ActionKind::Keys(a), ActionKind::Keys(b)) => {
+                a.iter().collect::<std::collections::HashSet<_>>()
+                    == b.iter().collect::<std::collections::HashSet<_>>()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Parse a `click_*`/`force_*` value: `left|right|middle|back|forward|none`
@@ -314,9 +424,39 @@ impl Config {
             ("force_3", &self.force_3),
             ("force_4", &self.force_4),
             ("force_5", &self.force_5),
+            ("slide_1", &self.slide_1),
+            ("slide_2", &self.slide_2),
+            ("slide_3", &self.slide_3),
+            ("slide_4", &self.slide_4),
+            ("slide_5", &self.slide_5),
         ] {
             parse_click_action(value)
                 .map_err(|e| anyhow::anyhow!("invalid {key} '{value}': {e}"))?;
+        }
+        for (key, value) in [
+            ("spoof_slide_1", self.spoof_slide_1),
+            ("spoof_slide_2", self.spoof_slide_2),
+            ("spoof_slide_3", self.spoof_slide_3),
+            ("spoof_slide_4", self.spoof_slide_4),
+            ("spoof_slide_5", self.spoof_slide_5),
+            ("spoof_click_1", self.spoof_click_1),
+            ("spoof_click_2", self.spoof_click_2),
+            ("spoof_click_3", self.spoof_click_3),
+            ("spoof_click_4", self.spoof_click_4),
+            ("spoof_click_5", self.spoof_click_5),
+            ("spoof_force_1", self.spoof_force_1),
+            ("spoof_force_2", self.spoof_force_2),
+            ("spoof_force_3", self.spoof_force_3),
+            ("spoof_force_4", self.spoof_force_4),
+            ("spoof_force_5", self.spoof_force_5),
+        ] {
+            if value > 5 {
+                anyhow::bail!("invalid {key} {value} (want 0..=5, 0 = passthrough)");
+            }
+        }
+        match self.transition_mode.as_str() {
+            "continuous" | "cut" => {}
+            other => anyhow::bail!("invalid transition_mode '{other}' (want continuous|cut)"),
         }
         if self.force_offset > MAX_BYTE_VALUE {
             anyhow::bail!(
@@ -358,6 +498,99 @@ impl Config {
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
         parse_click_action(raw).map_err(|e| anyhow::anyhow!("invalid force_{n} '{raw}': {e}"))
+    }
+
+    /// True when at least one `slide_N` maps an action (string-level
+    /// check, no parse: anything but `none` — modulo case/whitespace —
+    /// counts, including values that would fail validation, so an invalid
+    /// value still reaches the parse path and errors instead of being
+    /// silently skipped). The click machine uses this to skip slide
+    /// selection entirely in the common all-`none` case.
+    pub fn any_slide_mapped(&self) -> bool {
+        [
+            &self.slide_1,
+            &self.slide_2,
+            &self.slide_3,
+            &self.slide_4,
+            &self.slide_5,
+        ]
+        .iter()
+        .any(|s| !s.trim().eq_ignore_ascii_case("none"))
+    }
+
+    /// Slide-level action for finger count `n` (`1..=5`).
+    pub fn slide_action(&self, n: u8) -> Result<ClickAction> {
+        let raw = match n {
+            1 => &self.slide_1,
+            2 => &self.slide_2,
+            3 => &self.slide_3,
+            4 => &self.slide_4,
+            5 => &self.slide_5,
+            _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
+        };
+        parse_click_action(raw).map_err(|e| anyhow::anyhow!("invalid slide_{n} '{raw}': {e}"))
+    }
+
+    /// Raw spoof cell for (`status`, real count `n`): `0` = passthrough.
+    /// `status` is `slide`/`click`/`force`; anything else returns `0`.
+    /// Values above 5 can only come from an unvalidated `Config` (validation
+    /// rejects them): debug builds assert, release falls back to `0`
+    /// (passthrough) rather than emitting a bogus count.
+    pub fn spoof_cell(&self, status: &str, n: u8) -> u16 {
+        let cell = match (status, n) {
+            ("slide", 1) => self.spoof_slide_1,
+            ("slide", 2) => self.spoof_slide_2,
+            ("slide", 3) => self.spoof_slide_3,
+            ("slide", 4) => self.spoof_slide_4,
+            ("slide", 5) => self.spoof_slide_5,
+            ("click", 1) => self.spoof_click_1,
+            ("click", 2) => self.spoof_click_2,
+            ("click", 3) => self.spoof_click_3,
+            ("click", 4) => self.spoof_click_4,
+            ("click", 5) => self.spoof_click_5,
+            ("force", 1) => self.spoof_force_1,
+            ("force", 2) => self.spoof_force_2,
+            ("force", 3) => self.spoof_force_3,
+            ("force", 4) => self.spoof_force_4,
+            ("force", 5) => self.spoof_force_5,
+            _ => 0,
+        };
+        if cell > 5 {
+            debug_assert!(
+                false,
+                "spoof cell {cell} out of range (validate() must reject 6..)"
+            );
+            0
+        } else {
+            cell
+        }
+    }
+
+    /// Virtual count the computer sees for (`status`, real count `n`):
+    /// the spoof cell when set (`1..=5`), else the real count.
+    pub fn spoofed_count(&self, status: &str, real: u8) -> u8 {
+        let cell = self.spoof_cell(status, real);
+        if (1..=5).contains(&cell) {
+            cell as u8
+        } else {
+            real
+        }
+    }
+
+    /// Count used for `*_N` action selection: the spoofed count when
+    /// [`Config::spoof_select`] is on, else the real count.
+    pub fn select_count(&self, status: &str, real: u8) -> u8 {
+        if self.spoof_select {
+            self.spoofed_count(status, real)
+        } else {
+            real
+        }
+    }
+
+    /// True when a force edge cuts level-1/slide keys first (`"cut"`);
+    /// false is `"continuous"` (default: keys stay held, force joins).
+    pub fn is_cut_transition(&self) -> bool {
+        self.transition_mode == "cut"
     }
 
     /// Whether the second pressure level is armed (`force_offset > 0`).
@@ -459,6 +692,31 @@ mod tests {
         for f in [&c.force_1, &c.force_2, &c.force_3, &c.force_4, &c.force_5] {
             assert_eq!(f, "none");
         }
+        for s in [&c.slide_1, &c.slide_2, &c.slide_3, &c.slide_4, &c.slide_5] {
+            assert_eq!(s, "none");
+        }
+        for v in [
+            c.spoof_slide_1,
+            c.spoof_slide_2,
+            c.spoof_slide_3,
+            c.spoof_slide_4,
+            c.spoof_slide_5,
+            c.spoof_click_1,
+            c.spoof_click_2,
+            c.spoof_click_3,
+            c.spoof_click_4,
+            c.spoof_click_5,
+            c.spoof_force_1,
+            c.spoof_force_2,
+            c.spoof_force_3,
+            c.spoof_force_4,
+            c.spoof_force_5,
+        ] {
+            assert_eq!(v, 0);
+        }
+        assert!(!c.spoof_select);
+        assert_eq!(c.transition_mode, "continuous");
+        assert!(!c.is_cut_transition());
         c.validate().unwrap();
         assert!(!c.force_enabled());
         // No override → falls back to standard haptic.
@@ -639,6 +897,18 @@ mod tests {
     }
 
     #[test]
+    fn same_action_compares_wire_identity() {
+        let keys = |s: &str| parse_click_action(s).unwrap().kind;
+        assert!(keys("left+ctrl").is_same_action(&keys("ctrl+left")));
+        assert!(keys("left+left+ctrl").is_same_action(&keys("ctrl+left")));
+        assert!(!keys("left+ctrl").is_same_action(&keys("left+shift")));
+        assert!(!keys("left").is_same_action(&keys("left+ctrl")));
+        assert!(keys("empty").is_same_action(&keys("EMPTY")));
+        assert!(!keys("empty").is_same_action(&keys("left")));
+        assert!(!keys("none").is_same_action(&keys("empty")));
+    }
+
+    #[test]
     fn accepts_f13_through_f24_and_rejects_f25() {
         for n in 13..=24 {
             let name = format!("f{n}");
@@ -655,6 +925,137 @@ mod tests {
             ..Config::default()
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn slide_actions_validate_like_click() {
+        let bad = Config {
+            slide_2: "bogus-key".into(),
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
+        let ok = Config {
+            slide_1: "left".into(),
+            slide_2: "ctrl+c".into(),
+            slide_3: "empty".into(),
+            ..Config::default()
+        };
+        assert!(ok.validate().is_ok());
+        assert_eq!(
+            ok.slide_action(2).unwrap().kind,
+            ActionKind::Keys(vec!["ctrl".to_string(), "c".to_string()])
+        );
+        assert_eq!(ok.slide_action(4).unwrap().kind, ActionKind::None);
+        assert!(ok.slide_action(0).is_err());
+        assert!(ok.slide_action(6).is_err());
+    }
+
+    #[test]
+    fn any_slide_mapped_short_circuits_all_none() {
+        assert!(!Config::default().any_slide_mapped());
+        let mapped = Config {
+            slide_3: "middle".into(),
+            ..Config::default()
+        };
+        assert!(mapped.any_slide_mapped());
+        // Case/whitespace variants of none still count as unmapped…
+        let noneish = Config {
+            slide_1: " NONE ".into(),
+            ..Config::default()
+        };
+        assert!(!noneish.any_slide_mapped());
+        // …while invalid values count as mapped so the parse path still
+        // errors instead of silently skipping them.
+        let bad = Config {
+            slide_1: "bogus-key".into(),
+            ..Config::default()
+        };
+        assert!(bad.any_slide_mapped());
+        let mut m = crate::clicks::ClickMachine::new();
+        assert!(m
+            .update(
+                &[crate::apple_parse::FingerContact {
+                    id: 1,
+                    x: 0,
+                    y: 0,
+                    size: 10,
+                    orientation: 0,
+                    touch_major: 8,
+                    touch_minor: 6,
+                    pressure: 20,
+                    contact: true,
+                }],
+                0,
+                &bad
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_spoof_outside_0_5() {
+        for v in [6, 9, 255] {
+            let bad = Config {
+                spoof_click_2: v,
+                ..Config::default()
+            };
+            assert!(
+                bad.validate().is_err(),
+                "spoof_click_2 = {v} must be rejected"
+            );
+        }
+        for v in [0, 1, 3, 5] {
+            let ok = Config {
+                spoof_click_2: v,
+                spoof_slide_1: v,
+                spoof_force_5: v,
+                ..Config::default()
+            };
+            assert!(ok.validate().is_ok(), "spoof = {v} must be accepted");
+        }
+    }
+
+    #[test]
+    fn spoof_cells_default_passthrough() {
+        let c = Config::default();
+        assert_eq!(c.spoofed_count("click", 2), 2);
+        assert_eq!(c.select_count("click", 2), 2);
+        let c = Config {
+            spoof_click_2: 3,
+            ..Config::default()
+        };
+        c.validate().unwrap();
+        // Wire sees 3; selection still sees the real 2 unless spoof_select.
+        assert_eq!(c.spoofed_count("click", 2), 3);
+        assert_eq!(c.select_count("click", 2), 2);
+        assert_eq!(c.spoofed_count("click", 1), 1);
+        assert_eq!(c.spoofed_count("force", 2), 2);
+        let c = Config {
+            spoof_select: true,
+            ..c
+        };
+        assert_eq!(c.select_count("click", 2), 3);
+    }
+
+    #[test]
+    fn transition_mode_validates() {
+        let c = Config::default();
+        assert!(!c.is_cut_transition());
+        let cut = Config {
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        assert!(cut.validate().is_ok());
+        assert!(cut.is_cut_transition());
+        let bad = Config {
+            transition_mode: "restart".into(),
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
+        let bad = Config {
+            transition_mode: "CUT".into(),
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err(), "mode is exact lowercase");
     }
 
     #[test]
@@ -746,6 +1147,26 @@ force_5 = "none"
             c.click_action(2).unwrap().kind,
             ActionKind::Keys(vec!["ctrl".to_string(), "c".to_string()])
         );
+    }
+
+    #[test]
+    fn parses_gesture_power_toml() {
+        let text = r#"
+slide_1 = "left"
+slide_2 = "ctrl+c"
+slide_3 = "empty"
+spoof_click_2 = 3
+spoof_slide_1 = 2
+spoof_force_1 = 1
+spoof_select = true
+transition_mode = "cut"
+"#;
+        let c: Config = toml::from_str(text).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.slide_1, "left");
+        assert_eq!(c.spoofed_count("click", 2), 3);
+        assert_eq!(c.select_count("click", 2), 3);
+        assert!(c.is_cut_transition());
     }
 
     #[test]
