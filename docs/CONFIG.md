@@ -72,6 +72,7 @@ restart.
 | `spoof_force_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 5 while the force level holds. |
 | `spoof_select` | bool | `true\|false` | `false` | When `true`, `click_N`/`force_N`/`slide_N` selection uses the spoofed count instead of the real one (the edge's finger count reports it too). `false` (default): spoofing only changes what the computer sees, never which action fires. |
 | `transition_mode` | string enum | `continuous\|cut` | `"continuous"` | Force-edge behavior over an active click. `continuous` (default, current behavior): level-1 keys stay held, force keys join (shared codes down once, up once). `cut`: release ALL level-1/slide wire keys first (with SYN), then press the force combo fresh — shared codes show up+SYN+down, so `force_1 = left+super` starts a window drag instead of extending a held left; easing back below the force release re-presses the still-latched level-1 keys. Physical-`LEFT` carve-out: while the hardware button bit (`clicks & 1`) holds `BTN_LEFT`, cut skips its key-up (same rule as every release path) — the wire stays down instead of fluttering 0-then-1 in one frame. A force edge that absorbs a same-action slide handoff skips the cut (seamless merge wins for that frame). Tradeoff: continuous keeps drags alive across the force edge; cut restarts the gesture (dumb consumers may read the shared-code flutter as click-release-click). |
+| `combo_stagger_ms` | integer (ms) | `0..=500` | `50` | Stagger between a cut fresh-press's modifier group and its button group: modifiers go down + SYN, buttons follow only after this elapses (human-scale — only super-first-then-left starts a drag on some compositors). The 5 ms cut floor always applies first, so `0` still separates release and press by ≥5 ms. Cut fresh-press only; continuous and all other presses stay simultaneous. |
 
 ## Gate semantics (`enhanced_clicks`)
 
@@ -172,6 +173,7 @@ slide_1 = "left"
 slide_2 = "middle"
 spoof_click_2 = 3
 transition_mode = "cut"
+combo_stagger_ms = 50
 ```
 
 ## Troubleshooting
