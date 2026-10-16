@@ -159,6 +159,14 @@ pub struct Config {
     /// held left). Global single key; see [`crate::clicks::ClickMachine`].
     #[serde(default = "default_transition_mode")]
     pub transition_mode: String,
+    /// Stagger between a cut fresh-press's modifier group and its button
+    /// group, in milliseconds (`0..=500`, default 50): modifiers go down +
+    /// SYN, buttons follow only after this elapses (human-scale gap — a
+    /// frame-scale simultaneous press reads as the old drag continuing).
+    /// The 5 ms cut floor always applies first, so `0` still separates
+    /// release and press by ≥5 ms. Global single key.
+    #[serde(default = "default_combo_stagger_ms")]
+    pub combo_stagger_ms: u16,
 }
 
 fn default_log_level() -> String {
@@ -193,6 +201,9 @@ fn default_action_none() -> String {
 }
 fn default_transition_mode() -> String {
     "continuous".to_string()
+}
+fn default_combo_stagger_ms() -> u16 {
+    50
 }
 
 impl Default for Config {
@@ -241,6 +252,7 @@ impl Default for Config {
             spoof_force_5: 0,
             spoof_select: false,
             transition_mode: default_transition_mode(),
+            combo_stagger_ms: default_combo_stagger_ms(),
         }
     }
 }
@@ -457,6 +469,12 @@ impl Config {
         match self.transition_mode.as_str() {
             "continuous" | "cut" => {}
             other => anyhow::bail!("invalid transition_mode '{other}' (want continuous|cut)"),
+        }
+        if self.combo_stagger_ms > 500 {
+            anyhow::bail!(
+                "invalid combo_stagger_ms {} (want 0..=500)",
+                self.combo_stagger_ms
+            );
         }
         if self.force_offset > MAX_BYTE_VALUE {
             anyhow::bail!(
@@ -1056,6 +1074,23 @@ mod tests {
             ..Config::default()
         };
         assert!(bad.validate().is_err(), "mode is exact lowercase");
+    }
+
+    #[test]
+    fn combo_stagger_ms_defaults_and_validates() {
+        assert_eq!(Config::default().combo_stagger_ms, 50);
+        for ok in [0, 50, 500] {
+            let c = Config {
+                combo_stagger_ms: ok,
+                ..Config::default()
+            };
+            assert!(c.validate().is_ok(), "{ok} must validate");
+        }
+        let bad = Config {
+            combo_stagger_ms: 501,
+            ..Config::default()
+        };
+        assert!(bad.validate().is_err());
     }
 
     #[test]
