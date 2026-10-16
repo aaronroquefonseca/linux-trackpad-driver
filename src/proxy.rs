@@ -6645,6 +6645,75 @@ mod tests {
     }
 
     #[test]
+    fn transition_cut_full_cycle_pairs_super_and_hides_taps_under_hold() {
+        // Niri overview audit: super must pair exactly (one down/up) across
+        // a full cut cycle under physical hold, and taps made while the
+        // hardware button stays held must emit ZERO button traffic — the
+        // wire already reads held-down, so there is no fresh click for a
+        // compositor to dismiss on (same as a held physical mouse button).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 1))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![], 1))),
+            Ok(Some(frame(vec![], 0))),
+            Ok(Some(frame(vec![], 1))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 1))),
+            Ok(Some(frame(vec![], 1))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        for i in 0..6 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        // Full cycle: press / cut-break / deferred press / ease-repress /
+        // liftoff-under-hold / physical release. Super pairs exactly once.
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1, 0, 1, 0],
+            "full cycle under hold: {:?}",
+            sinks.pointer.events.lock().unwrap()
+        );
+        assert_eq!(
+            key_values(&sinks.extras, 125),
+            vec![1, 0],
+            "super pairs exactly once: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
+        // Taps under a held physical button: physical re-press owns its own
+        // down, but the pad tap itself adds no button traffic — no fresh
+        // click exists on the wire to dismiss on.
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 6)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 7)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 8)).unwrap();
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(
+            lefts,
+            vec![1],
+            "only the physical re-press itself; tap adds nothing: {tail:?}"
+        );
+    }
+
+    #[test]
     fn cut_force_press_staggers_super_then_left_on_one_wire() {
         // Owner HW: Mutter needs super held (framed) BEFORE left lands —
         // same-frame simultaneous downs read as one gesture. A single sink
