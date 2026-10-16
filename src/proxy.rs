@@ -69,10 +69,21 @@
 //!   fresh, so shared codes show up+SYN+down; easing back below the force
 //!   release re-presses the still-latched level-1 keys (one SYN frame, so
 //!   the restart reads as up/down pairs, never a stuck key). Skipped for
-//!   `none`/`empty` force actions, when nothing is held, while the
-//!   physical button holds `BTN_LEFT` (wire stays down, no 0-then-1
-//!   flutter), and when the edge absorbed a slide handoff (seamless
-//!   merge wins for that frame).
+//!   `none`/`empty` force actions, when nothing is held, and when the
+//!   edge absorbed a slide handoff (seamless merge wins for that frame).
+//!   Cut ALWAYS emits the release — even under a physically-held
+//!   `BTN_LEFT` (the visible break is the entire point of cut; the
+//!   physical carve-out stays continuous-only). The release lands on the
+//!   edge frame and the fresh press on a later frame once a 5 ms floor
+//!   elapses (clock-gated, not frame-counted): a same-frame up+SYN+down
+//!   reads as one gesture downstream and the drag never restarts (owner
+//!   HW). The fresh press itself stages modifiers-first (super down + SYN,
+//!   then left down `combo_stagger_ms` later — human-scale; only
+//!   super-first-then-left starts a drag on some compositors). A force
+//!   latch that vanishes before the press lands drops the pending press
+//!   cleanly. Continuous
+//!   skips the cut while the physical button holds `BTN_LEFT` (wire
+//!   stays down, no 0-then-1 flutter).
 //! - Slide level (`slide_1..=slide_5`, default `none`): the proxy holds a
 //!   third key set while fingers slide below the press threshold. Touch is
 //!   silent: slide edges never fire a haptic pulse (down or release), not
@@ -108,6 +119,13 @@ pub const EV_ABS: u16 = 0x03;
 /// Deliberately never used: no 2026 consumer (RESEARCH §6). Pinned by test.
 pub const EV_FF: u16 = 0x15;
 pub const SYN_REPORT: u16 = 0;
+/// Single-touch absolute position (owner sysfs 2026-10-17: the physical
+/// Apple nodes advertise `ABS_X`/`ABS_Y` alongside the MT slots, and
+/// libinput requires them for pointer/touchpad classification — without
+/// them button presses never reach compositor pointer bindings while
+/// motion still leaks through). Same ranges/density as the MT positions.
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
 pub const ABS_MT_SLOT: u16 = 47;
 pub const ABS_MT_TOUCH_MAJOR: u16 = 48;
 pub const ABS_MT_TOUCH_MINOR: u16 = 49;
@@ -399,6 +417,14 @@ impl From<&Config> for ProxySettings {
     }
 }
 
+/// Minimum gap between a cut-mode release SYN and the deferred fresh press
+/// (see [`ClickProxy::pending_force`]). Owner HW: an 11 us-apart up+down
+/// coalesces into the still-running drag (Mutter never starts drag #2);
+/// 5 ms is imperceptible and safely two gestures. Enforced on the
+/// monotonic frame clock, not frame counts — a fast next frame must not
+/// collapse the gap.
+const CUT_REPRESS_GAP: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// evdev-grab + uinput click proxy. Generic over injectable backends so unit
 /// tests run without hardware.
 pub struct ClickProxy<G, U, H, S> {
@@ -439,6 +465,34 @@ pub struct ClickProxy<G, U, H, S> {
     /// Same for the live force-level latch (`force_haptic_triggered`).
     /// The slide level never pulses (touch is silent): no flag, no debt.
     force_haptic: bool,
+    /// Cut-mode deferred force press: the force edge (frame N) emits the
+    /// level-1/slide release + SYN, the fresh force-combo modifiers land
+    /// once `now - released_at >= CUT_REPRESS_GAP` (5 ms floor on the
+    /// monotonic clock, not frame counts), and the buttons follow once
+    /// `now - mods_at >= combo_stagger_ms` (human-scale — only
+    /// super-first-then-left starts a drag on some compositors). The
+    /// release, modifiers and buttons must read as distinct gestures
+    /// downstream. If the force latch vanishes before the press lands
+    /// (liftoff/ease-off), the pending press is dropped: its keys never
+    /// went down, so there is nothing to release and nothing dangles.
+    pending_force: Option<PendingForcePress>,
+}
+
+/// One staged cut-press key group (modifiers or buttons): wire pairs in
+/// emit order.
+type KeyGroup = Vec<(u16, u16)>;
+
+/// A cut-mode force press waiting for its gap-gated frames (see
+/// [`ClickProxy::pending_force`]). `released_at` is the edge frame's
+/// clock: the modifier group lands once `now - released_at >=
+/// CUT_REPRESS_GAP`. `mods_at` is the modifiers' clock once they land:
+/// the button group follows once `now - mods_at >= combo_stagger_ms`
+/// (human-scale gap).
+#[derive(Debug, Clone)]
+struct PendingForcePress {
+    ev: ClickEvent,
+    released_at: std::time::Instant,
+    mods_at: Option<std::time::Instant>,
 }
 
 impl<G, U, H, S> ClickProxy<G, U, H, S>
@@ -468,6 +522,7 @@ where
             btn_left_down: false,
             pressed_haptic: false,
             force_haptic: false,
+            pending_force: None,
         }
     }
 
@@ -518,6 +573,7 @@ where
             self.machine.reset();
             self.pressed_haptic = false;
             self.force_haptic = false;
+            self.pending_force = None;
             self.last_pos.clear();
             self.attached = false;
             self.attached_node = None;
@@ -604,6 +660,7 @@ where
         self.machine.reset();
         self.pressed_haptic = false;
         self.force_haptic = false;
+        self.pending_force = None;
         self.last_pos.clear();
         self.max_slot = 0;
         self.attached = false;
@@ -709,18 +766,28 @@ where
         } else {
             None
         };
+        // Cut-mode deferred press (two stages, chronological: the deferred
+        // edge is older than this frame's own presses).
+        self.flush_cut_pending(cfg, haptic_pressure, now);
         if let Some(ref ev) = edges.first {
             self.press_level(ev, haptic_pressure);
         }
         if let Some(ref ev) = edges.force {
             // Cut mode: release ALL level-1/slide wire keys first (with
-            // SYN), then press the force combo fresh — shared codes show
-            // up+SYN+down instead of staying held. Skipped for `none` /
-            // `empty` (no keys to restart into: releasing the hold for a
-            // haptic-only pulse would flutter), when nothing is held, and
-            // when this frame absorbed a slide (the seamless handoff just
-            // merged those keys: cutting them would reintroduce the
-            // flutter the handoff avoided).
+            // SYN) on the edge frame; the fresh force combo follows in two
+            // clock-gated stages — modifiers once the 5 ms floor elapses,
+            // buttons `combo_stagger_ms` after the modifiers (human-scale:
+            // only super-first-then-left starts a drag on some
+            // compositors). The split is the point: a same-frame
+            // up+SYN+down lands ~11 us apart and the compositor merges it
+            // into the still-running drag (owner HW: overview opens, drag
+            // never starts). If the force latch vanishes before the press
+            // lands, the pending press drops cleanly (its keys never went
+            // down). Skipped for `none` / `empty` (no keys to restart into:
+            // releasing the hold for a haptic-only pulse would flutter),
+            // when nothing is held, and when this frame absorbed a slide
+            // (the seamless handoff just merged those keys: cutting them
+            // would reintroduce the flutter the handoff avoided).
             if cfg.is_cut_transition()
                 && !ev.is_none()
                 && !ev.is_empty()
@@ -729,19 +796,30 @@ where
             {
                 // No-op after a handoff (slide already absorbed/released),
                 // belt-and-braces so cut never leaves a slide hold behind.
-                self.release_slide_held(ClickMachine::physical_button(frame.clicks));
-                self.cut_first_wire(ClickMachine::physical_button(frame.clicks));
+                // Cut bypasses the physical carve-out (`false`): the visible
+                // break is the entire point of cut, and the user
+                // physically holds the click essentially always.
+                self.release_slide_held(false);
+                self.cut_first_wire();
                 self.uinput.sync();
+                self.pending_force = Some(PendingForcePress {
+                    ev: ev.clone(),
+                    released_at: now,
+                    mods_at: None,
+                });
+            } else {
+                self.press_level(ev, haptic_pressure);
             }
-            self.press_level(ev, haptic_pressure);
         }
         if edges.first.is_some() || edges.force.is_some() || edges.slide.is_some() {
             // Edge frames reconcile `BTN_LEFT` through the wire tracker
-            // (emits only on change — `press_level` already put fresh
-            // downs on the wire). Exactly one SYN per handled frame
-            // either way — except cut-mode force edges, which already
-            // synced once between the level-1 release and the fresh
-            // force press: `press_level` never syncs itself.
+            // (emits only on change — fresh downs already went out above,
+            // except a cut-mode force edge whose press is deferred to the
+            // next frame: the release went out with its SYN, and the
+            // reconcile below is a no-op, never a flutter).
+            // `press_level` never syncs itself; exactly one trailing SYN
+            // per handled frame — except a cut-mode force edge, which
+            // already synced once after the level-1 release.
             self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
             self.uinput.sync();
             return Ok(edges.primary());
@@ -876,42 +954,216 @@ where
     /// Key-down half of [`ClickProxy::press_level`]: emits fresh downs
     /// (deduplicated via [`ClickProxy::is_down`]) and records them on the
     /// level's held set for release accounting. `BTN_LEFT` goes through
-    /// the wire tracker (see [`ClickProxy::emit_btn_left`]).
+    /// the wire tracker (see [`ClickProxy::emit_btn_left`]). Extras-routed
+    /// codes (modifiers, combos) emit before pointer-routed buttons, stable
+    /// within each route — the compositor must see e.g. super held when
+    /// left lands (window-drag), regardless of config order (`left+super`
+    /// vs `super+left`). Simultaneous within one frame (continuous mode and
+    /// all non-cut presses keep this); the cut fresh-press staggers instead
+    /// (see [`ClickProxy::down_keys_staggered`]).
     fn down_keys(&mut self, keys: &[String], level: ClickLevel) {
+        let mut pairs = Self::resolve_keys(keys);
+        // Stable: extras first, pointer buttons second.
+        pairs.sort_by_key(|&(ty, code)| {
+            u8::from(matches!(split_route(ty, code), SplitRoute::Pointer))
+        });
+        for pair in pairs {
+            self.emit_key_down(pair, level);
+        }
+    }
+
+    /// Cut fresh-press key-downs for one stage: modifiers first as SEPARATE
+    /// steps — the extras-routed group goes down + `SYN`, then the
+    /// pointer-routed group goes down. Same-frame simultaneous combo downs
+    /// read as an extension of the old drag downstream (owner HW: drag never
+    /// restarts); the framed modifier-first order gives Mutter the modifier
+    /// established before the button that starts the move-drag.
+    /// Single-group actions behave exactly like [`ClickProxy::down_keys`]
+    /// (no stray `SYN`). Only the cut fresh-press stages this way (see
+    /// [`ClickProxy::flush_cut_pending`); continuous and all other presses
+    /// stay simultaneous.
+    fn down_keys_staggered(&mut self, keys: &[String], level: ClickLevel) {
+        let pairs = Self::resolve_keys(keys);
+        let (mods, btns): (Vec<_>, Vec<_>) = pairs
+            .into_iter()
+            .partition(|&(ty, code)| !matches!(split_route(ty, code), SplitRoute::Pointer));
+        for pair in &mods {
+            self.emit_key_down(*pair, level);
+        }
+        if !mods.is_empty() && !btns.is_empty() {
+            self.uinput.sync();
+        }
+        for pair in &btns {
+            self.emit_key_down(*pair, level);
+        }
+    }
+
+    /// Resolve action tokens to wire pairs (unknown tokens log + skip).
+    fn resolve_keys(keys: &[String]) -> Vec<(u16, u16)> {
+        let mut pairs = Vec::with_capacity(keys.len());
         for k in keys {
             match key_token_to_code(k) {
-                Some((ty, code)) => {
-                    let pair = (ty, code);
-                    // Skip the re-emit when another level already holds
-                    // the code down, but still record it in this level's
-                    // set so release accounting stays per-level.
-                    // `BTN_LEFT` goes through the wire tracker instead: it
-                    // is already down when the physical bit holds it, and
-                    // a duplicate down is redundant traffic the tracker
-                    // exists to remove.
-                    if pair == (EV_KEY, BTN_LEFT) {
-                        if !self.btn_left_down {
-                            self.uinput.emit(ty, code, 1);
-                            self.btn_left_down = true;
-                        }
-                    } else if !self.is_down(pair) {
-                        self.uinput.emit(ty, code, 1);
-                    }
-                    let held = match level {
-                        ClickLevel::First => &mut self.held_first,
-                        ClickLevel::Force => &mut self.held_force,
-                        ClickLevel::Slide => &mut self.held_slide,
-                    };
-                    // Same-level dedup: a handoff-absorbed code is already
-                    // recorded (one up per code on release); cross-level
-                    // sharing still records per level.
-                    if !held.contains(&pair) {
-                        held.push(pair);
-                    }
-                }
+                Some(pair) => pairs.push(pair),
                 None => log::warn!("proxy: no keycode for '{k}', skipped"),
             }
         }
+        pairs
+    }
+
+    /// One key-down: emit unless already down elsewhere (per-level record
+    /// always, so release accounting stays per-level). `BTN_LEFT` goes
+    /// through the wire tracker instead of a duplicate down.
+    fn emit_key_down(&mut self, pair: (u16, u16), level: ClickLevel) {
+        let (ty, code) = pair;
+        // Skip the re-emit when another level already holds
+        // the code down, but still record it in this level's
+        // set so release accounting stays per-level.
+        // `BTN_LEFT` goes through the wire tracker instead: it
+        // is already down when the physical bit holds it, and
+        // a duplicate down is redundant traffic the tracker
+        // exists to remove.
+        if pair == (EV_KEY, BTN_LEFT) {
+            if !self.btn_left_down {
+                self.uinput.emit(ty, code, 1);
+                self.btn_left_down = true;
+            }
+        } else if !self.is_down(pair) {
+            self.uinput.emit(ty, code, 1);
+        }
+        let held = match level {
+            ClickLevel::First => &mut self.held_first,
+            ClickLevel::Force => &mut self.held_force,
+            ClickLevel::Slide => &mut self.held_slide,
+        };
+        // Same-level dedup: a handoff-absorbed code is already
+        // recorded (one up per code on release); cross-level
+        // sharing still records per level.
+        if !held.contains(&pair) {
+            held.push(pair);
+        }
+    }
+
+    /// Cut fresh-press for single-group actions (modifiers-only or
+    /// buttons-only): one stage, simultaneous, framed by the caller's syncs
+    /// exactly like [`ClickProxy::down_keys`] — plus the level's own haptic
+    /// pulse (as in [`ClickProxy::press_level`]). Mixed actions never come
+    /// here (they stage through [`ClickProxy::flush_cut_pending`]).
+    fn press_cut_combo(&mut self, ev: &ClickEvent, pressure: u8) {
+        use crate::config::ActionKind;
+        match &ev.action.kind {
+            ActionKind::None => {
+                log::debug!("proxy: force_{} = none (swallowed)", ev.finger_count);
+            }
+            ActionKind::Empty => {
+                self.pulse_cut_haptic(ev, pressure);
+            }
+            ActionKind::Keys(keys) => {
+                self.down_keys_staggered(keys, ev.level);
+                self.pulse_cut_haptic(ev, pressure);
+            }
+        }
+    }
+
+    /// The level's own haptic pulse for a cut staged press.
+    fn pulse_cut_haptic(&mut self, ev: &ClickEvent, pressure: u8) {
+        let fired = self.fire_haptic(ev, pressure);
+        self.set_haptic_flag(ev.level, fired);
+    }
+
+    /// Split a force action's keys into (modifiers, buttons): extras-routed
+    /// first group, pointer-routed second. Non-key actions yield two empty
+    /// groups (cut never stores those; defensive).
+    fn partition_cut_keys(ev: &ClickEvent) -> (KeyGroup, KeyGroup) {
+        use crate::config::ActionKind;
+        match &ev.action.kind {
+            ActionKind::Keys(keys) => Self::resolve_keys(keys)
+                .into_iter()
+                .partition(|&(ty, code)| !matches!(split_route(ty, code), SplitRoute::Pointer)),
+            _ => (Vec::new(), Vec::new()),
+        }
+    }
+
+    /// Land a pending cut fresh-press in clock-gated stages. Drops the
+    /// pending press when the force latch already vanished (liftoff/ease-off
+    /// before the press lands): its keys never went down, so there is
+    /// nothing to release. Lands before this frame's own presses
+    /// (chronological: the deferred edge is older).
+    ///
+    /// Stage 1 (modifiers): once `now - released_at >= CUT_REPRESS_GAP`
+    /// (5 ms floor, clock-gated not frame-counted). Single-group actions
+    /// finish here via [`ClickProxy::press_cut_combo`].
+    ///
+    /// Stage 2 (buttons): once `now - mods_at >= combo_stagger_ms`
+    /// (human-scale; `0` lands both stages in one frame, still ≥5 ms after
+    /// the release). The haptic pulse fires with stage 1 (earliest feedback
+    /// for the threshold crossing).
+    fn flush_cut_pending(&mut self, cfg: &Config, pressure: u8, now: std::time::Instant) {
+        if self.machine.force_active().is_none() {
+            // Traced at debug with the survived time — a press that never
+            // survives the floor shows here, which distinguishes
+            // hold-instability from node/routing loss.
+            if let Some(pending) = self.pending_force.take() {
+                log::debug!(
+                    "proxy: cut pending force press dropped (latch gone after {}ms, floor {}ms)",
+                    now.saturating_duration_since(pending.released_at)
+                        .as_millis(),
+                    CUT_REPRESS_GAP.as_millis()
+                );
+            }
+            return;
+        }
+        let Some((ev, released_at)) = self
+            .pending_force
+            .as_ref()
+            .map(|p| (p.ev.clone(), p.released_at))
+        else {
+            return;
+        };
+        let mods_done = self
+            .pending_force
+            .as_ref()
+            .is_some_and(|p| p.mods_at.is_some());
+        // Stage 1 (modifiers): once the 5 ms floor elapses. Single-group
+        // actions finish here via [`ClickProxy::press_cut_combo`].
+        if !mods_done {
+            if now.saturating_duration_since(released_at) < CUT_REPRESS_GAP {
+                return;
+            }
+            let (mods, btns) = Self::partition_cut_keys(&ev);
+            if mods.is_empty() || btns.is_empty() {
+                self.press_cut_combo(&ev, pressure);
+                self.pending_force = None;
+                return;
+            }
+            for pair in &mods {
+                self.emit_key_down(*pair, ev.level);
+            }
+            self.uinput.sync();
+            self.pulse_cut_haptic(&ev, pressure);
+            if let Some(pending) = self.pending_force.as_mut() {
+                pending.mods_at = Some(now);
+            }
+        }
+        // Stage 2 (buttons): once `combo_stagger_ms` elapsed since the
+        // modifiers — same frame when the stagger is 0.
+        let mods_at = self.pending_force.as_ref().and_then(|p| p.mods_at);
+        if let Some(t) = mods_at {
+            if now.saturating_duration_since(t) >= Self::cut_stagger(cfg) {
+                let (_, btns) = Self::partition_cut_keys(&ev);
+                for pair in &btns {
+                    self.emit_key_down(*pair, ev.level);
+                }
+                self.pending_force = None;
+            }
+        }
+        // Else: stagger not elapsed — the buttons wait for a later frame.
+    }
+
+    /// Effective button stagger for the cut fresh-press: the configured
+    /// `combo_stagger_ms` (the 5 ms release→modifiers floor already applied
+    /// upstream, so `0` keeps release→press ≥5 ms).
+    fn cut_stagger(cfg: &Config) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(cfg.combo_stagger_ms))
     }
 
     /// Re-press the still-latched level-1 combo after a cut-mode force
@@ -1130,16 +1382,17 @@ where
     }
 
     /// Cut-mode release of level-1 wire keys on a force edge: every
-    /// `held_first` code goes up (physical-bit rule as
-    /// [`ClickProxy::release_held`]) and the vec clears, so the force
-    /// press re-downs shared codes fresh (up+SYN+down on the wire). The
-    /// first-level latch stays latched in the machine — only the wire
-    /// restarts. The caller syncs between this and the force press.
-    fn cut_first_wire(&mut self, phys_down: bool) {
+    /// `held_first` code goes up and the vec clears, so the force press
+    /// re-downs shared codes fresh (up+SYN+down on the wire). ALWAYS emits
+    /// — even under a physically-held `BTN_LEFT`: the visible break is the
+    /// entire point of cut (continuous keeps the carve-out in
+    /// [`ClickProxy::release_held`]). The first-level latch stays latched
+    /// in the machine — only the wire restarts. The caller syncs between
+    /// this and the force press; the edge-frame [`ClickProxy::emit_btn_left`]
+    /// reconciliation after the fresh press is then a no-op (wire already
+    /// down again), never a flutter.
+    fn cut_first_wire(&mut self) {
         for (ty, code) in std::mem::take(&mut self.held_first) {
-            if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
-                continue; // physical still holds it; wire stays down
-            }
             self.uinput.emit(ty, code, 0);
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 self.btn_left_down = false;
@@ -1200,12 +1453,18 @@ where
         let present_count = fingers.iter().filter(|f| clicks::touch_present(f)).count();
         let any_touch = present_count > 0;
         let n = fingers.len().min(16);
+        // Single-touch position mirrors the first touching contact (slot 0);
+        // skipped with no contacts (last position stands, as on hardware).
+        let mut first_xy: Option<(i32, i32)> = None;
         for (slot, f) in fingers.iter().take(16).enumerate() {
             self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32);
             if clicks::touch_present(f) {
                 self.uinput
                     .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id));
                 let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.speed);
+                if first_xy.is_none() {
+                    first_xy = Some((sx, sy));
+                }
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx);
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy);
                 self.uinput
@@ -1232,6 +1491,10 @@ where
             }
         }
         self.max_slot = n.saturating_sub(1);
+        if let Some((sx, sy)) = first_xy {
+            self.uinput.emit(EV_ABS, ABS_X, sx);
+            self.uinput.emit(EV_ABS, ABS_Y, sy);
+        }
         // Drop stale motion anchors: ids absent from this frame must not
         // anchor a future delta (stale-anchor jump on id reuse). Evict on
         // every frame, not only the empty one. Anchors key on the EMITTED
@@ -1452,12 +1715,17 @@ pub enum UinputRole {
 /// Positions use the old-service Trackpad2 dimensions WITH the
 /// old-service physical density ([`POSITION_RES_X`]/[`POSITION_RES_Y`]):
 /// libinput needs nonzero resolution to scale slot motion into cursor
-/// motion. Touch major/minor mirror the old-service 0..1020 axes.
+/// motion. `ABS_X`/`ABS_Y` mirror the first touching contact (slot 0)
+/// with the same ranges/density — the physical nodes advertise them and
+/// libinput requires them for pointer classification. Touch major/minor
+/// mirror the old-service 0..1020 axes.
 /// Deviations from old, documented: pressure range 0..253 (not 0..255,
 /// the kernel `absmax`) and resolution fixed at the 1:1 density (old
 /// varies it with speed; speed here applies once, in software).
 pub fn uinput_abs_setup() -> Vec<(u16, i32, i32, i32)> {
     vec![
+        (ABS_X, -3678, 3934, POSITION_RES_X),
+        (ABS_Y, -2478, 2587, POSITION_RES_Y),
         (ABS_MT_SLOT, 0, 15, 0),
         (ABS_MT_TRACKING_ID, 0, 65535, 0),
         (ABS_MT_POSITION_X, -3678, 3934, POSITION_RES_X),
@@ -2663,6 +2931,66 @@ mod tests {
     }
 
     #[test]
+    fn single_touch_xy_mirrors_slot_zero_and_skips_empty_frames() {
+        // Owner sysfs: physical nodes advertise ABS_X/Y; libinput requires
+        // them for pointer classification. Each touching frame carries
+        // ABS_X/Y equal to slot 0's MT position; empty frames carry none
+        // (last position stands, as on hardware).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 110, 70)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        let m0 = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let f0: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[m0..].to_vec();
+        let mt_x = f0
+            .iter()
+            .find(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|&(_, _, v)| v)
+            .expect("slot has MT X");
+        let mt_y = f0
+            .iter()
+            .find(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_Y)
+            .map(|&(_, _, v)| v)
+            .expect("slot has MT Y");
+        assert!(
+            f0.contains(&(EV_ABS, ABS_X, mt_x)),
+            "ABS_X mirrors slot 0: {f0:?}"
+        );
+        assert!(
+            f0.contains(&(EV_ABS, ABS_Y, mt_y)),
+            "ABS_Y mirrors slot 0: {f0:?}"
+        );
+        // Motion frame: X/Y track slot 0 again (changed values).
+        let m1 = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        let f1: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[m1..].to_vec();
+        assert!(
+            f1.iter().any(|&(t, c, _)| t == EV_ABS && c == ABS_X),
+            "motion frame carries ABS_X: {f1:?}"
+        );
+        assert!(
+            f1.iter().any(|&(t, c, _)| t == EV_ABS && c == ABS_Y),
+            "motion frame carries ABS_Y: {f1:?}"
+        );
+        // Empty frame: no X/Y (and no slots either).
+        let m2 = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        let f2: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[m2..].to_vec();
+        assert!(
+            !f2.iter()
+                .any(|&(t, c, _)| t == EV_ABS && (c == ABS_X || c == ABS_Y)),
+            "empty frame carries no X/Y: {f2:?}"
+        );
+    }
+
+    #[test]
     fn pressure_normalized_orientation_negated_on_wire() {
         assert_eq!(crate::apple_parse::PRESSURE_VALID_MAX, 253);
         let sinks = TestSinks::new();
@@ -2768,6 +3096,11 @@ mod tests {
         let get = |code: u16| abs.iter().find(|(c, _, _, _)| *c == code).unwrap();
         assert_eq!(get(ABS_MT_SLOT), &(ABS_MT_SLOT, 0, 15, 0));
         assert_eq!(get(ABS_MT_PRESSURE), &(ABS_MT_PRESSURE, 0, 253, 0));
+        // Single-touch position mirrors the MT ranges/density (owner sysfs:
+        // the physical nodes advertise ABS_X/Y; libinput requires them for
+        // pointer classification).
+        assert_eq!(get(ABS_X), &(ABS_X, -3678, 3934, POSITION_RES_X));
+        assert_eq!(get(ABS_Y), &(ABS_Y, -2478, 2587, POSITION_RES_Y));
         assert_eq!(get(ABS_MT_TOUCH_MAJOR), &(ABS_MT_TOUCH_MAJOR, 0, 1020, 0));
         assert_eq!(get(ABS_MT_TOUCH_MINOR), &(ABS_MT_TOUCH_MINOR, 0, 1020, 0));
         // Physical density: libinput scales slot motion by this.
@@ -3019,6 +3352,8 @@ mod tests {
         // MT axes + the 9 pointer codes → pointer node; SYN → both;
         // every other KEY (letters, modifiers, media, back/forward, app
         // keys) → extras node.
+        assert_eq!(split_route(EV_ABS, ABS_X), SplitRoute::Pointer);
+        assert_eq!(split_route(EV_ABS, ABS_Y), SplitRoute::Pointer);
         assert_eq!(split_route(EV_ABS, ABS_MT_SLOT), SplitRoute::Pointer);
         assert_eq!(split_route(EV_ABS, ABS_MT_POSITION_X), SplitRoute::Pointer);
         assert_eq!(split_route(EV_ABS, ABS_MT_TRACKING_ID), SplitRoute::Pointer);
@@ -4578,8 +4913,11 @@ mod tests {
     /// points at the open bug instead of a bare code number.
     const KEY_MINUS: u16 = 12;
 
-    /// Every `EV_ABS` code the proxy may ever emit (MT slot block only).
-    const ALLOWED_ABS: [u16; 8] = [
+    /// Every `EV_ABS` code the proxy may ever emit (single-touch position
+    /// plus the MT slot block).
+    const ALLOWED_ABS: [u16; 10] = [
+        ABS_X,
+        ABS_Y,
         ABS_MT_SLOT,
         ABS_MT_TRACKING_ID,
         ABS_MT_POSITION_X,
@@ -4607,7 +4945,7 @@ mod tests {
 
     /// Assert the COMPLETE wire stream uses only expected codes:
     /// - `EV_SYN` is exactly `(SYN_REPORT, 0)`;
-    /// - `EV_ABS` is one of the eight MT codes;
+    /// - `EV_ABS` is one of the ten position/slot codes;
     /// - `EV_KEY` is in `allowed_keys` or a `BTN_TOOL_*` classification
     ///   bit, with value 0/1 (the action-code guard is the primary net;
     ///   the extra `KEY_MINUS` assert below is a redundant pin);
@@ -4706,6 +5044,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 10),
+            (EV_ABS, ABS_Y, 20),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4724,6 +5064,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 15),
+            (EV_ABS, ABS_Y, 25),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4741,6 +5083,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 15),
+            (EV_ABS, ABS_Y, 25),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4833,6 +5177,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 0),
+            (EV_ABS, ABS_Y, 0),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4849,6 +5195,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 0),
+            (EV_ABS, ABS_Y, 0),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4864,6 +5212,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 0),
+            (EV_ABS, ABS_Y, 0),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -5245,6 +5595,8 @@ mod tests {
                 (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
                 (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
                 (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_X, 10),
+                (EV_ABS, ABS_Y, 20),
             ]
         };
         let tool_finger = || -> Vec<(u16, u16, i32)> {
@@ -5340,6 +5692,8 @@ mod tests {
                 (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
                 (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
                 (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_X, x0),
+                (EV_ABS, ABS_Y, y0),
             ]
         };
         let tool_double = || -> Vec<(u16, u16, i32)> {
@@ -5454,6 +5808,8 @@ mod tests {
                 (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
                 (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
                 (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_X, 0),
+                (EV_ABS, ABS_Y, 0),
             ]
         };
         let tool_triple = || -> Vec<(u16, u16, i32)> {
@@ -6260,13 +6616,18 @@ mod tests {
 
     #[test]
     fn transition_cut_restarts_force_combo() {
-        // Cut mode: the force edge releases left first (with SYN), then
-        // presses left+super fresh — up+SYN+down on the shared code.
+        // Cut mode, staged frames: the force edge (frame N) releases left
+        // (up+SYN); the modifiers land once the 5 ms floor elapses; the
+        // buttons follow `combo_stagger_ms` after the modifiers. The
+        // staging is the point: same-frame up+down merges into the running
+        // drag downstream.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
@@ -6281,6 +6642,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        // Edge frame: release only, press deferred.
         let mark = sinks.pointer.events.lock().unwrap().len();
         let emark = sinks.extras.events.lock().unwrap().len();
         let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
@@ -6292,21 +6654,55 @@ mod tests {
             .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
             .map(|(_, _, v)| v)
             .collect();
-        assert_eq!(lefts, vec![0, 1], "cut restarts shared left: {tail:?}");
-        let syns = tail
-            .iter()
-            .filter(|&&(ty, c, _)| ty == EV_SYN && c == SYN_REPORT)
-            .count();
-        assert!(syns >= 1, "cut separates release/press with SYN: {tail:?}");
-        // Super joins on the extras node.
+        assert_eq!(lefts, vec![0], "edge frame releases only: {tail:?}");
+        assert!(
+            tail.contains(&(EV_SYN, SYN_REPORT, 0)),
+            "release carries SYN: {tail:?}"
+        );
         let etail: Vec<(u16, u16, i32)> = sinks.extras.events.lock().unwrap()[emark..].to_vec();
-        assert!(etail.contains(&(EV_KEY, 125, 1)));
+        assert!(
+            !etail.contains(&(EV_KEY, 125, 1)),
+            "press deferred past the edge frame: {etail:?}"
+        );
+        // Next steady frame (60 ms later, floor elapsed): modifiers land,
+        // buttons still wait out the stagger.
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 2))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "buttons wait for the stagger"
+        );
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        assert!(px.pending_force.is_some(), "buttons still pending");
+        // Following frame (stagger elapsed): buttons land.
+        let mark3 = sinks.pointer.events.lock().unwrap().len();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 3))
+            .unwrap()
+            .is_none());
+        let tail3: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark3..].to_vec();
+        let lefts3: Vec<i32> = tail3
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(lefts3, vec![1], "buttons land after stagger: {tail3:?}");
+        assert!(px.pending_force.is_none(), "press flushed");
+        // Overall: exactly down/up/down, strict.
+        let all = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(all, vec![1, 0, 1], "staged cut: {all:?}");
+        assert_strict_alternation(&all, "BTN_LEFT");
     }
 
     #[test]
     fn transition_cut_represses_first_on_force_release() {
-        // Easing back below the force release re-presses the still-latched
-        // level-1 keys; the full release then owns the final key-ups.
+        // Easing back below the force release before the deferred press
+        // lands drops it (its keys never went down); the still-latched
+        // level-1 keys re-press and the full release owns the final key-ups.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
@@ -6329,12 +6725,633 @@ mod tests {
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
         // Cut dropped left at the force edge; force release re-presses it.
+        // The dropped force combo never touches the wire at all.
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         let left = key_values(&sinks.pointer, BTN_LEFT);
         assert_eq!(left, vec![1, 0, 1], "cut, re-press on return: {left:?}");
-        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 0));
+        assert!(
+            key_values(&sinks.extras, BTN_EXTRA).is_empty(),
+            "dropped press leaves no forward traffic: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn transition_cut_liftoff_before_press_drops_cleanly() {
+        // Liftoff before the deferred press lands: the pending press drops,
+        // the wire ends at exactly one down/up pair, no force keys ever
+        // appear, and the force haptic never fires (nothing to release).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        let left = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(left, vec![1, 0], "clean drop, no dangling: {left:?}");
+        assert_strict_alternation(&left, "BTN_LEFT");
+        assert!(
+            sinks
+                .extras
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|&(t, _, _)| t != EV_KEY),
+            "force combo never hits the wire: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1, "first press only");
+        assert_eq!(
+            haptic.releases.lock().unwrap().len(),
+            1,
+            "first release only"
+        );
+    }
+
+    #[test]
+    fn transition_cut_noisy_dip_holds_super_clean_liftoff_releases() {
+        // Owner NIRI (tune 30/130/5: press 30, force 190, first-release
+        // 25, force-release 155): a hold dipping to 150 (just under force
+        // release, still firmly pressed) must keep super down — otherwise
+        // niri sees super-tap (overview on release) plus a separate click,
+        // never the chord, and no drag starts. Only a clean liftoff
+        // releases. `combo_stagger_ms = 0` keeps the staging compact here;
+        // the stagger itself is pinned elsewhere.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 40, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 150, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 9, 9)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 30,
+            margin: 5,
+            force_offset: 130,
+            transition_mode: "cut".into(),
+            combo_stagger_ms: 0,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let t1 = spaced_at(t0, 1);
+        px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        let t2 = t1 + std::time::Duration::from_millis(60);
+        px.handle_frame_at(&cfg, t2).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        // Dip to 150 for 10 ms: hold survives, wire silent.
+        let t3 = t2 + std::time::Duration::from_millis(10);
+        assert!(
+            px.handle_frame_at(&cfg, t3).unwrap().is_none(),
+            "dip must not edge"
+        );
+        assert_eq!(
+            key_values(&sinks.extras, 125),
+            vec![1],
+            "dip just under release keeps super down"
+        );
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1],
+            "dip adds no button traffic"
+        );
+        // Back deep, then a clean liftoff releases everything once.
+        let t4 = t3 + std::time::Duration::from_millis(10);
+        px.handle_frame_at(&cfg, t4).unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        px.handle_frame_at(&cfg, t4 + std::time::Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1, 0],
+            "liftoff owns the final ups"
+        );
+        assert_strict_alternation(&key_values(&sinks.pointer, BTN_LEFT), "BTN_LEFT");
+        assert_strict_alternation(&key_values(&sinks.extras, 125), "super");
+    }
+
+    #[test]
+    fn transition_cut_press_waits_for_gap_floor() {
+        // The 5 ms floor is clock-gated, not frame-counted: a next frame 2 ms
+        // after the release holds the whole press; the modifiers land once
+        // 5 ms have elapsed, the buttons `combo_stagger_ms` after that.
+        // Controlled timestamps pin both gaps.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 13, 13)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let t1 = spaced_at(t0, 1);
+        let ev = px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        // +2 ms: floor not elapsed — press held, wire silent.
+        px.handle_frame_at(&cfg, t1 + std::time::Duration::from_millis(2))
+            .unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "gap floor holds the press"
+        );
+        assert!(
+            !sinks.extras.has(EV_KEY, 125, 1),
+            "super waits for the gap too"
+        );
+        assert!(
+            px.pending_force.is_some(),
+            "pending survives the fast frame"
+        );
+        // +5 ms: floor elapsed — modifiers land, buttons wait the stagger.
+        let tmods = t1 + std::time::Duration::from_millis(5);
+        px.handle_frame_at(&cfg, tmods).unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "buttons wait out the stagger"
+        );
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        assert!(px.pending_force.is_some(), "buttons still pending");
+        // +55 ms (50 ms stagger after the modifiers): buttons land.
+        px.handle_frame_at(&cfg, tmods + std::time::Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
+        assert!(px.pending_force.is_none(), "press flushed");
+    }
+
+    #[test]
+    fn transition_cut_zero_stagger_presses_both_stages_at_floor() {
+        // `combo_stagger_ms = 0`: modifiers and buttons land in one frame
+        // once the 5 ms floor elapses (still ≥5 ms after the release).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            combo_stagger_ms: 0,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let t1 = spaced_at(t0, 1);
+        px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        px.handle_frame_at(&cfg, t1 + std::time::Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        assert!(px.pending_force.is_none(), "press flushed");
+    }
+
+    #[test]
+    fn transition_cut_custom_stagger_delays_buttons() {
+        // `combo_stagger_ms = 120`: modifiers at the floor, buttons 120 ms
+        // after the modifiers — not a millisecond sooner.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 13, 13)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            combo_stagger_ms: 120,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let t1 = spaced_at(t0, 1);
+        px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        let tmods = t1 + std::time::Duration::from_millis(5);
+        px.handle_frame_at(&cfg, tmods).unwrap();
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        // +119 ms after the modifiers: buttons still held.
+        px.handle_frame_at(&cfg, tmods + std::time::Duration::from_millis(119))
+            .unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "buttons wait the full custom stagger"
+        );
+        assert!(px.pending_force.is_some());
+        // +120 ms: buttons land.
+        px.handle_frame_at(&cfg, tmods + std::time::Duration::from_millis(120))
+            .unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
+        assert!(px.pending_force.is_none(), "press flushed");
+    }
+
+    #[test]
+    fn transition_cut_full_cycle_pairs_super_and_hides_taps_under_hold() {
+        // Niri overview audit: super must pair exactly (one down/up) across
+        // a full cut cycle under physical hold, and taps made while the
+        // hardware button stays held must emit ZERO button traffic — the
+        // wire already reads held-down, so there is no fresh click for a
+        // compositor to dismiss on (same as a held physical mouse button).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 1))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![], 1))),
+            Ok(Some(frame(vec![], 0))),
+            Ok(Some(frame(vec![], 1))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 1))),
+            Ok(Some(frame(vec![], 1))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        for i in 0..7 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        // Full cycle: press / cut-break / deferred press / ease-repress /
+        // liftoff-under-hold / physical release. Super pairs exactly once.
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1, 0, 1, 0],
+            "full cycle under hold: {:?}",
+            sinks.pointer.events.lock().unwrap()
+        );
+        assert_eq!(
+            key_values(&sinks.extras, 125),
+            vec![1, 0],
+            "super pairs exactly once: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
+        // Taps under a held physical button: physical re-press owns its own
+        // down, but the pad tap itself adds no button traffic — no fresh
+        // click exists on the wire to dismiss on.
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 7)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 8)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 9)).unwrap();
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(
+            lefts,
+            vec![1],
+            "only the physical re-press itself; tap adds nothing: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn extras_key_down_up_each_syn_closed_like_pointer() {
+        // Owner NIRI: a super-down that lands WITHOUT its SYN is held by
+        // libinput and flushed with its up as a tap (overview) instead of a
+        // hold (drag modifier). Every extras key down/up must be SYN-closed
+        // in its own frame batch, exactly the pointer discipline (one shared
+        // fan-out sync — pinned here so any emit-without-sync regresses).
+        // Drive press / cut-edge / mods / buttons / ease / liftoff.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        for i in 0..6 {
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+        }
+        // Extras: super down alone in the flush frame, up alone in the ease
+        // frame — each immediately SYN-closed (a hold, never a batched tap).
+        let x: Vec<(u16, u16, i32)> = sinks.extras.events.lock().unwrap().clone();
+        let down = x
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 1))
+            .expect("super down lands");
+        assert_eq!(
+            x[down + 1],
+            (EV_SYN, SYN_REPORT, 0),
+            "super-down SYN-closed: {x:?}"
+        );
+        let up = x
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 0))
+            .expect("super up lands");
+        assert!(up > down, "up after down (a hold span, not a batch): {x:?}");
+        assert_eq!(
+            x[up + 1],
+            (EV_SYN, SYN_REPORT, 0),
+            "super-up SYN-closed: {x:?}"
+        );
+        // Pointer discipline, same bar: the flush-frame left re-press is
+        // SYN-closed, and the whole log ends batch-closed.
+        let p: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap().clone();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1, 0, 1, 0],
+            "left cycle: {p:?}"
+        );
+        assert_eq!(
+            p.last(),
+            Some(&(EV_SYN, SYN_REPORT, 0)),
+            "pointer log batch-closed: {p:?}"
+        );
+        assert_eq!(
+            x.last(),
+            Some(&(EV_SYN, SYN_REPORT, 0)),
+            "extras log batch-closed: {x:?}"
+        );
+    }
+
+    #[test]
+    fn cut_force_press_staggers_super_then_left_on_one_wire() {
+        // Owner HW: Mutter needs super held (framed) BEFORE left lands —
+        // same-frame simultaneous downs read as one gesture. A single sink
+        // pins GLOBAL order: super down + SYN strictly before the left
+        // re-press. (Audit: the deferred path replays the full force key
+        // set through the same `press_level`/`DualSink` routing — per-node
+        // tests already show extras 125 alongside the pointer re-press, and
+        // `is_down` has no stale holder here. This test pins the order.)
+        let wire = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::new(FakeGrab::ok())),
+            SharedUinput(Arc::clone(&wire)),
+            SharedHaptic(Arc::clone(&haptic)),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "super+left".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        // Modifiers stage (floor elapsed), buttons still pending.
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        // Buttons stage (stagger elapsed).
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+        let evs = wire.events.lock().unwrap().clone();
+        let super_down = evs
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 1))
+            .expect("super must go down");
+        let left_redown = evs
+            .iter()
+            .rposition(|&e| e == (EV_KEY, BTN_LEFT, 1))
+            .expect("left must re-press");
+        assert!(super_down < left_redown, "super before left: {evs:?}");
+        assert!(
+            evs[super_down..=left_redown].contains(&(EV_SYN, SYN_REPORT, 0)),
+            "a SYN must frame super before left lands: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn transition_cut_breaks_wire_under_physical_hold() {
+        // Owner hardware: transition_mode=cut with force_1=super+left must
+        // break the wire even while the user physically holds the click
+        // (`clicks & 1`). The cut bypasses the physical carve-out; release
+        // lands on the edge frame, modifiers on a later frame (5 ms floor),
+        // buttons `combo_stagger_ms` after that — with no same-frame
+        // re-flutter.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 1))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        // Edge frame: release only, even under hold.
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force());
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(lefts, vec![0], "cut must break under hold: {tail:?}");
+        assert!(
+            tail.contains(&(EV_SYN, SYN_REPORT, 0)),
+            "release carries SYN: {tail:?}"
+        );
+        // Modifiers land next (floor elapsed), buttons wait the stagger.
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "buttons wait for the stagger"
+        );
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+        // Stagger elapsed: buttons land.
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 3))
+            .unwrap()
+            .is_none());
+        // Next steady frame (gap elapsed): fresh press lands.
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 2))
+            .unwrap()
+            .is_none());
+        // No same-frame re-flutter: exactly down/up/down, strict.
+        let all = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(all, vec![1, 0, 1], "no extra flutter: {all:?}");
+        assert_strict_alternation(&all, "BTN_LEFT");
+        assert_eq!(transitions(&all), 2);
+        // Super joins on the extras node.
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+    }
+
+    #[test]
+    fn transition_continuous_holds_wire_under_physical_hold() {
+        // Continuous mode unchanged: the physical carve-out stays, so the
+        // force edge never breaks the held left under `clicks & 1`.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            ..Config::default()
+        };
+        assert!(!cfg.is_cut_transition());
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "continuous must not cut under hold"
+        );
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+    }
+
+    #[test]
+    fn force_combo_emits_super_before_left_regardless_of_config_order() {
+        // Window-drag needs super held when left lands. `down_keys` emits
+        // extras-routed codes before pointer buttons, so `left+super`
+        // still presses super first. Pinned via `held_force` order (push
+        // follows emit order).
+        for force in ["left+super", "super+left"] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let frames = vec![
+                Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+                Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+            ];
+            let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+            let cfg = Config {
+                click_1: "left".into(),
+                force_1: force.into(),
+                sensitivity: 64,
+                margin: 5,
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default()
+            };
+            let t0 = std::time::Instant::now();
+            px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+            px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+            // Deferred: nothing held yet on the edge frame.
+            assert!(px.held_force.is_empty(), "press deferred: {force:?}");
+            // Modifiers stage first, buttons follow the stagger.
+            px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+            assert_eq!(
+                px.held_force,
+                vec![(EV_KEY, 125)],
+                "modifiers first for force_1={force:?}"
+            );
+            px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+            assert_eq!(
+                px.held_force,
+                vec![(EV_KEY, 125), (EV_KEY, BTN_LEFT)],
+                "super-first for force_1={force:?}"
+            );
+        }
     }
 
     #[test]
