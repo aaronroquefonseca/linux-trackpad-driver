@@ -49,6 +49,8 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | ID | Thread | Branch/worktree | Scope | Status |
 |----|--------|-----------------|-------|--------|
 | force-click | T3 `bc87d3ce` — PR #8 `30bfa7c` (L1 + L2 fixed, verified) | `feat/force-click` | 2nd level + force actions | DONE, MERGED (`fb8674f`). Owner + 3 reviewers SETTLED |
+| config-docs | T3 `9ed508a0` — PR #34 `fcdda04` (CONFIG.md + drift test) | `docs/config-reference` | config reference | DONE, MERGED. Owner SETTLED |
+| gesture-power | T3 `f61ebd7b` — PR #35 `71c28cb` (slide/spoof/cut, 3 reviews × 3 rounds, CI green) | `feat/gesture-power` | slide/spoof/transition | DONE, MERGED. Owner + 3 reviewers SETTLED |
 
 ## Phase 2 — public readiness (all DONE 2026-10-14, all SETTLED)
 
