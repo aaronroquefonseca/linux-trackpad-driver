@@ -96,6 +96,9 @@ bits 6..7 are device-timestamp bits, not buttons.
   first level. First and force latches are independent and coexist (both key
   sets held; a code held by both stays down until both release); a drop below
   the first release clears both. Disabling mid-hold clears force (proxy releases).
+- One fresh edge per frame from idle (old `Released` admits `Pressed` only):
+  a deep jump latches first this report, force follows next report while held
+  deep; an already-latched first level takes the force edge immediately.
 - `haptic` 0..=255 output strength; `quiet_click` selects soft waveform.
 - `speed` scales pointer motion only in proxy path; never touches init.
 
