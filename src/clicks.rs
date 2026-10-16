@@ -55,6 +55,35 @@
 //!   `hid-magicmouse` negation; physical `clicks` byte contributes
 //!   `BTN = clicks & 1` (bits 6..7 are timestamp, not buttons) OR-ed into
 //!   the click state.
+//! - Slide third status (`slide_1..=slide_5`, default `none` = unmapped):
+//!   fires/holds while N fingers touch with every pressure at/below the
+//!   release threshold. Releases on liftoff, on count change (re-selects
+//!   when the new count maps an action, else releases silently), or on a
+//!   press-edge handoff. Handoff rule: the slide latch drops when a
+//!   first/force edge fires; the proxy releases slide keys first UNLESS
+//!   the slide and press actions carry identical key sets — then the hold
+//!   continues with no release/re-press. Haptic: the standard
+//!   `haptic`/`quiet_click` pulse iff the slide action is keys/`empty`;
+//!   `none` never latches, never pulses (default = current behavior).
+//! - Finger-count spoofing (`spoof_<slide|click|force>_<1..5>`, `0` =
+//!   passthrough default): the uinput touch stream (slots, `BTN_TOOL_*`)
+//!   reports the spoofed count via [`spoof_contacts`] (real centroid,
+//!   requested contacts on a tiny fixed pattern: pair ±18 x, 3+ on a
+//!   24-unit ring from straight up). Action selection keeps the real count
+//!   unless `spoof_select = true` (then selection uses the spoofed count
+//!   too, and the edge's `finger_count` reports it).
+//! - Level-transition mode (`transition_mode`, global): `"continuous"`
+//!   (default) holds level-1 keys while force keys join (shared codes down
+//!   once, up once); `"cut"` releases ALL level-1/slide keys first (with
+//!   SYN) then presses the force combo fresh — shared codes show
+//!   up+SYN+down. The machine latches identically either way; the mode
+//!   only changes the proxy's wire sequence on the force edge.
+//! - Combination semantics: slide hands off to press (same-action =
+//!   seamless, else release-then-press, one SYN); spoof reshapes the wire
+//!   under whichever status latch holds (force > first > slide > idle
+//!   slide-map); cut releases slide + level-1 wire keys before the force
+//!   press. All three compose: e.g. a spoofed 2→3 slide can hand off to a
+//!   real-count click that a force edge then cuts into a fresh combo.
 
 use std::time::Instant;
 
@@ -108,6 +137,71 @@ pub fn release_threshold(cfg: &Config) -> u8 {
     s.saturating_sub(m) as u8
 }
 
+/// Spoof pattern geometry (device units; density is 48/44 units/mm, so
+/// both are sub-millimeter): a requested pair splits ±`SPOOF_PAIR_DX` on
+/// x; 3+ contacts sit evenly on a `SPOOF_RING_RADIUS` circle starting at
+/// straight up (-90°), exactly like drafting positions around the real
+/// centroid. Fixed (not configurable): keeps the wire shape predictable
+/// for tests and downstream classifiers.
+pub const SPOOF_PAIR_DX: i32 = 18;
+pub const SPOOF_RING_RADIUS: i32 = 24;
+/// Axis clamps for synthesized contacts (pointer-node ranges, see
+/// [`crate::proxy::uinput_abs_setup`]): the centroid ± pattern stays
+/// inside the ranges except for pathological edge touches.
+pub const SPOOF_X_MIN: i32 = -3678;
+pub const SPOOF_X_MAX: i32 = 3934;
+pub const SPOOF_Y_MIN: i32 = -2478;
+pub const SPOOF_Y_MAX: i32 = 2587;
+
+/// Build the virtual contact list for a spoofed count: keeps the real
+/// centroid (mean of touching x/y), projects the requested number of
+/// contacts on the fixed small pattern around it ([`SPOOF_PAIR_DX`] /
+/// [`SPOOF_RING_RADIUS`]), copying size/orientation/pressure from the
+/// first touching contact with fresh ids `1..=N` and `contact = true`.
+///
+/// Identity fast path: when the requested count equals the real touching
+/// count the input slice is returned unchanged (ids and positions
+/// preserved — no synthetic jitter). Empty input (or `virtual_n == 0`)
+/// yields no contacts.
+pub fn spoof_contacts(real: &[FingerContact], virtual_n: u8) -> Vec<FingerContact> {
+    let touching: Vec<&FingerContact> = real.iter().filter(|f| touch_present(f)).collect();
+    let want = virtual_n.clamp(1, 5) as usize;
+    if touching.is_empty() || virtual_n == 0 {
+        return Vec::new();
+    }
+    if touching.len() == want {
+        return real.to_vec();
+    }
+    let cx = touching.iter().map(|f| i64::from(f.x)).sum::<i64>() / touching.len() as i64;
+    let cy = touching.iter().map(|f| i64::from(f.y)).sum::<i64>() / touching.len() as i64;
+    let template = *touching[0];
+    let mut pts = Vec::with_capacity(want);
+    if want == 1 {
+        pts.push((cx, cy));
+    } else if want == 2 {
+        pts.push((cx - i64::from(SPOOF_PAIR_DX), cy));
+        pts.push((cx + i64::from(SPOOF_PAIR_DX), cy));
+    } else {
+        for k in 0..want {
+            let ang =
+                -std::f64::consts::FRAC_PI_2 + 2.0 * std::f64::consts::PI * k as f64 / want as f64;
+            let dx = (f64::from(SPOOF_RING_RADIUS) * ang.cos()).round() as i64;
+            let dy = (f64::from(SPOOF_RING_RADIUS) * ang.sin()).round() as i64;
+            pts.push((cx + dx, cy + dy));
+        }
+    }
+    pts.into_iter()
+        .enumerate()
+        .map(|(i, (x, y))| FingerContact {
+            id: (i + 1) as u8,
+            x: x.clamp(i64::from(SPOOF_X_MIN), i64::from(SPOOF_X_MAX)) as i32,
+            y: y.clamp(i64::from(SPOOF_Y_MIN), i64::from(SPOOF_Y_MAX)) as i32,
+            contact: true,
+            ..template
+        })
+        .collect()
+}
+
 /// Which pressure level fired a [`ClickEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClickLevel {
@@ -116,6 +210,8 @@ pub enum ClickLevel {
     First,
     /// Second level (`force_N`, `effective_force_haptic()`, `force_quiet_click`).
     Force,
+    /// Touch-but-not-pressed (`slide_N`, standard `haptic`/`quiet_click`).
+    Slide,
 }
 
 /// A fired click: which fingers caused it and what to do.
@@ -146,35 +242,46 @@ impl ClickEvent {
     pub fn is_force(&self) -> bool {
         matches!(self.level, ClickLevel::Force)
     }
+    /// True for the touch-but-not-pressed (slide) level.
+    pub fn is_slide(&self) -> bool {
+        matches!(self.level, ClickLevel::Slide)
+    }
 }
 
 /// Per-frame press edges, in press order (first then force).
 ///
 /// When a deep press latches both levels on the same frame both are `Some`;
 /// reporters surface `force` (it supersedes while held past threshold) while
-/// holding both key sets.
+/// holding both key sets. `slide` fires only when neither press level edges
+/// (see [`ClickMachine`] handoff): reporters surface it when no press edge
+/// fired.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameOutcome {
     /// Fresh first-level press edge, if any.
     pub first: Option<ClickEvent>,
     /// Fresh force-level press edge, if any.
     pub force: Option<ClickEvent>,
+    /// Fresh slide-level edge, if any (touch-but-not-pressed onset or
+    /// finger-count re-select while sliding).
+    pub slide: Option<ClickEvent>,
 }
 
 impl FrameOutcome {
     /// Superseding edge for reporters: force while held past threshold,
-    /// else the first-level edge. A force `none` (swallowed gesture, no
-    /// haptic) never supersedes: reporters see the first-level edge that
-    /// actually emitted keys/haptic.
+    /// except a force `none` never supersedes (it emits nothing); else the
+    /// first-level edge; else the slide edge.
     pub fn primary(&self) -> Option<ClickEvent> {
         match &self.force {
             Some(f) if !f.is_none() => self.force.clone(),
-            _ => self.first.clone(),
+            _ => match &self.first {
+                Some(_) => self.first.clone(),
+                None => self.slide.clone(),
+            },
         }
     }
-    /// True when neither level fired this frame.
+    /// True when no level fired this frame.
     pub fn is_empty(&self) -> bool {
-        self.first.is_none() && self.force.is_none()
+        self.first.is_none() && self.force.is_none() && self.slide.is_none()
     }
 }
 
@@ -186,12 +293,29 @@ impl FrameOutcome {
 /// every pressed finger falls to/below the release threshold (or lifts).
 /// Physical button (`clicks & 1`) is folded in by the caller via
 /// [`ClickMachine::physical_button`].
+///
+/// Slide level: while idle (no first/force latch) with N fingers touching
+/// at/below the release threshold, `slide_N` latches instead of clicks.
+/// Count changes re-select (old releases, new fires); liftoff releases; a
+/// press edge hands off (the proxy releases slide keys first unless the
+/// slide and press actions are identical — then the hold continues with no
+/// wire flutter). A slide `none` (the default) never latches and never
+/// emits: zero behavior change unless the user opts in. Entry requires all
+/// touching pressures at/below release; once held it sticks (no flap on
+/// noisy slides) until lift/press/count-change. Slide edges are
+/// undebounced; a debounce-swallowed press neither fires nor hands off
+/// (the slide holds until the retried press lands).
 #[derive(Debug, Default)]
 pub struct ClickMachine {
     pressed: std::collections::HashMap<u8, bool>,
     active: Option<ClickEvent>,
     force_pressed: std::collections::HashMap<u8, bool>,
     force_active: Option<ClickEvent>,
+    slide_active: Option<ClickEvent>,
+    /// Real touching count (clamped 1..=5) the slide latch selected on.
+    /// Compared against the real count (not the spoof-aware select count)
+    /// so a `spoof_select` remap never re-fires every frame.
+    slide_real: Option<u8>,
     last_press_at: Option<Instant>,
     last_release_at: Option<Instant>,
 }
@@ -209,6 +333,11 @@ impl ClickMachine {
     /// Currently latched force-level click, if any.
     pub fn force_active(&self) -> Option<&ClickEvent> {
         self.force_active.as_ref()
+    }
+
+    /// Currently latched slide-level action, if any.
+    pub fn slide_active(&self) -> Option<&ClickEvent> {
+        self.slide_active.as_ref()
     }
 
     /// Whether tracking id `id` is currently pressed (first level).
@@ -363,17 +492,42 @@ impl ClickMachine {
             }
         }
 
-        // Phase 2: parse before mutating. `n` is shared: both edges capture
-        // the touching count of their edge frame, clamped 1..=5.
+        // Phase 2: parse before mutating. `n` is the real touching count
+        // of the edge frame, clamped 1..=5; each level selects on its
+        // spoof-aware count (`spoof_select` swaps real→virtual, default
+        // real — zero behavior change unless opted in).
         let contacting = fingers.iter().filter(|f| touch_present(f)).count();
         let n = (contacting.clamp(1, 5)) as u8;
+        let first_select = cfg.select_count("click", n);
+        let force_select = cfg.select_count("force", n);
+        let slide_select = cfg.select_count("slide", n);
         let first_action = if self.active.is_none() && !newly_pressed.is_empty() {
-            Some(cfg.click_action(n)?)
+            Some(cfg.click_action(first_select)?)
         } else {
             None
         };
         let force_action = if armed && self.force_active.is_none() && !newly_force.is_empty() {
-            Some(cfg.force_action(n)?)
+            Some(cfg.force_action(force_select)?)
+        } else {
+            None
+        };
+        // Slide entry/re-select: idle, no press edge this frame, someone
+        // touching, and not already holding this count. Entry needs every
+        // touching pressure at/below release (the hysteresis band is a
+        // dead zone: no slide, no press); a held slide sticks without
+        // re-parsing so noisy slides never flap.
+        let slide_wanted = self.active.is_none()
+            && self.force_active.is_none()
+            && first_action.is_none()
+            && force_action.is_none()
+            && contacting > 0
+            && self.slide_real != Some(n)
+            && fingers
+                .iter()
+                .filter(|f| touch_present(f))
+                .all(|f| f.pressure <= release);
+        let slide_action = if slide_wanted {
+            Some(cfg.slide_action(slide_select)?)
         } else {
             None
         };
@@ -459,6 +613,17 @@ impl ClickMachine {
             }
         }
 
+        // Slide releases: liftoff clears outright; a press edge that
+        // actually fires hands off (the proxy releases slide keys first
+        // unless the slide and press actions are identical — then the hold
+        // continues with no wire flutter). A debounce-swallowed press
+        // hands off nothing: the slide holds until the retried press lands.
+        let press_fired = (first_action.is_some() || force_action.is_some()) && !press_suppressed;
+        if contacting == 0 || press_fired {
+            self.slide_active = None;
+            self.slide_real = None;
+        }
+
         let mut out = FrameOutcome::default();
 
         // Press edge: first newly-pressed finger while idle latches.
@@ -467,7 +632,7 @@ impl ClickMachine {
                 // Swallowed: no latch, no edge; the reverted bits retry.
             } else {
                 let ev = ClickEvent {
-                    finger_count: n,
+                    finger_count: first_select,
                     action,
                     haptic: cfg.haptic,
                     quiet: cfg.quiet_click,
@@ -488,7 +653,7 @@ impl ClickMachine {
                 // Swallowed with the first-level press (see above).
             } else {
                 let ev = ClickEvent {
-                    finger_count: n,
+                    finger_count: force_select,
                     action,
                     haptic: cfg.effective_force_haptic(),
                     quiet: cfg.force_quiet_click,
@@ -496,6 +661,28 @@ impl ClickMachine {
                 };
                 self.force_active = Some(ev.clone());
                 out.force = Some(ev);
+            }
+        }
+        // Slide edge: unlike `none` clicks (which latch to swallow), a
+        // slide `none` — the default — latches nothing and emits nothing
+        // (zero behavior change unless opted in). A re-select onto an
+        // unmapped count releases the old hold with no edge; the proxy
+        // sees the `slide_active` transition and releases keys.
+        if let Some(action) = slide_action {
+            if matches!(action.kind, ActionKind::None) {
+                self.slide_active = None;
+                self.slide_real = None;
+            } else {
+                let ev = ClickEvent {
+                    finger_count: slide_select,
+                    action,
+                    haptic: cfg.haptic,
+                    quiet: cfg.quiet_click,
+                    level: ClickLevel::Slide,
+                };
+                self.slide_active = Some(ev.clone());
+                self.slide_real = Some(n);
+                out.slide = Some(ev);
             }
         }
         Ok(out)
@@ -508,6 +695,8 @@ impl ClickMachine {
         self.active = None;
         self.force_pressed.clear();
         self.force_active = None;
+        self.slide_active = None;
+        self.slide_real = None;
         self.last_press_at = None;
         self.last_release_at = None;
     }
@@ -1141,5 +1330,274 @@ mod tests {
         };
         let out = m.update(&[finger(1, 250)], 0, &good).unwrap();
         assert!(out.first.is_some() && out.force.is_some());
+    }
+
+    fn light(id: u8, pressure: u8) -> FingerContact {
+        finger(id, pressure)
+    }
+
+    #[test]
+    fn slide_default_none_never_latches() {
+        // Default slide_N = none: light touches move the cursor (slots)
+        // with zero latch state — current behavior exactly.
+        let cfg = Config::default();
+        let mut m = ClickMachine::new();
+        let out = m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        assert!(out.is_empty());
+        assert!(m.slide_active().is_none());
+        let out = m.update(&[light(1, 20), light(2, 20)], 0, &cfg).unwrap();
+        assert!(out.is_empty());
+        assert!(m.slide_active().is_none());
+    }
+
+    #[test]
+    fn slide_fires_holds_releases() {
+        let cfg = Config {
+            slide_1: "left".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let out = m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        assert!(out.first.is_none() && out.force.is_none());
+        let sev = out.slide.unwrap();
+        assert!(sev.is_slide());
+        assert_eq!(sev.finger_count, 1);
+        assert_eq!(sev.haptic, cfg.haptic);
+        // Steady slide: holds, no re-fire.
+        assert!(m.update(&[light(1, 25)], 0, &cfg).unwrap().is_empty());
+        assert!(m.slide_active().is_some());
+        // Liftoff releases.
+        assert!(m.update(&[], 0, &cfg).unwrap().is_empty());
+        assert!(m.slide_active().is_none());
+    }
+
+    #[test]
+    fn slide_entry_needs_below_release_band_is_dead() {
+        // sensitivity 64 / margin 5: release 59, press 64.
+        let cfg = Config {
+            sensitivity: 64,
+            margin: 5,
+            slide_1: "left".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        // Hysteresis band (62): neither slide nor press.
+        assert!(m.update(&[light(1, 62)], 0, &cfg).unwrap().is_empty());
+        assert!(m.slide_active().is_none());
+        assert!(m.active().is_none());
+        // At release (59): slide fires.
+        assert!(m.update(&[light(1, 59)], 0, &cfg).unwrap().slide.is_some());
+        // Press edge hands off: click fires, slide drops.
+        let mut m = ClickMachine::new();
+        m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        assert!(m.slide_active().is_some());
+        let out = m.update(&[light(1, 200)], 0, &cfg).unwrap();
+        assert!(out.first.is_some());
+        assert!(out.slide.is_none());
+        assert!(m.slide_active().is_none());
+        assert!(m.active().is_some());
+    }
+
+    #[test]
+    fn slide_count_change_reselects() {
+        let cfg = Config {
+            slide_1: "left".into(),
+            slide_2: "right".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        assert!(m.update(&[light(1, 20)], 0, &cfg).unwrap().slide.is_some());
+        // Second finger down light: re-select fires slide_2.
+        let out = m.update(&[light(1, 20), light(2, 20)], 0, &cfg).unwrap();
+        let sev = out.slide.unwrap();
+        assert_eq!(sev.finger_count, 2);
+        assert_eq!(sev.action.kind, ActionKind::Keys(vec!["right".to_string()]));
+        // Re-select onto an unmapped count releases silently.
+        let cfg = Config {
+            slide_1: "left".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        let out = m.update(&[light(1, 20), light(2, 20)], 0, &cfg).unwrap();
+        assert!(out.is_empty());
+        assert!(m.slide_active().is_none());
+    }
+
+    #[test]
+    fn slide_none_holds_until_press_then_fires_next_frame() {
+        // Click releases under still-touching light fingers: the release
+        // frame drops the latch, the NEXT light frame selects slide.
+        let cfg = Config {
+            slide_1: "left".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 200)], 0, &cfg).unwrap();
+        let out = m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        assert!(m.active().is_none());
+        assert!(out.slide.is_none(), "slide arms on the following frame");
+        let out = m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        assert!(out.slide.is_some());
+    }
+
+    #[test]
+    fn slide_parse_error_leaves_state_untouched() {
+        let bad = Config {
+            slide_1: "bogus-key".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        assert!(m.update(&[light(1, 20)], 0, &bad).is_err());
+        assert!(m.slide_active().is_none());
+        let out = m.update(&[light(1, 20)], 0, &Config::default()).unwrap();
+        assert!(out.is_empty(), "slide none latches nothing on retry");
+    }
+
+    #[test]
+    fn slide_empty_is_haptic_only() {
+        let cfg = Config {
+            slide_1: "empty".into(),
+            haptic: 7,
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let sev = m.update(&[light(1, 20)], 0, &cfg).unwrap().slide.unwrap();
+        assert!(sev.is_empty());
+        assert!(should_emit_haptic(sev.haptic));
+    }
+
+    #[test]
+    fn slide_primary_fallback() {
+        // A lone slide edge is what reporters see; a press edge wins.
+        let cfg = Config {
+            slide_1: "left".into(),
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        let out = m.update(&[light(1, 20)], 0, &cfg).unwrap();
+        assert!(out.primary().unwrap().is_slide());
+    }
+
+    #[test]
+    fn spoof_select_switches_action_lookup() {
+        let base = Config {
+            click_2: "right".into(),
+            click_3: "middle".into(),
+            spoof_click_2: 3,
+            ..Config::default()
+        };
+        // Default: selection uses the real count (2 → right), even though
+        // the wire reports 3.
+        let mut m = ClickMachine::new();
+        let ev = m
+            .update(&[finger(1, 200), finger(2, 200)], 0, &base)
+            .unwrap()
+            .first
+            .unwrap();
+        assert_eq!(ev.finger_count, 2);
+        assert_eq!(ev.action.kind, ActionKind::Keys(vec!["right".to_string()]));
+        // Opt-in: selection uses the spoofed count (3 → middle).
+        let cfg = Config {
+            spoof_select: true,
+            ..base
+        };
+        let mut m = ClickMachine::new();
+        let ev = m
+            .update(&[finger(1, 200), finger(2, 200)], 0, &cfg)
+            .unwrap()
+            .first
+            .unwrap();
+        assert_eq!(ev.finger_count, 3);
+        assert_eq!(ev.action.kind, ActionKind::Keys(vec!["middle".to_string()]));
+    }
+
+    #[test]
+    fn spoof_select_slide_uses_virtual_count() {
+        let cfg = Config {
+            slide_1: "left".into(),
+            slide_3: "middle".into(),
+            spoof_slide_1: 3,
+            spoof_select: true,
+            ..Config::default()
+        };
+        let mut m = ClickMachine::new();
+        // One real finger spoofs to 3: slide_3 fires, reported count 3.
+        let sev = m.update(&[light(1, 20)], 0, &cfg).unwrap().slide.unwrap();
+        assert_eq!(sev.finger_count, 3);
+        assert_eq!(
+            sev.action.kind,
+            ActionKind::Keys(vec!["middle".to_string()])
+        );
+        // …and the hold sticks on the real count (no per-frame re-fire).
+        assert!(m.update(&[light(1, 20)], 0, &cfg).unwrap().is_empty());
+        assert!(m.slide_active().is_some());
+    }
+
+    #[test]
+    fn spoof_contacts_identity_on_equal_count() {
+        let real = vec![finger(7, 200), finger(3, 200)];
+        let out = spoof_contacts(&real, 2);
+        assert_eq!(out, real, "equal counts preserve ids/positions");
+    }
+
+    #[test]
+    fn spoof_contacts_empty_and_zero() {
+        assert!(spoof_contacts(&[], 3).is_empty());
+        assert!(spoof_contacts(&[finger(1, 200)], 0).is_empty());
+    }
+
+    #[test]
+    fn spoof_contacts_pair_splits_on_centroid() {
+        let mut a = finger(1, 200);
+        a.x = 1000;
+        a.y = 500;
+        let out = spoof_contacts(&[a], 2);
+        assert_eq!(out.len(), 2);
+        let cx = (out[0].x as i64 + out[1].x as i64) / 2;
+        let cy = (out[0].y as i64 + out[1].y as i64) / 2;
+        assert_eq!((cx, cy), (1000, 500));
+        assert_eq!(out[1].x - out[0].x, 2 * SPOOF_PAIR_DX);
+        assert_eq!(out[0].y, out[1].y);
+        assert!(out.iter().all(|f| f.contact));
+    }
+
+    #[test]
+    fn spoof_contacts_ring_centroid_and_spacing() {
+        let mut a = finger(1, 200);
+        a.x = 0;
+        a.y = 0;
+        for want in [3u8, 4, 5] {
+            let out = spoof_contacts(&[a], want);
+            assert_eq!(out.len(), want as usize);
+            let cx = out.iter().map(|f| i64::from(f.x)).sum::<i64>() / want as i64;
+            let cy = out.iter().map(|f| i64::from(f.y)).sum::<i64>() / want as i64;
+            // Even ring around the centroid: mean ≈ center (±1 rounding).
+            assert!(
+                (cx, cy).0.abs() <= 1 && (cy).abs() <= 1,
+                "want {want}: ({cx},{cy})"
+            );
+            for f in &out {
+                let dx = f.x as i64;
+                let dy = f.y as i64;
+                let r = ((dx * dx + dy * dy) as f64).sqrt().round() as i64;
+                assert_eq!(r, i64::from(SPOOF_RING_RADIUS), "want {want}");
+            }
+        }
+        // Single: exactly the centroid.
+        let out = spoof_contacts(&[a], 1);
+        assert_eq!((out[0].x, out[0].y), (0, 0));
+    }
+
+    #[test]
+    fn spoof_contacts_clamp_to_axes() {
+        let mut a = finger(1, 200);
+        a.x = SPOOF_X_MAX;
+        a.y = SPOOF_Y_MAX;
+        let out = spoof_contacts(&[a], 3);
+        for f in &out {
+            assert!((SPOOF_X_MIN..=SPOOF_X_MAX).contains(&f.x));
+            assert!((SPOOF_Y_MIN..=SPOOF_Y_MAX).contains(&f.y));
+        }
     }
 }
