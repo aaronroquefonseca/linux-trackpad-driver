@@ -69,10 +69,13 @@
 //!   fresh, so shared codes show up+SYN+down; easing back below the force
 //!   release re-presses the still-latched level-1 keys (one SYN frame, so
 //!   the restart reads as up/down pairs, never a stuck key). Skipped for
-//!   `none`/`empty` force actions, when nothing is held, while the
-//!   physical button holds `BTN_LEFT` (wire stays down, no 0-then-1
-//!   flutter), and when the edge absorbed a slide handoff (seamless
-//!   merge wins for that frame).
+//!   `none`/`empty` force actions, when nothing is held, and when the
+//!   edge absorbed a slide handoff (seamless merge wins for that frame).
+//!   Cut ALWAYS emits the release — even under a physically-held
+//!   `BTN_LEFT` (the visible up+SYN+down break is the entire point of
+//!   cut; the physical carve-out stays continuous-only). Continuous
+//!   skips the cut while the physical button holds `BTN_LEFT` (wire
+//!   stays down, no 0-then-1 flutter).
 //! - Slide level (`slide_1..=slide_5`, default `none`): the proxy holds a
 //!   third key set while fingers slide below the press threshold. A press
 //!   edge hands off: identical slide/press key sets merge with no wire
@@ -735,8 +738,11 @@ where
             {
                 // No-op after a handoff (slide already absorbed/released),
                 // belt-and-braces so cut never leaves a slide hold behind.
-                self.release_slide_held(ClickMachine::physical_button(frame.clicks));
-                self.cut_first_wire(ClickMachine::physical_button(frame.clicks));
+                // Cut bypasses the physical carve-out (`false`): the visible
+                // up+SYN+down break is the entire point of cut, and the user
+                // physically holds the click essentially always.
+                self.release_slide_held(false);
+                self.cut_first_wire();
                 self.uinput.sync();
             }
             self.press_level(ev, haptic_pressure, absorbed == Some(ClickLevel::Force));
@@ -876,40 +882,50 @@ where
     /// Key-down half of [`ClickProxy::press_level`]: emits fresh downs
     /// (deduplicated via [`ClickProxy::is_down`]) and records them on the
     /// level's held set for release accounting. `BTN_LEFT` goes through
-    /// the wire tracker (see [`ClickProxy::emit_btn_left`]).
+    /// the wire tracker (see [`ClickProxy::emit_btn_left`]). Extras-routed
+    /// codes (modifiers, combos) emit before pointer-routed buttons, stable
+    /// within each route — the compositor must see e.g. super held when
+    /// left lands (window-drag), regardless of config order (`left+super`
+    /// vs `super+left`).
     fn down_keys(&mut self, keys: &[String], level: ClickLevel) {
+        let mut pairs: Vec<(u16, u16)> = Vec::with_capacity(keys.len());
         for k in keys {
             match key_token_to_code(k) {
-                Some((ty, code)) => {
-                    let pair = (ty, code);
-                    // Skip the re-emit when another level already holds
-                    // the code down, but still record it in this level's
-                    // set so release accounting stays per-level.
-                    // `BTN_LEFT` goes through the wire tracker instead: it
-                    // is already down when the physical bit holds it, and
-                    // a duplicate down is redundant traffic the tracker
-                    // exists to remove.
-                    if pair == (EV_KEY, BTN_LEFT) {
-                        if !self.btn_left_down {
-                            self.uinput.emit(ty, code, 1);
-                            self.btn_left_down = true;
-                        }
-                    } else if !self.is_down(pair) {
-                        self.uinput.emit(ty, code, 1);
-                    }
-                    let held = match level {
-                        ClickLevel::First => &mut self.held_first,
-                        ClickLevel::Force => &mut self.held_force,
-                        ClickLevel::Slide => &mut self.held_slide,
-                    };
-                    // Same-level dedup: a handoff-absorbed code is already
-                    // recorded (one up per code on release); cross-level
-                    // sharing still records per level.
-                    if !held.contains(&pair) {
-                        held.push(pair);
-                    }
-                }
+                Some(pair) => pairs.push(pair),
                 None => log::warn!("proxy: no keycode for '{k}', skipped"),
+            }
+        }
+        // Stable: extras first, pointer buttons second.
+        pairs.sort_by_key(|&(ty, code)| {
+            u8::from(matches!(split_route(ty, code), SplitRoute::Pointer))
+        });
+        for (ty, code) in pairs {
+            let pair = (ty, code);
+            // Skip the re-emit when another level already holds
+            // the code down, but still record it in this level's
+            // set so release accounting stays per-level.
+            // `BTN_LEFT` goes through the wire tracker instead: it
+            // is already down when the physical bit holds it, and
+            // a duplicate down is redundant traffic the tracker
+            // exists to remove.
+            if pair == (EV_KEY, BTN_LEFT) {
+                if !self.btn_left_down {
+                    self.uinput.emit(ty, code, 1);
+                    self.btn_left_down = true;
+                }
+            } else if !self.is_down(pair) {
+                self.uinput.emit(ty, code, 1);
+            }
+            let held = match level {
+                ClickLevel::First => &mut self.held_first,
+                ClickLevel::Force => &mut self.held_force,
+                ClickLevel::Slide => &mut self.held_slide,
+            };
+            // Same-level dedup: a handoff-absorbed code is already
+            // recorded (one up per code on release); cross-level
+            // sharing still records per level.
+            if !held.contains(&pair) {
+                held.push(pair);
             }
         }
     }
@@ -1142,16 +1158,17 @@ where
     }
 
     /// Cut-mode release of level-1 wire keys on a force edge: every
-    /// `held_first` code goes up (physical-bit rule as
-    /// [`ClickProxy::release_held`]) and the vec clears, so the force
-    /// press re-downs shared codes fresh (up+SYN+down on the wire). The
-    /// first-level latch stays latched in the machine — only the wire
-    /// restarts. The caller syncs between this and the force press.
-    fn cut_first_wire(&mut self, phys_down: bool) {
+    /// `held_first` code goes up and the vec clears, so the force press
+    /// re-downs shared codes fresh (up+SYN+down on the wire). ALWAYS emits
+    /// — even under a physically-held `BTN_LEFT`: the visible break is the
+    /// entire point of cut (continuous keeps the carve-out in
+    /// [`ClickProxy::release_held`]). The first-level latch stays latched
+    /// in the machine — only the wire restarts. The caller syncs between
+    /// this and the force press; the edge-frame [`ClickProxy::emit_btn_left`]
+    /// reconciliation after the fresh press is then a no-op (wire already
+    /// down again), never a flutter.
+    fn cut_first_wire(&mut self) {
         for (ty, code) in std::mem::take(&mut self.held_first) {
-            if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
-                continue; // physical still holds it; wire stays down
-            }
             self.uinput.emit(ty, code, 0);
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 self.btn_left_down = false;
@@ -6347,6 +6364,121 @@ mod tests {
         assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 0));
         px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn transition_cut_breaks_wire_under_physical_hold() {
+        // Owner hardware: transition_mode=cut with force_1=super+left must
+        // show up+SYN+down even while the user physically holds the click
+        // (`clicks & 1`). The cut bypasses the physical carve-out; the
+        // edge-frame reconcile must not re-flutter in the same frame.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force());
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert_eq!(lefts, vec![0, 1], "cut must break under hold: {tail:?}");
+        let syns = tail
+            .iter()
+            .filter(|&&(ty, c, _)| ty == EV_SYN && c == SYN_REPORT)
+            .count();
+        assert!(syns >= 1, "cut separates release/press with SYN: {tail:?}");
+        // No same-frame re-flutter: exactly down/up/down so far, strict.
+        let all = key_values(&sinks.pointer, BTN_LEFT);
+        assert_eq!(all, vec![1, 0, 1], "no extra flutter: {all:?}");
+        assert_strict_alternation(&all, "BTN_LEFT");
+        assert_eq!(transitions(&all), 2);
+        // Super joins on the extras node.
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+    }
+
+    #[test]
+    fn transition_continuous_holds_wire_under_physical_hold() {
+        // Continuous mode unchanged: the physical carve-out stays, so the
+        // force edge never breaks the held left under `clicks & 1`.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 1))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 1))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            ..Config::default()
+        };
+        assert!(!cfg.is_cut_transition());
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "continuous must not cut under hold"
+        );
+        assert!(sinks.extras.has(EV_KEY, 125, 1));
+    }
+
+    #[test]
+    fn force_combo_emits_super_before_left_regardless_of_config_order() {
+        // Window-drag needs super held when left lands. `down_keys` emits
+        // extras-routed codes before pointer buttons, so `left+super`
+        // still presses super first. Pinned via `held_force` order (push
+        // follows emit order).
+        for force in ["left+super", "super+left"] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let frames = vec![
+                Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            ];
+            let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+            let cfg = Config {
+                click_1: "left".into(),
+                force_1: force.into(),
+                sensitivity: 64,
+                margin: 5,
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default()
+            };
+            let t0 = std::time::Instant::now();
+            px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+            px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+            assert_eq!(
+                px.held_force,
+                vec![(EV_KEY, 125), (EV_KEY, BTN_LEFT)],
+                "super-first for force_1={force:?}"
+            );
+        }
     }
 
     #[test]
