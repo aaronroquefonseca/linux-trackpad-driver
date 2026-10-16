@@ -76,6 +76,7 @@ Research output: single `docs/RESEARCH.md` (PR to `main`). Must not block base-i
 | fkeys | T3 `4834bf4c` — PR #17 `7829c1b` (F13–F24 183–194, full table audit) | `feat/f13-keys` | F13–F24 + key audit | DONE, MERGED. Owner SETTLED |
 | key-coverage | T3 `52894d93` — PR #20 `d129225` (media/browser/app/micmute/search/calc/mail, all header-verified; FN-row deliberately excluded) | `feat/key-coverage` | complete clickable key set | DONE, MERGED. Owner SETTLED |
 | key-table | T3 `e312c389` — PR #21 `5aea652` (`docs/KEYS.md`: 138 names/113 codes + generator + drift-pin test) | `docs/key-table` | generated keycode docs | DONE, MERGED. Owner SETTLED |
+| cut-physical | T3 `c91067a4` — PR #36 (cut under hold + 5ms + stagger + ABS_X/Y; HW: drag+niri all work) | `fix/cut-physical` | cut release + niri detection | DONE, MERGED. Owner SETTLED |
 Remaining (owner-side): hardware session per TESTING.md; public launch =
 docs/RELEASING.md 5-min checklist; full EvdevGeneric impl = future work.
 
