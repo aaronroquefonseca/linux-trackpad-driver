@@ -50,13 +50,36 @@ restart.
 | `force_3` | action string | see Action values | `"none"` | 3-finger force-level action. |
 | `force_4` | action string | see Action values | `"none"` | 4-finger force-level action. |
 | `force_5` | action string | see Action values | `"none"` | 5-finger force-level action. |
+| `slide_1` | action string | see Action values | `"none"` | 1-finger slide action (touch-but-not-pressed: contact present, every pressure at/below `sensitivity - margin`). Fires/holds while sliding; releases on liftoff, count change (re-selects when the new count maps an action), or press-edge handoff (identical slide/press key sets merge seamlessly, else slide keys release first, one SYN). Haptic: standard `haptic`/`quiet_click` pulse iff keys/`empty`; `none` (default) never latches, never pulses. |
+| `slide_2` | action string | see Action values | `"none"` | 2-finger slide action (same handoff/release semantics as `slide_1`). |
+| `slide_3` | action string | see Action values | `"none"` | 3-finger slide action (same handoff/release semantics as `slide_1`). |
+| `slide_4` | action string | see Action values | `"none"` | 4-finger slide action (same handoff/release semantics as `slide_1`). |
+| `slide_5` | action string | see Action values | `"none"` | 5-finger slide action (same handoff/release semantics as `slide_1`). |
+| `spoof_slide_1` | integer | `0..=5` (`0` = passthrough) | `0` | Virtual finger count the computer sees when 1 finger really touches while sliding (no press latch). `0` = report the real count. Virtual contacts keep the real centroid with the requested count on a tiny fixed pattern (pair ±18 x, 3+ evenly on a 24-unit ring). Slots, `BTN_TOOL_*`, and `BTN_TOUCH` follow the virtual count; action selection still uses the real count unless `spoof_select = true`. |
+| `spoof_slide_2` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 2 while sliding. |
+| `spoof_slide_3` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 3 while sliding. |
+| `spoof_slide_4` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 4 while sliding. |
+| `spoof_slide_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 5 while sliding. |
+| `spoof_click_1` | integer | `0..=5` (`0` = passthrough) | `0` | Virtual finger count the computer sees when 1 finger really touches under a standard press latch (same pattern/selection rules as `spoof_slide_1`). E.g. `spoof_click_2 = 3`: a real two-finger press reports three contacts. |
+| `spoof_click_2` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 2 under a standard press latch. |
+| `spoof_click_3` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 3 under a standard press latch. |
+| `spoof_click_4` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 4 under a standard press latch. |
+| `spoof_click_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 5 under a standard press latch. |
+| `spoof_force_1` | integer | `0..=5` (`0` = passthrough) | `0` | Virtual finger count the computer sees when 1 finger really touches while the force level holds (same pattern/selection rules as `spoof_slide_1`). |
+| `spoof_force_2` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 2 while the force level holds. |
+| `spoof_force_3` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 3 while the force level holds. |
+| `spoof_force_4` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 4 while the force level holds. |
+| `spoof_force_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 5 while the force level holds. |
+| `spoof_select` | bool | `true\|false` | `false` | When `true`, `click_N`/`force_N`/`slide_N` selection uses the spoofed count instead of the real one (the edge's finger count reports it too). `false` (default): spoofing only changes what the computer sees, never which action fires. |
+| `transition_mode` | string enum | `continuous\|cut` | `"continuous"` | Force-edge behavior over an active click. `continuous` (default, current behavior): level-1 keys stay held, force keys join (shared codes down once, up once). `cut`: release ALL level-1/slide wire keys first (with SYN), then press the force combo fresh — shared codes show up+SYN+down, so `force_1 = left+super` starts a window drag instead of extending a held left; easing back below the force release re-presses the still-latched level-1 keys. Tradeoff: continuous keeps drags alive across the force edge; cut restarts the gesture (dumb consumers may read the shared-code flutter as click-release-click). |
 
 ## Gate semantics (`enhanced_clicks`)
 
 - `false` (default): device works via init alone — plain kernel/libinput
   passthrough. The proxy still subscribes but short-circuits to passthrough;
-  all `click_*` / `force_*` / `sensitivity` / `margin` / `haptic` /
-  `quiet_click` / `speed` tuning is parsed but **not acted on**.
+  all `click_*` / `force_*` / `slide_*` / `spoof_*` / `sensitivity` /
+  `margin` / `haptic` / `quiet_click` / `speed` / `transition_mode` tuning
+  is parsed but **not acted on**.
 - `true`: proxy grabs the physical node once the pump is ready (real
   `TouchSource` + draining pump + created uinput node) and emits the
   click/button/key pipeline. Grab failure degrades to passthrough with a log.
@@ -64,7 +87,7 @@ restart.
   does nothing, no haptic fires, pointer still moves fine. Fix: set
   `enhanced_clicks = true` and **restart**.
 
-## Action values (`click_*`, `force_*`)
+## Action values (`click_*`, `force_*`, `slide_*`)
 
 - `none`: no action, no haptic. `empty`: no keys, but haptic still fires.
 - `left | right | middle | back | forward`: mouse buttons (`back`/`forward`
@@ -133,6 +156,22 @@ force_quiet_click = false
 force_1 = "ctrl+c"
 force_2 = "ctrl+v"
 force_3 = "middle"
+```
+
+Gesture powers (slide + spoof + cut — verify on hardware):
+
+```toml
+enhanced_clicks = true
+sensitivity = 64
+margin = 5
+haptic = 5
+click_1 = "left"
+force_offset = 20
+force_1 = "left+super"
+slide_1 = "left"
+slide_2 = "middle"
+spoof_click_2 = 3
+transition_mode = "cut"
 ```
 
 ## Troubleshooting
