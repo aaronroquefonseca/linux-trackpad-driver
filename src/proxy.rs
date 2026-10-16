@@ -840,9 +840,9 @@ where
     /// [`ClickProxy::is_down`]) plus that level's own haptic pulse — unless
     /// `adopted` (a slide handoff merged into this level): then the slide's
     /// down-pulse is adopted as this level's haptic debt instead of firing
-    /// a second pulse, keeping one down / one up per session. A one-frame
-    /// jump through both levels therefore emits both pulses in press order
-    /// (first then force) — identical to staged arrival. Never syncs: the
+    /// a second pulse, keeping one down / one up per session. Edges arrive
+    /// staged old-exact (first frame one, force frame two), so each pulse
+    /// lands on its own frame. Never syncs: the
     /// caller emits buttons + a single `SYN` per frame. `pressure` is the
     /// actuator pressure byte (the press threshold, old-service parity);
     /// the event carries the intensity + waveform.
@@ -4015,12 +4015,13 @@ mod tests {
     }
 
     #[test]
-    fn same_frame_both_edges_hold_then_release() {
-        // One-frame jump latches both: both key sets down, force reported;
-        // dropping below all thresholds releases both.
+    fn staged_edges_hold_then_release() {
+        // Old-exact staging: deep jump latches first frame one, force
+        // frame two; dropping below all thresholds releases both.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
@@ -4028,13 +4029,15 @@ mod tests {
         let cfg = force_cfg();
         // Spaced: the release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
-        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(!first.is_force());
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
         assert!(ev.is_force());
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
         let mark = sinks.pointer.events.lock().unwrap().len();
         let emark = sinks.extras.events.lock().unwrap().len();
-        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         let tail = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
         assert!(
             tail.contains(&(EV_KEY, BTN_LEFT, 0)),
@@ -4072,25 +4075,128 @@ mod tests {
     }
 
     #[test]
-    fn one_frame_jump_emits_both_haptic_pulses() {
-        // Pins the single-vs-double decision: one frame through both levels
-        // emits both pulses in press order (first then force), identical to
-        // staged arrival.
+    fn staged_jump_emits_both_haptic_pulses_in_order() {
+        // Old-exact staging: one deep jump from idle emits the
+        // first-level pulse frame one, the force pulse frame two
+        // (never both on the same frame).
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let frames = vec![Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0)))];
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+        ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             force_haptic: Some(9),
             force_quiet_click: true,
             ..force_cfg()
         };
-        let ev = px.handle_frame(&cfg).unwrap().unwrap();
+        let t0 = std::time::Instant::now();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(!first.is_force());
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
         assert!(ev.is_force());
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
             &[(64, 5, false), (64, 9, true)]
         );
+    }
+
+    /// Owner's tune (6 months on old driver): sensitivity 30, haptic 2
+    /// quiet, force_offset 130, force_haptic 1. `forward` stands in for
+    /// the owner's force map (action identity is not under test; the
+    /// haptic pulse bytes + order are).
+    fn owner_cfg() -> Config {
+        Config {
+            sensitivity: 30,
+            margin: 5,
+            haptic: 2,
+            quiet_click: true,
+            force_offset: 130,
+            force_haptic: Some(1),
+            force_quiet_click: false,
+            force_1: "forward".into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn owner_tune_force_reports_pin_old_bytes() {
+        // Old-exact DOWN: pressure = sensitivity (30), amplitude 0x78
+        // (loud), intensity = force_haptic (1), pattern 6. UP: pressure =
+        // 30*3/5 (18), intensity 0, same waveform.
+        assert_eq!(
+            vibration_report(30, 1, false),
+            [0xF2, 0x53, 0x01, 30, 0x78, 0x02, 1, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+        );
+        assert_eq!(up_pressure(30), 18);
+        assert_eq!(
+            vibration_up_report(30, false),
+            [0xF2, 0x53, 0x01, 18, 0x78, 0x02, 0, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12]
+        );
+    }
+
+    #[test]
+    fn owner_tune_staged_force_down_up_pulse_sequence() {
+        // Staged gesture at owner tune: 50 (first hold) -> 200 (force
+        // edge) -> 100 (force step-down) -> 10 (full release). DOWN
+        // pulses carry (pressure 30, intensity, quiet); UP pulses echo
+        // the down pressure + waveform with intensity 0 on the wire.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 50, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = owner_cfg();
+        let t0 = std::time::Instant::now();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(!first.is_force());
+        let second = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(second.is_force());
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(30, 2, true), (30, 1, false)]
+        );
+        assert_eq!(
+            haptic.releases.lock().unwrap().as_slice(),
+            &[(30, false), (30, true)]
+        );
+    }
+
+    #[test]
+    fn owner_tune_deep_jump_stages_force_pulse() {
+        // Old-exact: a deep stab from idle emits the first-level DOWN
+        // only; the force DOWN follows on the next frame while held deep.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = owner_cfg();
+        let t0 = std::time::Instant::now();
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(!ev.is_force());
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(30, 2, true)],
+            "same-frame force pulse diverges from old (staged) feel"
+        );
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(
+            haptic.calls.lock().unwrap().as_slice(),
+            &[(30, 2, true), (30, 1, false)]
+        );
+        assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
     }
 
     #[test]
