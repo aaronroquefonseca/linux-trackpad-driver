@@ -119,6 +119,13 @@ pub const EV_ABS: u16 = 0x03;
 /// Deliberately never used: no 2026 consumer (RESEARCH §6). Pinned by test.
 pub const EV_FF: u16 = 0x15;
 pub const SYN_REPORT: u16 = 0;
+/// Single-touch absolute position (owner sysfs 2026-10-17: the physical
+/// Apple nodes advertise `ABS_X`/`ABS_Y` alongside the MT slots, and
+/// libinput requires them for pointer/touchpad classification — without
+/// them button presses never reach compositor pointer bindings while
+/// motion still leaks through). Same ranges/density as the MT positions.
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
 pub const ABS_MT_SLOT: u16 = 47;
 pub const ABS_MT_TOUCH_MAJOR: u16 = 48;
 pub const ABS_MT_TOUCH_MINOR: u16 = 49;
@@ -457,7 +464,6 @@ pub struct ClickProxy<G, U, H, S> {
     pressed_haptic: bool,
     /// Same for the live force-level latch (`force_haptic_triggered`).
     /// The slide level never pulses (touch is silent): no flag, no debt.
-    force_haptic: bool,
     force_haptic: bool,
     /// Cut-mode deferred force press: the force edge (frame N) emits the
     /// level-1/slide release + SYN, the fresh force-combo modifiers land
@@ -804,7 +810,6 @@ where
             } else {
                 self.press_level(ev, haptic_pressure);
             }
-        }
         }
         if edges.first.is_some() || edges.force.is_some() || edges.slide.is_some() {
             // Edge frames reconcile `BTN_LEFT` through the wire tracker
@@ -1448,12 +1453,18 @@ where
         let present_count = fingers.iter().filter(|f| clicks::touch_present(f)).count();
         let any_touch = present_count > 0;
         let n = fingers.len().min(16);
+        // Single-touch position mirrors the first touching contact (slot 0);
+        // skipped with no contacts (last position stands, as on hardware).
+        let mut first_xy: Option<(i32, i32)> = None;
         for (slot, f) in fingers.iter().take(16).enumerate() {
             self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32);
             if clicks::touch_present(f) {
                 self.uinput
                     .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id));
                 let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.speed);
+                if first_xy.is_none() {
+                    first_xy = Some((sx, sy));
+                }
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx);
                 self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy);
                 self.uinput
@@ -1480,6 +1491,10 @@ where
             }
         }
         self.max_slot = n.saturating_sub(1);
+        if let Some((sx, sy)) = first_xy {
+            self.uinput.emit(EV_ABS, ABS_X, sx);
+            self.uinput.emit(EV_ABS, ABS_Y, sy);
+        }
         // Drop stale motion anchors: ids absent from this frame must not
         // anchor a future delta (stale-anchor jump on id reuse). Evict on
         // every frame, not only the empty one. Anchors key on the EMITTED
@@ -1700,12 +1715,17 @@ pub enum UinputRole {
 /// Positions use the old-service Trackpad2 dimensions WITH the
 /// old-service physical density ([`POSITION_RES_X`]/[`POSITION_RES_Y`]):
 /// libinput needs nonzero resolution to scale slot motion into cursor
-/// motion. Touch major/minor mirror the old-service 0..1020 axes.
+/// motion. `ABS_X`/`ABS_Y` mirror the first touching contact (slot 0)
+/// with the same ranges/density — the physical nodes advertise them and
+/// libinput requires them for pointer classification. Touch major/minor
+/// mirror the old-service 0..1020 axes.
 /// Deviations from old, documented: pressure range 0..253 (not 0..255,
 /// the kernel `absmax`) and resolution fixed at the 1:1 density (old
 /// varies it with speed; speed here applies once, in software).
 pub fn uinput_abs_setup() -> Vec<(u16, i32, i32, i32)> {
     vec![
+        (ABS_X, -3678, 3934, POSITION_RES_X),
+        (ABS_Y, -2478, 2587, POSITION_RES_Y),
         (ABS_MT_SLOT, 0, 15, 0),
         (ABS_MT_TRACKING_ID, 0, 65535, 0),
         (ABS_MT_POSITION_X, -3678, 3934, POSITION_RES_X),
@@ -2911,6 +2931,66 @@ mod tests {
     }
 
     #[test]
+    fn single_touch_xy_mirrors_slot_zero_and_skips_empty_frames() {
+        // Owner sysfs: physical nodes advertise ABS_X/Y; libinput requires
+        // them for pointer classification. Each touching frame carries
+        // ABS_X/Y equal to slot 0's MT position; empty frames carry none
+        // (last position stands, as on hardware).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 110, 70)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        let m0 = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let f0: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[m0..].to_vec();
+        let mt_x = f0
+            .iter()
+            .find(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|&(_, _, v)| v)
+            .expect("slot has MT X");
+        let mt_y = f0
+            .iter()
+            .find(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_Y)
+            .map(|&(_, _, v)| v)
+            .expect("slot has MT Y");
+        assert!(
+            f0.contains(&(EV_ABS, ABS_X, mt_x)),
+            "ABS_X mirrors slot 0: {f0:?}"
+        );
+        assert!(
+            f0.contains(&(EV_ABS, ABS_Y, mt_y)),
+            "ABS_Y mirrors slot 0: {f0:?}"
+        );
+        // Motion frame: X/Y track slot 0 again (changed values).
+        let m1 = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        let f1: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[m1..].to_vec();
+        assert!(
+            f1.iter().any(|&(t, c, _)| t == EV_ABS && c == ABS_X),
+            "motion frame carries ABS_X: {f1:?}"
+        );
+        assert!(
+            f1.iter().any(|&(t, c, _)| t == EV_ABS && c == ABS_Y),
+            "motion frame carries ABS_Y: {f1:?}"
+        );
+        // Empty frame: no X/Y (and no slots either).
+        let m2 = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        let f2: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[m2..].to_vec();
+        assert!(
+            !f2.iter()
+                .any(|&(t, c, _)| t == EV_ABS && (c == ABS_X || c == ABS_Y)),
+            "empty frame carries no X/Y: {f2:?}"
+        );
+    }
+
+    #[test]
     fn pressure_normalized_orientation_negated_on_wire() {
         assert_eq!(crate::apple_parse::PRESSURE_VALID_MAX, 253);
         let sinks = TestSinks::new();
@@ -3016,6 +3096,11 @@ mod tests {
         let get = |code: u16| abs.iter().find(|(c, _, _, _)| *c == code).unwrap();
         assert_eq!(get(ABS_MT_SLOT), &(ABS_MT_SLOT, 0, 15, 0));
         assert_eq!(get(ABS_MT_PRESSURE), &(ABS_MT_PRESSURE, 0, 253, 0));
+        // Single-touch position mirrors the MT ranges/density (owner sysfs:
+        // the physical nodes advertise ABS_X/Y; libinput requires them for
+        // pointer classification).
+        assert_eq!(get(ABS_X), &(ABS_X, -3678, 3934, POSITION_RES_X));
+        assert_eq!(get(ABS_Y), &(ABS_Y, -2478, 2587, POSITION_RES_Y));
         assert_eq!(get(ABS_MT_TOUCH_MAJOR), &(ABS_MT_TOUCH_MAJOR, 0, 1020, 0));
         assert_eq!(get(ABS_MT_TOUCH_MINOR), &(ABS_MT_TOUCH_MINOR, 0, 1020, 0));
         // Physical density: libinput scales slot motion by this.
@@ -3267,6 +3352,8 @@ mod tests {
         // MT axes + the 9 pointer codes → pointer node; SYN → both;
         // every other KEY (letters, modifiers, media, back/forward, app
         // keys) → extras node.
+        assert_eq!(split_route(EV_ABS, ABS_X), SplitRoute::Pointer);
+        assert_eq!(split_route(EV_ABS, ABS_Y), SplitRoute::Pointer);
         assert_eq!(split_route(EV_ABS, ABS_MT_SLOT), SplitRoute::Pointer);
         assert_eq!(split_route(EV_ABS, ABS_MT_POSITION_X), SplitRoute::Pointer);
         assert_eq!(split_route(EV_ABS, ABS_MT_TRACKING_ID), SplitRoute::Pointer);
@@ -4826,8 +4913,11 @@ mod tests {
     /// points at the open bug instead of a bare code number.
     const KEY_MINUS: u16 = 12;
 
-    /// Every `EV_ABS` code the proxy may ever emit (MT slot block only).
-    const ALLOWED_ABS: [u16; 8] = [
+    /// Every `EV_ABS` code the proxy may ever emit (single-touch position
+    /// plus the MT slot block).
+    const ALLOWED_ABS: [u16; 10] = [
+        ABS_X,
+        ABS_Y,
         ABS_MT_SLOT,
         ABS_MT_TRACKING_ID,
         ABS_MT_POSITION_X,
@@ -4855,7 +4945,7 @@ mod tests {
 
     /// Assert the COMPLETE wire stream uses only expected codes:
     /// - `EV_SYN` is exactly `(SYN_REPORT, 0)`;
-    /// - `EV_ABS` is one of the eight MT codes;
+    /// - `EV_ABS` is one of the ten position/slot codes;
     /// - `EV_KEY` is in `allowed_keys` or a `BTN_TOOL_*` classification
     ///   bit, with value 0/1 (the action-code guard is the primary net;
     ///   the extra `KEY_MINUS` assert below is a redundant pin);
@@ -4954,6 +5044,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 10),
+            (EV_ABS, ABS_Y, 20),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4972,6 +5064,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 15),
+            (EV_ABS, ABS_Y, 25),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -4989,6 +5083,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 15),
+            (EV_ABS, ABS_Y, 25),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -5081,6 +5177,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 0),
+            (EV_ABS, ABS_Y, 0),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -5097,6 +5195,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 0),
+            (EV_ABS, ABS_Y, 0),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -5112,6 +5212,8 @@ mod tests {
             (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
             (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
             (EV_ABS, ABS_MT_ORIENTATION, -2),
+            (EV_ABS, ABS_X, 0),
+            (EV_ABS, ABS_Y, 0),
             (EV_KEY, BTN_TOUCH, 1),
             (EV_KEY, BTN_TOOL_FINGER, 1),
             (EV_KEY, BTN_TOOL_DOUBLETAP, 0),
@@ -5493,6 +5595,8 @@ mod tests {
                 (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
                 (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
                 (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_X, 10),
+                (EV_ABS, ABS_Y, 20),
             ]
         };
         let tool_finger = || -> Vec<(u16, u16, i32)> {
@@ -5588,6 +5692,8 @@ mod tests {
                 (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
                 (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
                 (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_X, x0),
+                (EV_ABS, ABS_Y, y0),
             ]
         };
         let tool_double = || -> Vec<(u16, u16, i32)> {
@@ -5702,6 +5808,8 @@ mod tests {
                 (EV_ABS, ABS_MT_TOUCH_MAJOR, 800),
                 (EV_ABS, ABS_MT_TOUCH_MINOR, 800),
                 (EV_ABS, ABS_MT_ORIENTATION, -2),
+                (EV_ABS, ABS_X, 0),
+                (EV_ABS, ABS_Y, 0),
             ]
         };
         let tool_triple = || -> Vec<(u16, u16, i32)> {
