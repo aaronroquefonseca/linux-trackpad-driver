@@ -78,7 +78,9 @@
 //!   elapses (clock-gated, not frame-counted): a same-frame up+SYN+down
 //!   reads as one gesture downstream and the drag never restarts (owner
 //!   HW). A force latch that vanishes before the press lands drops the
-//!   pending press cleanly. Continuous
+//!   pending press cleanly. The fresh press itself is staggered
+//!   modifiers-first (super down + SYN, then left down): simultaneous
+//!   combo downs read as the old drag continuing. Continuous
 //!   skips the cut while the physical button holds `BTN_LEFT` (wire
 //!   stays down, no 0-then-1 flutter).
 //! - Slide level (`slide_1..=slide_5`, default `none`): the proxy holds a
@@ -752,6 +754,8 @@ where
         // Cut-mode deferred press: last frame's force edge released the wire;
         // the fresh combo lands once the 5 ms floor has elapsed (clock-gated,
         // not frame-counted: a fast next frame must not collapse the gap).
+        // Staggered modifiers-first with a SYN between groups (owner HW:
+        // same-frame simultaneous downs read as the old drag continuing).
         // Dropped when the force latch already vanished (liftoff/ease-off
         // before the press lands): its keys never went down, so there is
         // nothing to release. Lands before this frame's own presses
@@ -767,7 +771,7 @@ where
             ) >= CUT_REPRESS_GAP
             {
                 let pending = self.pending_force.take().expect("pending checked above");
-                self.press_level(&pending.ev, haptic_pressure);
+                self.press_cut_combo(&pending.ev, haptic_pressure);
             }
         }
         if let Some(ref ev) = edges.first {
@@ -958,46 +962,105 @@ where
     /// codes (modifiers, combos) emit before pointer-routed buttons, stable
     /// within each route — the compositor must see e.g. super held when
     /// left lands (window-drag), regardless of config order (`left+super`
-    /// vs `super+left`).
+    /// vs `super+left`). Simultaneous within one frame (continuous mode and
+    /// all non-cut presses keep this); the cut fresh-press staggers instead
+    /// (see [`ClickProxy::down_keys_staggered`]).
     fn down_keys(&mut self, keys: &[String], level: ClickLevel) {
-        let mut pairs: Vec<(u16, u16)> = Vec::with_capacity(keys.len());
+        let mut pairs = Self::resolve_keys(keys);
+        // Stable: extras first, pointer buttons second.
+        pairs.sort_by_key(|&(ty, code)| {
+            u8::from(matches!(split_route(ty, code), SplitRoute::Pointer))
+        });
+        for pair in pairs {
+            self.emit_key_down(pair, level);
+        }
+    }
+
+    /// Cut fresh-press key-downs: modifiers first as SEPARATE steps — the
+    /// extras-routed group goes down + `SYN`, then the pointer-routed group
+    /// goes down. Same-frame simultaneous combo downs read as an extension
+    /// of the old drag downstream (owner HW: drag never restarts); the
+    /// framed modifier-first order gives Mutter the modifier established
+    /// before the button that starts the move-drag. Single-group actions
+    /// behave exactly like [`ClickProxy::down_keys`] (no stray `SYN`).
+    /// Cut-path only; continuous and all other presses stay simultaneous.
+    fn down_keys_staggered(&mut self, keys: &[String], level: ClickLevel) {
+        let pairs = Self::resolve_keys(keys);
+        let (mods, btns): (Vec<_>, Vec<_>) = pairs
+            .into_iter()
+            .partition(|&(ty, code)| !matches!(split_route(ty, code), SplitRoute::Pointer));
+        for pair in &mods {
+            self.emit_key_down(*pair, level);
+        }
+        if !mods.is_empty() && !btns.is_empty() {
+            self.uinput.sync();
+        }
+        for pair in &btns {
+            self.emit_key_down(*pair, level);
+        }
+    }
+
+    /// Resolve action tokens to wire pairs (unknown tokens log + skip).
+    fn resolve_keys(keys: &[String]) -> Vec<(u16, u16)> {
+        let mut pairs = Vec::with_capacity(keys.len());
         for k in keys {
             match key_token_to_code(k) {
                 Some(pair) => pairs.push(pair),
                 None => log::warn!("proxy: no keycode for '{k}', skipped"),
             }
         }
-        // Stable: extras first, pointer buttons second.
-        pairs.sort_by_key(|&(ty, code)| {
-            u8::from(matches!(split_route(ty, code), SplitRoute::Pointer))
-        });
-        for (ty, code) in pairs {
-            let pair = (ty, code);
-            // Skip the re-emit when another level already holds
-            // the code down, but still record it in this level's
-            // set so release accounting stays per-level.
-            // `BTN_LEFT` goes through the wire tracker instead: it
-            // is already down when the physical bit holds it, and
-            // a duplicate down is redundant traffic the tracker
-            // exists to remove.
-            if pair == (EV_KEY, BTN_LEFT) {
-                if !self.btn_left_down {
-                    self.uinput.emit(ty, code, 1);
-                    self.btn_left_down = true;
-                }
-            } else if !self.is_down(pair) {
+        pairs
+    }
+
+    /// One key-down: emit unless already down elsewhere (per-level record
+    /// always, so release accounting stays per-level). `BTN_LEFT` goes
+    /// through the wire tracker instead of a duplicate down.
+    fn emit_key_down(&mut self, pair: (u16, u16), level: ClickLevel) {
+        let (ty, code) = pair;
+        // Skip the re-emit when another level already holds
+        // the code down, but still record it in this level's
+        // set so release accounting stays per-level.
+        // `BTN_LEFT` goes through the wire tracker instead: it
+        // is already down when the physical bit holds it, and
+        // a duplicate down is redundant traffic the tracker
+        // exists to remove.
+        if pair == (EV_KEY, BTN_LEFT) {
+            if !self.btn_left_down {
                 self.uinput.emit(ty, code, 1);
+                self.btn_left_down = true;
             }
-            let held = match level {
-                ClickLevel::First => &mut self.held_first,
-                ClickLevel::Force => &mut self.held_force,
-                ClickLevel::Slide => &mut self.held_slide,
-            };
-            // Same-level dedup: a handoff-absorbed code is already
-            // recorded (one up per code on release); cross-level
-            // sharing still records per level.
-            if !held.contains(&pair) {
-                held.push(pair);
+        } else if !self.is_down(pair) {
+            self.uinput.emit(ty, code, 1);
+        }
+        let held = match level {
+            ClickLevel::First => &mut self.held_first,
+            ClickLevel::Force => &mut self.held_force,
+            ClickLevel::Slide => &mut self.held_slide,
+        };
+        // Same-level dedup: a handoff-absorbed code is already
+        // recorded (one up per code on release); cross-level
+        // sharing still records per level.
+        if !held.contains(&pair) {
+            held.push(pair);
+        }
+    }
+
+    /// Cut fresh-press: [`ClickProxy::down_keys_staggered`] plus the level's
+    /// own haptic pulse (as in [`ClickProxy::press_level`]).
+    fn press_cut_combo(&mut self, ev: &ClickEvent, pressure: u8) {
+        use crate::config::ActionKind;
+        match &ev.action.kind {
+            ActionKind::None => {
+                log::debug!("proxy: force_{} = none (swallowed)", ev.finger_count);
+            }
+            ActionKind::Empty => {
+                let fired = self.fire_haptic(ev, pressure);
+                self.set_haptic_flag(ev.level, fired);
+            }
+            ActionKind::Keys(keys) => {
+                self.down_keys_staggered(keys, ev.level);
+                let fired = self.fire_haptic(ev, pressure);
+                self.set_haptic_flag(ev.level, fired);
             }
         }
     }
@@ -6561,6 +6624,60 @@ mod tests {
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
         assert!(sinks.extras.has(EV_KEY, 125, 1));
         assert!(px.pending_force.is_none(), "press flushed");
+    }
+
+    #[test]
+    fn cut_force_press_staggers_super_then_left_on_one_wire() {
+        // Owner HW: Mutter needs super held (framed) BEFORE left lands —
+        // same-frame simultaneous downs read as one gesture. A single sink
+        // pins GLOBAL order: super down + SYN strictly before the left
+        // re-press. (Audit: the deferred path replays the full force key
+        // set through the same `press_level`/`DualSink` routing — per-node
+        // tests already show extras 125 alongside the pointer re-press, and
+        // `is_down` has no stale holder here. This test pins the order.)
+        let wire = Arc::new(FakeUinput::new());
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::new(FakeGrab::ok())),
+            SharedUinput(Arc::clone(&wire)),
+            SharedHaptic(Arc::clone(&haptic)),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "super+left".into(),
+            sensitivity: 64,
+            margin: 5,
+            force_offset: 20,
+            transition_mode: "cut".into(),
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        let evs = wire.events.lock().unwrap().clone();
+        let super_down = evs
+            .iter()
+            .position(|&e| e == (EV_KEY, 125, 1))
+            .expect("super must go down");
+        let left_redown = evs
+            .iter()
+            .rposition(|&e| e == (EV_KEY, BTN_LEFT, 1))
+            .expect("left must re-press");
+        assert!(super_down < left_redown, "super before left: {evs:?}");
+        assert!(
+            evs[super_down..=left_redown].contains(&(EV_SYN, SYN_REPORT, 0)),
+            "a SYN must frame super before left lands: {evs:?}"
+        );
     }
 
     #[test]
