@@ -1359,33 +1359,33 @@ mod tests {
 
     #[test]
     fn force_hold_hysteresis_survives_dip_then_liftoff_releases() {
-        // Tune 130/30/5: press 130, force 160, force-release 155. A dip to
+        // Tune 30/130/5: press 30, force 190, force-release 155. A dip to
         // 150 (noise just under release, still firmly pressed) holds the
         // latch inside the 30 ms hold window; past the window it drops;
         // liftoff always drops. (Old parity dropped undebounced.)
         let cfg = Config {
-            sensitivity: 130,
-            force_offset: 30,
+            sensitivity: 30,
+            force_offset: 130,
             margin: 5,
             ..Config::default()
         };
         let mut m = ClickMachine::new();
         let t0 = Instant::now();
         assert!(m
-            .update_at(&[finger(1, 140)], 0, &cfg, at(t0, 0))
+            .update_at(&[finger(1, 40)], 0, &cfg, at(t0, 0))
             .unwrap()
             .first
             .is_some());
         // Deep stab: first already latched, force edges immediately.
         let t1 = at(t0, 60);
         assert!(m
-            .update_at(&[finger(1, 175)], 0, &cfg, t1)
+            .update_at(&[finger(1, 200)], 0, &cfg, t1)
             .unwrap()
             .force
             .is_some());
         let t2 = at(t1, 60);
         assert!(m
-            .update_at(&[finger(1, 175)], 0, &cfg, t2)
+            .update_at(&[finger(1, 200)], 0, &cfg, t2)
             .unwrap()
             .is_empty());
         assert!(m.force_active().is_some());
@@ -1399,7 +1399,7 @@ mod tests {
         // Back deep, then a dip 40 ms after the last held frame: drops.
         let t4 = at(t3, 10);
         assert!(m
-            .update_at(&[finger(1, 175)], 0, &cfg, t4)
+            .update_at(&[finger(1, 200)], 0, &cfg, t4)
             .unwrap()
             .is_empty());
         let t5 = at(t4, 40);
@@ -1411,7 +1411,7 @@ mod tests {
         // Latch re-edges on the next deep frame (not stuck released).
         let t6 = at(t5, 60);
         assert!(m
-            .update_at(&[finger(1, 175)], 0, &cfg, t6)
+            .update_at(&[finger(1, 200)], 0, &cfg, t6)
             .unwrap()
             .force
             .is_some());

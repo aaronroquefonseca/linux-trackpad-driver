@@ -6682,8 +6682,8 @@ mod tests {
 
     #[test]
     fn transition_cut_noisy_dip_holds_super_clean_liftoff_releases() {
-        // Owner NIRI (tune 130/30/5: press 130, force 160, first-release
-        // 125, force-release 155): a hold dipping to 150 (just under force
+        // Owner NIRI (tune 30/130/5: press 30, force 190, first-release
+        // 25, force-release 155): a hold dipping to 150 (just under force
         // release, still firmly pressed) must keep super down — otherwise
         // niri sees super-tap (overview on release) plus a separate click,
         // never the chord, and no drag starts. Only a clean liftoff
@@ -6692,20 +6692,20 @@ mod tests {
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
-            Ok(Some(frame(vec![finger(1, 140, 0, 0)], 0))),
-            Ok(Some(frame(vec![finger(1, 175, 0, 0)], 0))),
-            Ok(Some(frame(vec![finger(1, 175, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 40, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 5, 5)], 0))),
             Ok(Some(frame(vec![finger(1, 150, 5, 5)], 0))),
-            Ok(Some(frame(vec![finger(1, 175, 9, 9)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 9, 9)], 0))),
             Ok(Some(frame(vec![], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             click_1: "left".into(),
             force_1: "left+super".into(),
-            sensitivity: 130,
+            sensitivity: 30,
             margin: 5,
-            force_offset: 30,
+            force_offset: 130,
             transition_mode: "cut".into(),
             combo_stagger_ms: 0,
             ..Config::default()
