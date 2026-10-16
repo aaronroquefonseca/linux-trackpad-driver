@@ -63,8 +63,9 @@
 //!   press-edge handoff. Handoff rule: the slide latch drops when a
 //!   first/force edge fires; the proxy releases slide keys first UNLESS
 //!   the slide and press actions carry identical key sets — then the hold
-//!   continues with no release/re-press. Haptic: the standard
-//!   `haptic`/`quiet_click` pulse iff the slide action is keys/`empty`;
+//!   continues with no release/re-press. Slide never pulses: touching is
+//!   silent, so `slide_* = empty` is keys-nothing + haptic-nothing
+//!   (valid-but-silent — prefer `none`; old configs keep working).
 //!   `none` never latches, never pulses (default = current behavior).
 //! - Finger-count spoofing (`spoof_<slide|click|force>_<1..5>`, `0` =
 //!   passthrough default): the uinput touch stream (slots, `BTN_TOOL_*`)
@@ -211,7 +212,8 @@ pub enum ClickLevel {
     First,
     /// Second level (`force_N`, `effective_force_haptic()`, `force_quiet_click`).
     Force,
-    /// Touch-but-not-pressed (`slide_N`, standard `haptic`/`quiet_click`).
+    /// Touch-but-not-pressed (`slide_N`): never pulses (touch is silent —
+    /// only click/force buzz). Keys still flow.
     Slide,
 }
 
