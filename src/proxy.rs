@@ -6698,6 +6698,76 @@ mod tests {
     }
 
     #[test]
+    fn transition_cut_noisy_dip_holds_super_clean_liftoff_releases() {
+        // Owner NIRI (tune 130/30/5: press 130, force 160, first-release
+        // 125, force-release 155): a hold dipping to 150 (just under force
+        // release, still firmly pressed) must keep super down — otherwise
+        // niri sees super-tap (overview on release) plus a separate click,
+        // never the chord, and no drag starts. Only a clean liftoff
+        // releases. `combo_stagger_ms = 0` keeps the staging compact here;
+        // the stagger itself is pinned elsewhere.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 140, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 175, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 175, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 150, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 175, 9, 9)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click_1: "left".into(),
+            force_1: "left+super".into(),
+            sensitivity: 130,
+            margin: 5,
+            force_offset: 30,
+            transition_mode: "cut".into(),
+            combo_stagger_ms: 0,
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        let t1 = spaced_at(t0, 1);
+        px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        let t2 = t1 + std::time::Duration::from_millis(60);
+        px.handle_frame_at(&cfg, t2).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        // Dip to 150 for 10 ms: hold survives, wire silent.
+        let t3 = t2 + std::time::Duration::from_millis(10);
+        assert!(
+            px.handle_frame_at(&cfg, t3).unwrap().is_none(),
+            "dip must not edge"
+        );
+        assert_eq!(
+            key_values(&sinks.extras, 125),
+            vec![1],
+            "dip just under release keeps super down"
+        );
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1],
+            "dip adds no button traffic"
+        );
+        // Back deep, then a clean liftoff releases everything once.
+        let t4 = t3 + std::time::Duration::from_millis(10);
+        px.handle_frame_at(&cfg, t4).unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        px.handle_frame_at(&cfg, t4 + std::time::Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0, 1, 0],
+            "liftoff owns the final ups"
+        );
+        assert_strict_alternation(&key_values(&sinks.pointer, BTN_LEFT), "BTN_LEFT");
+        assert_strict_alternation(&key_values(&sinks.extras, 125), "super");
+    }
+
+    #[test]
     fn transition_cut_press_waits_for_gap_floor() {
         // The 5 ms floor is clock-gated, not frame-counted: a next frame 2 ms
         // after the release holds the whole press; the modifiers land once
