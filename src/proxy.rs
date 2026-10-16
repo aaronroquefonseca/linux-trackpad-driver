@@ -6143,21 +6143,24 @@ mod tests {
     }
 
     #[test]
-    fn slide_handoff_force_first_absorbs_superseding_level() {
-        // Both edges on one frame, slide == force: the merge owns force
-        // (checked before first), left never ups, right presses alongside.
+    fn slide_handoff_absorbs_into_matching_press_level() {
+        // Staged composition: slide == first merges seamlessly on the stab
+        // frame (no pulse, no wire traffic — left never ups); force follows
+        // on the next frame with its own pulse while the hold continues.
+        // Left: exactly one down/up pair. Right presses alongside on frame 3.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
             Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
             Ok(Some(frame(vec![], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
             slide_1: "left".into(),
-            click_1: "right".into(),
-            force_1: "left".into(),
+            click_1: "left".into(),
+            force_1: "right".into(),
             sensitivity: 64,
             margin: 5,
             force_offset: 20,
@@ -6170,8 +6173,8 @@ mod tests {
             .unwrap()
             .is_slide());
         let mark = sinks.pointer.events.lock().unwrap().len();
-        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
-        assert!(ev.is_force(), "force supersedes in reporting");
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(!first.is_force(), "staged: first edge lands alone");
         let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
         let lefts: Vec<i32> = tail
             .iter()
@@ -6183,10 +6186,13 @@ mod tests {
             lefts.iter().all(|&v| v == 1),
             "no left up mid-hold: {tail:?}"
         );
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap().unwrap();
+        assert!(ev.is_force(), "force supersedes in reporting");
         assert!(sinks.pointer.has(EV_KEY, BTN_RIGHT, 1));
-        // Two downs (slide adopted into force + first) / two ups.
+        // Two downs (slide + force; first adopted the slide pulse) / two ups.
         assert_eq!(haptic.calls.lock().unwrap().len(), 2);
-        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
         assert_eq!(haptic.releases.lock().unwrap().len(), 2);
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
         assert!(sinks.pointer.has(EV_KEY, BTN_RIGHT, 0));
