@@ -62,13 +62,13 @@
 //!   Dropping below the force release (`sensitivity + offset - margin`)
 //!   releases force keys only back to the first-level hold; dropping below
 //!   the first release clears all. `force_offset = 0` disables force.
-//! - Level-transition mode (`transition_mode`): `"continuous"` (default)
-//!   holds level-1 keys while force keys join (shared codes down once, up
-//!   once — see the reference-held rule below). `"cut"` releases ALL
-//!   level-1/slide wire keys first (with SYN) then presses the force combo
-//!   fresh, so shared codes show up+SYN+down; easing back below the force
-//!   release re-presses the still-latched level-1 keys (one SYN frame, so
-//!   the restart reads as up/down pairs, never a stuck key). Skipped for
+//! - Level-transition mode (`transition_mode`): `"cut"` (default)
+//!   releases ALL level-1/slide wire keys first (with SYN) then presses
+//!   the force combo fresh, so shared codes show up+SYN+down; easing back
+//!   below the force release re-presses the still-latched level-1 keys
+//!   (one SYN frame, so the restart reads as up/down pairs, never a stuck
+//!   key). `"continuous"` holds level-1 keys while force keys join (shared
+//!   codes down once, up once — see the reference-held rule below). Skipped for
 //!   `none`/`empty` force actions, when nothing is held, and when the
 //!   edge absorbed a slide handoff (seamless merge wins for that frame).
 //!   Cut ALWAYS emits the release — even under a physically-held
@@ -4181,6 +4181,7 @@ mod tests {
             margin: 5,
             force_offset: 20,
             force_1: "forward".into(),
+            transition_mode: "continuous".into(),
             ..Config::default()
         }
     }
@@ -4344,6 +4345,7 @@ mod tests {
             force_offset: 20,
             click_1: "ctrl+c".into(),
             force_1: "ctrl+v".into(),
+            transition_mode: "continuous".into(),
             ..Config::default()
         };
         // Spaced: the full-release frame must clear the release debounce.
@@ -4404,6 +4406,7 @@ mod tests {
             margin: 5,
             force_offset: 20,
             force_1: "left".into(),
+            transition_mode: "continuous".into(),
             ..Config::default()
         };
         // Spaced: the release frame must clear the release debounce.
@@ -4536,6 +4539,7 @@ mod tests {
             force_haptic: Some(1),
             force_quiet_click: false,
             force_1: "forward".into(),
+            transition_mode: "continuous".into(),
             ..Config::default()
         }
     }
@@ -6384,6 +6388,7 @@ mod tests {
                 r#"
                 sensitivity = 30
                 force_offset = 130
+                transition_mode = "continuous"
                 click_1 = {{ action = "super+left", stagger_ms = 100 }}
                 force_1 = {{ action = "ctrl+{}", stagger_ms = 50 }}
             "#,
@@ -6683,6 +6688,7 @@ mod tests {
             r#"
             sensitivity = 30
             force_offset = 130
+            transition_mode = "continuous"
             click_1 = { action = "super+left", stagger_ms = 120 }
             force_1 = { action = "super+right", stagger_ms = 50 }
         "#,
@@ -6796,6 +6802,7 @@ mod tests {
                 r#"
                 sensitivity = 30
                 force_offset = 130
+                transition_mode = "continuous"
                 slide_1 = {{ action = "super+left", stagger_ms = 120 }}
                 click_1 = {{ action = "left+super", stagger_ms = 0 }}
                 force_1 = {{ action = "ctrl+left", stagger_ms = {force_delay} }}
@@ -7765,6 +7772,7 @@ mod tests {
             sensitivity: 64,
             margin: 5,
             force_offset: 20,
+            transition_mode: "continuous".into(),
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -7840,7 +7848,7 @@ mod tests {
 
     #[test]
     fn transition_continuous_holds_first_under_force() {
-        // Default mode: force joins, left never ups mid-hold.
+        // Continuous mode: force joins, left never ups mid-hold.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![
@@ -7856,6 +7864,7 @@ mod tests {
             sensitivity: 64,
             margin: 5,
             force_offset: 20,
+            transition_mode: "continuous".into(),
             ..Config::default()
         };
         assert!(!cfg.is_cut_transition());
@@ -8551,6 +8560,7 @@ mod tests {
             sensitivity: 64,
             margin: 5,
             force_offset: 20,
+            transition_mode: "continuous".into(),
             ..Config::default()
         };
         assert!(!cfg.is_cut_transition());
