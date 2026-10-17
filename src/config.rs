@@ -63,15 +63,15 @@ pub struct Config {
     /// Finger-count press actions; see [`parse_click_action`]. Defaults
     /// `left/right/middle/none/none`.
     #[serde(default = "default_click_1")]
-    pub click_1: String,
+    pub click_1: ActionBinding,
     #[serde(default = "default_click_2")]
-    pub click_2: String,
+    pub click_2: ActionBinding,
     #[serde(default = "default_click_3")]
-    pub click_3: String,
+    pub click_3: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub click_4: String,
+    pub click_4: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub click_5: String,
+    pub click_5: ActionBinding,
     /// Second-level pressure offset: force fires at
     /// `sensitivity + force_offset`. `0` disables. `0..=255`. Default 0.
     #[serde(default)]
@@ -85,29 +85,29 @@ pub struct Config {
     pub force_quiet_click: bool,
     /// Force-level finger-count actions. Defaults all `none`.
     #[serde(default = "default_action_none")]
-    pub force_1: String,
+    pub force_1: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub force_2: String,
+    pub force_2: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub force_3: String,
+    pub force_3: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub force_4: String,
+    pub force_4: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub force_5: String,
+    pub force_5: ActionBinding,
     /// Slide-level finger-count actions (touch-but-not-pressed: contact
     /// present, every pressure at/below the release threshold). Defaults
     /// all `none` (= no action, current behavior: sliding only moves the
     /// cursor). See [`crate::clicks::ClickMachine`] for handoff semantics.
     #[serde(default = "default_action_none")]
-    pub slide_1: String,
+    pub slide_1: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub slide_2: String,
+    pub slide_2: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub slide_3: String,
+    pub slide_3: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub slide_4: String,
+    pub slide_4: ActionBinding,
     #[serde(default = "default_action_none")]
-    pub slide_5: String,
+    pub slide_5: ActionBinding,
     /// Finger-count spoofing: virtual count reported to the computer when
     /// the real touching count is N under a status (`0` = passthrough,
     /// report the real count; `1..=5` = spoof). Fifteen keys cover
@@ -164,6 +164,8 @@ pub struct Config {
     /// down + SYN first; pointer buttons follow on the monotonic pump
     /// clock, including idle polls. `0` emits both groups in the same poll.
     /// Cut force presses additionally keep their 5 ms release floor.
+    /// Selected action objects can override the gap on any mixed binding;
+    /// omitted ordinary click/continuous force timing stays immediate.
     #[serde(default = "default_combo_stagger_ms")]
     pub combo_stagger_ms: u16,
 }
@@ -186,17 +188,17 @@ fn default_haptic() -> u16 {
 fn default_speed() -> u32 {
     100
 }
-fn default_click_1() -> String {
-    "left".to_string()
+fn default_click_1() -> ActionBinding {
+    "left".into()
 }
-fn default_click_2() -> String {
-    "right".to_string()
+fn default_click_2() -> ActionBinding {
+    "right".into()
 }
-fn default_click_3() -> String {
-    "middle".to_string()
+fn default_click_3() -> ActionBinding {
+    "middle".into()
 }
-fn default_action_none() -> String {
-    "none".to_string()
+fn default_action_none() -> ActionBinding {
+    "none".into()
 }
 fn default_transition_mode() -> String {
     "continuous".to_string()
@@ -256,11 +258,88 @@ impl Default for Config {
     }
 }
 
+/// A flat action setting: legacy string or `{ action = "...", stagger_ms = N }`.
+/// Missing timing deliberately stays distinct from an explicit zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionBinding {
+    pub action: String,
+    pub stagger_ms: Option<u16>,
+}
+
+impl From<&str> for ActionBinding {
+    fn from(action: &str) -> Self {
+        Self {
+            action: action.into(),
+            stagger_ms: None,
+        }
+    }
+}
+
+impl From<String> for ActionBinding {
+    fn from(action: String) -> Self {
+        Self {
+            action,
+            stagger_ms: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionBinding {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct BindingVisitor;
+        impl<'de> serde::de::Visitor<'de> for BindingVisitor {
+            type Value = ActionBinding;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an action string or { action = string, stagger_ms = 0..=500 }")
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(value.into())
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Expanded {
+                    action: String,
+                    stagger_ms: Option<u16>,
+                }
+                let value =
+                    Expanded::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ActionBinding {
+                    action: value.action,
+                    stagger_ms: value.stagger_ms,
+                })
+            }
+        }
+        deserializer.deserialize_any(BindingVisitor)
+    }
+}
+
+impl ActionBinding {
+    fn parse(&self) -> std::result::Result<ClickAction, String> {
+        if self.stagger_ms.is_some_and(|ms| ms > 500) {
+            return Err("stagger_ms must be 0..=500 milliseconds".into());
+        }
+        let mut action = parse_click_action(&self.action)?;
+        action.stagger_ms = self.stagger_ms;
+        Ok(action)
+    }
+}
+
 /// A validated click/force action value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClickAction {
     /// Original string as written in config.
     pub raw: String,
+    /// Selected binding timing; None preserves the applicable legacy path.
+    pub stagger_ms: Option<u16>,
     /// Classified meaning.
     pub kind: ActionKind,
 }
@@ -278,7 +357,7 @@ pub enum ActionKind {
 
 impl ActionKind {
     /// Wire-identity compare: key sets match as sets (order- and
-    /// duplicate-insensitive, mirroring `down_keys` same-level dedup:
+    /// duplicate-insensitive, mirroring proxy same-level dedup:
     /// `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one `left`
     /// and one `ctrl`). `Empty == Empty`; `None` only equals `None`
     /// (a latched slide is never `None`, so handoffs only merge real
@@ -314,12 +393,14 @@ pub fn parse_click_action(s: &str) -> std::result::Result<ClickAction, String> {
     if lowered == "none" {
         return Ok(ClickAction {
             raw: s.to_string(),
+            stagger_ms: None,
             kind: ActionKind::None,
         });
     }
     if lowered == "empty" {
         return Ok(ClickAction {
             raw: s.to_string(),
+            stagger_ms: None,
             kind: ActionKind::Empty,
         });
     }
@@ -342,6 +423,7 @@ pub fn parse_click_action(s: &str) -> std::result::Result<ClickAction, String> {
     }
     Ok(ClickAction {
         raw: s.to_string(),
+        stagger_ms: None,
         kind: ActionKind::Keys(keys),
     })
 }
@@ -441,8 +523,9 @@ impl Config {
             ("slide_4", &self.slide_4),
             ("slide_5", &self.slide_5),
         ] {
-            parse_click_action(value)
-                .map_err(|e| anyhow::anyhow!("invalid {key} '{value}': {e}"))?;
+            value
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid {key}: {e}"))?;
         }
         for (key, value) in [
             ("spoof_slide_1", self.spoof_slide_1),
@@ -501,7 +584,8 @@ impl Config {
             5 => &self.click_5,
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
-        parse_click_action(raw).map_err(|e| anyhow::anyhow!("invalid click_{n} '{raw}': {e}"))
+        raw.parse()
+            .map_err(|e| anyhow::anyhow!("invalid click_{n}: {e}"))
     }
 
     /// Force-level action for finger count `n` (`1..=5`).
@@ -514,7 +598,8 @@ impl Config {
             5 => &self.force_5,
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
-        parse_click_action(raw).map_err(|e| anyhow::anyhow!("invalid force_{n} '{raw}': {e}"))
+        raw.parse()
+            .map_err(|e| anyhow::anyhow!("invalid force_{n}: {e}"))
     }
 
     /// True when at least one `slide_N` maps an action (string-level
@@ -532,7 +617,7 @@ impl Config {
             &self.slide_5,
         ]
         .iter()
-        .any(|s| !s.trim().eq_ignore_ascii_case("none"))
+        .any(|s| !s.action.trim().eq_ignore_ascii_case("none"))
     }
 
     /// Slide-level action for finger count `n` (`1..=5`).
@@ -545,7 +630,8 @@ impl Config {
             5 => &self.slide_5,
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
-        parse_click_action(raw).map_err(|e| anyhow::anyhow!("invalid slide_{n} '{raw}': {e}"))
+        raw.parse()
+            .map_err(|e| anyhow::anyhow!("invalid slide_{n}: {e}"))
     }
 
     /// Raw spoof cell for (`status`, real count `n`): `0` = passthrough.
@@ -698,19 +784,19 @@ mod tests {
         assert_eq!(c.haptic, 5);
         assert!(!c.quiet_click);
         assert_eq!(c.speed, 100);
-        assert_eq!(c.click_1, "left");
-        assert_eq!(c.click_2, "right");
-        assert_eq!(c.click_3, "middle");
-        assert_eq!(c.click_4, "none");
-        assert_eq!(c.click_5, "none");
+        assert_eq!(c.click_1.action, "left");
+        assert_eq!(c.click_2.action, "right");
+        assert_eq!(c.click_3.action, "middle");
+        assert_eq!(c.click_4.action, "none");
+        assert_eq!(c.click_5.action, "none");
         assert_eq!(c.force_offset, 0);
         assert_eq!(c.force_haptic, None);
         assert!(!c.force_quiet_click);
         for f in [&c.force_1, &c.force_2, &c.force_3, &c.force_4, &c.force_5] {
-            assert_eq!(f, "none");
+            assert_eq!(f.action, "none");
         }
         for s in [&c.slide_1, &c.slide_2, &c.slide_3, &c.slide_4, &c.slide_5] {
-            assert_eq!(s, "none");
+            assert_eq!(s.action, "none");
         }
         for v in [
             c.spoof_slide_1,
@@ -1197,7 +1283,7 @@ transition_mode = "cut"
 "#;
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();
-        assert_eq!(c.slide_1, "left");
+        assert_eq!(c.slide_1.action, "left");
         assert_eq!(c.spoofed_count("click", 2), 3);
         assert_eq!(c.select_count("click", 2), 3);
         assert!(c.is_cut_transition());
@@ -1210,7 +1296,7 @@ transition_mode = "cut"
         let c: Config = toml::from_str("polling_rate = 90\nenhanced_clicks = false\n").unwrap();
         assert_eq!(c.polling_rate, 90);
         assert_eq!(c.sensitivity, 64);
-        assert_eq!(c.click_1, "left");
+        assert_eq!(c.click_1.action, "left");
         assert_eq!(c.force_offset, 0);
         c.validate().unwrap();
     }
@@ -1230,6 +1316,94 @@ transition_mode = "cut"
         let path = dir.path().join("badkey.toml");
         std::fs::write(&path, "click_1 = \"frobnicate\"\n").unwrap();
         assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+    }
+
+    fn binding_names() -> Vec<String> {
+        ["click", "force", "slide"]
+            .into_iter()
+            .flat_map(|level| (1..=5).map(move |n| format!("{level}_{n}")))
+            .collect()
+    }
+
+    #[test]
+    fn all_bindings_accept_objects_and_omission_equals_legacy_string() {
+        for name in binding_names() {
+            for action in [
+                "left",
+                "super+left",
+                "alt+f4",
+                "control+right",
+                "none",
+                "empty",
+            ] {
+                let legacy: Config = toml::from_str(&format!("{name} = \"{action}\"")).unwrap();
+                let expanded: Config =
+                    toml::from_str(&format!("{name} = {{ action = \"{action}\" }}")).unwrap();
+                legacy.validate().unwrap();
+                expanded.validate().unwrap();
+                assert_eq!(legacy, expanded, "{name}: omitted timing must stay omitted");
+                for ms in [0, 50, 500] {
+                    let timed: Config = toml::from_str(&format!(
+                        "{name} = {{ action = \"{action}\", stagger_ms = {ms} }}"
+                    ))
+                    .unwrap();
+                    timed.validate().unwrap();
+                    let (level, n) = name.split_once('_').unwrap();
+                    let n = n.parse().unwrap();
+                    let parsed = match level {
+                        "click" => timed.click_action(n),
+                        "force" => timed.force_action(n),
+                        _ => timed.slide_action(n),
+                    }
+                    .unwrap();
+                    assert_eq!(parsed.stagger_ms, Some(ms), "{name}");
+                    assert_eq!(parsed.kind, parse_click_action(action).unwrap().kind);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bad_binding_objects_name_the_binding_and_problem() {
+        for name in binding_names() {
+            for (value, problem) in [
+                ("{}", "action"),
+                ("{ stagger_ms = 50 }", "action"),
+                ("{ action = 3 }", "string"),
+                ("{ action = true }", "string"),
+                ("{ action = [] }", "string"),
+                ("{ action = \"left\", stagger_ms = -1 }", "u16"),
+                ("{ action = \"left\", stagger_ms = 501 }", "0..=500"),
+                ("{ action = \"left\", stagger_ms = 65536 }", "u16"),
+                ("{ action = \"left\", stagger_ms = \"50\" }", "u16"),
+                ("{ action = \"left\", stagger_ms = 1.5 }", "u16"),
+                ("{ action = \"left\", stagger_ms = true }", "u16"),
+                ("{ action = \"left\", stagger_ms = {} }", "u16"),
+                ("{ action = \"left\", typo = 50 }", "unknown field"),
+                ("{ action = \"ctrl++c\" }", "empty key"),
+                ("{ action = \"bogus\" }", "unknown key"),
+                ("{ action = \"\" }", "empty click"),
+                ("50", "action string"),
+                ("[]", "action string"),
+            ] {
+                let result = toml::from_str::<Config>(&format!("{name} = {value}"))
+                    .map_err(anyhow::Error::from)
+                    .and_then(|cfg| cfg.validate());
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&name), "missing binding: {error}");
+                assert!(error.contains(problem), "missing {problem}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn documentation_examples_use_the_real_config_reader() {
+        let doc = include_str!("../docs/CONFIG.md");
+        for block in doc.split("```toml\n").skip(1) {
+            let text = block.split("```").next().unwrap();
+            let cfg: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            cfg.validate().unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
     }
 
     #[test]
