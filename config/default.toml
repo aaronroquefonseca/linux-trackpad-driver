@@ -1,182 +1,81 @@
-# Default configuration for linux-trackpad-driver (full schema).
+# Default configuration for linux-trackpad-driver (v1 sectioned schema).
 #
-# Unknown keys are rejected (likely typos); any omitted key takes its
-# documented default, so Phase-0 subset files with only log_level /
-# polling_rate / enhanced_clicks keep working unchanged.
-
-# log_level: debug|info|warn|error
+# Device tiers: L0 basic no-pressure (pointer speed + finger-count remapping);
+# L1 pressure no host buzz (+click/force/slide); L2 pressure+host buzz all
+# active (Apple proprietary today, ChromeOS standard planned). Only Apple
+# Magic Trackpad 2 implemented; others planned.
+# [device] stands alone (independent of enhanced_clicks); [pointer]/[click]/
+# [haptics]/[force]/[slide]/[spoof] require enhanced_clicks=true (unsupported
+# stay saved+inactive). Omitted keys fall back to defaults. Device-specific
+# pressure values, not portable. Unknown keys error.
+# Apply: sudo systemctl restart linux-trackpad-driver (required for now; live
+# reload planned).
+schema_version = 1
 log_level = "info"
+enhanced_clicks = true
 
-# Requested polling rate in Hz. CAPPED posture: the default is the
-# demonstrated device maximum, ~110 Hz (X = 0x23 = 35, 3850/35 ≈ 110).
-# Values above 110 are rejected here; the init layer additionally clamps
-# any runtime override, so X >= 0x23 is always what hits the wire.
-# (Higher device modes are unverified — X < 35 may be NAKed/ignored.)
-# DEVIATION from old driver (intentional, KEEP): old defaults to 500 Hz;
-# no 500 Hz mode is verified on hardware, so 110 Hz stays the cap.
+# Apple USB only. Requested Hz 16..110, default 110 (capped device maximum,
+# ~110 Hz, 99 F2 X with X = 0x23 = 35, 3850/35 ~= 110; higher unverified).
+[device]
 polling_rate = 110
 
-# Opt-in gate for the entire clicks pipeline. Default OFF: the device
-# must work perfectly with init alone (plain kernel/libinput passthrough).
-enhanced_clicks = false
-
-# -------------------------------------------------------------------------
-# Click pipeline tuning (parsed always, acted on only when enhanced_clicks)
-#
-# Old-driver feel parity (hardware-tuned, adopted vs deviated per key):
-# - sensitivity 64 / margin 5 / haptic 5 / quiet false / speed 100:
-#   ADOPTED (numeric defaults match old exactly).
-# - Press detection: ADOPTED — a touch counts when the device flag says
-#   so OR pressure > 10 (light touches move the cursor without
-#   clicking); press swallowed within 50 ms of the last release,
-#   release held within 30 ms of the press edge (old debounce).
-# - Haptic mapping: ADOPTED — actuator pressure byte = sensitivity
-#   (threshold), intensity = haptic; amplitude 120 / pattern 6 normal,
-#   255 / 0 quiet. DEVIATION: old also fires a release up-pulse
-#   (pressure sensitivity*3/5); only the down pulse is emitted here
-#   (owner feel-checklist item).
-# - Pointer speed: ADOPTED linear curve (old expresses it as axis
-#   resolution 48*100/speed; here resolution stays at the physical
-#   48/44 density and speed scales deltas in software — same 1:1 feel
-#   at 100, single application, no double-scaling).
-# - Pressure on the wire: DEVIATION — raw pressure clamped to 253
-#   (kernel absmax); old normalizes every contact to a fixed 60.
-# - Tracking IDs: DEVIATION — the device id per slot; old mints
-#   monotonic ids per slot. Both are valid Type-B; cursor motion is
-#   unaffected.
-# -------------------------------------------------------------------------
-
-# Pressure sensitivity threshold (1-255). Lower = more sensitive.
-sensitivity = 64
-
-# Release hysteresis: release fires at (sensitivity - margin). 0-255.
-# DEVIATION: saturates at 0 (pressure 0 = no touch releases); old
-# floors the release point at 1. Feel-identical outside extremes.
-margin = 5
-
-# Haptic feedback strength (0-255). 0 = silent.
-haptic = 5
-
-# Soft haptic waveform.
-quiet_click = false
-
-# Pointer speed percent. 100 = 1:1. 1-1000.
+[pointer]
+# Pointer speed percent, 1..1000, default 100 = 1:1.
 speed = 100
 
-# -------------------------------------------------------------------------
-# Click actions (standard level). ADOPTED: left/right/middle/none/none
-# match the old-driver defaults exactly.
-# left|right|middle|back|forward|none|empty, or '+'-joined key combos
-# (e.g. "ctrl+c"). 'none' = no action, no haptic. 'empty' = no keys,
-# but haptic still fires.
-# Key names: modifiers (ctrl/control/lctrl/rctrl, shift/lshift/rshift,
-# alt/lalt/ralt, meta/super/cmd/command/win/lmeta/rmeta), nav/edit
-# (esc/escape, enter/return, space, tab, backspace, delete, home, end,
-# pageup/pgup, pagedown/pgdn, up/arrow_up, down/arrow_down, left_arrow,
-# right_arrow), media (volup, voldown, mute, play, pause), letters a-z,
-# digits 0-9, function keys f1-f24.
-# -------------------------------------------------------------------------
+[click]
+# Press threshold 1..255, default 30 (firmer alt 64). Lower = more sensitive.
+sensitivity = 30
+# Release hysteresis 0..255, default 5 (release at sensitivity - margin).
+margin = 5
 click_1 = "left"
 click_2 = "right"
 click_3 = "middle"
 click_4 = "none"
 click_5 = "none"
+# Per-binding timing opt-in (same keys, different timing):
+# click_4 = { action = "super+right", stagger_ms = 0 }
 
-# -------------------------------------------------------------------------
-# Force click (second pressure level at sensitivity + force_offset)
-# -------------------------------------------------------------------------
-
-# Additional pressure offset (0-255). 0 disables the force level.
-force_offset = 0
-
-# Haptic strength for the force level (0-255). Omitted = use `haptic`.
-# force_haptic = 5
-
-# Soft waveform for the force level.
+[haptics]
+# Strength 0..255 (0 = silent), default 2.
+haptic = 2
+quiet_click = true
+# force_haptic omitted = inherit haptic.
 force_quiet_click = false
 
-# Force-level actions (same strings or inline action objects as click_*).
+[force]
+# Offset 0..255 (0 disables), default 0. Example owner tune 130 with
+# sensitivity 30 fires at 160.
+force_offset = 0
 force_1 = "none"
 force_2 = "none"
 force_3 = "none"
 force_4 = "none"
 force_5 = "none"
+# cut (default) releases click keys first; continuous joins force keys.
+transition_mode = "cut"
+# Fallback gap 0..500 ms, default 50.
+combo_stagger_ms = 50
+# Per-binding timing opt-in:
+# force_1 = { action = "super+left", stagger_ms = 50 }
 
-# -------------------------------------------------------------------------
-# Slide status (third mappable status: touch-but-not-pressed)
-#
-# A slide_N action fires/holds while exactly N fingers touch with every
-# pressure at/below the release threshold (sensitivity - margin) — i.e.
-# sliding/dragging fingers around without pressing. Defaults all "none"
-# (= no action, current behavior: slides only move the cursor).
-# Handoff: a press edge releases the slide action first, UNLESS the slide
-# and click actions are identical (same keys) — then the hold continues
-# with no release/re-press flutter. Touch is silent: slide never fires a
-# haptic pulse (down or release), not even for keys/empty — only the
-# button levels (click/force) buzz. slide_* = empty is valid-but-silent
-# (keys-nothing + haptic-nothing; prefer "none"; old configs keep working).
-# -------------------------------------------------------------------------
+[slide]
 slide_1 = "none"
 slide_2 = "none"
 slide_3 = "none"
 slide_4 = "none"
 slide_5 = "none"
+# Five-finger drag opt-in:
+# slide_5 = { action = "super+left", stagger_ms = 50 }
 
-# -------------------------------------------------------------------------
-# Finger-count spoofing (what the COMPUTER sees)
-#
-# Sparse tables — set only needed rows, omitted rows are passthrough
-# (report real). Each N = V overrides the reported finger count when
-# the real touching count is N under that status: 0 = passthrough
-# (default), 1..=5 = report that many virtual contacts instead. The
-# virtual contacts keep the real centroid (midpoint) with the requested
-# number of contacts projected on a tiny fixed pattern around it (1 at
-# center; 2 split ±18 units on x; 3+ evenly spaced on a 24-unit-radius
-# circle — sub-millimeter at the 48/44 units/mm density, inside axis
-# ranges; template copies the first real contact's size/orientation).
-# The uinput touch stream (slots, BTN_TOOL_*, BTN_TOUCH) always uses the
-# spoofed count (wire always virtual: the desktop is fooled via wire
-# always). Action selection keeps using the REAL count when
-# [spoof] actions_follow_spoof = false (default, recommended), or the
-# virtual count when true (advanced alias, not recommended: e.g. real 5
-# with 5 = 4 fires click_4, which reduces combos). Example with
-# [spoof.click] 3 = 1: real 3 fires click_3 when false, click_1 when true.
-# -------------------------------------------------------------------------
+# TOML-safe: parent first, then sparse subtables. Omitted = real count,
+# 0 = passthrough, 1..5 = virtual. Wire always virtual; false = real-count
+# actions (recommended), true = virtual (advanced).
+[spoof]
+actions_follow_spoof = false
+# [spoof.slide]
+# 5 = 1
 # [spoof.click]
 # 2 = 3
-# [spoof.slide]
-# 1 = 2
 # [spoof.force]
 # 1 = 1
-# [spoof]
-# actions_follow_spoof = false
-
-# -------------------------------------------------------------------------
-# Level-transition mode (force edge over an active click)
-#
-# continuous: force keys join held click keys.
-# cut (default): release click keys first, then press force keys.
-# -------------------------------------------------------------------------
-transition_mode = "cut"
-
-# Fallback modifier-to-button gap for fresh mixed slides and cut-force
-# fresh presses that OMIT binding timing (milliseconds, 0..=500, default 50).
-# Ordinary clicks/continuous force stay immediate when timing is omitted.
-# All 15 click_N/force_N/slide_N actions also accept inline objects:
-#   slide_5 = { action = "super+left", stagger_ms = 50 }
-#   force_1 = { action = "super+left", stagger_ms = 50 }
-#   click_4 = { action = "super+left", stagger_ms = 0 }
-# Replace the relevant assignment above to try one; these are opt-in edits.
-# `action` is required; only `stagger_ms` is optional (integer 0..=500 ms).
-# A string and { action = "..." } preserve the same applicable defaults.
-# A positive override works on any mixed click/force/slide action: extras
-# go down + SYN, then pointer buttons after the gap, without blocking input.
-# 0 means no timed wait (extras first in the same poll, not cross-node
-# simultaneity). Slide/cut retain an inter-group SYN; ordinary click and
-# continuous force use the trailing frame SYN. Cut always keeps its separate
-# 5 ms release/repress floor. Keyboard-only (alt+f4) and pointer-only actions
-# have no division to delay. These are held actions: same-action handoffs
-# retain the original pending deadline; slides never fire haptics.
-# See docs/CONFIG.md for flat examples: Back/Forward on force_2/force_3,
-# opt-in Alt+F4, GNOME window menu/force drag, and silent five-finger drag.
-combo_stagger_ms = 50
