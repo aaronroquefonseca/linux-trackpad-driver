@@ -114,13 +114,14 @@ never drop.
 sudo libinput quirks list /dev/input/eventX
 ```
 
-## 2. USB init matrix (`enhanced_clicks = false` throughout)
+## 2. USB init matrix (passthrough baseline: set `enhanced_clicks = false`)
 
-Default config stays pure-passthrough: init only, no grab, no proxy.
-Verify with:
+Shipped default is `enhanced_clicks = true`, so set the gate off explicitly
+for this section: init only, no grab, no proxy. Set + verify with:
 
 ```sh
-grep -E 'enhanced_clicks' /etc/linux-trackpad-driver/config.toml || echo "default false (good)"
+sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = false/' /etc/linux-trackpad-driver/config.toml
+grep -E '^enhanced_clicks' /etc/linux-trackpad-driver/config.toml  # expect false
 ```
 
 ### 2a. `run` from cold plug
@@ -212,7 +213,7 @@ BT /dev/hidrawN: single-node path, no init dance — device ready
 
 (no `02 01` / `21 01` / `99 F2` reports on BT, ever).
 
-- [ ] With `enhanced_clicks=false` (default): pointer works via kernel
+- [ ] With `enhanced_clicks=false`: pointer works via kernel
       passthrough. Log shows passthrough intact at debug level, no unbind.
 - [ ] Double-input check: slow diagonal drag in `evtest` on the physical
       node — each physical motion produces exactly one event stream.
@@ -229,11 +230,13 @@ sudo ltd reconnect /dev/hidrawN -d
 
 ## 4. Click-proxy matrix (`enhanced_clicks = true`)
 
-Gate on, daemon restarted. Proxy attaches per `Ready`; any proxy failure
-must fall back to passthrough (init unaffected).
+Gate on, daemon restarted. Proxy attaches per `Ready`; USB proxy failure
+falls back to passthrough (init unaffected; on BT a failed enhanced path
+may need re-bind/replug — see README Troubleshooting).
 
 ```sh
-sudo sed -i 's/enhanced_clicks = false/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml
+sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml
+grep -E '^enhanced_clicks' /etc/linux-trackpad-driver/config.toml  # expect true
 sudo systemctl restart linux-trackpad-driver.service
 journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
 ```
@@ -255,7 +258,12 @@ journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
       combo (e.g. `click_1 = "ctrl+c"`) still types (extras node).
 - [ ] Gate-off fallback (sanity): set gate back to `false`, restart —
       expect `proxy: gate off, passthrough for /dev/hidrawN`, no grab,
-      pointer works.
+      pointer works. Then restore `true` and restart before continuing:
+
+```sh
+sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml
+sudo systemctl restart linux-trackpad-driver.service
+```
 - [ ] 1–5 finger actions with defaults
       (`click_1=left click_2=right click_3=middle click_4/5=none`):
       press with N fingers over `sensitivity`, confirm action per row in §9.
