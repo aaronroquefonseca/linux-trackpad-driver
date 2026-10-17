@@ -220,6 +220,10 @@ jobs:
       TAG: ${{ needs.preflight.outputs.tag }}
       COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist-release
@@ -227,44 +231,7 @@ jobs:
       - name: create/refresh draft GitHub Release (never public)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          files=(
-            "dist/linux-trackpad-driver-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-            "dist/linux-trackpad-driver-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
-            "dist/CHANGELOG-${TAG}.md"
-            dist/*.deb
-            dist/SHA256SUMS
-          )
-          for f in "${files[@]}"; do
-            [ -f "$f" ] || { echo "::error::missing release file: $f"; exit 1; }
-          done
-          notes="dist/CHANGELOG-${TAG}.md"
-          if gh release view "$TAG" --json tagName,isDraft,isPrerelease \
-              > release-state.json 2>/dev/null; then
-            draft="$(python3 -c 'import json; print(json.load(open("release-state.json"))["isDraft"])')"
-            prerelease="$(python3 -c 'import json; print(json.load(open("release-state.json"))["isPrerelease"])')"
-            if [ "$prerelease" = "True" ]; then
-              echo "::error::release $TAG is marked prerelease; stable pipeline ships finals only"
-              exit 1
-            fi
-            if [ "$draft" != "True" ]; then
-              # Rerun guard: a published release is immutable to automation.
-              # Refreshing it would silently rewrite public assets.
-              echo "::error::release $TAG is already published; refusing to mutate public assets (cut a new patch release instead)"
-              exit 1
-            fi
-            echo "refreshing existing draft release $TAG"
-            gh release upload "$TAG" --clobber "${files[@]}"
-            gh release edit "$TAG" --title "$TAG" --notes-file "$notes"
-          else
-            echo "creating draft release $TAG at $COMMIT"
-            gh release create "$TAG" "${files[@]}" \
-              --target "$COMMIT" \
-              --title "$TAG" --notes-file "$notes" \
-              --draft
-          fi
-          is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-          [ "$is_draft" = "true" ] \
-            || { echo "::error::release $TAG did not stay a draft"; exit 1; }
-          echo "draft release $TAG ready for human review; nothing published"
+          ./packaging/release/manage-draft-release.sh \
+            --tag "$TAG" --commit "$COMMIT" --dist-dir dist

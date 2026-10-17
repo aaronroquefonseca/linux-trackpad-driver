@@ -147,7 +147,111 @@ grep -q "ssh client not found" "$TMP_BASE/ssh-err.txt" \
   || { echo "FAIL: ssh guard names the missing client" >&2; exit 1; }
 ok "ssh client guard fails closed without openssh"
 
-# 5. workflow contracts ---------------------------------------------------------
+# 5. draft manager against a stubbed gh (empty cwd, no git inference) ---------
+DRAFT_TAG="v9.9.9"
+DRAFT_COMMIT="$(printf 'c%.0s' $(seq 40))"
+mk_draft_dist() { # dir
+  mkdir -p "$1"
+  echo x86 > "$1/linux-trackpad-driver-v9.9.9-x86_64-unknown-linux-gnu.tar.gz"
+  echo arm > "$1/linux-trackpad-driver-v9.9.9-aarch64-unknown-linux-gnu.tar.gz"
+  echo notes > "$1/CHANGELOG-v9.9.9.md"
+  echo deb > "$1/fake_9.9.9_amd64.deb"
+  ( cd "$1" && sha256sum -- * > SHA256SUMS )
+}
+FAKEBIN="$TMP_BASE/fakebin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/gh" <<'STUB'
+#!/usr/bin/env bash
+# Minimal gh stub: backs `release view/upload/edit/create` with a state file
+# so the draft manager can be exercised with no network and no git repo.
+echo "$@" >> "$FAKE_GH_CALLS"
+repo_ok=0
+args=( "$@" )
+for (( i=0; i<${#args[@]}; i++ )); do
+  if [ "${args[$i]}" = "--repo" ] && [ "${args[$((i+1))]:-}" = "$FAKE_GH_REPO" ]; then
+    repo_ok=1
+  fi
+done
+[ "$repo_ok" = "1" ] || { echo "stub gh: missing --repo $FAKE_GH_REPO" >&2; exit 3; }
+state="$(cat "$FAKE_GH_STATE_FILE")"
+case "${args[1]:-}" in
+  view)
+    [ "$state" = "missing" ] && { echo "release not found" >&2; exit 1; }
+    case "${args[${#args[@]}-1]}" in
+      .isDraft) [ "$state" = "draft" ] && echo "true" || echo "false" ;;
+      .isPrerelease) [ "$state" = "prerelease" ] && echo "true" || echo "false" ;;
+      *) echo "true" ;;
+    esac
+    ;;
+  upload)
+    [ "$state" = "draft" ] || { echo "stub gh: upload outside draft" >&2; exit 1; }
+    [[ " $* " == *" --clobber "* ]] || { echo "stub gh: upload without --clobber" >&2; exit 1; }
+    ;;
+  edit) [ "$state" = "draft" ] || { echo "stub gh: edit outside draft" >&2; exit 1; } ;;
+  create)
+    [ "$state" = "missing" ] || { echo "stub gh: create over existing" >&2; exit 1; }
+    [[ " $* " == *" --draft "* ]] || { echo "stub gh: create without --draft" >&2; exit 1; }
+    [[ " $* " == *" --target $FAKE_GH_COMMIT "* ]] \
+      || { echo "stub gh: create without exact --target" >&2; exit 1; }
+    printf 'draft' > "$FAKE_GH_STATE_FILE"
+    ;;
+  *) echo "stub gh: unknown subcommand" >&2; exit 2 ;;
+esac
+STUB
+chmod +x "$FAKEBIN/gh"
+run_draft() { # state dir
+  printf '%s' "$1" > "$TMP_BASE/gh-state"
+  : > "$TMP_BASE/gh-calls"
+  ( cd "$TMP_BASE/empty-cwd" 2>/dev/null || mkdir -p "$TMP_BASE/empty-cwd"; cd "$TMP_BASE/empty-cwd"
+    FAKE_GH_STATE_FILE="$TMP_BASE/gh-state" FAKE_GH_CALLS="$TMP_BASE/gh-calls" \
+    FAKE_GH_REPO="testowner/testrepo" FAKE_GH_COMMIT="$DRAFT_COMMIT" \
+    PATH="$FAKEBIN:$PATH" GH_REPO="testowner/testrepo" \
+    "$REL/manage-draft-release.sh" --tag "$DRAFT_TAG" --commit "$DRAFT_COMMIT" --dist-dir "$2" )
+}
+DWORK="$TMP_BASE/dwork"; mk_draft_dist "$DWORK"
+mkdir -p "$TMP_BASE/empty-cwd"
+# Finding-3 shape: no GH_REPO (fresh job, empty cwd) must fail naming GH_REPO.
+if ( cd "$TMP_BASE/empty-cwd" && PATH="$FAKEBIN:$PATH" \
+  "$REL/manage-draft-release.sh" --tag "$DRAFT_TAG" --commit "$DRAFT_COMMIT" \
+  --dist-dir "$DWORK" 2>"$TMP_BASE/norepo-err.txt" ); then
+  echo "FAIL: draft manager requires GH_REPO" >&2; exit 1
+fi
+grep -q "GH_REPO" "$TMP_BASE/norepo-err.txt" \
+  || { echo "FAIL: missing GH_REPO names the variable" >&2; exit 1; }
+ok "draft manager requires GH_REPO (no repo inference)"
+run_draft missing "$DWORK" >/dev/null 2>&1 \
+  || { echo "FAIL: draft creation from scratch" >&2; exit 1; }
+grep -q "create $DRAFT_TAG" "$TMP_BASE/gh-calls" && ok "missing release is created, never published"
+grep -q -- "--draft" "$TMP_BASE/gh-calls" \
+  || { echo "FAIL: creation stays a draft" >&2; exit 1; }
+ok "creation stays a draft"
+[ "$(cat "$TMP_BASE/gh-state")" = "draft" ] \
+  || { echo "FAIL: created release ends as draft" >&2; exit 1; }
+ok "created release ends as draft"
+run_draft draft "$DWORK" >/dev/null 2>&1 \
+  || { echo "FAIL: draft refresh" >&2; exit 1; }
+grep -q "upload $DRAFT_TAG" "$TMP_BASE/gh-calls" \
+  || { echo "FAIL: draft refresh re-uploads" >&2; exit 1; }
+grep -q "edit $DRAFT_TAG" "$TMP_BASE/gh-calls" \
+  || { echo "FAIL: draft refresh updates notes" >&2; exit 1; }
+if grep -q "create $DRAFT_TAG" "$TMP_BASE/gh-calls"; then
+  echo "FAIL: refresh must not recreate" >&2; exit 1
+fi
+ok "draft refresh re-uploads with clobber, no recreate"
+expect_fail "published release is never mutated" run_draft published "$DWORK"
+if grep -qE "upload $DRAFT_TAG|edit $DRAFT_TAG|create $DRAFT_TAG" "$TMP_BASE/gh-calls"; then
+  echo "FAIL: published path made no mutating calls" >&2; exit 1
+fi
+ok "published path made no mutating calls"
+expect_fail "prerelease is rejected" run_draft prerelease "$DWORK"
+DBROKEN="$TMP_BASE/dbroken"; mk_draft_dist "$DBROKEN"; rm "$DBROKEN"/fake_*.deb
+: > "$TMP_BASE/gh-calls"
+if run_draft missing "$DBROKEN" >/dev/null 2>&1; then
+  echo "FAIL: missing asset fails before any gh call" >&2; exit 1
+fi
+[ -s "$TMP_BASE/gh-calls" ] && { echo "FAIL: no gh calls on missing asset" >&2; exit 1; }
+ok "missing asset fails before any gh call"
+
+# 6. workflow contracts ---------------------------------------------------------
 WF="$REPO_ROOT/.github/workflows"
 for required in release-tag.yml aur-stable.yml aur-git.yml; do
   [ -f "$WF/$required" ] || { echo "FAIL: missing $WF/$required" >&2; exit 1; }
@@ -178,6 +282,8 @@ assert_grep "$WF/aur-stable.yml" 'types: \[published\]' "aur-stable runs on rele
 assert_grep "$WF/aur-stable.yml" 'ENABLE_AUR_STABLE' "aur-stable gated on ENABLE_AUR_STABLE"
 assert_grep "$WF/aur-git.yml" 'ENABLE_AUR_GIT' "aur-git gated on ENABLE_AUR_GIT"
 assert_grep "$WF/release-tag.yml" 'persist-credentials: false' "release checkout keeps no credentials"
+assert_grep "$WF/release-tag.yml" 'GH_REPO' "draft job binds GH_REPO (no repo inference)"
+assert_grep "$WF/release-tag.yml" 'manage-draft-release.sh' "draft logic lives in the tested script"
 assert_grep "$WF/release-tag.yml" 'LICENSE-APACHE' "release tarball stages both licenses"
 assert_grep "$REL/publish-aur.sh" 'aur\.archlinux\.org ssh-ed25519' "AUR host key pinned, no ssh-keyscan"
 
