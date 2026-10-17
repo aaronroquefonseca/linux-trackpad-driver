@@ -70,12 +70,16 @@ git tag -s vX.Y.Z && git push origin vX.Y.Z
    known false positives.
 5. Commit the release prep, push, wait for CI green on `main`.
 6. Create the **signed** tag (only after the signing key exists; until then
-   hold the release — unsigned tags fail the SOP warning gate):
+   hold the release):
    ```sh
    git tag -s vX.Y.Z -m "Release vX.Y.Z"
    git show vX.Y.Z --show-signature   # verify signature
    git push origin vX.Y.Z
    ```
+   The workflow rejects lightweight tags and logs the `git tag -v` result
+   as a warning only — that warning is not cryptographic verification.
+   The release stays held until the tag page shows "Verified" and step 9
+   is done by a human.
 7. Review the **draft** GitHub Release auto-created by `release-tag.yml`
    (artifacts + SHA256SUMS + git-cliff notes): verify, then publish it
    manually. The workflow never publishes a Release itself — draft only.
@@ -135,13 +139,16 @@ downgrade, published assets are never rewritten.
   git-cliff excerpt → **draft** GitHub Release (rerun-safe, never public).
 - `.github/workflows/aur-stable.yml` — `release.published` (or manual
   retry): verifies the release is public + final, checksums both arch
-  tarballs against SHA256SUMS, binds the source archive to the tag commit,
+  tarballs against SHA256SUMS, requires the checksummed BUILD_COMMIT to
+  equal the release commit (moved tags fail), requires that commit on
+  upstream main, binds the source archive to the tag commit and version,
   renders all three AUR trees via `render-aur.sh` on real Arch tooling, then
   pushes `linux-trackpad-driver` + `linux-trackpad-driver-bin` (master,
   append-only).
 - `.github/workflows/aur-git.yml` — `main` pushes touching
   `packaging/arch/**`, `systemd/**`, `udev/**`, `config/default.toml`,
-  `Cargo.toml`, `Cargo.lock` (or manual retry): regenerates `-git` metadata
+  `Cargo.toml`, `Cargo.lock` (or a manual retry targeting main — other refs
+  are denied): regenerates `-git` metadata
   and pushes `linux-trackpad-driver-git` (master, append-only).
 - `packaging/arch/PKGBUILD-stable.in` — stable spec (release-tarball
   `source=`, no git dependency). `packaging/arch/PKGBUILD-bin.in` — per-arch
@@ -149,8 +156,10 @@ downgrade, published assets are never rewritten.
   dynamic). `packaging/arch/.SRCINFO` is generated at render time, never
   committed here.
 - `packaging/release/` — `check-version-sync.sh`, `check-release-json.sh`,
-  `verify-assets.sh`, `publish-aur.sh` (+ offline tests in
-  `test-release-scripts.sh`, run by CI without secrets).
+  `verify-assets.sh`, `verify-stable-release.sh` (BUILD_COMMIT binding,
+  moved-tag, main ancestry), `manage-draft-release.sh` (GH_REPO-bound draft
+  create/refresh), `gate-aur-git.sh` (main-ref boundary), `publish-aur.sh`
+  (+ offline tests in `test-release-scripts.sh`, run by CI without secrets).
 - `cliff.toml` — git-cliff Conventional Commits config. Preview with
   `git-cliff --unreleased --strip all`. Gotcha: never set
   `limit_commits = 0` (means "take zero commits", yields an empty
@@ -158,9 +167,10 @@ downgrade, published assets are never rewritten.
 
 ## Guardrails (do not weaken without review)
 
-- Publishing requires secrets that do not exist yet; every publish leg
-  also checks its `ENABLE_*` variable. Missing secret or toggle → clean
-  stop at artifacts with an explanatory log line, never a half-publish.
+- Publishing requires the `AUR_SSH_PRIVATE_KEY` secret (not yet configured)
+  plus the matching toggle; every publish leg checks both. Missing secret
+  or toggle → clean stop at artifacts with an explanatory log line, never
+  a half-publish.
 - Releases are created as **drafts**; a human clicks Publish.
 - AUR stable legs only run off public, final releases; drafts and
   prereleases fail closed before any download is trusted.
