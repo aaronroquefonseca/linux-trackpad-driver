@@ -117,7 +117,7 @@ pub struct Config {
     /// a real two-finger press reports three contacts). The uinput
     /// touch stream (slots, `BTN_TOOL_*`) always uses the spoofed
     /// count; action selection uses the real count unless
-    /// [`SpoofConfig::select`]. All tables default empty (passthrough:
+    /// [`SpoofConfig::actions_follow_spoof`]. All tables default empty (passthrough:
     /// zero behavior change).
     #[serde(default)]
     pub spoof: SpoofConfig,
@@ -199,8 +199,8 @@ where
 /// Finger-count spoofing (`[spoof]` table). Sparse: set only needed
 /// rows (`[spoof.slide]` / `[spoof.click]` / `[spoof.force]` with
 /// `N = V`, N = real count `1..=5`, V = virtual `0..=5` where `0` =
-/// passthrough). Omitted rows are passthrough. `select` swaps action
-/// selection to the spoofed count (default false: wire only).
+/// passthrough). Omitted rows are passthrough. `actions_follow_spoof`
+/// swaps action selection to the spoofed count (default false: wire only).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SpoofConfig {
@@ -213,10 +213,15 @@ pub struct SpoofConfig {
     /// Force-level map: real count → virtual count.
     #[serde(default, deserialize_with = "deserialize_spoof_table")]
     pub force: BTreeMap<u8, u16>,
-    /// When true, `click_N`/`force_N`/`slide_N` selection uses the
-    /// spoofed count instead of the real one.
+    /// When false (default, recommended), `click_N`/`force_N`/`slide_N`
+    /// selection uses the real count while the wire always reports the
+    /// virtual count (the desktop is fooled via wire always). When true
+    /// (advanced alias), selection uses the virtual count too: e.g. real
+    /// 5 with `5 = 4` fires `click_4`, reducing combos. Example with
+    /// `[spoof.click]` `3 = 1`: real 3 fires `click_3` when false,
+    /// `click_1` when true.
     #[serde(default)]
-    pub select: bool,
+    pub actions_follow_spoof: bool,
 }
 
 impl Default for Config {
@@ -662,9 +667,9 @@ impl Config {
     }
 
     /// Count used for `*_N` action selection: the spoofed count when
-    /// [`SpoofConfig::select`] is on, else the real count.
+    /// [`SpoofConfig::actions_follow_spoof`] is on, else the real count.
     pub fn select_count(&self, status: &str, real: u8) -> u8 {
-        if self.spoof.select {
+        if self.spoof.actions_follow_spoof {
             self.spoofed_count(status, real)
         } else {
             real
@@ -782,7 +787,7 @@ mod tests {
         assert!(c.spoof.slide.is_empty());
         assert!(c.spoof.click.is_empty());
         assert!(c.spoof.force.is_empty());
-        assert!(!c.spoof.select);
+        assert!(!c.spoof.actions_follow_spoof);
         assert_eq!(c.transition_mode, "continuous");
         assert!(!c.is_cut_transition());
         c.validate().unwrap();
@@ -1112,14 +1117,14 @@ mod tests {
             ..Config::default()
         };
         c.validate().unwrap();
-        // Wire sees 3; selection still sees the real 2 unless select.
+        // Wire sees 3; selection still sees the real 2 unless actions_follow_spoof.
         assert_eq!(c.spoofed_count("click", 2), 3);
         assert_eq!(c.select_count("click", 2), 2);
         assert_eq!(c.spoofed_count("click", 1), 1);
         assert_eq!(c.spoofed_count("force", 2), 2);
         let c = Config {
             spoof: SpoofConfig {
-                select: true,
+                actions_follow_spoof: true,
                 ..c.spoof.clone()
             },
             ..c
@@ -1144,7 +1149,7 @@ mod tests {
         assert_eq!(c.spoofed_count("slide", 2), 3);
         assert_eq!(c.spoofed_count("slide", 1), 1);
         assert_eq!(c.spoofed_count("force", 2), 2);
-        assert!(!c.spoof.select);
+        assert!(!c.spoof.actions_follow_spoof);
         // Explicit 0 equals omitted: passthrough.
         let c: Config = toml::from_str("[spoof.click]\n2 = 0\n").unwrap();
         c.validate().unwrap();
@@ -1163,6 +1168,16 @@ mod tests {
         assert!(legacy.is_err());
         let legacy: std::result::Result<Config, _> = toml::from_str("spoof_select = true\n");
         assert!(legacy.is_err());
+        // Old `[spoof] select` key is gone (breaking, pre-v1): unknown field.
+        let old: std::result::Result<Config, _> = toml::from_str("[spoof]\nselect = true\n");
+        assert!(old.is_err());
+        // New key parses both values.
+        for value in ["true", "false"] {
+            let c: Config =
+                toml::from_str(&format!("[spoof]\nactions_follow_spoof = {value}\n")).unwrap();
+            c.validate().unwrap();
+            assert_eq!(c.spoof.actions_follow_spoof, value == "true");
+        }
     }
 
     #[test]
@@ -1313,7 +1328,7 @@ transition_mode = "cut"
 1 = 1
 
 [spoof]
-select = true
+actions_follow_spoof = true
 "#;
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();

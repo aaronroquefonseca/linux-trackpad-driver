@@ -134,10 +134,13 @@ slide_5 = "none"
 # center; 2 split ±18 units on x; 3+ evenly spaced on a 24-unit-radius
 # circle — sub-millimeter at the 48/44 units/mm density, inside axis
 # ranges; template copies the first real contact's size/orientation).
-# The uinput touch stream (slots, BTN_TOOL_*) always uses the spoofed
-# count. Action selection keeps using the REAL count unless
-# [spoof] select = true (then click_N/force_N/slide_N select on the
-# spoofed count too).
+# The uinput touch stream (slots, BTN_TOOL_*, BTN_TOUCH) always uses the
+# spoofed count (wire always virtual: the desktop is fooled via wire
+# always). Action selection keeps using the REAL count when
+# [spoof] actions_follow_spoof = false (default, recommended), or the
+# virtual count when true (advanced alias, not recommended: e.g. real 5
+# with 5 = 4 fires click_4, which reduces combos). Example with
+# [spoof.click] 3 = 1: real 3 fires click_3 when false, click_1 when true.
 # -------------------------------------------------------------------------
 # [spoof.click]
 # 2 = 3
@@ -146,7 +149,7 @@ slide_5 = "none"
 # [spoof.force]
 # 1 = 1
 # [spoof]
-# select = false
+# actions_follow_spoof = false
 
 # -------------------------------------------------------------------------
 # Level-transition mode (force edge over an active click)

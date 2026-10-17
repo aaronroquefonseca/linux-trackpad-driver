@@ -72,9 +72,9 @@
 //!   uinput touch stream (slots, `BTN_TOOL_*`) reports the spoofed count
 //!   via [`spoof_contacts`] (real centroid, requested contacts on a tiny
 //!   fixed pattern: pair ±18 x, 3+ on a 24-unit ring from straight up).
-//!   Action selection keeps the real count unless `[spoof] select = true`
-//!   (then selection uses the spoofed count too, and the edge's
-//!   `finger_count` reports it).
+//!   Action selection keeps the real count (default, recommended) unless
+//!   `[spoof] actions_follow_spoof = true` (then selection uses the
+//!   spoofed count too, and the edge's `finger_count` reports it).
 //! - Level-transition mode (`transition_mode`, global): `"continuous"`
 //!   (default) holds level-1 keys while force keys join (shared codes down
 //!   once, up once); `"cut"` releases ALL level-1/slide keys first (with
@@ -318,7 +318,7 @@ pub struct ClickMachine {
     slide_active: Option<ClickEvent>,
     /// Real touching count (clamped 1..=5) the slide latch selected on.
     /// Compared against the real count (not the spoof-aware select count)
-    /// so a `[spoof] select` remap never re-fires every frame.
+    /// so an `[spoof] actions_follow_spoof` remap never re-fires every frame.
     slide_real: Option<u8>,
     last_press_at: Option<Instant>,
     last_release_at: Option<Instant>,
@@ -514,8 +514,8 @@ impl ClickMachine {
 
         // Phase 2: parse before mutating. `n` is the real touching count
         // of the edge frame, clamped 1..=5; each level selects on its
-        // spoof-aware count (`[spoof] select` swaps real→virtual, default
-        // real — zero behavior change unless opted in).
+        // spoof-aware count (`[spoof] actions_follow_spoof` swaps
+        // real→virtual, default real — zero behavior change unless opted in).
         let contacting = fingers.iter().filter(|f| touch_present(f)).count();
         let n = (contacting.clamp(1, 5)) as u8;
         let first_select = cfg.select_count("click", n);
@@ -1799,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn spoof_select_switches_action_lookup() {
+    fn spoof_actions_follow_spoof_switches_action_lookup() {
         let mut click = std::collections::BTreeMap::new();
         click.insert(2u8, 3u16);
         let base = Config {
@@ -1823,7 +1823,7 @@ mod tests {
         assert_eq!(ev.action.kind, ActionKind::Keys(vec!["right".to_string()]));
         // Opt-in: selection uses the spoofed count (3 → middle).
         let mut cfg = base.clone();
-        cfg.spoof.select = true;
+        cfg.spoof.actions_follow_spoof = true;
         let mut m = ClickMachine::new();
         let ev = m
             .update(&[finger(1, 200), finger(2, 200)], 0, &cfg)
@@ -1835,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn spoof_select_slide_uses_virtual_count() {
+    fn spoof_actions_follow_spoof_slide_uses_virtual_count() {
         let mut slide = std::collections::BTreeMap::new();
         slide.insert(1u8, 3u16);
         let cfg = Config {
@@ -1843,7 +1843,7 @@ mod tests {
             slide_3: "middle".into(),
             spoof: crate::config::SpoofConfig {
                 slide,
-                select: true,
+                actions_follow_spoof: true,
                 ..Default::default()
             },
             ..Config::default()
