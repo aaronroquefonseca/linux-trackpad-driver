@@ -22,6 +22,56 @@ other trackpads is planned.
 
 ## Install
 
+### Arch Linux (AUR)
+
+Recommended for most users (fast, stable, prebuilt):
+
+```sh
+yay -S linux-trackpad-driver-bin
+```
+
+Pick exactly one — the three variants conflict and replace one another:
+
+- `linux-trackpad-driver` — stable source build via Cargo.
+- `linux-trackpad-driver-bin` — stable prebuilt `x86_64`/`aarch64` (recommended).
+- `linux-trackpad-driver-git` — latest `main` snapshot, compiled at install.
+
+```sh
+yay -S linux-trackpad-driver      # source build
+yay -S linux-trackpad-driver-bin  # prebuilt (recommended)
+yay -S linux-trackpad-driver-git  # main snapshot
+```
+
+Package pages: [`linux-trackpad-driver`](https://aur.archlinux.org/packages/linux-trackpad-driver),
+[`linux-trackpad-driver-bin`](https://aur.archlinux.org/packages/linux-trackpad-driver-bin),
+[`linux-trackpad-driver-git`](https://aur.archlinux.org/packages/linux-trackpad-driver-git).
+Without an AUR helper, clone the package repo and run `makepkg -si`
+([AUR usage](https://wiki.archlinux.org/title/Arch_User_Repository#Installing_and_upgrading_packages)).
+
+The package ships the default config, udev rules, and systemd units. The
+config at `/etc/linux-trackpad-driver/config.toml` is preserved on
+upgrade — edit that copy. Units ship disabled by design; opt in explicitly:
+
+```sh
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+Then verify with `ltd doctor` (see Troubleshooting limits below).
+
+### Debian / Ubuntu (`.deb`)
+
+`.deb` files (`x86_64`) are attached to each
+[GitHub Release](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases):
+
+```sh
+sudo apt install ./linux-trackpad-driver_*_amd64.deb
+```
+
+Then enable and verify as above
+(`sudo systemctl enable --now linux-trackpad-driver.service`, `ltd doctor`).
+
+### From source (other distros)
+
 ```sh
 git clone https://github.com/aaronroquefonseca/linux-trackpad-driver
 cd linux-trackpad-driver
@@ -38,18 +88,7 @@ sudo systemctl enable --now linux-trackpad-driver.service
 
 Verify with `ltd doctor` (below).
 
-## Distribution packages (planned, not yet published)
-
-Release automation (signed tags → draft GitHub Release → AUR) is implemented
-but not yet armed: no tags, releases, or AUR packages exist. Once the first
-release is published, this section will carry the install lines for:
-
-- `linux-trackpad-driver` — AUR source build,
-- `linux-trackpad-driver-bin` — AUR prebuilt binaries,
-- `linux-trackpad-driver-git` — AUR VCS snapshot of `main`,
-- `.deb` — attached to each GitHub Release (x86_64).
-
-Until then, build from source as above. Details: [`docs/RELEASING.md`](docs/RELEASING.md).
+Maintainer release process: [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Supported hardware and testing status
 
@@ -70,10 +109,19 @@ It is independent of the click engine and ignored on Bluetooth and other pads.
 ## Configuration
 
 Full reference: [`config/default.toml`](config/default.toml) and
-[`docs/CONFIG.md`](docs/CONFIG.md). The shipped defaults use a light press
-(threshold 30) with soft feedback (strength 2, quiet waveform) — my
-preference. If clicks feel too eager or too faint, try the firmer classic
-values: `sensitivity = 64`, `haptic = 5`, `quiet_click = false`.
+[`docs/CONFIG.md`](docs/CONFIG.md). The shipped defaults are a conventional
+trackpad map (1-finger left, 2-finger right, 3-finger middle; force and slide
+actions opt-in, off by default) with a light press (threshold 30) and soft
+feedback (strength 2, quiet waveform) — my preference. If clicks feel too
+eager or too faint, try the firmer classic tune:
+
+```toml
+[click]
+sensitivity = 64
+[haptics]
+haptic = 5
+quiet_click = false
+```
 
 You only need the lines you want to change; omitted keys fall back to the
 documented defaults. The key gate:
