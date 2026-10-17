@@ -8,7 +8,8 @@
 # linux-trackpad-driver-git}/{PKGBUILD,.SRCINFO,ltd.install}, staged in a
 # temp dir and swapped in only after all three variants succeed.
 # Fails closed on bad version/digest, missing inputs, leftover placeholders,
-# or unexpected tarball contents; a failed run leaves prior output untouched.
+# or unexpected tarball contents; a failure during generation/metadata
+# leaves prior output untouched (final install I/O is not transactional).
 # Deterministic: same inputs -> same bytes
 # (no timestamps; .SRCINFO via `makepkg --printsrcinfo`).
 set -euo pipefail
@@ -99,8 +100,9 @@ check_tarball() { # kind, file, want_sha, arch_or_empty
 command -v makepkg >/dev/null 2>&1 || fail "makepkg not found"
 
 # Stage the whole tree, then swap it in only after all three variants
-# render: a failed run leaves any prior output untouched and never leaves
-# a half-written tree (the old `rm -rf $OUT` first did both wrong).
+# render: a failure during generation/metadata leaves any prior output
+# untouched. Once generation succeeds the staged tree replaces the output;
+# final install I/O errors (rm/mv) are not transactional.
 STAGE="$WORK_DIR/out"
 mkdir -p -- "$STAGE/linux-trackpad-driver" "$STAGE/linux-trackpad-driver-bin" "$STAGE/linux-trackpad-driver-git"
 
@@ -128,6 +130,7 @@ for d in linux-trackpad-driver linux-trackpad-driver-bin linux-trackpad-driver-g
 done
 
 rm -rf -- "$OUT"
+mkdir -p -- "$(dirname -- "$OUT")"
 mv -- "$STAGE" "$OUT"
 
 echo "render-aur: wrote $OUT/{linux-trackpad-driver,linux-trackpad-driver-bin,linux-trackpad-driver-git}/"

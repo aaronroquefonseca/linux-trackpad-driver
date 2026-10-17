@@ -163,6 +163,31 @@ fi
 grep -q sentinel-prior-output "$RDIR/keep/linux-trackpad-driver/PKGBUILD" \
   || { echo 'failed render destroyed prior output' >&2; exit 1; }
 test ! -e "$RDIR/keep/linux-trackpad-driver/.SRCINFO"
+# Regression: --out beneath an absent parent (e.g. documented dist/aur on a
+# fresh checkout) must work, and stay deterministic across reruns.
+packaging/arch/render-aur.sh --version "$VER" \
+  --source-sha256 "$S_SHA" --bin-x86_64-sha256 "$X_SHA" \
+  --bin-aarch64-sha256 "$A_SHA" --out "$RDIR/nest/new-parent/aur" \
+  --source-tarball "/tmp/aur-fixtures/source-${VER}.tar.gz" \
+  --bin-x86_64-tarball "/tmp/aur-fixtures/bin-${VER}-x86_64.tar.gz" \
+  --bin-aarch64-tarball "/tmp/aur-fixtures/bin-${VER}-aarch64.tar.gz"
+test -f "$RDIR/nest/new-parent/aur/linux-trackpad-driver/.SRCINFO"
+packaging/arch/render-aur.sh --version "$VER" \
+  --source-sha256 "$S_SHA" --bin-x86_64-sha256 "$X_SHA" \
+  --bin-aarch64-sha256 "$A_SHA" --out "$RDIR/nest2/new-parent/aur" \
+  --source-tarball "/tmp/aur-fixtures/source-${VER}.tar.gz" \
+  --bin-x86_64-tarball "/tmp/aur-fixtures/bin-${VER}-x86_64.tar.gz" \
+  --bin-aarch64-tarball "/tmp/aur-fixtures/bin-${VER}-aarch64.tar.gz"
+diff -r "$RDIR/nest/new-parent/aur" "$RDIR/nest2/new-parent/aur"
+REPO_ROOT="$PWD"
+mkdir -p "$RDIR/cwd" && ( cd "$RDIR/cwd" && "$REPO_ROOT/packaging/arch/render-aur.sh" \
+  --version "$VER" \
+  --source-sha256 "$S_SHA" --bin-x86_64-sha256 "$X_SHA" \
+  --bin-aarch64-sha256 "$A_SHA" --out dist/aur \
+  --source-tarball "/tmp/aur-fixtures/source-${VER}.tar.gz" \
+  --bin-x86_64-tarball "/tmp/aur-fixtures/bin-${VER}-x86_64.tar.gz" \
+  --bin-aarch64-tarball "/tmp/aur-fixtures/bin-${VER}-aarch64.tar.gz" )
+test -f "$RDIR/cwd/dist/aur/linux-trackpad-driver/.SRCINFO"
 
 rm -rf /tmp/aur-src
 mkdir -p /tmp/aur-src
