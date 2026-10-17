@@ -218,10 +218,11 @@ BT /dev/hidrawN: single-node path, no init dance — device ready
 - [ ] Double-input check: slow diagonal drag in `evtest` on the physical
       node — each physical motion produces exactly one event stream.
       Duplicated streams = finding (paste `evtest` excerpt + `dmesg` tail).
-- [ ] With `enhanced_clicks=true` (proxy not yet merged): expect the LOUD
-      warning (`suppressing physical input with no replacement`) and a
-      silent trackpad until re-bind/replug. This is known/temporary —
-      record it, then set the gate back to `false` and replug:
+- [ ] With `enhanced_clicks=true`: the proxy attaches per device `Ready`
+      (see README Troubleshooting + `docs/CONFIG.md` gate semantics).
+      USB proxy failure falls back to passthrough; on BT a failed enhanced
+      path may need re-bind/replug. Record the attach line, then set the
+      gate back to `false` and replug:
 
 ```sh
 sudo ltd reconnect /dev/hidrawN -d
