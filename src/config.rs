@@ -159,12 +159,11 @@ pub struct Config {
     /// held left). Global single key; see [`crate::clicks::ClickMachine`].
     #[serde(default = "default_transition_mode")]
     pub transition_mode: String,
-    /// Stagger between a cut fresh-press's modifier group and its button
-    /// group, in milliseconds (`0..=500`, default 50): modifiers go down +
-    /// SYN, buttons follow only after this elapses (human-scale gap — a
-    /// frame-scale simultaneous press reads as the old drag continuing).
-    /// The 5 ms cut floor always applies first, so `0` still separates
-    /// release and press by ≥5 ms. Global single key.
+    /// Modifier-to-button gap for fresh mixed slide combos and cut force
+    /// fresh-presses, in milliseconds (`0..=500`, default 50). Extras go
+    /// down + SYN first; pointer buttons follow on the monotonic pump
+    /// clock, including idle polls. `0` emits both groups in the same poll.
+    /// Cut force presses additionally keep their 5 ms release floor.
     #[serde(default = "default_combo_stagger_ms")]
     pub combo_stagger_ms: u16,
 }
