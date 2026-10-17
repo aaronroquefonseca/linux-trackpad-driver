@@ -44,7 +44,7 @@ packaging/arch/render-aur.sh --version 0.1.0 \
 - `--*-tarball` (optional but recommended in CI): verifies the digest and
   checks interior layout, see below.
 
-## Release artifact contract (`release-tag.yml`, next task)
+## Release artifact contract (`release-tag.yml`)
 
 - Tag `vX.Y.Z` (signed). Stable source URL needs no upload: the GitHub
   tag tarball extracts to `linux-trackpad-driver-X.Y.Z/` with `Cargo.lock`
@@ -55,9 +55,8 @@ packaging/arch/render-aur.sh --version 0.1.0 \
   `config/default.toml`, `udev/99-linux-trackpad-driver.rules`,
   `systemd/*.service` (3 units), `systemd/system-sleep/ltd-resume` (0755),
   `README.md`, `INSTALL.md`, **`LICENSE-MIT`, `LICENSE-APACHE`**.
-  The last two are NOT in the current `release-tag.yml` STAGE — adding them
-  is a required step of the next workflow PR (bin `package()` already
-  installs them and fixtures prove it).
+  The release job stages both licenses (bin `package()` installs them and
+  fixtures prove it).
 - No absolute paths or `..` in any tarball; no root-owned surprises
   (release job builds as runner user; `package()` sets modes explicitly).
 
@@ -95,12 +94,20 @@ so the version never goes backward at the first release. Static `pkgver` in
   layout checks only; GitHub tag-tarball bytes (and hence its SHA) only
   exist after the tag push.
 
-## Push (next workflow PR, not this one)
+## Push (release workflows, not this directory)
 
-Per variant repo: copy `PKGBUILD` + `ltd.install`, run
-`makepkg --printsrcinfo > .SRCINFO`, commit on `master`, push
-`ssh://aur@aur.archlinux.org/<pkgbase>.git`. First push of each new
-pkgbase is manual (AUR creates the repo on first push from an account key).
-Keep `release-tag.yml`/`nightly.yml` inert until then; `nightly.yml` still
-points at the deleted `PKGBUILD-nightly` and must be repointed at
-`PKGBUILD-git` + the `-git` repo by that PR.
+Publishing is done by automation once armed (see `docs/RELEASING.md`);
+nothing here is pushed by hand. Per variant repo, the flow copies the
+rendered `PKGBUILD` + `.SRCINFO` + `ltd.install`, commits on `master`, and
+pushes append-only (never force). The first authenticated push from the
+registered AUR key creates each package — no separate manual bootstrap is
+needed. Shared helper: `packaging/release/publish-aur.sh` (pinned AUR host
+key, temp key file, noop/downgrade guards, unrelated files preserved).
+
+- Stable + bin: `.github/workflows/aur-stable.yml` runs on
+  `release.published` (or a trusted manual retry that re-verifies the
+  release is public): verify → render via `render-aur.sh` → push
+  `linux-trackpad-driver` + `linux-trackpad-driver-bin`.
+- VCS: `.github/workflows/aur-git.yml` runs on packaging-relevant `main`
+  pushes (or manual retry): regenerate `.SRCINFO` via
+  `makepkg --printsrcinfo`, push `linux-trackpad-driver-git`.

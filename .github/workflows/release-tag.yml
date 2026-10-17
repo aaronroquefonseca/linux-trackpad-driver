@@ -1,23 +1,18 @@
 name: Release (tag)
 
-# READY BUT INERT — owner enables on public launch, nothing publishes before then.
+# Tag `vX.Y.Z` -> build matrix (x86_64 + aarch64) -> x86_64 .deb (debian/) +
+# per-arch binary tarballs (binary + systemd units + udev rules + default
+# config + licenses) + full-history git-cliff CHANGELOG excerpt + SHA256SUMS
+# -> draft GitHub Release. A human publishes the draft; the stable AUR
+# pipeline (aur-stable.yml) only runs after that manual publish step.
 #
-# What this does once enabled:
-#   tag `v*` -> build matrix (linux x86_64 + aarch64) -> .deb (x86_64, from
-#   debian/) + .tar.gz (binary + systemd units + udev rules + default config)
-#   + SHA256SUMS + git-cliff CHANGELOG excerpt -> GitHub Release **draft**.
+# Activation: set repo variable ENABLE_RELEASE_PUBLISH=true (Settings >
+# Variables). Without it, tag pushes and dispatches only build and upload
+# workflow *artifacts* — no Release object is created or touched.
+# Secret inventory: none. This workflow uses only GITHUB_TOKEN.
 #
-# Enable (see docs/RELEASING.md, 5-minute checklist):
-#   1. Set repo variable ENABLE_RELEASE_PUBLISH=true (Settings > Variables).
-#   2. Push tag `vX.Y.Z` (after bumping Cargo.toml + debian/changelog, see docs).
-# Without the variable every publish step is skipped: tag pushes only build
-# and upload workflow *artifacts* (no Release object, no AUR push, no-op).
-#
-# AUR stable push: job `aur-stable` below is PRESENT BUT HARD-DISABLED
-# (`if: false`). To arm it you must ALL of: add secret AUR_SSH_PRIVATE_KEY
-# (SSH key registered with the AUR account), set repo variable
-# ENABLE_AUR_STABLE=true, and flip the job condition to
-# `needs.preflight.outputs.aur == 'true'`. Never commit keys.
+# Retry: re-running a tag build never mutates a PUBLISHED release. If the
+# release already left draft state the draft step fails closed.
 
 on:
   push:
@@ -26,41 +21,85 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to (re)build, e.g. v0.1.0 (must exist locally as a tag)"
+        description: "Existing tag to (re)build, e.g. v0.1.0 (never builds main)"
         required: true
+        type: string
       publish:
         description: "Create/refresh the draft GitHub Release (else build-only)"
-        type: boolean
+        required: false
         default: false
+        type: boolean
 
 permissions:
-  contents: write # needed only for the draft Release step when enabled
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   preflight:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.gate.outputs.tag }}
+      version: ${{ steps.gate.outputs.version }}
+      commit: ${{ steps.gate.outputs.commit }}
       publish: ${{ steps.gate.outputs.publish }}
-      aur: ${{ steps.gate.outputs.aur }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Dispatch rebuilds the exact tag tree, never the branch it runs on.
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
       - id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_PUBLISH_VAR: ${{ vars.ENABLE_RELEASE_PUBLISH }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          TAG="${TAG#refs/tags/}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event.inputs.publish }}" = "true" ] \
-            || [ "${{ vars.ENABLE_RELEASE_PUBLISH }}" = "true" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false (INERT: set repo variable ENABLE_RELEASE_PUBLISH=true or dispatch with publish=true)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          raw_tag="${INPUT_TAG:-$REF_NAME}"
+          raw_tag="${raw_tag#refs/tags/}"
+          [[ "$raw_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::bad tag '$raw_tag' (want vX.Y.Z)"; exit 1; }
+          git rev-parse -q --verify "refs/tags/$raw_tag" >/dev/null \
+            || { echo "::error::tag '$raw_tag' does not exist upstream"; exit 1; }
+          commit="$(git rev-parse "$raw_tag^{commit}")"
+          # Trust only tags pointing into main history; PR trees never qualify
+          # (this workflow has no pull_request trigger by design).
+          git merge-base --is-ancestor "$commit" origin/main \
+            || { echo "::error::tag '$raw_tag' ($commit) is not reachable from origin/main"; exit 1; }
+          # Signed-tag SOP (docs/RELEASING.md): tags must be annotated. A
+          # verifiable signature is warned on, not hard-required, so the flow
+          # stays usable before the maintainer's signing key is configured —
+          # the draft is human-gated before anything goes public.
+          if [ "$(git cat-file -t "$raw_tag")" != "tag" ]; then
+            echo "::error::tag '$raw_tag' is lightweight; create an annotated tag (git tag -s/-a), never re-tag a release"
+            exit 1
           fi
-          if [ "${{ vars.ENABLE_AUR_STABLE }}" = "true" ] \
-            && [ -n "${{ secrets.AUR_SSH_PRIVATE_KEY }}" ]; then
-            echo "aur=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "aur=false (aur-stable job is if:false regardless; see header)" >> "$GITHUB_OUTPUT"
+          if ! git tag -v "$raw_tag" >/dev/null 2>&1; then
+            echo "::warning::tag '$raw_tag' has no verifiable GPG signature (SOP wants git tag -s)"
           fi
+          version="${raw_tag#v}"
+          ./packaging/release/check-version-sync.sh "$version"
+          want="false"
+          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_PUBLISH" = "true" ]; then
+            want="true"
+          fi
+          publish="false"
+          if [ "$want" = "true" ] && [ "$RELEASE_PUBLISH_VAR" = "true" ]; then
+            publish="true"
+          fi
+          {
+            echo "tag=$raw_tag"
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "preflight: tag=$raw_tag commit=$commit publish=$publish (want=$want, toggle=${RELEASE_PUBLISH_VAR:-unset})"
 
   build:
     needs: preflight
@@ -74,10 +113,15 @@ jobs:
             deb: false
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
+          # Exact tagged commit resolved once in preflight: a dispatch tag
+          # must not silently build whatever main points at.
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -93,15 +137,16 @@ jobs:
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: stage dist tarball
         run: |
-          BIN="target/${{ matrix.target }}/release/ltd"
-          STAGE="dist-stage/linux-trackpad-driver-${TAG}-${{ matrix.target }}"
-          mkdir -p "$STAGE"/{config,udev,systemd/system-sleep}
-          cp "$BIN" "$STAGE/ltd"
-          cp config/default.toml "$STAGE/config/"
-          cp udev/99-linux-trackpad-driver.rules "$STAGE/udev/"
-          cp systemd/*.service "$STAGE/systemd/"
-          cp systemd/system-sleep/ltd-resume "$STAGE/systemd/system-sleep/"
-          cp README.md INSTALL.md "$STAGE/"
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/ltd"
+          stage="dist-stage/linux-trackpad-driver-${TAG}-${{ matrix.target }}"
+          mkdir -p "$stage"/{config,udev,systemd/system-sleep}
+          cp "$bin" "$stage/ltd"
+          cp config/default.toml "$stage/config/"
+          cp udev/99-linux-trackpad-driver.rules "$stage/udev/"
+          cp systemd/*.service "$stage/systemd/"
+          cp systemd/system-sleep/ltd-resume "$stage/systemd/system-sleep/"
+          cp README.md INSTALL.md LICENSE-MIT LICENSE-APACHE "$stage/"
           mkdir -p dist
           tar -C dist-stage -czf \
             "dist/linux-trackpad-driver-${TAG}-${{ matrix.target }}.tar.gz" \
@@ -110,79 +155,94 @@ jobs:
         if: matrix.deb
         run: |
           # Release .deb reuses the in-tree debian/ packaging as-is.
-          # Cargo/debian version sync is a manual pre-tag step (docs/RELEASING.md).
+          # Cargo/debian version sync is verified in preflight (fail-closed).
           dpkg-buildpackage -b -us -uc -d
           mv ../*.deb dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
           path: dist/
+          if-no-files-found: error
+          retention-days: 7
 
-  release:
+  assemble:
     needs: [preflight, build]
-    # INERT DEFAULT: skipped unless explicitly enabled (see header).
-    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.preflight.outputs.commit }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - name: SHA256SUMS
-        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-      - name: CHANGELOG excerpt (git-cliff)
-        uses: orhun/git-cliff-action@v4
+      - name: CHANGELOG excerpt (git-cliff, full history)
+        # Release notes style: git-cliff excerpt from Conventional Commits
+        # (cliff.toml). This differs from MyWhisper's PR-linked notes
+        # generator — that repo has no cliff.toml; both produce coherent
+        # per-release notes, the mechanism is not claimed identical.
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
         with:
           config: cliff.toml
-          args: --tag ${{ env.TAG }} --strip all --output dist/CHANGELOG-${{ env.TAG }}.md
-      - name: draft GitHub Release (never auto-published)
-        uses: softprops/action-gh-release@v2
+          # --current scopes the excerpt to this tag only (without it the
+          # action emits every previous release too). Full CHANGELOG.md
+          # generation keeps full history (docs/RELEASING.md).
+          args: --tag ${{ env.TAG }} --current --strip all --output dist/CHANGELOG-${{ env.TAG }}.md
+      - name: SHA256SUMS (explicit assets, never self)
+        run: |
+          set -euo pipefail
+          cd dist
+          # Immutable build metadata: the exact commit these assets were built
+          # from, checksummed with everything else. aur-stable refuses to
+          # publish unless it matches the release commit (moved tags fail).
+          printf '%s' "$COMMIT" > BUILD_COMMIT
+          sha256sum -- \
+            "linux-trackpad-driver-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "linux-trackpad-driver-${TAG}-aarch64-unknown-linux-gnu.tar.gz" \
+            ./*.deb \
+            "CHANGELOG-${TAG}.md" \
+            BUILD_COMMIT > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          tag_name: ${{ env.TAG }}
-          draft: true
-          generate_release_notes: false
-          body_path: dist/CHANGELOG-${{ env.TAG }}.md
-          files: dist/*
+          name: dist-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
 
-  aur-stable:
-    needs: [preflight, release]
-    # HARD-DISABLED: present for review, never runs until the owner arms it.
-    # Arm ALL three (secret + toggle + condition), see header + docs/RELEASING.md:
-    #   secret: AUR_SSH_PRIVATE_KEY (AUR-registered SSH private key)
-    #   toggle: repo variable ENABLE_AUR_STABLE=true
-    #   then flip this `if: false` to `needs.preflight.outputs.aur == 'true'`.
-    if: false
+  draft-release:
+    needs: [preflight, assemble]
+    # Explicit gate: draft Release objects are only created when armed (see
+    # header). Build-only runs stop at workflow artifacts.
+    if: needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
-      - name: publish stable PKGBUILD to AUR (linux-trackpad-driver)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Exact tagged commit from preflight (never the dispatch branch):
+          # write-token steps only execute trusted release code.
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-release
+          path: dist
+      - name: create/refresh draft GitHub Release (never public)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          test -n "${{ secrets.AUR_SSH_PRIVATE_KEY }}" # fail loudly if key missing
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          printf 'Host aur.archlinux.org\n\tIdentityFile ~/.ssh/aur\n\tStrictHostKeyChecking yes\n' > ~/.ssh/config
-          rm -rf aur-stable && git clone ssh://aur@aur.archlinux.org/linux-trackpad-driver.git aur-stable
-          PKGVER="${TAG#v}"
-          sed -i "s/^pkgver=.*/pkgver=$PKGVER/; s/^pkgrel=.*/pkgrel=1/" packaging/arch/PKGBUILD
-          # Fill the release-tarball checksum before copying.
-          TARBALL_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/linux-trackpad-driver-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          SHA=$(curl -sL "$TARBALL_URL.sha256" 2>/dev/null | awk '{print $1}')
-          if [ -n "$SHA" ]; then
-            sed -i "s/^sha256sums=.*/sha256sums=('$SHA')/" packaging/arch/PKGBUILD
-          fi
-          cp packaging/arch/PKGBUILD aur-stable/PKGBUILD
-          cp packaging/arch/ltd.install aur-stable/ltd.install
-          (cd aur-stable && makepkg --printsrcinfo > .SRCINFO \
-            && git add PKGBUILD ltd.install .SRCINFO \
-            && git -c user.name="github-actions[bot]" \
-                 -c user.email="github-actions[bot]@users.noreply.github.com" \
-                 commit -m "release $TAG" && git push)
+          ./packaging/release/manage-draft-release.sh \
+            --tag "$TAG" --commit "$COMMIT" --dist-dir dist

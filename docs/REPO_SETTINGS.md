@@ -12,13 +12,14 @@ Settings → Branches / Rules / Actions / Security as noted.
   - [ ] `ci` (fmt + clippy + test)
   - [ ] `deb` (packaging validation)
   - [ ] `aur` (AUR template/render/offline-build validation)
+  - [ ] `release-scripts` (release/AUR script syntax + offline guards)
 - [ ] Require branches to be up to date before merging.
 - [ ] Do not allow bypassing the above settings (no bypass list).
 - [ ] Block force pushes and deletions on `main`.
 
 ## CI
 
-- [ ] `.github/workflows/ci.yml` `ci` + `deb` + `aur` jobs required (see above).
+- [ ] `.github/workflows/ci.yml` `ci` + `deb` + `aur` + `release-scripts` jobs required (see above).
 - [ ] Dependabot alerts enabled (cargo); `Cargo.lock` committed.
 
 ## Releases
@@ -26,6 +27,9 @@ Settings → Branches / Rules / Actions / Security as noted.
 - [ ] Signed-tag SOP followed for every release: `docs/RELEASING.md`.
 - [ ] Tags named `vX.Y.Z`, GPG-signed (`git tag -s`), "Verified" on GitHub.
 - [ ] crates.io: do NOT publish (metadata kept ready only).
+- [ ] Release activation (post-review, owner): secret `AUR_SSH_PRIVATE_KEY`
+      plus variables `ENABLE_RELEASE_PUBLISH`, `ENABLE_AUR_STABLE`,
+      `ENABLE_AUR_GIT` (`docs/RELEASING.md`); workflows are inert without them.
 
 ## Secret inventory (2026-10-14 scan)
 
@@ -35,7 +39,8 @@ Settings → Branches / Rules / Actions / Security as noted.
       key-code mapping identifiers in source).
 - [x] No `.env`, credentials, or private keys tracked; `.gitignore`
       covers `.env`/`.env.*`.
-- [x] No GitHub Actions secrets required (CI builds + lints only).
+- [ ] Actions secret `AUR_SSH_PRIVATE_KEY` set at activation (dedicated
+      AUR-registered key; CI/release jobs only — never PR builds).
 
 ## Visibility
 

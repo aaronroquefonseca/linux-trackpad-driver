@@ -3,30 +3,63 @@
 SOP for cutting a signed release. Releases are git tags + GitHub Release;
 crates.io publish is **not** done (metadata is kept ready, see `Cargo.toml`).
 
-Release automation (workflows, AUR specs, changelog config) is **ready but
-inert**: nothing can publish until the owner completes the [enable
-checklist](#5-minute-enable-checklist-owner-at-public-launch) below. Until
-then tag pushes only build (workflow artifacts), and the AUR jobs never run
-(`if: false`).
+## Pipeline
+
+`release-tag.yml` builds on every `vX.Y.Z` tag push (or manual dispatch of an
+existing tag) and uploads workflow artifacts. It creates/refreshes a **draft**
+GitHub Release only when repo variable `ENABLE_RELEASE_PUBLISH=true` — and it
+never publishes: the draft stays a draft until a human clicks Publish.
+
+`aur-stable.yml` runs on the `release.published` event (and only then, or on
+an explicit manual retry that re-verifies the release is already public). It
+publishes `linux-trackpad-driver` (source) and `linux-trackpad-driver-bin`
+(prebuilt) to AUR, gated on repo variable `ENABLE_AUR_STABLE=true` plus the
+`AUR_SSH_PRIVATE_KEY` secret.
+
+`aur-git.yml` replaces the old `nightly.yml` (deleted). It pushes
+`linux-trackpad-driver-git` after packaging-relevant `main` changes, gated on
+repo variable `ENABLE_AUR_GIT=true` plus the same secret. Never per-driver
+version bumps: `pkgver()` computes at install time.
+
+Event chain (note the GITHUB_TOKEN gap: automation creates drafts, but a
+token-created release does not emit workflow events — so the AUR leg only
+starts when a human publishes via web UI or their own token):
+
+```text
+git tag -s vX.Y.Z && git push origin vX.Y.Z
+  -> release-tag.yml: build matrix, SHA256SUMS, git-cliff excerpt, draft
+  -> maintainer reviews the draft, clicks Publish
+  -> release.published -> aur-stable.yml: verify public+final,
+     download + checksum assets, render via render-aur.sh, push both AUR repos
+```
 
 ## Prerequisites
 
 - GPG signing key configured (`git config user.signingkey <KEYID>`).
 - Clean tree on `main`, CI green.
 - Maintainer access to repo settings (see `docs/REPO_SETTINGS.md`).
+- For AUR legs: `AUR_SSH_PRIVATE_KEY` secret set (dedicated key registered
+  with the AUR account) and the matching `ENABLE_*` variable (below).
 
 ## Steps
 
 1. Bump version:
    - `Cargo.toml` (`version = "X.Y.Z"`, keep `Cargo.lock` in sync via `cargo build`).
    - `debian/changelog` (new stanza, `dch -v X.Y.Z-1`).
-   - `packaging/arch/PKGBUILD` (`pkgver=X.Y.Z`, regenerate `.SRCINFO`).
+   - No AUR template edits: stable/bin digests render at publish time,
+     `-git` needs no bump (`pkgver()` is dynamic).
 2. Update the changelog: `git-cliff --tag vX.Y.Z --strip all -o CHANGELOG.md`.
+   Notes style is the git-cliff excerpt from Conventional Commits (see
+   `cliff.toml`); this differs from projects using PR-linked notes
+   generators — the mechanism is not claimed identical, both yield coherent
+   per-release notes.
 3. Run gates locally:
    ```sh
    cargo fmt --all -- --check
    cargo clippy --all-targets -- -D warnings
    cargo test
+   packaging/arch/check-aur.sh
+   packaging/release/test-release-scripts.sh
    ```
 4. Secret scan (must be clean before tagging):
    ```sh
@@ -36,17 +69,40 @@ then tag pushes only build (workflow artifacts), and the AUR jobs never run
    Triage every hit; `key_token_to_code` and similar code identifiers are
    known false positives.
 5. Commit the release prep, push, wait for CI green on `main`.
-6. Create the **signed** tag:
+6. Create the **signed** tag (only after the signing key exists; until then
+   hold the release):
    ```sh
    git tag -s vX.Y.Z -m "Release vX.Y.Z"
    git show vX.Y.Z --show-signature   # verify signature
    git push origin vX.Y.Z
    ```
+   The workflow rejects lightweight tags and logs the `git tag -v` result
+   as a warning only — that warning is not cryptographic verification.
+   The release stays held until the tag page shows "Verified" and step 9
+   is done by a human.
 7. Review the **draft** GitHub Release auto-created by `release-tag.yml`
    (artifacts + SHA256SUMS + git-cliff notes): verify, then publish it
    manually. The workflow never publishes a Release itself — draft only.
-8. Announce only after the tag signature verifies on GitHub
+   Publishing is what arms the AUR stable leg; a published release is
+   immutable to automation (reruns fail closed instead of rewriting it).
+8. Watch `aur-stable.yml` push both AUR repos (or noop-log if already
+   current). A stale/older `release.published` event arriving late refuses
+   to downgrade the AUR master.
+9. Announce only after the tag signature verifies on GitHub
    (tag page shows "Verified").
+
+## Dry runs (no toggles, no pushes)
+
+```sh
+# Rebuild an existing tag, artifacts only (publish=false is the default):
+gh workflow run release-tag.yml -f tag=vX.Y.Z -f publish=false
+# Stable leg without pushing (verifies publicity + digests, renders, uploads):
+gh workflow run aur-stable.yml -f tag=vX.Y.Z -f publish=false
+# -git leg without pushing:
+gh workflow run aur-git.yml -f publish=false
+```
+
+Download a dry-run's evidence with `gh run download <run-id>`.
 
 ## Never
 
@@ -54,66 +110,56 @@ then tag pushes only build (workflow artifacts), and the AUR jobs never run
 - Never publish to crates.io without a separate decision + audit
   (current policy: do NOT publish).
 - Never commit secrets to fix a release — rotate + cut a new release.
+- Never let automation publish a Release object (that would skip the AUR
+  trigger and the human review in one step).
 
-## 5-minute enable checklist (owner, at public launch)
+## Activation (owner, once)
 
-- [ ] **1. AUR SSH key secret (~2 min).**
-      Generate a dedicated key, register the public half with your AUR
-      account (`https://aur.archlinux.org/account/`), store the private half:
-      ```sh
-      ssh-keygen -t ed25519 -f ~/.ssh/aur-release -C "ltd-release" -N ""
-      # add ~/.ssh/aur-release.pub to your AUR account, then:
-      gh secret set AUR_SSH_PRIVATE_KEY < ~/.ssh/aur-release
-      ```
-      Secret name is exact: **`AUR_SSH_PRIVATE_KEY`**. Both AUR jobs
-      (`aur-stable` in `release-tag.yml`, `publish-nightly` in
-      `nightly.yml`) reference this name. Never commit keys.
-- [ ] **2. Workflow toggles (~1 min).** Repo Settings > Variables > New:
-      | Variable | Enables |
-      |---|---|
-      | `ENABLE_RELEASE_PUBLISH=true` | draft GitHub Release creation on `v*` tags |
-      | `ENABLE_AUR_STABLE=true` | stable AUR push (also needs step 3) |
-      | `ENABLE_NIGHTLY_PUBLISH=true` | -nightly AUR push on main (also needs step 3) |
-- [ ] **3. Arm the two AUR jobs (~1 min).** Each is hard-disabled with
-      `if: false` plus a comment naming the secret + toggle:
-      - `release-tag.yml`, job `aur-stable`: flip to
-        `if: needs.preflight.outputs.aur == 'true'`.
-      - `nightly.yml`, job `publish-nightly`: flip to
-        `if: needs.preflight.outputs.publish == 'true'`.
-- [ ] **4. Create the -nightly AUR repo once (~1 min).** The first push to a
-      new AUR package must come from your own key (the bot cannot create
-      the repo):
-      ```sh
-      git clone ssh://aur@aur.archlinux.org/linux-trackpad-driver-nightly.git
-      cp packaging/arch/PKGBUILD-nightly linux-trackpad-driver-nightly/PKGBUILD
-      cp packaging/arch/ltd.install linux-trackpad-driver-nightly/
-      cd linux-trackpad-driver-nightly
-      makepkg --printsrcinfo > .SRCINFO && git add PKGBUILD ltd.install .SRCINFO
-      git commit -m "initial nightly snapshot" && git push
-      ```
-- [ ] **5. First tag procedure (~1 min + CI time).** Follow Steps above
-      (note step 7: tags are signed). Stable AUR picks up the tag on the
-      next `release-tag.yml` run (pkgver bump + checksum from the draft
-      Release's SHA256SUMS).
+| Setting | Enables |
+|---|---|
+| Secret `AUR_SSH_PRIVATE_KEY` | AUR pushes (dedicated key, AUR-registered; both stable and -git legs use it). Never commit keys. |
+| `ENABLE_RELEASE_PUBLISH=true` | draft GitHub Release creation on `v*` tags |
+| `ENABLE_AUR_STABLE=true` | stable AUR push on `release.published` (also needs the secret) |
+| `ENABLE_AUR_GIT=true` | -git AUR push on packaging changes (also needs the secret) |
 
-To go back to inert: delete the repo variables (or set them `false`) and
-revert the two `if:` conditions to `false`. The `preflight` jobs always
-print which outputs are live, so any run's log shows inert vs armed.
+To go back to inert: delete the repo variables (or set them `false`).
+Workflows stay inert by default: without the variables every publish leg
+skips and runs stop at downloadable artifacts.
+
+Manual retries are safe: identical reruns noop, partial successes resume
+(one repo pushed + one pending retries cleanly), older events never
+downgrade, published assets are never rewritten.
 
 ## Layout
 
 - `.github/workflows/release-tag.yml` — `v*` tags (and manual dispatch):
-  build matrix (x86_64 + aarch64), `.deb` from `debian/` (x86_64),
-  `.tar.gz` (binary + systemd units + udev rules + default config),
-  `SHA256SUMS`, git-cliff excerpt → **draft** GitHub Release.
-  AUR stable push present but `if: false`.
-- `.github/workflows/nightly.yml` — `main` pushes: computes the would-be
-  `pkgver`, prints it, stops. Armed form bumps `PKGBUILD-nightly` and
-  pushes to the **separate** repo `linux-trackpad-driver-nightly`.
-- `packaging/arch/PKGBUILD` — stable spec (release-tarball `source=`,
-  no git dependency). `packaging/arch/.SRCINFO` regenerated per release.
-- `packaging/arch/PKGBUILD-nightly` — nightly template (VCS `source=`,
-  `pkgver()`); copied to `PKGBUILD` by the nightly job.
+  strict tag validation, exact-commit checkout, version sync
+  (Cargo/Cargo.lock/debian), build matrix (x86_64 + aarch64), `.deb` from
+  `debian/` (x86_64), binary tarballs **with both licenses**, `SHA256SUMS`,
+  git-cliff excerpt → **draft** GitHub Release (rerun-safe, never public).
+- `.github/workflows/aur-stable.yml` — `release.published` (or manual
+  retry): verifies the release is public + final, checksums both arch
+  tarballs against SHA256SUMS, requires the checksummed BUILD_COMMIT to
+  equal the release commit (moved tags fail), requires that commit on
+  upstream main, binds the source archive to the tag commit and version,
+  renders all three AUR trees via `render-aur.sh` on real Arch tooling, then
+  pushes `linux-trackpad-driver` + `linux-trackpad-driver-bin` (master,
+  append-only).
+- `.github/workflows/aur-git.yml` — `main` pushes touching
+  `packaging/arch/**`, `systemd/**`, `udev/**`, `config/default.toml`,
+  `Cargo.toml`, `Cargo.lock` (or a manual retry targeting main — other refs
+  are denied): regenerates `-git` metadata
+  and pushes `linux-trackpad-driver-git` (master, append-only).
+- `packaging/arch/PKGBUILD-stable.in` — stable spec (release-tarball
+  `source=`, no git dependency). `packaging/arch/PKGBUILD-bin.in` — per-arch
+  prebuilt spec. `packaging/arch/PKGBUILD-git` — VCS spec (`pkgver()`
+  dynamic). `packaging/arch/.SRCINFO` is generated at render time, never
+  committed here.
+- `packaging/release/` — `check-version-sync.sh`, `check-release-json.sh`,
+  `verify-assets.sh`, `verify-stable-release.sh` (BUILD_COMMIT binding,
+  moved-tag, main ancestry), `manage-draft-release.sh` (GH_REPO-bound draft
+  create/refresh), `gate-aur-git.sh` (main-ref boundary), `publish-aur.sh`
+  (+ offline tests in `test-release-scripts.sh`, run by CI without secrets).
 - `cliff.toml` — git-cliff Conventional Commits config. Preview with
   `git-cliff --unreleased --strip all`. Gotcha: never set
   `limit_commits = 0` (means "take zero commits", yields an empty
@@ -121,10 +167,17 @@ print which outputs are live, so any run's log shows inert vs armed.
 
 ## Guardrails (do not weaken without review)
 
-- Publishing requires secrets that do not exist yet; every publish step
-  also checks its `ENABLE_*` variable. Missing secret or toggle → clean
-  skip with an explanatory log line, never a half-publish.
+- Publishing requires the `AUR_SSH_PRIVATE_KEY` secret (provisioned for
+  activation; kept unset until root review passes) plus the matching
+  toggle; every publish leg checks both. Missing secret or toggle →
+  clean stop at artifacts with an explanatory log line, never a half-publish.
 - Releases are created as **drafts**; a human clicks Publish.
-- AUR stable and -nightly are separate repos and separate jobs; stable
-  never builds from git, nightly never touches the stable repo.
+- AUR stable legs only run off public, final releases; drafts and
+  prereleases fail closed before any download is trusted.
+- AUR stable and -git are separate repos and separate workflows; stable
+  never builds from git, -git never touches the stable repos.
+- SSH to AUR uses a pinned host key + `StrictHostKeyChecking`, temp key
+  files (mode 600, scrubbed on exit), no `ssh-keyscan`, no
+  `StrictHostKeyChecking=no`. The secret is only mapped in the push jobs,
+  which never run on PRs.
 - Never commit `AUR_SSH_PRIVATE_KEY` or any key material.

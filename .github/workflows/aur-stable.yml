@@ -1,0 +1,247 @@
+name: AUR stable (source + bin)
+
+# Publishes ONLY linux-trackpad-driver (source build) and
+# linux-trackpad-driver-bin (prebuilt) from a PUBLIC, final GitHub release.
+# Drafts never trigger this: GITHUB_TOKEN-created drafts do not emit release
+# events, so the intended chain is
+#   release-tag.yml builds + opens a draft ->
+#   maintainer reviews and clicks Publish (web UI or own token) ->
+#   release.published fires -> this workflow verifies + renders + pushes.
+# A trusted manual retry (workflow_dispatch with publish=true) re-verifies
+# that the release is already public before pushing anything.
+#
+# Activation: repo variable ENABLE_AUR_STABLE=true plus secret
+# AUR_SSH_PRIVATE_KEY (SSH key registered with the AUR account). Without both,
+# runs stop after verify/render (workflow artifacts only).
+# The first authenticated push creates the AUR package — no manual repo
+# bootstrap needed. Both packages share the same AUR account/key.
+#
+# Safety: no force-push (ever), no silent downgrades (a stale release event
+# older than the AUR master fails closed), idempotent noops, partial-success
+# retries safe, unrelated AUR files preserved. Serialized via concurrency.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to (re)publish, e.g. v0.1.0"
+        required: true
+        type: string
+      publish:
+        description: "Push to AUR (else dry-run: verify + render only)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-stable
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    # Execution trust before any checkout or script: manual dispatches run
+    # only on main. The release.published path stays allowed — its artifacts
+    # still face the commit binding + main ancestry checks below. Artifact
+    # ancestry alone never authorizes the execution tree.
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      version: ${{ steps.gate.outputs.version }}
+      commit: ${{ steps.gate.outputs.commit }}
+      exec-sha: ${{ steps.gate.outputs.exec-sha }}
+      bin-x86: ${{ steps.gate.outputs.bin-x86 }}
+      bin-aarch64: ${{ steps.gate.outputs.bin-aarch64 }}
+      source-sha: ${{ steps.gate.outputs.source-sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Trusted execution tree (main), never the dispatch ref and never
+          # the validated artifact tag commit: code trust and artifact trust
+          # are separate boundaries.
+          ref: main
+          persist-credentials: false
+          # Full history: the ancestry check pins the release commit to main.
+          fetch-depth: 0
+      - id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            raw_tag="$EVENT_TAG"
+          else
+            raw_tag="$INPUT_TAG"
+          fi
+          work="$(mktemp -d)"
+          trap 'rm -rf -- "$work"' EXIT
+          # Public + final, or stop before any download: drafts and
+          # prereleases never reach AUR stable.
+          gh release view "$raw_tag" --repo "$GH_REPO" \
+            --json tagName,isDraft,isPrerelease > "$work/release.json"
+          api_commit="$(gh api "repos/${GH_REPO}/commits/${raw_tag}" --jq .sha)"
+          mkdir -p "$work/assets"
+          gh release download "$raw_tag" --repo "$GH_REPO" --dir "$work/assets" \
+            --pattern 'SHA256SUMS' \
+            --pattern 'BUILD_COMMIT' \
+            --pattern 'linux-trackpad-driver-v*.tar.gz'
+          # Stable source is the GitHub tag archive (no upload needed). Its
+          # bytes only exist after the tag push, so digest it here.
+          curl --fail --show-error --location --retry 3 --retry-all-errors \
+            -o "$work/source.tar.gz" \
+            "https://github.com/${GH_REPO}/archive/refs/tags/${raw_tag}.tar.gz"
+          # Pin current upstream main for the ancestry check below.
+          git fetch origin main:refs/remotes/origin/main
+          # All trust checks (publicity, manifest, BUILD_COMMIT binding,
+          # moved-tag, main ancestry, source version) live in the tested
+          # script; the workflow only moves bytes and records outputs.
+          out="$(./packaging/release/verify-stable-release.sh \
+            --tag "$raw_tag" --release-json "$work/release.json" \
+            --assets-dir "$work/assets" --source-tarball "$work/source.tar.gz" \
+            --api-commit "$api_commit" \
+            --origin-url "https://github.com/${GH_REPO}.git" \
+            --checkout-dir "$GITHUB_WORKSPACE" --main-ref origin/main)"
+          tag="$(printf '%s\n' "$out" | sed -n 's/^TAG=//p')"
+          version="$(printf '%s\n' "$out" | sed -n 's/^VERSION=//p')"
+          commit="$(printf '%s\n' "$out" | sed -n 's/^COMMIT=//p')"
+          bin_x86="$(printf '%s\n' "$out" | sed -n 's/^BIN_X86_64_SHA=//p')"
+          bin_arm="$(printf '%s\n' "$out" | sed -n 's/^BIN_AARCH64_SHA=//p')"
+          source_sha="$(printf '%s\n' "$out" | sed -n 's/^SOURCE_SHA=//p')"
+          [ -n "$tag" ] && [ -n "$version" ] && [ -n "$commit" ] \
+            && [ -n "$bin_x86" ] && [ -n "$bin_arm" ] && [ -n "$source_sha" ] \
+            || { echo "::error::verify script returned incomplete outputs"; exit 1; }
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "exec-sha=$(git rev-parse HEAD)"
+            echo "bin-x86=$bin_x86"
+            echo "bin-aarch64=$bin_arm"
+            echo "source-sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "verify: $tag bound to $commit, ready to render"
+          mkdir -p aur-input
+          cp "$work/assets"/linux-trackpad-driver-*.tar.gz "$work/source.tar.gz" aur-input/
+          cp "$work/assets/SHA256SUMS" "$work/assets/BUILD_COMMIT" aur-input/
+          printf '%s' "$version" > aur-input/VERSION
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aur-stable-input
+          path: aur-input/
+          if-no-files-found: error
+          retention-days: 7
+
+  render:
+    needs: verify
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Exact execution tree recorded by verify, not the event ref.
+          ref: ${{ needs.verify.outputs.exec-sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aur-stable-input
+          path: aur-input
+      - name: install Arch toolchain (real makepkg metadata)
+        run: pacman -Syu --noconfirm --needed base-devel git
+      - name: render + validate as unprivileged user
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          BIN_X86: ${{ needs.verify.outputs.bin-x86 }}
+          BIN_ARM: ${{ needs.verify.outputs.bin-aarch64 }}
+          SOURCE_SHA: ${{ needs.verify.outputs.source-sha }}
+        run: |
+          set -euo pipefail
+          for digest in "$BIN_X86" "$BIN_ARM" "$SOURCE_SHA"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad digest from verify"; exit 1; }
+          done
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE" "${RUNNER_TEMP:-/tmp}"
+          # shellcheck disable=SC2016 # $0..$4 expand in the su'd shell, not here.
+          su builder -s /bin/bash -c 'cd "$0" && packaging/arch/render-aur.sh \
+            --version "$1" \
+            --source-sha256 "$2" \
+            --bin-x86_64-sha256 "$3" \
+            --bin-aarch64-sha256 "$4" \
+            --out aur-out \
+            --source-tarball aur-input/source.tar.gz \
+            --bin-x86_64-tarball aur-input/linux-trackpad-driver-v"$1"-x86_64-unknown-linux-gnu.tar.gz \
+            --bin-aarch64-tarball aur-input/linux-trackpad-driver-v"$1"-aarch64-unknown-linux-gnu.tar.gz' \
+            "$GITHUB_WORKSPACE" "$VERSION" "$SOURCE_SHA" "$BIN_X86" "$BIN_ARM"
+          echo "rendered:"
+          find aur-out -maxdepth 2 | sort
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aur-rendered
+          path: aur-out/
+          # .SRCINFO files are hidden; without this the push job would
+          # download a tree missing its mandatory metadata.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  push:
+    needs: [verify, render]
+    # Credentialed job: independently requires the toggle AND a trusted
+    # publish signal (release event, or a main-ref manual dispatch with
+    # publish=true). Helper outputs alone never authorize this job.
+    if: >-
+      vars.ENABLE_AUR_STABLE == 'true' &&
+      needs.verify.outputs.tag != '' &&
+      (github.event_name == 'release' ||
+       (github.ref == 'refs/heads/main' && inputs.publish == true))
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base
+    env:
+      TAG: ${{ needs.verify.outputs.tag }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      COMMIT: ${{ needs.verify.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Exact execution tree recorded by verify, not the event ref.
+          ref: ${{ needs.verify.outputs.exec-sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aur-rendered
+          path: aur-rendered
+      - name: install git + ssh (push clones and authenticates, never the checkout tree)
+        run: |
+          pacman -Syu --noconfirm --needed git openssh
+          command -v git
+          command -v ssh
+      - name: push source + bin repos (master, append-only)
+        env:
+          # Secret scoped to this gated step only: nothing earlier in this
+          # job (checkout, download, setup) sees publication credentials.
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_KNOWN_HOSTS: aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+        run: |
+          set -euo pipefail
+          [ -n "${AUR_SSH_PRIVATE_KEY:-}" ] \
+            || { echo "::error::AUR_SSH_PRIVATE_KEY secret is unset"; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
+          msg="AUR stable $VERSION (release $TAG, $COMMIT)"
+          ./packaging/release/publish-aur.sh --pkg linux-trackpad-driver \
+            --dir aur-rendered/linux-trackpad-driver --message "$msg" \
+            --expect-pkgver "$VERSION"
+          ./packaging/release/publish-aur.sh --pkg linux-trackpad-driver-bin \
+            --dir aur-rendered/linux-trackpad-driver-bin --message "$msg" \
+            --expect-pkgver "$VERSION"
