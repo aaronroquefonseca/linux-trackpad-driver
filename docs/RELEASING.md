@@ -167,10 +167,10 @@ downgrade, published assets are never rewritten.
 
 ## Guardrails (do not weaken without review)
 
-- Publishing requires the `AUR_SSH_PRIVATE_KEY` secret (not yet configured)
-  plus the matching toggle; every publish leg checks both. Missing secret
-  or toggle → clean stop at artifacts with an explanatory log line, never
-  a half-publish.
+- Publishing requires the `AUR_SSH_PRIVATE_KEY` secret (provisioned for
+  activation; kept unset until root review passes) plus the matching
+  toggle; every publish leg checks both. Missing secret or toggle →
+  clean stop at artifacts with an explanatory log line, never a half-publish.
 - Releases are created as **drafts**; a human clicks Publish.
 - AUR stable legs only run off public, final releases; drafts and
   prereleases fail closed before any download is trusted.
