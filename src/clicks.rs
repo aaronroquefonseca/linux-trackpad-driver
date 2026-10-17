@@ -75,11 +75,11 @@
 //!   Action selection keeps the real count (default, recommended) unless
 //!   `[spoof] actions_follow_spoof = true` (then selection uses the
 //!   spoofed count too, and the edge's `finger_count` reports it).
-//! - Level-transition mode (`transition_mode`, global): `"continuous"`
-//!   (default) holds level-1 keys while force keys join (shared codes down
-//!   once, up once); `"cut"` releases ALL level-1/slide keys first (with
+//! - Level-transition mode (`transition_mode`, global): `"cut"`
+//!   (default) releases ALL level-1/slide keys first (with
 //!   SYN) then presses the force combo fresh — shared codes show
-//!   up+SYN+down. The machine latches identically either way; the mode
+//!   up+SYN+down; `"continuous"` holds level-1 keys while force keys join
+//!   (shared codes down once, up once). The machine latches identically either way; the mode
 //!   only changes the proxy's wire sequence on the force edge.
 //! - Combination semantics: slide hands off to press (same-action =
 //!   seamless, else release-then-press, one SYN); spoof reshapes the wire

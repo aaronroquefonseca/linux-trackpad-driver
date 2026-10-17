@@ -154,16 +154,10 @@ slide_5 = "none"
 # -------------------------------------------------------------------------
 # Level-transition mode (force edge over an active click)
 #
-# "continuous" (default, current behavior): level-1 keys stay held, force
-# keys join (shared codes go down once, up once). "cut": release ALL
-# level-1/slide keys first (with SYN), then press the force combo fresh —
-# so force_1 = left+super starts a window drag instead of extending a
-# held left. Tradeoff: continuous keeps drags alive across the force
-# edge (good for pressure-augmented clicks); cut restarts the gesture
-# (good for mode-switch combos, at the cost of a up+SYN+down flutter on
-# shared codes that dumb consumers may read as click-release-click).
+# continuous: force keys join held click keys.
+# cut (default): release click keys first, then press force keys.
 # -------------------------------------------------------------------------
-transition_mode = "continuous"
+transition_mode = "cut"
 
 # Fallback modifier-to-button gap for fresh mixed slides and cut-force
 # fresh presses that OMIT binding timing (milliseconds, 0..=500, default 50).

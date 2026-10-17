@@ -122,11 +122,9 @@ pub struct Config {
     #[serde(default)]
     pub spoof: SpoofConfig,
     /// Level-transition mode on a force edge over an active click:
-    /// `"continuous"` (default, current behavior: level-1 keys stay held,
-    /// force keys join) or `"cut"` (release ALL level-1/slide keys first
-    /// with a SYN, then press the force combo fresh — so
-    /// `force_1 = left+super` starts a window drag instead of extending a
-    /// held left). Global single key; see [`crate::clicks::ClickMachine`].
+    /// `"continuous"` (force keys join held click keys) or `"cut"`
+    /// (default: release click keys first, then press force keys).
+    /// Global single key; see [`crate::clicks::ClickMachine`].
     #[serde(default = "default_transition_mode")]
     pub transition_mode: String,
     /// Modifier-to-button gap for fresh mixed slide combos and cut force
@@ -171,7 +169,7 @@ fn default_action_none() -> ActionBinding {
     "none".into()
 }
 fn default_transition_mode() -> String {
-    "continuous".to_string()
+    "cut".to_string()
 }
 fn default_combo_stagger_ms() -> u16 {
     50
@@ -676,8 +674,8 @@ impl Config {
         }
     }
 
-    /// True when a force edge cuts level-1/slide keys first (`"cut"`);
-    /// false is `"continuous"` (default: keys stay held, force joins).
+    /// True when a force edge cuts level-1/slide keys first (`"cut"`, default);
+    /// false is `"continuous"` (force keys join held click keys).
     pub fn is_cut_transition(&self) -> bool {
         self.transition_mode == "cut"
     }
@@ -788,8 +786,8 @@ mod tests {
         assert!(c.spoof.click.is_empty());
         assert!(c.spoof.force.is_empty());
         assert!(!c.spoof.actions_follow_spoof);
-        assert_eq!(c.transition_mode, "continuous");
-        assert!(!c.is_cut_transition());
+        assert_eq!(c.transition_mode, "cut");
+        assert!(c.is_cut_transition());
         c.validate().unwrap();
         assert!(!c.force_enabled());
         // No override → falls back to standard haptic.
@@ -1183,7 +1181,13 @@ mod tests {
     #[test]
     fn transition_mode_validates() {
         let c = Config::default();
-        assert!(!c.is_cut_transition());
+        assert!(c.is_cut_transition());
+        let continuous = Config {
+            transition_mode: "continuous".into(),
+            ..Config::default()
+        };
+        assert!(continuous.validate().is_ok());
+        assert!(!continuous.is_cut_transition());
         let cut = Config {
             transition_mode: "cut".into(),
             ..Config::default()
