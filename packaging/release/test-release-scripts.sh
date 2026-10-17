@@ -373,7 +373,10 @@ awk '/name: push -git repo/{seen=1} /AUR_SSH_PRIVATE_KEY: /{if (!seen) exit 1}' 
   || { echo "FAIL: key scoped to the gated push step" >&2; exit 1; }
 ok "key scoped to the gated push step"
 
-# 8. workflow contracts ---------------------------------------------------------
+# 8. workflow authorization contracts (evaluates the real `if:` logic) --------
+must "workflow authorization contracts" python3 "$REL/test-workflow-auth.py"
+
+# 9. workflow file contracts --------------------------------------------------
 for required in release-tag.yml aur-stable.yml aur-git.yml; do
   [ -f "$WF/$required" ] || { echo "FAIL: missing $WF/$required" >&2; exit 1; }
 done
@@ -413,7 +416,7 @@ assert_grep "$WF/aur-git.yml" 'openssh' "-git installs an ssh client"
 assert_grep "$WF/aur-stable.yml" 'openssh' "stable push installs an ssh client"
 assert_grep "$REL/publish-aur.sh" 'aur\.archlinux\.org ssh-ed25519' "AUR host key pinned, no ssh-keyscan"
 
-# 9. real makepkg payload check for the prebuilt variant -------------------------
+# 10. real makepkg payload check for the prebuilt variant ------------------------
 if [ "$(id -u)" -eq 0 ]; then
   echo "skip: makepkg payload check needs a non-root user (CI runs it as builder)"
 else
