@@ -102,30 +102,54 @@ bits 6..7 are device-timestamp bits, not buttons.
 - `haptic` 0..=255 output strength; `quiet_click` selects soft waveform.
 - `speed` scales pointer motion only in proxy path; never touches init.
 
-## Config schema (target, `config-schema` task owns final)
+## Config schema (v1 sectioned, `config-schema` owns final)
+
+Device tiers: L0 basic no-pressure (pointer `speed` + finger-count remapping);
+L1 pressure no host buzz (+`click`/`force`/`slide`); L2 pressure+host buzz all
+active (Apple proprietary today, ChromeOS standard planned). Only Apple Magic
+Trackpad 2 implemented; others planned. `[device]` independent of
+`enhanced_clicks`; `[pointer]`/`[click]`/`[haptics]`/`[force]`/`[slide]`/
+`[spoof]` require `enhanced_clicks=true` (unsupported stay saved+inactive).
+Omitted keys fall back to defaults; device-specific pressure values, not
+portable. Unknown keys error. Apply: `sudo systemctl restart
+linux-trackpad-driver` (required for now; live reload planned).
 
 ```toml
+schema_version = 1
 log_level = "info"        # debug|info|warn|error
-polling_rate = 110        # requested Hz, CAPPED: device max demonstrated ~111
-                          # (0x99 report `99 F2 XX`, ≈3850/XX; XX=0x23 → ~111 Hz).
-                          # Never request above device max; verify by measurement.
-                          # BT rate equivalent unknown — USB-first.
-enhanced_clicks = false   # opt-in gate for entire clicks pipeline
-sensitivity = 64          # 1..=255
-margin = 5
-haptic = 5                # 0..=255, 0 = silent
-quiet_click = false
-speed = 100
+enhanced_clicks = true    # opt-in gate for entire clicks pipeline
+[device]
+polling_rate = 110        # Apple USB only, 16..110
+[pointer]
+speed = 100               # 1..1000
+[click]
+sensitivity = 30          # 1..255, firmer alt 64
+margin = 5                # 0..255
 click_1 = "left"          # left|right|middle|back|forward|none|empty|keys
-click_2 = "right"
+click_2 = "right"         # (+ per-binding stagger_ms objects)
 click_3 = "middle"
 click_4 = "none"
 click_5 = "none"
-force_offset = 0          # 0 disables force level
-# force_haptic, force_quiet_click, force_1..=force_5 optional
+[haptics]
+haptic = 2                # 0..255, 0 = silent
+quiet_click = true
+# force_haptic omit = inherit haptic
+force_quiet_click = false
+[force]
+force_offset = 0          # 0 disables; e.g. 130 -> 160 with sensitivity 30
+force_1 = "none"          # force_1..5 + transition_mode + combo_stagger_ms
+transition_mode = "cut"   # continuous|cut
+combo_stagger_ms = 50     # 0..500
+[slide]
+slide_1 = "none"          # slide_1..5, e.g. slide_5 super+left
+[spoof]
+actions_follow_spoof = false  # FIRST under [spoof]
+# [spoof.slide]/[spoof.click]/[spoof.force] sparse: omitted = real,
+# 0 = passthrough, 1..5 = virtual; wire always virtual
 ```
 
-New key vs reference: `enhanced_clicks` (explicit opt-in gate).
+Strict v1: `schema_version = 1` required, `deny_unknown_fields` everywhere
+incl. nested, unknown version errors.
 
 ## Daemon CLI
 
