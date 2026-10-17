@@ -768,9 +768,12 @@ where
         // A slide handed to a press can still be inside that press's
         // release debounce on clean liftoff. Cancel staged work outright:
         // idle polls must never turn that stale latch into a late down.
+        // End the matching latch too, so retouch can retry after the normal
+        // press debounce instead of silently reviving an actionless hold.
         if (self.pending_buttons.is_some() || self.pending_force.is_some())
             && !frame.fingers.iter().any(clicks::touch_present)
         {
+            self.machine.cancel_pending_press_at(now);
             self.release_held(ClickMachine::physical_button(frame.clicks));
         }
         // Slide re-select: a count change onto a different action ends the
@@ -6769,6 +6772,184 @@ mod tests {
         }
         assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
         assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+    }
+
+    #[test]
+    fn slide_mixed_rapid_retouch_after_pending_handoff_retries_after_debounce() {
+        for explicit_lift in [false, true] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let lifted = if explicit_lift {
+                Ok(Some(frame(
+                    (1..=5)
+                        .map(|id| FingerContact {
+                            contact: false,
+                            ..finger(id, 0, 0, 20)
+                        })
+                        .collect(),
+                    0,
+                )))
+            } else {
+                slide_report(0, 0, 0)
+            };
+            let mut px = drive_ready_proxy(
+                &sinks,
+                &haptic,
+                vec![slide_report(5, 10, 0), slide_report(5, 60, 0), lifted],
+            );
+            let cfg = Config {
+                click_5: "super+left".into(),
+                ..five_slide_cfg()
+            };
+            let t0 = std::time::Instant::now();
+            for ms in [0, 10, 15] {
+                px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            }
+            assert!(px.machine.active().is_none());
+            assert!(px.pending_buttons.is_none());
+            assert!(px.held_first.is_empty());
+            // No report after liftoff: neither the old deadline nor an idle
+            // poll can revive the cancelled button.
+            px.handle_frame_at(&cfg, ms_after(t0, 19)).unwrap();
+            px.replace_source(ScriptSource::new(vec![slide_report(5, 60, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, 20)).unwrap();
+            assert!(
+                px.machine.active().is_none(),
+                "press debounce still applies"
+            );
+            for ms in [50, 64] {
+                px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            }
+            assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+            assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+            px.replace_source(ScriptSource::new(vec![slide_report(5, 60, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, 70)).unwrap();
+            assert!(px.machine.active().is_some());
+            assert!(!px.held_first.is_empty());
+            assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1]);
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+            px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, 110)).unwrap();
+            assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1, 0]);
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+            assert_eq!(haptic.calls.lock().unwrap().len(), 2);
+            assert_eq!(haptic.releases.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn slide_mixed_pending_handoff_pressure_dip_keeps_latch_and_deadline() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(5, 60, 0),
+                slide_report(5, 10, 0),
+                slide_report(5, 60, 0),
+            ],
+        );
+        let cfg = Config {
+            click_5: "super+left".into(),
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        for ms in [0, 10, 15, 20, 49] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+        }
+        assert!(px.machine.active().is_some());
+        assert!(px.pending_buttons.is_some());
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        // Contact never ended: the original slide deadline still applies,
+        // even though a pressure dip cleared the per-finger pressed bits.
+        px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+        px.handle_frame_at(&cfg, ms_after(t0, 100)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1);
+        assert_eq!(haptic.releases.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_force_liftoff_cancels_both_stages_and_retouch_retries() {
+        for mods_first in [false, true] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let mut px = drive_ready_proxy(
+                &sinks,
+                &haptic,
+                vec![slide_report(5, 60, 0), slide_report(5, 200, 0)],
+            );
+            let cfg = Config {
+                click_5: "super+left".into(),
+                force_5: "super+left".into(),
+                ..five_slide_cfg()
+            };
+            let t0 = std::time::Instant::now();
+            for ms in [0, 10] {
+                px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            }
+            assert!(px.pending_force.is_some());
+            if mods_first {
+                // No report: force modifiers still advance at the 5 ms
+                // floor on idle polls, while the button waits 50 ms more.
+                px.handle_frame_at(&cfg, ms_after(t0, 15)).unwrap();
+                assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1]);
+            }
+            let lift_at = if mods_first { 16 } else { 12 };
+            px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, lift_at)).unwrap();
+            assert!(px.machine.active().is_none());
+            assert!(px.machine.force_active().is_none());
+            assert!(px.pending_force.is_none());
+            assert!(px.held_first.is_empty() && px.held_force.is_empty());
+            let cancelled_super = if mods_first {
+                vec![1, 0, 1, 0]
+            } else {
+                vec![1, 0]
+            };
+            px.handle_frame_at(&cfg, ms_after(t0, 19)).unwrap();
+            px.replace_source(ScriptSource::new(vec![slide_report(5, 200, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, 20)).unwrap();
+            assert!(
+                px.machine.active().is_none(),
+                "press debounce still applies"
+            );
+            for ms in [60, 65] {
+                px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            }
+            assert_eq!(key_values(&sinks.extras, 125), cancelled_super);
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+            // Fresh deep contact retries first, then force on the next
+            // report; cut keeps its 5 ms floor and 50 ms button gap.
+            px.replace_source(ScriptSource::new(vec![
+                slide_report(5, 200, 0),
+                slide_report(5, 200, 0),
+            ]));
+            for ms in [70, 71, 75, 76, 125] {
+                px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            }
+            assert!(px.machine.active().is_some());
+            assert!(px.machine.force_active().is_some());
+            assert!(px.pending_force.is_some());
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1, 0]);
+            px.handle_frame_at(&cfg, ms_after(t0, 126)).unwrap();
+            assert!(px.pending_force.is_none());
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1, 0, 1]);
+            px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, 200)).unwrap();
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0, 1, 0, 1, 0]);
+            let mut expected_super = cancelled_super;
+            expected_super.extend([1, 0, 1, 0]);
+            assert_eq!(key_values(&sinks.extras, 125), expected_super);
+            assert!(px.machine.active().is_none());
+            assert!(px.machine.force_active().is_none());
+        }
     }
 
     #[test]

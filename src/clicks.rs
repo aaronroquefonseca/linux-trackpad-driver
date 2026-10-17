@@ -754,6 +754,21 @@ impl ClickMachine {
         Ok(out)
     }
 
+    /// End a staged press cancelled by the proxy on genuine liftoff.
+    /// Its wire hold is gone, so the release-hold debounce must not retain
+    /// a latch that would swallow the next contact's edge. Keep the normal
+    /// press debounce measured from this release (or the prior release if
+    /// update already ended the press); detach's reset alone would lose it.
+    pub(crate) fn cancel_pending_press_at(&mut self, now: Instant) {
+        let released_at = if self.active.is_some() {
+            Some(now)
+        } else {
+            self.last_release_at
+        };
+        self.reset();
+        self.last_release_at = released_at;
+    }
+
     /// Latch reset (detach path): clears both levels and debounce clocks
     /// so a re-attach starts undebounced.
     pub fn reset(&mut self) {
