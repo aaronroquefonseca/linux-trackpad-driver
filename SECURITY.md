@@ -55,17 +55,15 @@ this rewrite (issue #42).
 
 ## Privileges and attack surface
 
-The shipped systemd unit has no `User=` directive, so the service runs
-as root, which raw HID (`/dev/hidrawN`), evdev grab, and uinput access
-require. There is no privilege dropping today. Sandboxing or privilege
+The shipped systemd unit has no `User=` directive. The shipped service currently runs as root to access HID and input devices. There is no privilege dropping today. Sandboxing or privilege
 reduction are future ideas only, not current protections.
 
 What is in place today:
 
-- No network surface (control channel is a local unix socket only).
+- No network listener or remote API. A local Unix socket is used for single-instance locking and daemon liveness detection.
 - No secret storage.
 - HID report lengths are validated before parsing (`src/apple_parse.rs`).
-- The proxy never swallows input it cannot re-emit: grab failure,
+- The USB proxy never swallows input it cannot re-emit: grab failure,
   pump loss, or detach returns the device to passthrough.
 
 If you find a memory-safety or privilege issue (out-of-bounds parse,
