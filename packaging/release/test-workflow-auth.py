@@ -262,7 +262,7 @@ gpush = next(
     s["if"] for s in gitwf["snapshot"]["steps"] if s["name"].startswith("push -git")
 )
 check("git push step condition exists", gpush is not None)
-MAL = dict(C("workflow_dispatch", FEAT, True, "true"), **{})  # base
+MAL = dict(C("workflow_dispatch", FEAT, True, "true", "true"), **{})  # base
 MAL["steps.gate.outputs.publish"] = "true"  # replaced malicious helper
 check("malicious helper cannot self-authorize off-main", not allows(gpush, MAL))
 check(
