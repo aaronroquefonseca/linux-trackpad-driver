@@ -116,6 +116,36 @@ expect_fail "stale event (older version) refused" "$REL/publish-aur.sh" \
 ok "refused push leaves remote untouched"
 expect_fail "force-push never attempted (push is append-only)" \
   grep -nE 'git .*push.*--force' "$REL/publish-aur.sh"
+# Regression (review P1): a relative --dir must resolve before the script
+# cds into the temporary clone. r2/9.9.10 is already published, so this
+# must succeed as a noop from a different working directory.
+mkdir -p "$TMP_BASE/relwork"
+rm -rf "$TMP_BASE/relwork/rendered"
+cp -r "$TMP_BASE/r2" "$TMP_BASE/relwork/rendered"
+if ! ( cd "$TMP_BASE/relwork" && "$REL/publish-aur.sh" \
+  --pkg linux-trackpad-driver --dir rendered \
+  --message "test relative dir" --expect-pkgver 9.9.10 --remote "$REMOTE" \
+  >/dev/null 2>&1 ); then
+  echo "FAIL: relative --dir resolves outside the clone" >&2; exit 1
+fi
+ok "relative --dir resolves outside the clone"
+# ssh:// remotes fail closed when no ssh client exists (Arch git does not
+# depend on openssh), instead of dying mid-clone.
+HIDE="$TMP_BASE/hide"; mkdir -p "$HIDE"
+BIN_BASH="$(command -v bash)"
+for tool in mktemp grep chmod; do
+  ln -sf "$(command -v "$tool")" "$HIDE/$tool"
+done
+if PATH="$HIDE" AUR_SSH_PRIVATE_KEY=dummy "$BIN_BASH" "$REL/publish-aur.sh" \
+  --pkg linux-trackpad-driver --dir "$TMP_BASE/r1" \
+  --message "test no ssh" --expect-pkgver 9.9.9 \
+  --remote ssh://aur@aur.archlinux.org/linux-trackpad-driver.git \
+  >/dev/null 2>"$TMP_BASE/ssh-err.txt"; then
+  echo "FAIL: ssh client guard fails closed without openssh" >&2; exit 1
+fi
+grep -q "ssh client not found" "$TMP_BASE/ssh-err.txt" \
+  || { echo "FAIL: ssh guard names the missing client" >&2; exit 1; }
+ok "ssh client guard fails closed without openssh"
 
 # 5. workflow contracts ---------------------------------------------------------
 WF="$REPO_ROOT/.github/workflows"

@@ -41,6 +41,9 @@ fi
 for managed in PKGBUILD .SRCINFO ltd.install; do
   [ -f "$DIR/$managed" ] || { echo "publish-aur: missing $DIR/$managed" >&2; exit 1; }
 done
+# Resolve before any cd: callers may pass a relative dir and every copy
+# below runs inside the temporary clone.
+DIR="$(cd -- "$DIR" && pwd)" || { echo "publish-aur: cannot resolve --dir" >&2; exit 1; }
 
 WORK_DIR="$(mktemp -d)" || { echo "publish-aur: cannot mktemp" >&2; exit 1; }
 cleanup() { rm -rf -- "$WORK_DIR"; }
@@ -48,6 +51,8 @@ trap cleanup EXIT
 
 GIT_SSH_OPTS=()
 if [[ "$REMOTE" == ssh://* ]]; then
+  command -v ssh >/dev/null \
+    || { echo "publish-aur: ssh client not found (install openssh)" >&2; exit 1; }
   KEY="${AUR_SSH_PRIVATE_KEY:-}"
   [ -n "$KEY" ] || { echo "publish-aur: AUR_SSH_PRIVATE_KEY is unset" >&2; exit 1; }
   case $- in
