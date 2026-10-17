@@ -47,6 +47,7 @@ sudo ltd reconnect /dev/hidraw2
 ```sh
 sudo install -m644 systemd/linux-trackpad-driver.service \
   systemd/linux-trackpad-driver-reconnect@.service /etc/systemd/system/
+sudo install -Dm644 config/default.toml /etc/linux-trackpad-driver/config.toml  # edit this copy; absent → built-in defaults
 sudo systemctl daemon-reload
 sudo systemctl enable --now linux-trackpad-driver.service
 systemctl status linux-trackpad-driver.service

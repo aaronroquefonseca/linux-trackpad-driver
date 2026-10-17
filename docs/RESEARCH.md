@@ -1,7 +1,7 @@
 # Research — input-stack + haptic-trackpad survey (2026-10-14)
 
 Two parallel research threads. Sources inline. `[SPECULATION]` marks unverified
-claims. Validates / corrects the L0/L1/L2 tier model in ROADMAP/ARCHITECTURE.
+claims. Validates / corrects the L0/L1/L2 tier model in ARCHITECTURE.
 
 ## 1. Standards baseline
 
@@ -140,8 +140,7 @@ Rules derived:
   + `0x0E` waveforms + physical units + transport (HID vs SPI) + mode
   (device- vs host-controlled).
 - `TouchSource` trait: add `pressure_units()` (arbitrary vs grams) alongside
-  `tier()` so L1a/L1b is machine-checked. ARCHITECTURE.md to be amended in
-  Phase 1 by `config-schema` or `apple-parse` owner.
+  `tier()` so L1a/L1b is machine-checked. ARCHITECTURE.md amended: tiers + `pressure_units()` adopted (see `src/apple_parse.rs`).
 
 ## 5. Plan verdicts (per-thread)
 
@@ -168,7 +167,7 @@ unverified (may NAK/ignore). Posture: request CAPPED value (~110), clamp to
 device max, verify by measurement — never 500 Hz. BT equivalent unknown.
 https://github.com/benjaminwestern/linux-apple-trackpad ,
 https://github.com/mr-cal/Linux-Magic-Trackpad-2-USB-C-Driver/issues/26
-ROADMAP + ARCHITECTURE amended; `base-init` notified in-flight.
+ARCHITECTURE amended; the init owner was notified in-flight.
 
 ### hidraw ordering: defer-retry-verify (new detail)
 Kernel probe sends its own init; userspace `HIDIOCSFEATURE` at `add` races it.

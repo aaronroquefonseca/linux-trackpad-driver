@@ -1,88 +1,36 @@
-# Architecture — linux-trackpad-driver (target)
+# Architecture — linux-trackpad-driver
 
-> Coordinator spec. Agents reimplement from this; do not copy reference code.
-
-## Crate layout (proposed, base-init may adjust with justification)
-
-```
-linux-trackpad-driver/
-  Cargo.toml            # workspace
-  crates/
-    ltd-core/           # config, logging, error types, daemon lifecycle
-    ltd-init/           # USB/BT init: feature reports, polling, BT single-node
-    ltd-input/          # TouchSource trait + AppleHidraw; EvdevGeneric stub
-    ltd-clicks/         # pressure state machine, haptics, 1-5 finger map, force
-    ltd-uinput/         # evdev grab + uinput emit (clicks only, never init)
-    ltd-daemon/         # `run` / `reconnect` CLI, udev hook entry, signals
-  udev/                 # 99-*.rules (add-only, hidraw, VID:PID-gated)
-  systemd/              # service unit (simple, Restart=on-failure)
-  config/               # default TOML
-  docs/
-```
-
-Single binary is acceptable for Phase 0/1 if workspace feels heavy —
-decision belongs to `base-init`, recorded here afterwards.
+Single crate: binary `ltd` (`src/main.rs` + modules `apple_parse`, `cli`,
+`clicks`, `config`, `daemon`, `discovery`, `evdev`, `evdev_generic`,
+`hw_mock`, `init`, `lock`, `proxy`, `pump`, `resume`, `test_env`).
 
 ## Layering
 
 ```
-hidraw/evdev ──> ltd-init (always on) ──> kernel/libinput passthrough (default path)
-                        │
-                        └──> ltd-input ──> ltd-clicks ──> ltd-uinput (opt-in only)
-                                                  ▲
-                                            config (enhanced_clicks=false default)
+hidraw/evdev ──> init (always on) ──> kernel/libinput passthrough (fallback path)
+                      │
+                      └──> input ──> clicks ──> uinput (gated by enhanced_clicks)
+                                                ▲
+                                          config (enhanced_clicks=true default)
 ```
 
-- `ltd-init` has zero deps on `ltd-clicks` / `ltd-uinput`.
-- Clicks subscribe to init's device-ready events; never drive init.
+- `init` has zero deps on clicks/uinput (`src/init.rs` imports std + anyhow only).
+- Clicks subscribes to init's device-ready events (`DeviceReadyHub` in
+  `src/daemon.rs`); never drives init.
 - Clicks failure mode: log, release grab, passthrough continues.
+- Bluetooth bring-up is single-node: no init reports, no rate tuning
+  (`init_bluetooth` in `src/init.rs`).
+- Polling is an Apple-USB-only setting (default 110 Hz, usable 16..110):
+  requests above ~110 Hz still place `X = 0x23` on the wire and warn;
+  requests below ~16 Hz are rejected instead of rounding up.
 
-## TouchSource trait (contract, names may evolve)
+## Touch input contract
 
-```rust
-// Illustrative only — implementing agent owns final signatures.
-pub enum CapabilityTier { L0, L1, L2 }
-
-pub struct TouchFrame {
-    pub fingers: Vec<Finger>,
-    pub timestamp_ms: u64,
-}
-
-pub struct Finger {
-    pub id: u8,
-    pub pressure: u8,      // RAW device byte (Apple: 0..=253 valid, 254/255
-                           // reserved passthrough — see RESEARCH §6). NOT
-                           // normalized: clicks thresholds operate on this
-                           // scale; uinput stage emits old-service
-                           // normalized 60/800/800 per down contact.
-    pub contact: bool,
-}
-
-pub trait TouchSource {
-    fn tier(&self) -> CapabilityTier;
-    /// L1a (area-proxy, res==0) vs L1b (true grams, res!=0). Apple MT2 = Arbitrary.
-    fn pressure_units(&self) -> PressureUnits;
-    fn poll_frame(&mut self) -> anyhow::Result<Option<TouchFrame>>;
-}
-```
-
-- `AppleHidraw`: hidraw 9-byte blocks, pressure @ offset 7, multitouch decode.
-- `EvdevGeneric`: stub in Phase 1 (returns tier + `unimplemented` poll with
-  a clear error, plus mock path for tests). Full impl Phase 2.
-
-### Phase-1 note (apple-parse): adopted tiers + `pressure_units()`
-
-`CapabilityTier` uses the `docs/RESEARCH.md` §4 split
-(`L0/L1a/L1b/L2s/L2p`), and `TouchSource` gains
-`fn pressure_units() -> PressureUnits` (`Arbitrary` vs `Grams`) so the
-L1a/L1b distinction is machine-checked. Apple MT2 reports
-`tier() == L2p` (proprietary device-autonomous pad) with
-`pressure_units() == Arbitrary`: pressure @ offset 7 is a nominal 0..253
-byte with `res == 0` — never grams/newtons, never `EV_FF`/`FF_HAPTIC`.
-Decode-only: `poll_frame` errs (transport belongs to `uinput-proxy`);
-the caller logs and drops the failed frame, never aborts the read loop.
-`TouchFrame.clicks` is raw `report[1]`: button state is `clicks & 1`;
-bits 6..7 are device-timestamp bits, not buttons.
+- `TouchSource` trait (`src/apple_parse.rs`): `tier()` + `pressure_units()`
+  (`Arbitrary` vs `Grams`) + `poll_frame()`; Apple MT2 reports `L2p`/`Arbitrary`,
+  pressure is the raw byte at 9-byte-block offset 7 (0..=253 valid, arbitrary units).
+- `TouchFrame { fingers: Vec<FingerContact>, clicks /* raw report[1], button = clicks & 1 */, timestamp_ms /* always 0 */ }`.
+- `EvdevGeneric` (`src/evdev_generic.rs`) is an L0/L1a stub; full decode is future work.
 
 ## Click state machine (spec)
 
@@ -102,7 +50,7 @@ bits 6..7 are device-timestamp bits, not buttons.
 - `haptic` 0..=255 output strength; `quiet_click` selects soft waveform.
 - `speed` scales pointer motion only in proxy path; never touches init.
 
-## Config schema (v1 sectioned, `config-schema` owns final)
+## Config schema (v1 sectioned)
 
 Device tiers: L0 basic no-pressure (pointer `speed` + finger-count remapping);
 L1 pressure no host buzz (+`click`/`force`/`slide`); L2 pressure+host buzz all
@@ -156,70 +104,17 @@ incl. nested, unknown version errors.
 - `ltd run [-c config]` — init loop + optional clicks pipeline.
 - `ltd reconnect <hidraw-dev> [-f] [-p Hz] [-d]` — udev entry; idempotent;
   `-f` proceeds when daemon socket absent; `-d` disengage path.
+- `ltd resume [-p Hz] [-c config]` — re-run init after suspend (also via sleep hook).
+- `ltd doctor [-c config]` — read-only checklist: device scan + config validate + socket dial.
 - Single-instance lock via `/run/linux-trackpad-driver/driver.sock`
-  (name TBD by base-init; must not collide with old `magic-trackpad-driver` path
-  unless migration is handled).
+  (`$LTD_SOCKET` overrides for tests/unprivileged runs).
 
 ## Udev / systemd / suspend
 
 - udev: `ACTION=="add", SUBSYSTEM=="hidraw"`, VID:PID-gated
-  (`05ac`/`004c` × `0265`/`0324`), runs `reconnect /dev/%k`. No bind/unbind tricks.
+  (`05ac`/`004c` × `0265`/`0324`), requests `linux-trackpad-driver-reconnect@%k.service`
+  via `SYSTEMD_WANTS` (the service runs `reconnect /dev/%I`). No bind/unbind tricks.
 - systemd: `Type=simple`, `Restart=on-failure`, `RuntimeDirectory=`.
-- suspend/resume: re-run init sequence on resume; clicks pipeline re-attaches,
-  never reorders init.
-
-## Phase-0 decision record (base-init, 2026-10-14)
-
-- **Single crate, not workspace.** Binary `ltd` (`src/main.rs` + modules
-  `cli/config/discovery/init/lock/daemon`) instead of the proposed
-  `crates/ltd-*` workspace. Rationale: base is small enough that a workspace
-  adds scaffolding without isolation benefit; the hard isolation rule
-  (init has zero clicks deps) is enforced at module level plus a buildable,
-  tested stub hook (`DeviceReadyHub`). Split into `ltd-core/ltd-init/...`
-  when the clicks pipeline lands (Phase 1 `uinput-proxy` or later).
-- **Polling posture corrected (coordinator directive).** Default request is
-  the capped device maximum ~110 Hz (`X = 0x23 = 35`, `3850/35 ≈ 110`) —
-  never 500 Hz. `resolve_polling` maps the raw request to `X`, then floors
-  the wire byte at `0x23`, so requests above ~110 Hz still place `X = 0x23`
-  on the wire (unverified divisor range; device may NAK/ignore `X < 35`).
-  `theoretical_hz` reports the raw request's meaning pre-floor; over-cap
-  requests warn at the daemon layer. Config default `polling_rate = 110`;
-  requests below ~16 Hz are rejected (`X` saturates at 255).
-- **Ordering.** `reconnect`/`run` wait for the hidraw node (2 s poll), send
-  each report with backoff retry (5 attempts; sleeps 25/50/100/200 ms),
-  retry the whole USB sequence up to 3× on transient (`ENOENT`, node
-  mid-bind) only — `EINVAL`/`ENOTTY`/`EACCES` fail fast at both layers —
-  and best-effort verify the polling report via `HIDIOCGFEATURE`. Resume
-  MUST re-run the sequence from multitouch enable
-  (report `0x02` 21→8 byte regression across power transition).
-- **BT scope.** Single-node bring-up only; no init reports, no rate tuning.
-  No exclusivity vs `hid-magicmouse` — double-input handling (unbind or
-  evdev-grab behind the opt-in flag) belongs to Phase 1.
-- **Socket.** `/run/linux-trackpad-driver/driver.sock` (never the legacy
-  `magic-trackpad-driver` path; legacy constant kept only as a refusal
-  guard). `$LTD_SOCKET` overrides for tests/unprivileged runs.
-- **Downstream contract note.** Future proxy node: `res == 0`, arbitrary
-  0..253 range, Type-B slots + tracking IDs; no grams/newtons claims, no
-  `EV_FF`/`FF_HAPTIC` advertisement (no 2026 libinput/Wayland consumer).
-
-## Review follow-ups (base-init, 2026-10-14, verdict REQUEST-CHANGES → fixed)
-
-- **L0 ioctl dir.** `HIDIOCSFEATURE`/`HIDIOCGFEATURE` are
-  `_IOC(_IOC_WRITE|_IOC_READ, ...)` (dir = 3); the initial code used 1/2 and
-  would have failed with `ENOTTY` on hardware. Pinned to `0xC0024806` /
-  `0xC0034806` / `0xC0034807`, cross-checked against the host
-  `linux/hidraw.h` in tests and a compiled-C ground truth.
-- **Polling floor.** Requests below ~16 Hz (`X` saturates at 255) are
-  rejected instead of silently rounding up ~15×. `theoretical_hz` reflects
-  the raw request pre-cap; over-cap requests warn at the daemon layer.
-- **Fail-closed reconnect.** Unrecognized nodes are rejected, never defaulted
-  to USB; BT engage waits for the node like USB; BT disengage emits
-  `Detached`, not `Ready`.
-- **Retry policy.** Backoff retries `ENOENT` (node mid-bind) only; `EINVAL` /
-  `ENOTTY` / `EACCES` fail fast at both per-report and whole-sequence layers.
-- **Lock.** Stale-socket removal only on refused/missing connect; anything
-  else (e.g. `EACCES`) bails and preserves the file.
-- **Hub.** Listeners run on lock-free snapshots; mutex poison recovered, not
-  panicked; re-entrant subscribe safe.
-- Sibling `hw_mock` tests updated where they pinned pre-review behavior
-  (sub-16 sweep, EINVAL-retry expectations); transient tests now use `ENOENT`.
+- suspend/resume: re-run init sequence on resume (USB restarts from multitouch
+  enable — report `0x02` shrinks 21→8 bytes across power transitions);
+  clicks pipeline re-attaches, never reorders init.

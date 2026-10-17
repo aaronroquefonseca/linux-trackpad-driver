@@ -114,13 +114,14 @@ never drop.
 sudo libinput quirks list /dev/input/eventX
 ```
 
-## 2. USB init matrix (`enhanced_clicks = false` throughout)
+## 2. USB init matrix (passthrough baseline: set `enhanced_clicks = false`)
 
-Default config stays pure-passthrough: init only, no grab, no proxy.
-Verify with:
+Shipped default is `enhanced_clicks = true`, so set the gate off explicitly
+for this section: init only, no grab, no proxy. Set + verify with:
 
 ```sh
-grep -E 'enhanced_clicks' /etc/linux-trackpad-driver/config.toml || echo "default false (good)"
+sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = false/' /etc/linux-trackpad-driver/config.toml
+grep -E '^enhanced_clicks' /etc/linux-trackpad-driver/config.toml  # expect false
 ```
 
 ### 2a. `run` from cold plug
@@ -212,15 +213,16 @@ BT /dev/hidrawN: single-node path, no init dance — device ready
 
 (no `02 01` / `21 01` / `99 F2` reports on BT, ever).
 
-- [ ] With `enhanced_clicks=false` (default): pointer works via kernel
+- [ ] With `enhanced_clicks=false`: pointer works via kernel
       passthrough. Log shows passthrough intact at debug level, no unbind.
 - [ ] Double-input check: slow diagonal drag in `evtest` on the physical
       node — each physical motion produces exactly one event stream.
       Duplicated streams = finding (paste `evtest` excerpt + `dmesg` tail).
-- [ ] With `enhanced_clicks=true` (proxy not yet merged): expect the LOUD
-      warning (`suppressing physical input with no replacement`) and a
-      silent trackpad until re-bind/replug. This is known/temporary —
-      record it, then set the gate back to `false` and replug:
+- [ ] With `enhanced_clicks=true`: the proxy attaches per device `Ready`
+      (see README Troubleshooting + `docs/CONFIG.md` gate semantics).
+      USB proxy failure falls back to passthrough; on BT a failed enhanced
+      path may need re-bind/replug. Record the attach line, then set the
+      gate back to `false` and replug:
 
 ```sh
 sudo ltd reconnect /dev/hidrawN -d
@@ -229,11 +231,13 @@ sudo ltd reconnect /dev/hidrawN -d
 
 ## 4. Click-proxy matrix (`enhanced_clicks = true`)
 
-Gate on, daemon restarted. Proxy attaches per `Ready`; any proxy failure
-must fall back to passthrough (init unaffected).
+Gate on, daemon restarted. Proxy attaches per `Ready`; USB proxy failure
+falls back to passthrough (init unaffected; on BT a failed enhanced path
+may need re-bind/replug — see README Troubleshooting).
 
 ```sh
-sudo sed -i 's/enhanced_clicks = false/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml
+sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml
+grep -E '^enhanced_clicks' /etc/linux-trackpad-driver/config.toml  # expect true
 sudo systemctl restart linux-trackpad-driver.service
 journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
 ```
@@ -255,7 +259,12 @@ journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
       combo (e.g. `click_1 = "ctrl+c"`) still types (extras node).
 - [ ] Gate-off fallback (sanity): set gate back to `false`, restart —
       expect `proxy: gate off, passthrough for /dev/hidrawN`, no grab,
-      pointer works.
+      pointer works. Then restore `true` and restart before continuing:
+
+```sh
+sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml
+sudo systemctl restart linux-trackpad-driver.service
+```
 - [ ] 1–5 finger actions with defaults
       (`click_1=left click_2=right click_3=middle click_4/5=none`):
       press with N fingers over `sensitivity`, confirm action per row in §9.
@@ -264,7 +273,7 @@ journalctl -u linux-trackpad-driver.service -f | tee /tmp/ltd-proxy.log
       release fires below press point (`sensitivity - margin`), no chatter
       at the edge. Try `margin = 0` (chattery, expected) vs `margin = 10`
       (sticky release, expected), then restore `margin = 5`.
-- [ ] Haptic levels: `haptic = 0` (silent click), `5` (default),
+- [ ] Haptic levels: `haptic = 0` (silent click), `2` (default),
       `40` (strong). Each press still emits its action; only feel changes.
 - [ ] `quiet_click = true`: softer waveform at same strength.
 - [ ] Force levels: set `force_offset = 30`, `force_1 = "middle"` (rest `none`).
@@ -421,7 +430,7 @@ Copy into the PR/issue reply, one row per check.
 | 4a | proxy attach | `grabbed ... uinput up` | | |
 | 4b | click_1..5 | L/R/M/none/none | | |
 | 4c | hysteresis | clean edge, margin 5 | | |
-| 4d | haptic 0/5/40 | silent/default/strong | | |
+| 4d | haptic 0/2/40 | silent/default/strong | | |
 | 4e | quiet_click | softer waveform | | |
 | 4f | force level | 2nd action + haptic, clean release | | |
 | 4g | stop releases grab | passthrough, no stuck keys | | |
