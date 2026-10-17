@@ -55,8 +55,10 @@ this rewrite (issue #42).
 
 ## Privileges and attack surface
 
-The shipped systemd unit has no `User=` directive. The shipped service currently runs as root to access HID and input devices. There is no privilege dropping today. Sandboxing or privilege
-reduction are future ideas only, not current protections.
+The shipped systemd unit has no `User=` directive. The shipped service
+currently runs as root to access HID and input devices. There is no
+privilege dropping today. Sandboxing or privilege reduction are future
+ideas only, not current protections.
 
 What is in place today:
 
