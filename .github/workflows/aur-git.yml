@@ -1,9 +1,10 @@
 name: AUR git snapshot
 
 # Publishes ONLY linux-trackpad-driver-git (VCS snapshot of main) after
-# trusted packaging changes on main, or after an explicit manual retry.
-# Never bumps versions per driver commit: pkgver() computes at install time,
-# and the static pkgver line is refreshed at release-prep time only.
+# trusted packaging-relevant main changes, or after an explicit manual retry
+# targeting main. Never bumps versions per driver commit: pkgver() computes
+# at install time, and the static pkgver line is refreshed at release-prep
+# time only.
 #
 # Activation: repo variable ENABLE_AUR_GIT=true plus secret
 # AUR_SSH_PRIVATE_KEY (same AUR-registered key as stable). Without both, runs
@@ -18,6 +19,7 @@ on:
     branches: [main]
     paths:
       - "packaging/arch/**"
+      - "packaging/release/publish-aur.sh"
       - "systemd/**"
       - "udev/**"
       - "config/default.toml"
@@ -44,41 +46,41 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: archlinux:base
-    env:
-      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: install Arch toolchain (real makepkg metadata)
-        run: pacman -Syu --noconfirm --needed base-devel git
       - id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
           INPUT_PUBLISH: ${{ inputs.publish }}
           SNAPSHOT: ${{ github.sha }}
           AUR_GIT_VAR: ${{ vars.ENABLE_AUR_GIT }}
         run: |
           set -euo pipefail
-          [[ "$SNAPSHOT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad snapshot sha"; exit 1; }
-          short="$(git rev-parse --short "$SNAPSHOT" 2>/dev/null || printf '%s' "$SNAPSHOT" | cut -c1-7)"
-          want="false"
-          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_PUBLISH" = "true" ]; then
-            want="true"
-          fi
-          publish="false"
-          if [ "$want" = "true" ] && [ "$AUR_GIT_VAR" = "true" ]; then
-            publish="true"
-          fi
-          # .git-less checkout fallback (no git at checkout time): the
-          # snapshot sha still comes from the trusted event payload.
+          # Trusted-ref boundary (tested in gate-aur-git.sh): dispatches
+          # against any ref but main are denied here, before any packaging
+          # output is generated or published.
+          out="$(./packaging/release/gate-aur-git.sh)"
+          short="$(printf '%s\n' "$out" | sed -n 's/^short=//p')"
+          snapshot="$(printf '%s\n' "$out" | sed -n 's/^snapshot=//p')"
+          publish="$(printf '%s\n' "$out" | sed -n 's/^publish=//p')"
+          [[ "$snapshot" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad snapshot"; exit 1; }
+          [ "$publish" = "true" ] || [ "$publish" = "false" ] \
+            || { echo "::error::bad publish decision"; exit 1; }
           {
             echo "short=$short"
-            echo "snapshot=$SNAPSHOT"
+            echo "snapshot=$snapshot"
             echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
-          echo "gate: snapshot=$SNAPSHOT publish=$publish (want=$want, toggle=${AUR_GIT_VAR:-unset})"
+      - name: install Arch toolchain (real makepkg metadata)
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git openssh
+          command -v git
+          command -v ssh
+          command -v makepkg
       - name: generate -git metadata as unprivileged user
         env:
           SHORT: ${{ steps.gate.outputs.short }}
@@ -97,11 +99,16 @@ jobs:
         with:
           name: aur-git-rendered
           path: git-out/
+          # .SRCINFO is hidden; the downloadable evidence must carry it.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
       - name: push -git repo (master, append-only)
         if: steps.gate.outputs.publish == 'true'
         env:
+          # Secret is scoped to this gated step only: metadata generation
+          # above never sees publication credentials.
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           SHORT: ${{ steps.gate.outputs.short }}
           SNAPSHOT: ${{ steps.gate.outputs.snapshot }}
           AUR_KNOWN_HOSTS: aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
@@ -109,5 +116,7 @@ jobs:
           set -euo pipefail
           [ -n "${AUR_SSH_PRIVATE_KEY:-}" ] \
             || { echo "::error::AUR_SSH_PRIVATE_KEY secret is unset"; exit 1; }
+          command -v ssh >/dev/null \
+            || { echo "::error::ssh client not found (install openssh)"; exit 1; }
           ./packaging/release/publish-aur.sh --pkg linux-trackpad-driver-git \
             --dir git-out --message "git snapshot $SHORT (main $SNAPSHOT)"

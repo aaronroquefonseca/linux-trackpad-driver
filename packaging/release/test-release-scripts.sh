@@ -8,6 +8,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REL="$REPO_ROOT/packaging/release"
+WF="$REPO_ROOT/.github/workflows"
 TMP_BASE="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_BASE"' EXIT
 
@@ -327,8 +328,52 @@ mk_src_tar "$SV/src-drift.tar.gz" 9.9.8
 expect_fail "source version drift refused" \
   run_sv "$SV/j-ok.json" "$SV/a-ok" "$SV/src-drift.tar.gz" "$SHA_A"
 
-# 7. workflow contracts ---------------------------------------------------------
-WF="$REPO_ROOT/.github/workflows"
+# 7. -git gate: trusted main ref, no secret outside the push ---------------
+GOOD_SHA="$(printf 'b%.0s' $(seq 40))"
+run_gate() { # event ref input-publish toggle snapshot
+  EVENT_NAME="$1" GITHUB_REF="$2" INPUT_PUBLISH="$3" AUR_GIT_VAR="$4" \
+    SNAPSHOT="$5" "$REL/gate-aur-git.sh"
+}
+GATE_OUT="$(run_gate push refs/heads/main false true "$GOOD_SHA" 2>/dev/null)" \
+  || { echo "FAIL: push gate allows" >&2; exit 1; }
+printf '%s\n' "$GATE_OUT" | grep -q '^publish=true$' \
+  || { echo "FAIL: armed push publishes" >&2; exit 1; }
+printf '%s\n' "$GATE_OUT" | grep -q "^short=${GOOD_SHA:0:7}\$" \
+  || { echo "FAIL: short sha reported" >&2; exit 1; }
+ok "armed push publishes with short sha"
+GATE_OUT="$(run_gate push refs/heads/main false '' "$GOOD_SHA" 2>/dev/null)" \
+  || { echo "FAIL: unarmed push gate allows" >&2; exit 1; }
+printf '%s\n' "$GATE_OUT" | grep -q '^publish=false$' \
+  || { echo "FAIL: unarmed push stays dry" >&2; exit 1; }
+ok "unarmed push stays dry"
+GATE_OUT="$(run_gate workflow_dispatch refs/heads/main true true "$GOOD_SHA" 2>/dev/null)" \
+  || { echo "FAIL: main retry gate allows" >&2; exit 1; }
+printf '%s\n' "$GATE_OUT" | grep -q '^publish=true$' \
+  || { echo "FAIL: main retry publishes" >&2; exit 1; }
+ok "manual retry on main publishes when armed"
+GATE_OUT="$(run_gate workflow_dispatch refs/heads/main false true "$GOOD_SHA" 2>/dev/null)" \
+  || { echo "FAIL: dry retry gate allows" >&2; exit 1; }
+printf '%s\n' "$GATE_OUT" | grep -q '^publish=false$' \
+  || { echo "FAIL: publish=false stays dry" >&2; exit 1; }
+ok "publish=false stays dry"
+# Reviewer repro: dispatch against an unmerged branch with publish=true and
+# the toggle set must be denied, not publish=true.
+expect_fail "feature-branch manual retry denied" \
+  run_gate workflow_dispatch refs/heads/unmerged-packaging true true "$GOOD_SHA"
+expect_fail "tag-ref manual retry denied" \
+  run_gate workflow_dispatch refs/tags/v9.9.9 true true "$GOOD_SHA"
+expect_fail "bad snapshot rejected" \
+  run_gate push refs/heads/main false true deadbeef
+# The private key is mapped only in the gated push step, never job-wide, so
+# dry-run metadata generation cannot see publication credentials.
+[ "$(grep -c 'AUR_SSH_PRIVATE_KEY: ${{ secrets' "$WF/aur-git.yml")" = "1" ] \
+  || { echo "FAIL: key mapped exactly once (push step)" >&2; exit 1; }
+awk '/name: push -git repo/{seen=1} /AUR_SSH_PRIVATE_KEY: /{if (!seen) exit 1}' \
+  "$WF/aur-git.yml" \
+  || { echo "FAIL: key scoped to the gated push step" >&2; exit 1; }
+ok "key scoped to the gated push step"
+
+# 8. workflow contracts ---------------------------------------------------------
 for required in release-tag.yml aur-stable.yml aur-git.yml; do
   [ -f "$WF/$required" ] || { echo "FAIL: missing $WF/$required" >&2; exit 1; }
 done
@@ -361,9 +406,14 @@ assert_grep "$WF/release-tag.yml" 'persist-credentials: false' "release checkout
 assert_grep "$WF/release-tag.yml" 'GH_REPO' "draft job binds GH_REPO (no repo inference)"
 assert_grep "$WF/release-tag.yml" 'manage-draft-release.sh' "draft logic lives in the tested script"
 assert_grep "$WF/release-tag.yml" 'LICENSE-APACHE' "release tarball stages both licenses"
+assert_grep "$WF/aur-stable.yml" 'include-hidden-files' "rendered AUR tree keeps hidden metadata"
+assert_grep "$WF/aur-git.yml" 'include-hidden-files' "-git evidence keeps hidden metadata"
+assert_grep "$WF/aur-git.yml" 'packaging/release/publish-aur.sh' "-git watches its shared publisher"
+assert_grep "$WF/aur-git.yml" 'openssh' "-git installs an ssh client"
+assert_grep "$WF/aur-stable.yml" 'openssh' "stable push installs an ssh client"
 assert_grep "$REL/publish-aur.sh" 'aur\.archlinux\.org ssh-ed25519' "AUR host key pinned, no ssh-keyscan"
 
-# 8. real makepkg payload check for the prebuilt variant -------------------------
+# 9. real makepkg payload check for the prebuilt variant -------------------------
 if [ "$(id -u)" -eq 0 ]; then
   echo "skip: makepkg payload check needs a non-root user (CI runs it as builder)"
 else
