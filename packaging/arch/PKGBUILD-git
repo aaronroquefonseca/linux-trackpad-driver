@@ -8,7 +8,7 @@
 # so it sorts below the first `0.1.0.r...` tag build (no version rollback).
 
 pkgname=linux-trackpad-driver-git
-pkgver=r210.ddaa236
+pkgver=r211.6ebc164
 pkgrel=1
 pkgdesc="Userspace Rust driver for Apple Magic Trackpad 2 (USB/BT core-init) — git snapshot"
 arch=('x86_64' 'aarch64')
