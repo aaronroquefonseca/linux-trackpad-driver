@@ -51,21 +51,33 @@ for pair in "source:$SOURCE_SHA" "bin-x86_64:$BIN_X86_SHA" "bin-aarch64:$BIN_ARM
   [[ "${pair#*:}" =~ ^[0-9a-f]{64}$ ]] || fail "bad ${pair%%:*} sha256 (want 64 lowercase hex, never SKIP)"
 done
 
+# Scratch dir for tarball listings; removed on any exit.
+WORK_DIR="$(mktemp -d)" || fail "cannot create temp working dir"
+trap 'rm -rf -- "$WORK_DIR"' EXIT
+LIST_FILE="$WORK_DIR/listing.txt"
+
 check_tarball() { # kind, file, want_sha, arch_or_empty
   local kind="$1" file="$2" want="$3" marker="$4"
   [ -f "$file" ] || fail "missing $kind tarball: $file"
   local got
   got="$(sha256sum -- "$file" | awk '{print $1}')"
   [ "$got" = "$want" ] || fail "$kind digest mismatch for $file"
-  local list
-  list="$(tar -tzf "$file")" || fail "$kind is not a readable gzip tarball: $file"
-  echo "$list" | grep -Eq '(^|/)\.\.(/|$)|^/' && fail "$kind contains absolute or parent paths"
+  tar -tzf "$file" > "$LIST_FILE" || fail "$kind is not a readable gzip tarball: $file"
+  # NOTE: grep reads the saved listing file, never a pipe. Under `pipefail`,
+  # `echo "$list" | grep -q` can report failure AFTER a real match: grep
+  # exits on the first hit while the producer still holds pending lines, the
+  # producer dies on SIGPIPE, and pipefail propagates that as failure (or a
+  # forbidden early entry can hide behind exit-zero). File input has no
+  # producer, so matches are exact.
+  grep -Eq '(^|/)\.\.(/|$)|^/' "$LIST_FILE" && fail "$kind contains absolute or parent paths"
   if [ "$kind" = "source" ]; then
     local prefix="linux-trackpad-driver-${VERSION}/"
     for member in "Cargo.toml" "Cargo.lock" "src/main.rs" "config/default.toml" \
         "udev/99-linux-trackpad-driver.rules" "systemd/linux-trackpad-driver.service" \
+        "systemd/linux-trackpad-driver-reconnect@.service" \
+        "systemd/linux-trackpad-driver-resume.service" \
         "systemd/system-sleep/ltd-resume" "LICENSE-MIT" "LICENSE-APACHE"; do
-      echo "$list" | grep -qxF "${prefix}${member}" || fail "source tarball missing ${prefix}${member}"
+      grep -qxF "${prefix}${member}" "$LIST_FILE" || fail "source tarball missing ${prefix}${member}"
     done
   else
     local prefix="linux-trackpad-driver-v${VERSION}-${marker}-unknown-linux-gnu/"
@@ -73,7 +85,7 @@ check_tarball() { # kind, file, want_sha, arch_or_empty
         "systemd/linux-trackpad-driver.service" "systemd/linux-trackpad-driver-reconnect@.service" \
         "systemd/linux-trackpad-driver-resume.service" "systemd/system-sleep/ltd-resume" \
         "LICENSE-MIT" "LICENSE-APACHE" "README.md" "INSTALL.md"; do
-      echo "$list" | grep -qxF "${prefix}${member}" || fail "bin tarball ($marker) missing ${prefix}${member}"
+      grep -qxF "${prefix}${member}" "$LIST_FILE" || fail "bin tarball ($marker) missing ${prefix}${member}"
     done
   fi
 }
