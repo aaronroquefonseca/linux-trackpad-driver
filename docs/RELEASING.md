@@ -22,31 +22,30 @@ then tag pushes only build (workflow artifacts), and the AUR jobs never run
    - `debian/changelog` (new stanza, `dch -v X.Y.Z-1`).
    - `packaging/arch/PKGBUILD` (`pkgver=X.Y.Z`, regenerate `.SRCINFO`).
 2. Update the changelog: `git-cliff --tag vX.Y.Z --strip all -o CHANGELOG.md`.
-3. Update `docs/ROADMAP.md` status line if needed.
-4. Run gates locally:
+3. Run gates locally:
    ```sh
    cargo fmt --all -- --check
    cargo clippy --all-targets -- -D warnings
    cargo test
    ```
-5. Secret scan (must be clean before tagging):
+4. Secret scan (must be clean before tagging):
    ```sh
    git log -p --all | grep -inE \
      'api[_-]?key|secret|token|password|BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY|aws_access|ghp_|github_token'
    ```
    Triage every hit; `key_token_to_code` and similar code identifiers are
    known false positives.
-6. Commit the release prep, push, wait for CI green on `main`.
-7. Create the **signed** tag:
+5. Commit the release prep, push, wait for CI green on `main`.
+6. Create the **signed** tag:
    ```sh
    git tag -s vX.Y.Z -m "Release vX.Y.Z"
    git show vX.Y.Z --show-signature   # verify signature
    git push origin vX.Y.Z
    ```
-8. Review the **draft** GitHub Release auto-created by `release-tag.yml`
+7. Review the **draft** GitHub Release auto-created by `release-tag.yml`
    (artifacts + SHA256SUMS + git-cliff notes): verify, then publish it
    manually. The workflow never publishes a Release itself — draft only.
-9. Announce only after the tag signature verifies on GitHub
+8. Announce only after the tag signature verifies on GitHub
    (tag page shows "Verified").
 
 ## Never
