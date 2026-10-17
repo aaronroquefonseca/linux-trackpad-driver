@@ -1,6 +1,8 @@
-# ltd.install — install scriptlets for linux-trackpad-driver-git.
-# shellcheck: no shellcheck in build env; kept POSIX sh + quoted, `|| true`
-# guarded so failures never break the transaction.
+# ltd.install — shared install scriptlets for linux-trackpad-driver{,-bin,-git}.
+# Policy: never enable or start the daemon on install (admin opts in with
+# `systemctl enable --now linux-trackpad-driver.service`, same as debian/).
+# Only reloads udev/systemd so hotplug works immediately after upgrade.
+# Kept POSIX sh, quoted, `|| true` guarded so failures never break transactions.
 
 post_install() {
   udevadm control --reload-rules >/dev/null 2>&1 || true
