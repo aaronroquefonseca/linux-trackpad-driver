@@ -130,13 +130,13 @@ pub fn should_emit_haptic(haptic: u16) -> bool {
 
 /// Press threshold = `sensitivity` (1..=255).
 pub fn press_threshold(cfg: &Config) -> u8 {
-    cfg.sensitivity.clamp(1, 255) as u8
+    cfg.click.sensitivity.clamp(1, 255) as u8
 }
 
 /// Release threshold = `sensitivity - margin`, saturating at 0.
 pub fn release_threshold(cfg: &Config) -> u8 {
-    let s = cfg.sensitivity.clamp(1, 255);
-    let m = cfg.margin.min(255);
+    let s = cfg.click.sensitivity.clamp(1, 255);
+    let m = cfg.click.margin.min(255);
     s.saturating_sub(m) as u8
 }
 
@@ -364,11 +364,12 @@ impl ClickMachine {
     /// [`release_threshold`] (`margin` capped at 255). `None` when
     /// `force_offset == 0` (force disabled entirely).
     pub fn force_threshold(cfg: &Config) -> Option<u16> {
-        if cfg.force_offset > 0 {
+        if cfg.force.force_offset > 0 {
             Some(
-                cfg.sensitivity
+                cfg.click
+                    .sensitivity
                     .clamp(1, 255)
-                    .saturating_add(cfg.force_offset.min(255)),
+                    .saturating_add(cfg.force.force_offset.min(255)),
             )
         } else {
             None
@@ -378,7 +379,7 @@ impl ClickMachine {
     /// Force release point: `sensitivity + force_offset - margin`, saturating
     /// at 0 (mirrors [`release_threshold`]). `None` when disabled.
     pub fn force_release_threshold(cfg: &Config) -> Option<u16> {
-        Self::force_threshold(cfg).map(|press| press.saturating_sub(cfg.margin.min(255)))
+        Self::force_threshold(cfg).map(|press| press.saturating_sub(cfg.click.margin.min(255)))
     }
 
     /// Physical button bit from the raw `clicks` byte (`clicks & 1`).
@@ -698,8 +699,8 @@ impl ClickMachine {
                 let ev = ClickEvent {
                     finger_count: first_select,
                     action,
-                    haptic: cfg.haptic,
-                    quiet: cfg.quiet_click,
+                    haptic: cfg.haptics.haptic,
+                    quiet: cfg.haptics.quiet_click,
                     level: ClickLevel::First,
                 };
                 // `none` still latches (swallows the gesture); caller emits
@@ -722,7 +723,7 @@ impl ClickMachine {
                     finger_count: force_select,
                     action,
                     haptic: cfg.effective_force_haptic(),
-                    quiet: cfg.force_quiet_click,
+                    quiet: cfg.haptics.force_quiet_click,
                     level: ClickLevel::Force,
                 };
                 self.force_active = Some(ev.clone());
@@ -743,8 +744,8 @@ impl ClickMachine {
                 let ev = ClickEvent {
                     finger_count: slide_select,
                     action,
-                    haptic: cfg.haptic,
-                    quiet: cfg.quiet_click,
+                    haptic: cfg.haptics.haptic,
+                    quiet: cfg.haptics.quiet_click,
                     level: ClickLevel::Slide,
                 };
                 self.slide_active = Some(ev.clone());
@@ -814,8 +815,11 @@ mod tests {
     #[test]
     fn hysteresis_press_release_edges() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
             ..Config::default()
         };
         assert_eq!(press_threshold(&cfg), 64);
@@ -838,8 +842,11 @@ mod tests {
     #[test]
     fn release_saturates_at_zero() {
         let cfg = Config {
-            sensitivity: 3,
-            margin: 10,
+            click: crate::config::ClickConfig {
+                sensitivity: 3,
+                margin: 10,
+                ..Config::default().click
+            },
             ..Config::default()
         };
         assert_eq!(release_threshold(&cfg), 0);
@@ -848,9 +855,12 @@ mod tests {
     #[test]
     fn finger_count_selects_action() {
         let cfg = Config {
-            click_1: "left".into(),
-            click_2: "right".into(),
-            click_3: "middle".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                click_2: "right".into(),
+                click_3: "middle".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -863,7 +873,10 @@ mod tests {
     #[test]
     fn none_latches_but_marks_is_none() {
         let cfg = Config {
-            click_1: "none".into(),
+            click: crate::config::ClickConfig {
+                click_1: "none".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -876,8 +889,14 @@ mod tests {
     #[test]
     fn empty_marks_haptic_only() {
         let cfg = Config {
-            click_1: "empty".into(),
-            haptic: 7,
+            click: crate::config::ClickConfig {
+                click_1: "empty".into(),
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 7,
+                ..Config::default().haptics
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -931,8 +950,11 @@ mod tests {
     #[test]
     fn second_finger_mid_latch_does_not_refire() {
         let cfg = Config {
-            click_1: "left".into(),
-            click_2: "right".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                click_2: "right".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -949,8 +971,11 @@ mod tests {
     #[test]
     fn margin_zero_releases_at_threshold() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 0,
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 0,
+                ..Config::default().click
+            },
             ..Config::default()
         };
         assert_eq!(release_threshold(&cfg), 64);
@@ -965,8 +990,14 @@ mod tests {
     #[test]
     fn force_arming_and_disabled() {
         let off = Config {
-            force_offset: 20,
-            sensitivity: 64,
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         assert_eq!(ClickMachine::force_threshold(&off), Some(84));
@@ -987,13 +1018,19 @@ mod tests {
     #[test]
     fn force_edge_and_finger_map() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            click_1: "left".into(),
-            click_2: "right".into(),
-            force_1: "forward".into(),
-            force_2: "ctrl+c".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                click_1: "left".into(),
+                click_2: "right".into(),
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                force_2: "ctrl+c".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1025,13 +1062,22 @@ mod tests {
     fn force_haptic_override_and_fallback() {
         // Fallback: no override -> standard haptic; quiet follows force flag.
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            haptic: 5,
-            quiet_click: false,
-            force_quiet_click: true,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 5,
+                quiet_click: false,
+                force_quiet_click: true,
+                ..Config::default().haptics
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1041,11 +1087,9 @@ mod tests {
         assert_eq!(fev.haptic, 5);
         assert!(fev.quiet);
         // Override wins.
-        let cfg = Config {
-            force_haptic: Some(9),
-            force_quiet_click: false,
-            ..cfg
-        };
+        let mut cfg = cfg;
+        cfg.haptics.force_haptic = Some(9);
+        cfg.haptics.force_quiet_click = false;
         let mut m = ClickMachine::new();
         m.update(&[finger(1, 70)], 0, &cfg).unwrap();
         let out = m.update(&[finger(1, 100)], 0, &cfg).unwrap();
@@ -1057,9 +1101,15 @@ mod tests {
     #[test]
     fn force_hysteresis_returns_to_first_hold() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         // Release point: 64 + 20 - 5 = 79.
@@ -1088,10 +1138,16 @@ mod tests {
         // follows on the next frame while held deep (Released admits
         // Pressed only). Reporters see first, then force supersedes.
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1113,10 +1169,16 @@ mod tests {
     #[test]
     fn force_no_overflow_at_max_sensitivity() {
         let cfg = Config {
-            sensitivity: 255,
-            margin: 5,
-            force_offset: 255,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 255,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 255,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         // 255 + 255 = 510 in u16: representable, but unreachable by a u8.
@@ -1132,11 +1194,17 @@ mod tests {
     #[test]
     fn primary_skips_force_none() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            click_1: "left".into(),
-            force_1: "none".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                click_1: "left".into(),
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "none".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1158,10 +1226,16 @@ mod tests {
     #[test]
     fn force_disarm_mid_hold_clears_latch() {
         let armed = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1172,10 +1246,8 @@ mod tests {
             .force
             .is_some());
         // Offset back to 0 mid-hold: force drops, first holds, no re-attach.
-        let off = Config {
-            force_offset: 0,
-            ..armed
-        };
+        let mut off = armed;
+        off.force.force_offset = 0;
         let out = m.update(&[finger(1, 100)], 0, &off).unwrap();
         assert!(out.is_empty());
         assert!(m.force_active().is_none());
@@ -1186,9 +1258,15 @@ mod tests {
     #[test]
     fn six_finger_clamp_both_levels() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1204,10 +1282,16 @@ mod tests {
     #[test]
     fn force_margin_zero_mirrors_first() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 0,
-            force_offset: 20,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 0,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         // margin 0: force release == force press (84).
@@ -1230,9 +1314,15 @@ mod tests {
     fn force_threshold_clamp_symmetry() {
         // Unvalidated extremes clamp exactly like press/release_threshold.
         let cfg = Config {
-            sensitivity: 0,
-            margin: 300,
-            force_offset: 300,
+            click: crate::config::ClickConfig {
+                sensitivity: 0,
+                margin: 300,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 300,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         assert_eq!(press_threshold(&cfg), 1);
@@ -1244,11 +1334,17 @@ mod tests {
     #[test]
     fn partial_finger_lift_releases_force_holds_first() {
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "forward".into(),
-            force_2: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                force_2: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1269,7 +1365,10 @@ mod tests {
     #[test]
     fn parse_error_leaves_state_untouched() {
         let bad = Config {
-            click_1: "bogus-key".into(),
+            click: crate::config::ClickConfig {
+                click_1: "bogus-key".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1289,14 +1388,23 @@ mod tests {
     /// quiet, force_offset 130, force_haptic 1. Margin/defaults otherwise.
     fn owner_cfg() -> Config {
         Config {
-            sensitivity: 30,
-            margin: 5,
-            haptic: 2,
-            quiet_click: true,
-            force_offset: 130,
-            force_haptic: Some(1),
-            force_quiet_click: false,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 30,
+                margin: 5,
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 2,
+                quiet_click: true,
+                force_haptic: Some(1),
+                force_quiet_click: false,
+                ..Config::default().haptics
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 130,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         }
     }
@@ -1380,9 +1488,15 @@ mod tests {
         // latch inside the 30 ms hold window; past the window it drops;
         // liftoff always drops. (Old parity dropped undebounced.)
         let cfg = Config {
-            sensitivity: 30,
-            force_offset: 130,
-            margin: 5,
+            click: crate::config::ClickConfig {
+                sensitivity: 30,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 130,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1498,10 +1612,16 @@ mod tests {
         // latch (first at T, force at T+10), full liftoff at T+20 still
         // drops both latches on that frame.
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1549,12 +1669,12 @@ mod tests {
 
     #[test]
     fn touch_floor_drives_presence_below_click_threshold() {
-        // contact=false but pressure 50 (> 10): present for slots and
+        // contact=false but pressure 20 (> 10): present for slots and
         // finger-count, still below the click threshold (no latch).
         let cfg = Config::default();
         let hover = FingerContact {
             contact: false,
-            ..finger(1, 50)
+            ..finger(1, 20)
         };
         assert!(touch_present(&hover));
         let mut m = ClickMachine::new();
@@ -1577,7 +1697,10 @@ mod tests {
         // not hold the latch while the remaining finger moves lightly.
         // Stale-bit hold = BTN stuck down across motion = ghostty drag.
         let cfg = Config {
-            click_2: "right".into(),
+            click: crate::config::ClickConfig {
+                click_2: "right".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1599,10 +1722,16 @@ mod tests {
     #[test]
     fn force_parse_error_does_not_swallow_first_edge() {
         let bad = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "bogus-key".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "bogus-key".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1610,10 +1739,8 @@ mod tests {
         // Neither level latched: the good first edge is retried, not lost.
         assert!(m.active().is_none());
         assert!(m.force_active().is_none());
-        let good = Config {
-            force_1: "forward".into(),
-            ..bad
-        };
+        let mut good = bad;
+        good.force.force_1 = "forward".into();
         // Staged retry: frame one latches first only, frame two force.
         let out = m.update(&[finger(1, 250)], 0, &good).unwrap();
         assert!(out.first.is_some() && out.force.is_none());
@@ -1642,7 +1769,10 @@ mod tests {
     #[test]
     fn slide_fires_holds_releases() {
         let cfg = Config {
-            slide_1: "left".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1651,7 +1781,7 @@ mod tests {
         let sev = out.slide.unwrap();
         assert!(sev.is_slide());
         assert_eq!(sev.finger_count, 1);
-        assert_eq!(sev.haptic, cfg.haptic);
+        assert_eq!(sev.haptic, cfg.haptics.haptic);
         // Steady slide: holds, no re-fire.
         assert!(m.update(&[light(1, 25)], 0, &cfg).unwrap().is_empty());
         assert!(m.slide_active().is_some());
@@ -1664,9 +1794,15 @@ mod tests {
     fn slide_entry_needs_below_release_band_is_dead() {
         // sensitivity 64 / margin 5: release 59, press 64.
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            slide_1: "left".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1690,8 +1826,11 @@ mod tests {
     #[test]
     fn slide_count_change_reselects() {
         let cfg = Config {
-            slide_1: "left".into(),
-            slide_2: "right".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                slide_2: "right".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1704,7 +1843,10 @@ mod tests {
         // Re-select onto an unmapped count releases silently and remembers
         // the count: later same-count frames hold without re-parsing.
         let cfg = Config {
-            slide_1: "left".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1723,10 +1865,16 @@ mod tests {
         // new finger lands in the band re-selects (no stale action); the
         // band still blocks *initial* entry (dead zone, no press either).
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            slide_1: "left".into(),
-            slide_2: "right".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                slide_2: "right".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1748,7 +1896,10 @@ mod tests {
         // Click releases under still-touching light fingers: the release
         // frame drops the latch, the NEXT light frame selects slide.
         let cfg = Config {
-            slide_1: "left".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1763,7 +1914,10 @@ mod tests {
     #[test]
     fn slide_parse_error_leaves_state_untouched() {
         let bad = Config {
-            slide_1: "bogus-key".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "bogus-key".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1776,8 +1930,14 @@ mod tests {
     #[test]
     fn slide_empty_is_haptic_only() {
         let cfg = Config {
-            slide_1: "empty".into(),
-            haptic: 7,
+            haptics: crate::config::HapticsConfig {
+                haptic: 7,
+                ..Config::default().haptics
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "empty".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1790,7 +1950,10 @@ mod tests {
     fn slide_primary_fallback() {
         // A lone slide edge is what reporters see; a press edge wins.
         let cfg = Config {
-            slide_1: "left".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
@@ -1803,11 +1966,14 @@ mod tests {
         let mut click = std::collections::BTreeMap::new();
         click.insert(2u8, 3u16);
         let base = Config {
-            click_2: "right".into(),
-            click_3: "middle".into(),
             spoof: crate::config::SpoofConfig {
                 click,
                 ..Default::default()
+            },
+            click: crate::config::ClickConfig {
+                click_2: "right".into(),
+                click_3: "middle".into(),
+                ..Config::default().click
             },
             ..Config::default()
         };
@@ -1839,12 +2005,15 @@ mod tests {
         let mut slide = std::collections::BTreeMap::new();
         slide.insert(1u8, 3u16);
         let cfg = Config {
-            slide_1: "left".into(),
-            slide_3: "middle".into(),
             spoof: crate::config::SpoofConfig {
                 slide,
                 actions_follow_spoof: true,
                 ..Default::default()
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                slide_3: "middle".into(),
+                ..Config::default().slide
             },
             ..Config::default()
         };

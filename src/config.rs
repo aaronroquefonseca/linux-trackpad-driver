@@ -1,16 +1,24 @@
-//! Full TOML config schema for the driver.
+//! Sectioned v1 TOML config schema for the driver.
 //!
-//! Phase-1 `config-schema` owner. Covers every key in
-//! [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) §"Config schema":
-//! log level, capped polling rate, the `enhanced_clicks` opt-in gate,
-//! pressure/haptic/speed tuning, 1–5 finger click maps (buttons, `none`,
-//! `empty`, `+`-joined key combos), and the optional force-click level.
+//! File layout (strict): `schema_version = 1` is required; every table and
+//! nested object denies unknown keys (typos fail). Omitted keys fall back
+//! to documented defaults; omitted tables fall back wholesale.
+//!
+//! ```toml
+//! schema_version = 1
+//! log_level = "info"
+//! enhanced_clicks = true
+//! [device]
+//! polling_rate = 110
+//! [pointer]
+//! speed = 100
+//! [click]
+//! sensitivity = 30
+//! ```
 //!
 //! Range-checked fields use a type wider than their valid range (`u16` for
 //! byte-ranged values) so [`Config::validate`] can reject out-of-range
 //! input with a clear error instead of failing opaquely at TOML parse.
-//! (`u8` fields would make e.g. `sensitivity = 300` an unrepresentable
-//! value that never reaches validation.)
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,6 +26,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// File schema version. Only `1` is accepted (breaking pre-v1 allowed).
+pub const SCHEMA_VERSION: u8 = 1;
 /// Requested polling default (Hz): the capped device-maximum intent, ~110 Hz
 /// (`X = 0x23 = 35`, `3850/35 ≈ 110`). See [`crate::init`].
 pub const DEFAULT_POLLING_HZ: u32 = 110;
@@ -31,38 +41,77 @@ pub const MAX_BYTE_VALUE: u16 = 255;
 pub const MIN_SPEED: u32 = 1;
 pub const MAX_SPEED: u32 = 1000;
 
-/// Parsed daemon configuration (full schema).
+/// Parsed daemon configuration (sectioned v1 schema).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// File schema version. Must be `1`.
+    pub schema_version: u8,
     /// `debug|info|warn|error`. Defaults to `info`.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Opt-in gate for the entire clicks pipeline. Default ON; init works
+    /// identically either way (passthrough via kernel/libinput).
+    #[serde(default = "default_enhanced_clicks")]
+    pub enhanced_clicks: bool,
+    /// USB device tuning (independent of `enhanced_clicks`).
+    #[serde(default)]
+    pub device: DeviceConfig,
+    /// Pointer tuning (requires `enhanced_clicks` to act).
+    #[serde(default)]
+    pub pointer: PointerConfig,
+    /// Press thresholds + standard-level maps (requires `enhanced_clicks`).
+    #[serde(default)]
+    pub click: ClickConfig,
+    /// Haptic output tuning (requires `enhanced_clicks`).
+    #[serde(default)]
+    pub haptics: HapticsConfig,
+    /// Second pressure level (requires `enhanced_clicks`).
+    #[serde(default)]
+    pub force: ForceConfig,
+    /// Touch-but-not-pressed maps (requires `enhanced_clicks`).
+    #[serde(default)]
+    pub slide: SlideConfig,
+    /// Finger-count spoofing (requires `enhanced_clicks` to act).
+    #[serde(default)]
+    pub spoof: SpoofConfig,
+}
+
+/// USB device tuning. Independent of `enhanced_clicks`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeviceConfig {
     /// Requested polling Hz, `1..=110` (capped device maximum). Default 110.
+    /// Apple USB only; effective floor 16 at init. No BT rate equivalent.
     #[serde(default = "default_polling")]
     pub polling_rate: u32,
-    /// Opt-in gate for the entire clicks pipeline. Default OFF; init works
-    /// identically either way (passthrough via kernel/libinput).
-    #[serde(default)]
-    pub enhanced_clicks: bool,
-    /// Press pressure threshold. `1..=255`. Default 64.
+}
+
+/// Pointer tuning. Requires `enhanced_clicks` to act.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct PointerConfig {
+    /// Pointer speed percent (`100` = 1:1). `1..=1000`. Default 100.
+    /// Software delta scaling in the proxy path only, applied exactly once.
+    #[serde(default = "default_speed")]
+    pub speed: u32,
+}
+
+/// Press thresholds + standard-level finger maps. Requires `enhanced_clicks`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickConfig {
+    /// Press pressure threshold. `1..=255`. Default 30 (firmer alt 64).
+    /// Lower = more sensitive. Device-specific, not portable.
     #[serde(default = "default_sensitivity")]
     pub sensitivity: u16,
     /// Release hysteresis: release at `sensitivity - margin`. `0..=255`.
     /// Default 5.
     #[serde(default = "default_margin")]
     pub margin: u16,
-    /// Haptic output strength, `0` = silent. `0..=255`. Default 5.
-    #[serde(default = "default_haptic")]
-    pub haptic: u16,
-    /// Soft haptic waveform. Default false.
-    #[serde(default)]
-    pub quiet_click: bool,
-    /// Pointer speed percent (`100` = 1:1). `1..=1000`. Default 100.
-    #[serde(default = "default_speed")]
-    pub speed: u32,
     /// Finger-count press actions; see [`parse_click_action`]. Defaults
-    /// `left/right/middle/none/none`.
+    /// `left/right/middle/none/none`. Each also accepts
+    /// `{ action = "...", stagger_ms = 0..=500 }`.
     #[serde(default = "default_click_1")]
     pub click_1: ActionBinding,
     #[serde(default = "default_click_2")]
@@ -73,18 +122,38 @@ pub struct Config {
     pub click_4: ActionBinding,
     #[serde(default = "default_action_none")]
     pub click_5: ActionBinding,
-    /// Second-level pressure offset: force fires at
-    /// `sensitivity + force_offset`. `0` disables. `0..=255`. Default 0.
-    #[serde(default)]
-    pub force_offset: u16,
-    /// Force-level haptic override; falls back to [`Config::haptic`] when
-    /// unset. See [`Config::effective_force_haptic`].
+}
+
+/// Haptic output tuning. Requires `enhanced_clicks` to act.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct HapticsConfig {
+    /// Haptic output strength, `0` = silent. `0..=255`. Default 2.
+    #[serde(default = "default_haptic")]
+    pub haptic: u16,
+    /// Soft haptic waveform for the standard level. Default true.
+    #[serde(default = "default_quiet_click")]
+    pub quiet_click: bool,
+    /// Force-level haptic override; falls back to [`HapticsConfig::haptic`]
+    /// when unset. See [`Config::effective_force_haptic`].
     #[serde(default)]
     pub force_haptic: Option<u16>,
     /// Soft waveform for the force level. Default false.
     #[serde(default)]
     pub force_quiet_click: bool,
+}
+
+/// Second pressure level. Requires `enhanced_clicks` to act.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ForceConfig {
+    /// Second-level pressure offset: force fires at
+    /// `sensitivity + force_offset`. `0` disables. `0..=255`. Default 0.
+    /// Example owner tune `130` with `sensitivity 30` fires at 160.
+    #[serde(default)]
+    pub force_offset: u16,
     /// Force-level finger-count actions. Defaults all `none`.
+    /// Each also accepts `{ action = "...", stagger_ms = 0..=500 }`.
     #[serde(default = "default_action_none")]
     pub force_1: ActionBinding,
     #[serde(default = "default_action_none")]
@@ -95,36 +164,9 @@ pub struct Config {
     pub force_4: ActionBinding,
     #[serde(default = "default_action_none")]
     pub force_5: ActionBinding,
-    /// Slide-level finger-count actions (touch-but-not-pressed: contact
-    /// present, every pressure at/below the release threshold). Defaults
-    /// all `none` (= no action, current behavior: sliding only moves the
-    /// cursor). See [`crate::clicks::ClickMachine`] for handoff semantics.
-    #[serde(default = "default_action_none")]
-    pub slide_1: ActionBinding,
-    #[serde(default = "default_action_none")]
-    pub slide_2: ActionBinding,
-    #[serde(default = "default_action_none")]
-    pub slide_3: ActionBinding,
-    #[serde(default = "default_action_none")]
-    pub slide_4: ActionBinding,
-    #[serde(default = "default_action_none")]
-    pub slide_5: ActionBinding,
-    /// Finger-count spoofing (`[spoof]` table): virtual count reported
-    /// to the computer when the real touching count is N under a
-    /// status. Sparse tables — set only needed rows, omitted rows are
-    /// passthrough (report the real count); an explicit `0` also means
-    /// passthrough, `1..=5` spoofs (e.g. `[spoof.click]` with `2 = 3`:
-    /// a real two-finger press reports three contacts). The uinput
-    /// touch stream (slots, `BTN_TOOL_*`) always uses the spoofed
-    /// count; action selection uses the real count unless
-    /// [`SpoofConfig::actions_follow_spoof`]. All tables default empty (passthrough:
-    /// zero behavior change).
-    #[serde(default)]
-    pub spoof: SpoofConfig,
     /// Level-transition mode on a force edge over an active click:
     /// `"continuous"` (force keys join held click keys) or `"cut"`
     /// (default: release click keys first, then press force keys).
-    /// Global single key; see [`crate::clicks::ClickMachine`].
     #[serde(default = "default_transition_mode")]
     pub transition_mode: String,
     /// Modifier-to-button gap for fresh mixed slide combos and cut force
@@ -138,20 +180,48 @@ pub struct Config {
     pub combo_stagger_ms: u16,
 }
 
+/// Touch-but-not-pressed maps. Requires `enhanced_clicks` to act.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SlideConfig {
+    /// Slide-level finger-count actions (touch-but-not-pressed: contact
+    /// present, every pressure at/below the release threshold). Defaults
+    /// all `none` (= no action, sliding only moves the cursor).
+    /// Each also accepts `{ action = "...", stagger_ms = 0..=500 }`.
+    /// Example: `slide_5 = { action = "super+left", stagger_ms = 50 }`.
+    /// See [`crate::clicks::ClickMachine`] for handoff semantics.
+    #[serde(default = "default_action_none")]
+    pub slide_1: ActionBinding,
+    #[serde(default = "default_action_none")]
+    pub slide_2: ActionBinding,
+    #[serde(default = "default_action_none")]
+    pub slide_3: ActionBinding,
+    #[serde(default = "default_action_none")]
+    pub slide_4: ActionBinding,
+    #[serde(default = "default_action_none")]
+    pub slide_5: ActionBinding,
+}
+
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_enhanced_clicks() -> bool {
+    true
 }
 fn default_polling() -> u32 {
     DEFAULT_POLLING_HZ
 }
 fn default_sensitivity() -> u16 {
-    64
+    30
 }
 fn default_margin() -> u16 {
     5
 }
 fn default_haptic() -> u16 {
-    5
+    2
+}
+fn default_quiet_click() -> bool {
+    true
 }
 fn default_speed() -> u32 {
     100
@@ -173,6 +243,74 @@ fn default_transition_mode() -> String {
 }
 fn default_combo_stagger_ms() -> u16 {
     50
+}
+
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        Self {
+            polling_rate: default_polling(),
+        }
+    }
+}
+
+impl Default for PointerConfig {
+    fn default() -> Self {
+        Self {
+            speed: default_speed(),
+        }
+    }
+}
+
+impl Default for ClickConfig {
+    fn default() -> Self {
+        Self {
+            sensitivity: default_sensitivity(),
+            margin: default_margin(),
+            click_1: default_click_1(),
+            click_2: default_click_2(),
+            click_3: default_click_3(),
+            click_4: default_action_none(),
+            click_5: default_action_none(),
+        }
+    }
+}
+
+impl Default for HapticsConfig {
+    fn default() -> Self {
+        Self {
+            haptic: default_haptic(),
+            quiet_click: default_quiet_click(),
+            force_haptic: None,
+            force_quiet_click: false,
+        }
+    }
+}
+
+impl Default for ForceConfig {
+    fn default() -> Self {
+        Self {
+            force_offset: 0,
+            force_1: default_action_none(),
+            force_2: default_action_none(),
+            force_3: default_action_none(),
+            force_4: default_action_none(),
+            force_5: default_action_none(),
+            transition_mode: default_transition_mode(),
+            combo_stagger_ms: default_combo_stagger_ms(),
+        }
+    }
+}
+
+impl Default for SlideConfig {
+    fn default() -> Self {
+        Self {
+            slide_1: default_action_none(),
+            slide_2: default_action_none(),
+            slide_3: default_action_none(),
+            slide_4: default_action_none(),
+            slide_5: default_action_none(),
+        }
+    }
 }
 
 /// Sparse finger-count spoof table: TOML integer keys (`2 = 3`) arrive
@@ -225,41 +363,22 @@ pub struct SpoofConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            schema_version: SCHEMA_VERSION,
             log_level: default_log_level(),
-            polling_rate: default_polling(),
-            enhanced_clicks: false,
-            sensitivity: default_sensitivity(),
-            margin: default_margin(),
-            haptic: default_haptic(),
-            quiet_click: false,
-            speed: default_speed(),
-            click_1: default_click_1(),
-            click_2: default_click_2(),
-            click_3: default_click_3(),
-            click_4: default_action_none(),
-            click_5: default_action_none(),
-            force_offset: 0,
-            force_haptic: None,
-            force_quiet_click: false,
-            force_1: default_action_none(),
-            force_2: default_action_none(),
-            force_3: default_action_none(),
-            force_4: default_action_none(),
-            force_5: default_action_none(),
-            slide_1: default_action_none(),
-            slide_2: default_action_none(),
-            slide_3: default_action_none(),
-            slide_4: default_action_none(),
-            slide_5: default_action_none(),
+            enhanced_clicks: default_enhanced_clicks(),
+            device: DeviceConfig::default(),
+            pointer: PointerConfig::default(),
+            click: ClickConfig::default(),
+            haptics: HapticsConfig::default(),
+            force: ForceConfig::default(),
+            slide: SlideConfig::default(),
             spoof: SpoofConfig::default(),
-            transition_mode: default_transition_mode(),
-            combo_stagger_ms: default_combo_stagger_ms(),
         }
     }
 }
 
 /// A flat action setting: legacy string or `{ action = "...", stagger_ms = N }`.
-/// Missing timing deliberately stays distinct from an explicit zero.
+/// Missing timing stays distinct from an explicit zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionBinding {
     pub action: String,
@@ -475,62 +594,71 @@ impl Config {
     /// Validate every user-facing value; each failure names the key and the
     /// accepted range/set.
     pub fn validate(&self) -> Result<()> {
+        if self.schema_version != SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported schema_version {} (want {SCHEMA_VERSION})",
+                self.schema_version
+            );
+        }
         match self.log_level.as_str() {
             "debug" | "info" | "warn" | "error" => {}
             other => anyhow::bail!("invalid log_level '{other}' (want debug|info|warn|error)"),
         }
-        if self.polling_rate == 0 || self.polling_rate > MAX_POLLING_HZ {
+        if self.device.polling_rate == 0 || self.device.polling_rate > MAX_POLLING_HZ {
             anyhow::bail!(
-                "invalid polling_rate {} (want 1..={MAX_POLLING_HZ}; device max ~110 Hz, 99 F2 0x23)",
-                self.polling_rate
+                "invalid [device] polling_rate {} (want 1..={MAX_POLLING_HZ}; device max ~110 Hz, 99 F2 0x23)",
+                self.device.polling_rate
             );
         }
-        if self.sensitivity == 0 || self.sensitivity > MAX_BYTE_VALUE {
+        if self.click.sensitivity == 0 || self.click.sensitivity > MAX_BYTE_VALUE {
             anyhow::bail!(
-                "invalid sensitivity {} (want 1..={MAX_BYTE_VALUE})",
-                self.sensitivity
+                "invalid [click] sensitivity {} (want 1..={MAX_BYTE_VALUE})",
+                self.click.sensitivity
             );
         }
-        if self.margin > MAX_BYTE_VALUE {
-            anyhow::bail!("invalid margin {} (want 0..={MAX_BYTE_VALUE})", self.margin);
-        }
-        if self.haptic > MAX_BYTE_VALUE {
+        if self.click.margin > MAX_BYTE_VALUE {
             anyhow::bail!(
-                "invalid haptic {} (want 0..={MAX_BYTE_VALUE}, 0 = silent)",
-                self.haptic
+                "invalid [click] margin {} (want 0..={MAX_BYTE_VALUE})",
+                self.click.margin
             );
         }
-        if self.speed < MIN_SPEED || self.speed > MAX_SPEED {
+        if self.haptics.haptic > MAX_BYTE_VALUE {
             anyhow::bail!(
-                "invalid speed {} (want {MIN_SPEED}..={MAX_SPEED}, 100 = 1:1)",
-                self.speed
+                "invalid [haptics] haptic {} (want 0..={MAX_BYTE_VALUE}, 0 = silent)",
+                self.haptics.haptic
+            );
+        }
+        if self.pointer.speed < MIN_SPEED || self.pointer.speed > MAX_SPEED {
+            anyhow::bail!(
+                "invalid [pointer] speed {} (want {MIN_SPEED}..={MAX_SPEED}, 100 = 1:1)",
+                self.pointer.speed
             );
         }
         for (key, value) in [
-            ("click_1", &self.click_1),
-            ("click_2", &self.click_2),
-            ("click_3", &self.click_3),
-            ("click_4", &self.click_4),
-            ("click_5", &self.click_5),
-            ("force_1", &self.force_1),
-            ("force_2", &self.force_2),
-            ("force_3", &self.force_3),
-            ("force_4", &self.force_4),
-            ("force_5", &self.force_5),
-            ("slide_1", &self.slide_1),
-            ("slide_2", &self.slide_2),
-            ("slide_3", &self.slide_3),
-            ("slide_4", &self.slide_4),
-            ("slide_5", &self.slide_5),
+            ("[click] click_1", &self.click.click_1),
+            ("[click] click_2", &self.click.click_2),
+            ("[click] click_3", &self.click.click_3),
+            ("[click] click_4", &self.click.click_4),
+            ("[click] click_5", &self.click.click_5),
+            ("[force] force_1", &self.force.force_1),
+            ("[force] force_2", &self.force.force_2),
+            ("[force] force_3", &self.force.force_3),
+            ("[force] force_4", &self.force.force_4),
+            ("[force] force_5", &self.force.force_5),
+            ("[slide] slide_1", &self.slide.slide_1),
+            ("[slide] slide_2", &self.slide.slide_2),
+            ("[slide] slide_3", &self.slide.slide_3),
+            ("[slide] slide_4", &self.slide.slide_4),
+            ("[slide] slide_5", &self.slide.slide_5),
         ] {
             value
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid {key}: {e}"))?;
         }
         for (table, map) in [
-            ("spoof.slide", &self.spoof.slide),
-            ("spoof.click", &self.spoof.click),
-            ("spoof.force", &self.spoof.force),
+            ("[spoof.slide]", &self.spoof.slide),
+            ("[spoof.click]", &self.spoof.click),
+            ("[spoof.force]", &self.spoof.force),
         ] {
             for (real, virtual_n) in map {
                 if !(1..=5).contains(real) {
@@ -543,26 +671,28 @@ impl Config {
                 }
             }
         }
-        match self.transition_mode.as_str() {
+        match self.force.transition_mode.as_str() {
             "continuous" | "cut" => {}
-            other => anyhow::bail!("invalid transition_mode '{other}' (want continuous|cut)"),
+            other => {
+                anyhow::bail!("invalid [force] transition_mode '{other}' (want continuous|cut)")
+            }
         }
-        if self.combo_stagger_ms > 500 {
+        if self.force.combo_stagger_ms > 500 {
             anyhow::bail!(
-                "invalid combo_stagger_ms {} (want 0..=500)",
-                self.combo_stagger_ms
+                "invalid [force] combo_stagger_ms {} (want 0..=500)",
+                self.force.combo_stagger_ms
             );
         }
-        if self.force_offset > MAX_BYTE_VALUE {
+        if self.force.force_offset > MAX_BYTE_VALUE {
             anyhow::bail!(
-                "invalid force_offset {} (want 0..={MAX_BYTE_VALUE}, 0 = disabled)",
-                self.force_offset
+                "invalid [force] force_offset {} (want 0..={MAX_BYTE_VALUE}, 0 = disabled)",
+                self.force.force_offset
             );
         }
-        if let Some(h) = self.force_haptic {
+        if let Some(h) = self.haptics.force_haptic {
             if h > MAX_BYTE_VALUE {
                 anyhow::bail!(
-                    "invalid force_haptic {h} (want 0..={MAX_BYTE_VALUE}; omit to use haptic)"
+                    "invalid [haptics] force_haptic {h} (want 0..={MAX_BYTE_VALUE}; omit to use haptic)"
                 );
             }
         }
@@ -572,29 +702,29 @@ impl Config {
     /// Standard-level action for finger count `n` (`1..=5`).
     pub fn click_action(&self, n: u8) -> Result<ClickAction> {
         let raw = match n {
-            1 => &self.click_1,
-            2 => &self.click_2,
-            3 => &self.click_3,
-            4 => &self.click_4,
-            5 => &self.click_5,
+            1 => &self.click.click_1,
+            2 => &self.click.click_2,
+            3 => &self.click.click_3,
+            4 => &self.click.click_4,
+            5 => &self.click.click_5,
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
         raw.parse()
-            .map_err(|e| anyhow::anyhow!("invalid click_{n}: {e}"))
+            .map_err(|e| anyhow::anyhow!("invalid [click] click_{n}: {e}"))
     }
 
     /// Force-level action for finger count `n` (`1..=5`).
     pub fn force_action(&self, n: u8) -> Result<ClickAction> {
         let raw = match n {
-            1 => &self.force_1,
-            2 => &self.force_2,
-            3 => &self.force_3,
-            4 => &self.force_4,
-            5 => &self.force_5,
+            1 => &self.force.force_1,
+            2 => &self.force.force_2,
+            3 => &self.force.force_3,
+            4 => &self.force.force_4,
+            5 => &self.force.force_5,
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
         raw.parse()
-            .map_err(|e| anyhow::anyhow!("invalid force_{n}: {e}"))
+            .map_err(|e| anyhow::anyhow!("invalid [force] force_{n}: {e}"))
     }
 
     /// True when at least one `slide_N` maps an action (string-level
@@ -605,11 +735,11 @@ impl Config {
     /// selection entirely in the common all-`none` case.
     pub fn any_slide_mapped(&self) -> bool {
         [
-            &self.slide_1,
-            &self.slide_2,
-            &self.slide_3,
-            &self.slide_4,
-            &self.slide_5,
+            &self.slide.slide_1,
+            &self.slide.slide_2,
+            &self.slide.slide_3,
+            &self.slide.slide_4,
+            &self.slide.slide_5,
         ]
         .iter()
         .any(|s| !s.action.trim().eq_ignore_ascii_case("none"))
@@ -618,15 +748,15 @@ impl Config {
     /// Slide-level action for finger count `n` (`1..=5`).
     pub fn slide_action(&self, n: u8) -> Result<ClickAction> {
         let raw = match n {
-            1 => &self.slide_1,
-            2 => &self.slide_2,
-            3 => &self.slide_3,
-            4 => &self.slide_4,
-            5 => &self.slide_5,
+            1 => &self.slide.slide_1,
+            2 => &self.slide.slide_2,
+            3 => &self.slide.slide_3,
+            4 => &self.slide.slide_4,
+            5 => &self.slide.slide_5,
             _ => anyhow::bail!("finger count {n} out of range (want 1..=5)"),
         };
         raw.parse()
-            .map_err(|e| anyhow::anyhow!("invalid slide_{n}: {e}"))
+            .map_err(|e| anyhow::anyhow!("invalid [slide] slide_{n}: {e}"))
     }
 
     /// Raw spoof cell for (`status`, real count `n`): `0` = passthrough
@@ -677,26 +807,25 @@ impl Config {
     /// True when a force edge cuts level-1/slide keys first (`"cut"`, default);
     /// false is `"continuous"` (force keys join held click keys).
     pub fn is_cut_transition(&self) -> bool {
-        self.transition_mode == "cut"
+        self.force.transition_mode == "cut"
     }
 
     /// Whether the second pressure level is armed (`force_offset > 0`).
     pub fn force_enabled(&self) -> bool {
-        self.force_offset > 0
+        self.force.force_offset > 0
     }
 
     /// Haptic strength for the force level: explicit `force_haptic` override,
-    /// else the standard [`Config::haptic`] value.
+    /// else the standard [`HapticsConfig::haptic`] value.
     pub fn effective_force_haptic(&self) -> u16 {
-        self.force_haptic.unwrap_or(self.haptic)
+        self.haptics.force_haptic.unwrap_or(self.haptics.haptic)
     }
 }
 
 /// Load config from `path`, or defaults when `None`. Missing file with an
 /// explicit path is an error; `None` never fails. Unknown keys are rejected
-/// (likely typos); omitted keys take documented defaults, so Phase-0
-/// subset files (`log_level`, `polling_rate`, `enhanced_clicks`) keep
-/// parsing unchanged.
+/// at every level (likely typos); omitted keys/tables take documented
+/// defaults. `schema_version = 1` is required in files.
 pub fn load_or_default(path: Option<&str>) -> Result<Config> {
     let Some(path) = path else {
         return Ok(Config::default());
@@ -757,41 +886,145 @@ pub fn init_logging(level: &str) {
 mod tests {
     use super::*;
 
+    fn minimal_toml(body: &str) -> String {
+        format!("schema_version = 1\n{body}")
+    }
+
+    fn toml_in(section: &str, key: &str, value: &str) -> String {
+        format!("schema_version = 1\n[{section}]\n{key} = {value}\n")
+    }
+
     #[test]
-    fn defaults_match_spec() {
+    fn defaults_match_v1_spec() {
         let c = Config::default();
+        assert_eq!(c.schema_version, 1);
         assert_eq!(c.log_level, "info");
-        assert_eq!(c.polling_rate, 110);
-        assert!(!c.enhanced_clicks);
-        assert_eq!(c.sensitivity, 64);
-        assert_eq!(c.margin, 5);
-        assert_eq!(c.haptic, 5);
-        assert!(!c.quiet_click);
-        assert_eq!(c.speed, 100);
-        assert_eq!(c.click_1.action, "left");
-        assert_eq!(c.click_2.action, "right");
-        assert_eq!(c.click_3.action, "middle");
-        assert_eq!(c.click_4.action, "none");
-        assert_eq!(c.click_5.action, "none");
-        assert_eq!(c.force_offset, 0);
-        assert_eq!(c.force_haptic, None);
-        assert!(!c.force_quiet_click);
-        for f in [&c.force_1, &c.force_2, &c.force_3, &c.force_4, &c.force_5] {
+        assert!(c.enhanced_clicks);
+        assert_eq!(c.device.polling_rate, 110);
+        assert_eq!(c.pointer.speed, 100);
+        assert_eq!(c.click.sensitivity, 30);
+        assert_eq!(c.click.margin, 5);
+        assert_eq!(c.click.click_1.action, "left");
+        assert_eq!(c.click.click_2.action, "right");
+        assert_eq!(c.click.click_3.action, "middle");
+        assert_eq!(c.click.click_4.action, "none");
+        assert_eq!(c.click.click_5.action, "none");
+        assert_eq!(c.haptics.haptic, 2);
+        assert!(c.haptics.quiet_click);
+        assert_eq!(c.haptics.force_haptic, None);
+        assert!(!c.haptics.force_quiet_click);
+        assert_eq!(c.force.force_offset, 0);
+        for f in [
+            &c.force.force_1,
+            &c.force.force_2,
+            &c.force.force_3,
+            &c.force.force_4,
+            &c.force.force_5,
+        ] {
             assert_eq!(f.action, "none");
         }
-        for s in [&c.slide_1, &c.slide_2, &c.slide_3, &c.slide_4, &c.slide_5] {
+        for s in [
+            &c.slide.slide_1,
+            &c.slide.slide_2,
+            &c.slide.slide_3,
+            &c.slide.slide_4,
+            &c.slide.slide_5,
+        ] {
             assert_eq!(s.action, "none");
         }
         assert!(c.spoof.slide.is_empty());
         assert!(c.spoof.click.is_empty());
         assert!(c.spoof.force.is_empty());
         assert!(!c.spoof.actions_follow_spoof);
-        assert_eq!(c.transition_mode, "cut");
+        assert_eq!(c.force.transition_mode, "cut");
         assert!(c.is_cut_transition());
         c.validate().unwrap();
         assert!(!c.force_enabled());
-        // No override → falls back to standard haptic.
-        assert_eq!(c.effective_force_haptic(), 5);
+        assert_eq!(c.effective_force_haptic(), 2);
+    }
+
+    #[test]
+    fn schema_version_required_and_rejected_when_unknown() {
+        // Missing version fails at parse (required field).
+        let missing: std::result::Result<Config, _> = toml::from_str("enhanced_clicks = true\n");
+        assert!(missing.is_err());
+        // Wrong version parses but fails validation.
+        for v in [0, 2, 99] {
+            let cfg: Config = toml::from_str(&format!("schema_version = {v}\n")).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("schema_version"), "v={v}: {err}");
+        }
+        let ok: Config = toml::from_str("schema_version = 1\n").unwrap();
+        ok.validate().unwrap();
+    }
+
+    #[test]
+    fn omission_equals_defaults() {
+        let bare: Config = toml::from_str("schema_version = 1\n").unwrap();
+        bare.validate().unwrap();
+        assert_eq!(bare, Config::default());
+        // Omitted tables fall back wholesale.
+        let partial: Config =
+            toml::from_str("schema_version = 1\n[click]\nsensitivity = 48\n").unwrap();
+        partial.validate().unwrap();
+        assert_eq!(partial.click.sensitivity, 48);
+        assert_eq!(partial.click.margin, 5);
+        assert_eq!(partial.click.click_1.action, "left");
+        assert_eq!(partial.device.polling_rate, 110);
+        assert_eq!(
+            partial,
+            Config {
+                click: ClickConfig {
+                    sensitivity: 48,
+                    ..ClickConfig::default()
+                },
+                ..Config::default()
+            }
+        );
+    }
+
+    #[test]
+    fn nested_typo_rejected_everywhere() {
+        // Top-level typo.
+        assert!(toml::from_str::<Config>("schema_version = 1\nsensitivty = 30\n").is_err());
+        // Section typos.
+        for (section, key) in [
+            ("device", "poling_rate"),
+            ("pointer", "speeed"),
+            ("click", "sensitivty"),
+            ("click", "click_6"),
+            ("haptics", "haptik"),
+            ("force", "force_6"),
+            ("force", "transition_modes"),
+            ("slide", "slide_6"),
+            ("spoof", "bogus"),
+        ] {
+            let text = format!("schema_version = 1\n[{section}]\n{key} = 1\n");
+            assert!(
+                toml::from_str::<Config>(&text).is_err(),
+                "{section}.{key} must be rejected"
+            );
+        }
+        // Nested binding object typo.
+        let bad: std::result::Result<Config, _> = toml::from_str(
+            "schema_version = 1\n[click]\nclick_1 = { action = \"left\", typo = 1 }\n",
+        );
+        assert!(bad.is_err());
+        // Spoof sub-table typo.
+        let bad: std::result::Result<Config, _> =
+            toml::from_str("schema_version = 1\n[spoof.bogus]\n1 = 2\n");
+        assert!(bad.is_err());
+        // Legacy flat keys are gone (breaking, pre-v1): unknown field.
+        for flat in [
+            "schema_version = 1\nsensitivity = 30\n",
+            "schema_version = 1\npolling_rate = 110\n",
+            "schema_version = 1\nspoof_click_2 = 3\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(flat).is_err(),
+                "{flat:?} must fail"
+            );
+        }
     }
 
     #[test]
@@ -806,96 +1039,72 @@ mod tests {
     #[test]
     fn rejects_polling_zero_and_above_cap() {
         for rate in [0, 111, 500, 65535] {
-            let bad = Config {
-                polling_rate: rate,
-                ..Config::default()
-            };
-            assert!(bad.validate().is_err(), "rate {rate} must be rejected");
+            let mut c = Config::default();
+            c.device.polling_rate = rate;
+            assert!(c.validate().is_err(), "rate {rate} must be rejected");
         }
-        // Boundary still accepted.
         for rate in [1, 60, 110] {
-            let ok = Config {
-                polling_rate: rate,
-                ..Config::default()
-            };
-            assert!(ok.validate().is_ok(), "rate {rate} must be accepted");
+            let mut c = Config::default();
+            c.device.polling_rate = rate;
+            assert!(c.validate().is_ok(), "rate {rate} must be accepted");
         }
     }
 
     #[test]
     fn rejects_sensitivity_outside_1_255() {
         for v in [0, 256, 1000] {
-            let bad = Config {
-                sensitivity: v,
-                ..Config::default()
-            };
-            assert!(bad.validate().is_err(), "sensitivity {v} must be rejected");
+            let mut c = Config::default();
+            c.click.sensitivity = v;
+            assert!(c.validate().is_err(), "sensitivity {v} must be rejected");
         }
-        for v in [1, 64, 255] {
-            let ok = Config {
-                sensitivity: v,
-                ..Config::default()
-            };
-            assert!(ok.validate().is_ok(), "sensitivity {v} must be accepted");
+        for v in [1, 30, 64, 255] {
+            let mut c = Config::default();
+            c.click.sensitivity = v;
+            assert!(c.validate().is_ok(), "sensitivity {v} must be accepted");
         }
     }
 
     #[test]
     fn rejects_margin_above_255() {
-        let bad = Config {
-            margin: 256,
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.click.margin = 256;
         assert!(bad.validate().is_err());
-        let ok = Config {
-            margin: 0,
-            ..Config::default()
-        };
+        let mut ok = Config::default();
+        ok.click.margin = 0;
         assert!(ok.validate().is_ok());
     }
 
     #[test]
     fn rejects_haptic_above_255() {
-        let bad = Config {
-            haptic: 300,
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.haptics.haptic = 300;
         assert!(bad.validate().is_err());
-        // 0 = silent is valid.
-        let ok = Config {
-            haptic: 0,
-            ..Config::default()
-        };
+        let mut ok = Config::default();
+        ok.haptics.haptic = 0;
         assert!(ok.validate().is_ok());
     }
 
     #[test]
     fn rejects_speed_outside_1_1000() {
         for v in [0, 1001, 10_000] {
-            let bad = Config {
-                speed: v,
-                ..Config::default()
-            };
-            assert!(bad.validate().is_err(), "speed {v} must be rejected");
+            let mut c = Config::default();
+            c.pointer.speed = v;
+            assert!(c.validate().is_err(), "speed {v} must be rejected");
         }
         for v in [1, 100, 1000] {
-            let ok = Config {
-                speed: v,
-                ..Config::default()
-            };
-            assert!(ok.validate().is_ok(), "speed {v} must be accepted");
+            let mut c = Config::default();
+            c.pointer.speed = v;
+            assert!(c.validate().is_ok(), "speed {v} must be accepted");
         }
     }
 
     #[test]
     fn rejects_bad_click_values() {
         for bad_value in ["doubleclick", "ctrl++c", "ctrl+", "", "left click"] {
-            let bad = Config {
-                click_1: bad_value.into(),
-                ..Config::default()
-            };
+            let mut c = Config::default();
+            c.click.click_1 = bad_value.into();
             assert!(
-                bad.validate().is_err(),
+                c.validate().is_err(),
                 "click_1 '{bad_value}' must be rejected"
             );
         }
@@ -952,11 +1161,9 @@ mod tests {
             "ctrl+playpause",
             "shift+browserback",
         ] {
-            let ok = Config {
-                click_4: good.into(),
-                ..Config::default()
-            };
-            assert!(ok.validate().is_ok(), "click_4 '{good}' must be accepted");
+            let mut c = Config::default();
+            c.click.click_4 = good.into();
+            assert!(c.validate().is_ok(), "click_4 '{good}' must be accepted");
         }
         let combo = parse_click_action("ctrl+c").unwrap();
         assert_eq!(
@@ -991,26 +1198,20 @@ mod tests {
 
     #[test]
     fn rejects_bad_force_actions() {
-        let bad = Config {
-            force_2: "bogus-key".into(),
-            ..Config::default()
-        };
-        assert!(bad.validate().is_err());
+        let mut c = Config::default();
+        c.force.force_2 = "bogus-key".into();
+        assert!(c.validate().is_err());
     }
 
     #[test]
     fn slide_actions_validate_like_click() {
-        let bad = Config {
-            slide_2: "bogus-key".into(),
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.slide.slide_2 = "bogus-key".into();
         assert!(bad.validate().is_err());
-        let ok = Config {
-            slide_1: "left".into(),
-            slide_2: "ctrl+c".into(),
-            slide_3: "empty".into(),
-            ..Config::default()
-        };
+        let mut ok = Config::default();
+        ok.slide.slide_1 = "left".into();
+        ok.slide.slide_2 = "ctrl+c".into();
+        ok.slide.slide_3 = "empty".into();
         assert!(ok.validate().is_ok());
         assert_eq!(
             ok.slide_action(2).unwrap().kind,
@@ -1024,23 +1225,14 @@ mod tests {
     #[test]
     fn any_slide_mapped_short_circuits_all_none() {
         assert!(!Config::default().any_slide_mapped());
-        let mapped = Config {
-            slide_3: "middle".into(),
-            ..Config::default()
-        };
+        let mut mapped = Config::default();
+        mapped.slide.slide_3 = "middle".into();
         assert!(mapped.any_slide_mapped());
-        // Case/whitespace variants of none still count as unmapped…
-        let noneish = Config {
-            slide_1: " NONE ".into(),
-            ..Config::default()
-        };
+        let mut noneish = Config::default();
+        noneish.slide.slide_1 = " NONE ".into();
         assert!(!noneish.any_slide_mapped());
-        // …while invalid values count as mapped so the parse path still
-        // errors instead of silently skipping them.
-        let bad = Config {
-            slide_1: "bogus-key".into(),
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.slide.slide_1 = "bogus-key".into();
         assert!(bad.any_slide_mapped());
         let mut m = crate::clicks::ClickMachine::new();
         assert!(m
@@ -1067,12 +1259,12 @@ mod tests {
         for v in [6, 9, 255] {
             let mut spoof = SpoofConfig::default();
             spoof.click.insert(2, v);
-            let bad = Config {
+            let c = Config {
                 spoof,
                 ..Config::default()
             };
             assert!(
-                bad.validate().is_err(),
+                c.validate().is_err(),
                 "spoof.click 2 = {v} must be rejected"
             );
         }
@@ -1081,23 +1273,21 @@ mod tests {
             spoof.click.insert(2, v);
             spoof.slide.insert(1, v);
             spoof.force.insert(5, v);
-            let ok = Config {
+            let c = Config {
                 spoof,
                 ..Config::default()
             };
-            assert!(ok.validate().is_ok(), "spoof = {v} must be accepted");
+            assert!(c.validate().is_ok(), "spoof = {v} must be accepted");
         }
-        // Real-count keys outside 1..=5 are rejected, even with a
-        // passthrough value.
         for bad_key in [0, 6, 255] {
             let mut spoof = SpoofConfig::default();
             spoof.click.insert(bad_key, 3);
-            let bad = Config {
+            let c = Config {
                 spoof,
                 ..Config::default()
             };
             assert!(
-                bad.validate().is_err(),
+                c.validate().is_err(),
                 "spoof key {bad_key} must be rejected"
             );
         }
@@ -1115,7 +1305,6 @@ mod tests {
             ..Config::default()
         };
         c.validate().unwrap();
-        // Wire sees 3; selection still sees the real 2 unless actions_follow_spoof.
         assert_eq!(c.spoofed_count("click", 2), 3);
         assert_eq!(c.select_count("click", 2), 2);
         assert_eq!(c.spoofed_count("click", 1), 1);
@@ -1132,14 +1321,9 @@ mod tests {
 
     #[test]
     fn spoof_sparse_toml_omitted_is_passthrough() {
-        let c: Config = toml::from_str(
-            r#"
-[spoof.click]
-2 = 3
-[spoof.slide]
-2 = 3
-"#,
-        )
+        let c: Config = toml::from_str(&minimal_toml(
+            "[spoof.click]\n2 = 3\n[spoof.slide]\n2 = 3\n",
+        ))
         .unwrap();
         c.validate().unwrap();
         assert_eq!(c.spoofed_count("click", 2), 3);
@@ -1148,31 +1332,24 @@ mod tests {
         assert_eq!(c.spoofed_count("slide", 1), 1);
         assert_eq!(c.spoofed_count("force", 2), 2);
         assert!(!c.spoof.actions_follow_spoof);
-        // Explicit 0 equals omitted: passthrough.
-        let c: Config = toml::from_str("[spoof.click]\n2 = 0\n").unwrap();
+        let c: Config = toml::from_str(&minimal_toml("[spoof.click]\n2 = 0\n")).unwrap();
         c.validate().unwrap();
         assert_eq!(c.spoofed_count("click", 2), 2);
-        // Out-of-range value and key fail (value via validate, key via
-        // validate for struct-built maps; TOML parse rejects non-u8 keys).
-        let c: Config = toml::from_str("[spoof.click]\n2 = 6\n").unwrap();
+        let c: Config = toml::from_str(&minimal_toml("[spoof.click]\n2 = 6\n")).unwrap();
         assert!(c.validate().is_err());
-        let bad: std::result::Result<Config, _> = toml::from_str("[spoof.click]\nfoo = 3\n");
+        let bad: std::result::Result<Config, _> =
+            toml::from_str(&minimal_toml("[spoof.click]\nfoo = 3\n"));
         assert!(bad.is_err());
-        let unknown: std::result::Result<Config, _> =
-            toml::from_str("[spoof.click]\n2 = 3\n[spoof.bogus]\n1 = 2\n");
+        let unknown: std::result::Result<Config, _> = toml::from_str(&minimal_toml(
+            "[spoof.click]\n2 = 3\n[spoof.bogus]\n1 = 2\n",
+        ));
         assert!(unknown.is_err());
-        // Legacy flat keys are gone (breaking, pre-v1): unknown field.
-        let legacy: std::result::Result<Config, _> = toml::from_str("spoof_click_2 = 3\n");
-        assert!(legacy.is_err());
-        let legacy: std::result::Result<Config, _> = toml::from_str("spoof_select = true\n");
-        assert!(legacy.is_err());
-        // Old `[spoof] select` key is gone (breaking, pre-v1): unknown field.
-        let old: std::result::Result<Config, _> = toml::from_str("[spoof]\nselect = true\n");
-        assert!(old.is_err());
-        // New key parses both values.
+        // New key parses both values (TOML-safe: parent first).
         for value in ["true", "false"] {
-            let c: Config =
-                toml::from_str(&format!("[spoof]\nactions_follow_spoof = {value}\n")).unwrap();
+            let c: Config = toml::from_str(&minimal_toml(&format!(
+                "[spoof]\nactions_follow_spoof = {value}\n"
+            )))
+            .unwrap();
             c.validate().unwrap();
             assert_eq!(c.spoof.actions_follow_spoof, value == "true");
         }
@@ -1182,83 +1359,60 @@ mod tests {
     fn transition_mode_validates() {
         let c = Config::default();
         assert!(c.is_cut_transition());
-        let continuous = Config {
-            transition_mode: "continuous".into(),
-            ..Config::default()
-        };
+        let mut continuous = Config::default();
+        continuous.force.transition_mode = "continuous".into();
         assert!(continuous.validate().is_ok());
         assert!(!continuous.is_cut_transition());
-        let cut = Config {
-            transition_mode: "cut".into(),
-            ..Config::default()
-        };
+        let mut cut = Config::default();
+        cut.force.transition_mode = "cut".into();
         assert!(cut.validate().is_ok());
         assert!(cut.is_cut_transition());
-        let bad = Config {
-            transition_mode: "restart".into(),
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.force.transition_mode = "restart".into();
         assert!(bad.validate().is_err());
-        let bad = Config {
-            transition_mode: "CUT".into(),
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.force.transition_mode = "CUT".into();
         assert!(bad.validate().is_err(), "mode is exact lowercase");
     }
 
     #[test]
     fn combo_stagger_ms_defaults_and_validates() {
-        assert_eq!(Config::default().combo_stagger_ms, 50);
+        assert_eq!(Config::default().force.combo_stagger_ms, 50);
         for ok in [0, 50, 500] {
-            let c = Config {
-                combo_stagger_ms: ok,
-                ..Config::default()
-            };
+            let mut c = Config::default();
+            c.force.combo_stagger_ms = ok;
             assert!(c.validate().is_ok(), "{ok} must validate");
         }
-        let bad = Config {
-            combo_stagger_ms: 501,
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.force.combo_stagger_ms = 501;
         assert!(bad.validate().is_err());
     }
 
     #[test]
     fn rejects_force_offset_and_haptic_out_of_range() {
-        let bad = Config {
-            force_offset: 256,
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.force.force_offset = 256;
         assert!(bad.validate().is_err());
-        let bad = Config {
-            force_haptic: Some(999),
-            ..Config::default()
-        };
+        let mut bad = Config::default();
+        bad.haptics.force_haptic = Some(999);
         assert!(bad.validate().is_err());
-        // 0 disables the force level; explicit 0 haptic override is valid.
-        let ok = Config {
-            force_offset: 0,
-            force_haptic: Some(0),
-            ..Config::default()
-        };
+        let mut ok = Config::default();
+        ok.force.force_offset = 0;
+        ok.haptics.force_haptic = Some(0);
         assert!(ok.validate().is_ok());
     }
 
     #[test]
     fn force_override_fallback() {
         let c = Config::default();
-        assert_eq!(c.effective_force_haptic(), c.haptic);
-        let c = Config {
-            haptic: 5,
-            force_haptic: Some(9),
-            ..Config::default()
-        };
+        assert_eq!(c.effective_force_haptic(), c.haptics.haptic);
+        let mut c = Config::default();
+        c.haptics.haptic = 5;
+        c.haptics.force_haptic = Some(9);
         c.validate().unwrap();
         assert_eq!(c.effective_force_haptic(), 9);
-        let armed = Config {
-            force_offset: 20,
-            ..Config::default()
-        };
+        let mut armed = Config::default();
+        armed.force.force_offset = 20;
         assert!(armed.force_enabled());
     }
 
@@ -1277,34 +1431,45 @@ mod tests {
     }
 
     #[test]
-    fn parses_full_toml() {
-        let text = r#"
+    fn parses_full_sectioned_toml() {
+        let text = minimal_toml(
+            r#"
 log_level = "debug"
-polling_rate = 90
 enhanced_clicks = true
+[device]
+polling_rate = 90
+[pointer]
+speed = 120
+[click]
 sensitivity = 80
 margin = 8
-haptic = 7
-quiet_click = true
-speed = 120
 click_1 = "left"
 click_2 = "ctrl+c"
 click_3 = "middle"
 click_4 = "back"
 click_5 = "empty"
-force_offset = 20
+[haptics]
+haptic = 7
+quiet_click = true
 force_haptic = 9
 force_quiet_click = true
+[force]
+force_offset = 20
 force_1 = "forward"
 force_2 = "none"
 force_3 = "none"
 force_4 = "none"
 force_5 = "none"
-"#;
-        let c: Config = toml::from_str(text).unwrap();
+transition_mode = "cut"
+combo_stagger_ms = 50
+[slide]
+slide_1 = "none"
+"#,
+        );
+        let c: Config = toml::from_str(&text).unwrap();
         c.validate().unwrap();
         assert_eq!(c.log_level, "debug");
-        assert_eq!(c.polling_rate, 90);
+        assert_eq!(c.device.polling_rate, 90);
         assert!(c.enhanced_clicks);
         assert!(c.force_enabled());
         assert_eq!(c.effective_force_haptic(), 9);
@@ -1316,71 +1481,49 @@ force_5 = "none"
 
     #[test]
     fn parses_gesture_power_toml() {
-        let text = r#"
+        let text = minimal_toml(
+            r#"
+[click]
+click_1 = "left"
+[force]
+force_offset = 20
+force_1 = "left+super"
+transition_mode = "cut"
+[slide]
 slide_1 = "left"
 slide_2 = "ctrl+c"
-slide_3 = "empty"
-transition_mode = "cut"
-
 [spoof.click]
 2 = 3
-
 [spoof.slide]
 1 = 2
-
 [spoof.force]
 1 = 1
-
 [spoof]
 actions_follow_spoof = true
-"#;
-        let c: Config = toml::from_str(text).unwrap();
+"#,
+        );
+        let c: Config = toml::from_str(&text).unwrap();
         c.validate().unwrap();
-        assert_eq!(c.slide_1.action, "left");
+        assert_eq!(c.slide.slide_1.action, "left");
         assert_eq!(c.spoofed_count("click", 2), 3);
         assert_eq!(c.select_count("click", 2), 3);
         assert!(c.is_cut_transition());
     }
 
-    #[test]
-    fn phase0_subset_still_parses() {
-        // Backward compat: files with only the Phase-0 keys take defaults
-        // for everything else.
-        let c: Config = toml::from_str("polling_rate = 90\nenhanced_clicks = false\n").unwrap();
-        assert_eq!(c.polling_rate, 90);
-        assert_eq!(c.sensitivity, 64);
-        assert_eq!(c.click_1.action, "left");
-        assert_eq!(c.force_offset, 0);
-        c.validate().unwrap();
-    }
-
-    #[test]
-    fn unknown_keys_rejected() {
-        let r = toml::from_str::<Config>("sensitivty = 64\n");
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn invalid_file_values_fail_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bad.toml");
-        std::fs::write(&path, "polling_rate = 500\n").unwrap();
-        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
-        let path = dir.path().join("badkey.toml");
-        std::fs::write(&path, "click_1 = \"frobnicate\"\n").unwrap();
-        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
-    }
-
-    fn binding_names() -> Vec<String> {
+    fn binding_sections() -> Vec<(&'static str, &'static str)> {
         ["click", "force", "slide"]
             .into_iter()
-            .flat_map(|level| (1..=5).map(move |n| format!("{level}_{n}")))
+            .flat_map(|level| (1..=5).map(move |n| (level, n)))
+            .map(|(level, n)| {
+                let name: &'static str = Box::leak(format!("{level}_{n}").into_boxed_str());
+                (level, name)
+            })
             .collect()
     }
 
     #[test]
-    fn all_bindings_accept_objects_and_omission_equals_legacy_string() {
-        for name in binding_names() {
+    fn all_bindings_accept_objects_and_omission_equals_string() {
+        for (section, name) in binding_sections() {
             for action in [
                 "left",
                 "super+left",
@@ -1389,27 +1532,36 @@ actions_follow_spoof = true
                 "none",
                 "empty",
             ] {
-                let legacy: Config = toml::from_str(&format!("{name} = \"{action}\"")).unwrap();
-                let expanded: Config =
-                    toml::from_str(&format!("{name} = {{ action = \"{action}\" }}")).unwrap();
+                let legacy: Config =
+                    toml::from_str(&toml_in(section, name, &format!("\"{action}\""))).unwrap();
+                let expanded: Config = toml::from_str(&toml_in(
+                    section,
+                    name,
+                    &format!("{{ action = \"{action}\" }}"),
+                ))
+                .unwrap();
                 legacy.validate().unwrap();
                 expanded.validate().unwrap();
-                assert_eq!(legacy, expanded, "{name}: omitted timing must stay omitted");
+                assert_eq!(
+                    legacy, expanded,
+                    "{section}.{name}: omitted timing stays omitted"
+                );
                 for ms in [0, 50, 500] {
-                    let timed: Config = toml::from_str(&format!(
-                        "{name} = {{ action = \"{action}\", stagger_ms = {ms} }}"
+                    let timed: Config = toml::from_str(&toml_in(
+                        section,
+                        name,
+                        &format!("{{ action = \"{action}\", stagger_ms = {ms} }}"),
                     ))
                     .unwrap();
                     timed.validate().unwrap();
-                    let (level, n) = name.split_once('_').unwrap();
-                    let n = n.parse().unwrap();
-                    let parsed = match level {
+                    let n: u8 = name.split_once('_').unwrap().1.parse().unwrap();
+                    let parsed = match section {
                         "click" => timed.click_action(n),
                         "force" => timed.force_action(n),
                         _ => timed.slide_action(n),
                     }
                     .unwrap();
-                    assert_eq!(parsed.stagger_ms, Some(ms), "{name}");
+                    assert_eq!(parsed.stagger_ms, Some(ms), "{section}.{name}");
                     assert_eq!(parsed.kind, parse_click_action(action).unwrap().kind);
                 }
             }
@@ -1418,7 +1570,7 @@ actions_follow_spoof = true
 
     #[test]
     fn bad_binding_objects_name_the_binding_and_problem() {
-        for name in binding_names() {
+        for (section, name) in binding_sections() {
             for (value, problem) in [
                 ("{}", "action"),
                 ("{ stagger_ms = 50 }", "action"),
@@ -1439,11 +1591,12 @@ actions_follow_spoof = true
                 ("50", "action string"),
                 ("[]", "action string"),
             ] {
-                let result = toml::from_str::<Config>(&format!("{name} = {value}"))
+                let text = format!("schema_version = 1\n[{section}]\n{name} = {value}\n");
+                let result = toml::from_str::<Config>(&text)
                     .map_err(anyhow::Error::from)
                     .and_then(|cfg| cfg.validate());
                 let error = result.unwrap_err().to_string();
-                assert!(error.contains(&name), "missing binding: {error}");
+                assert!(error.contains(name), "missing binding: {error}");
                 assert!(error.contains(problem), "missing {problem}: {error}");
             }
         }
@@ -1473,14 +1626,14 @@ actions_follow_spoof = true
 
     #[test]
     fn env_config_propagates_non_default_values() {
-        // The reconnect path loads via env (udev passes no -c): a non-default
-        // value in the env-pointed file must reach the caller.
-        // Holds the shared env lock: set_var racing any concurrent env
-        // read is unsound under the threaded harness.
         let _env_guard = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ltd.toml");
-        std::fs::write(&path, "enhanced_clicks = true\npolling_rate = 90\n").unwrap();
+        std::fs::write(
+            &path,
+            "schema_version = 1\nenhanced_clicks = true\n[device]\npolling_rate = 90\n",
+        )
+        .unwrap();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, &path) };
         let cfg = load_or_default_with_env(None).unwrap();
@@ -1489,18 +1642,17 @@ actions_follow_spoof = true
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert!(cfg.enhanced_clicks);
-        assert_eq!(cfg.polling_rate, 90);
+        assert_eq!(cfg.device.polling_rate, 90);
     }
 
     #[test]
     fn explicit_path_wins_over_env() {
-        // Serialized with all other env tests (see above).
         let _env_guard = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join("env.toml");
         let cli_path = dir.path().join("cli.toml");
-        std::fs::write(&env_path, "enhanced_clicks = true\n").unwrap();
-        std::fs::write(&cli_path, "enhanced_clicks = false\n").unwrap();
+        std::fs::write(&env_path, "schema_version = 1\nenhanced_clicks = true\n").unwrap();
+        std::fs::write(&cli_path, "schema_version = 1\nenhanced_clicks = false\n").unwrap();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, &env_path) };
         let cfg = load_or_default_with_env(Some(cli_path.to_str().unwrap())).unwrap();
@@ -1513,7 +1665,6 @@ actions_follow_spoof = true
 
     #[test]
     fn missing_env_file_falls_back_to_defaults() {
-        // Serialized with all other env tests (see above).
         let _env_guard = crate::test_env::lock_env();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, "/nonexistent-ltd-config-xyz.toml") };
@@ -1528,5 +1679,20 @@ actions_follow_spoof = true
     #[test]
     fn missing_explicit_file_errors() {
         assert!(load_or_default(Some("/nonexistent-ltd-config-xyz.toml")).is_err());
+    }
+
+    #[test]
+    fn invalid_file_values_fail_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "schema_version = 1\n[device]\npolling_rate = 500\n").unwrap();
+        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+        let path = dir.path().join("badkey.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n[click]\nclick_1 = \"frobnicate\"\n",
+        )
+        .unwrap();
+        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
     }
 }

@@ -1,10 +1,10 @@
-//! Drift guard: every `Config` struct field is documented in
+//! Drift guard: every v1 sectioned field is documented in
 //! `docs/CONFIG.md`, and every TOML example in that doc parses with no
-//! unknown keys.
+//! unknown top-level keys.
 //!
 //! No hardware needed. String-level on purpose: this crate is binary-only
 //! (`src/main.rs`), so the test reads `src/config.rs` for the `pub <field>:`
-//! lines of `pub struct Config` instead of importing it.
+//! lines of the sectioned structs instead of importing them.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,13 +14,14 @@ fn repo_file(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// Field names of `pub struct Config` in `src/config.rs`.
-fn config_fields(src: &str) -> Vec<String> {
+/// Field names of a `pub struct <name>` in `src/config.rs`.
+fn struct_fields(src: &str, name: &str) -> Vec<String> {
+    let needle = format!("pub struct {name}");
     let start = src
-        .find("pub struct Config")
-        .expect("src/config.rs: `pub struct Config` missing");
+        .find(&needle)
+        .unwrap_or_else(|| panic!("src/config.rs: `{needle}` missing"));
     let body = &src[start..];
-    let open = body.find('{').expect("Config struct has no body");
+    let open = body.find('{').expect("struct has no body");
     let mut depth = 0;
     let mut end = None;
     for (i, c) in body[open..].char_indices() {
@@ -34,19 +35,37 @@ fn config_fields(src: &str) -> Vec<String> {
             }
         }
     }
-    let body = &body[open..end.expect("Config struct body never closes")];
+    let body = &body[open..end.expect("struct body never closes")];
     body.lines()
         .filter_map(|l| {
             let t = l.trim();
             t.strip_prefix("pub ")
                 .and_then(|rest| rest.split(':').next())
                 .map(str::trim)
-                .filter(|name| {
-                    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                .filter(|n| {
+                    !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 })
                 .map(str::to_string)
         })
         .collect()
+}
+
+/// All v1 sectioned fields across Config + section structs.
+fn all_fields(src: &str) -> Vec<String> {
+    let mut all = Vec::new();
+    for s in [
+        "Config",
+        "DeviceConfig",
+        "PointerConfig",
+        "ClickConfig",
+        "HapticsConfig",
+        "ForceConfig",
+        "SlideConfig",
+        "SpoofConfig",
+    ] {
+        all.extend(struct_fields(src, s));
+    }
+    all
 }
 
 /// Fenced ```toml blocks in a markdown doc.
@@ -77,14 +96,19 @@ fn toml_blocks(doc: &str) -> Vec<String> {
 fn config_doc_covers_every_field() {
     let src = repo_file("src/config.rs");
     let doc = repo_file("docs/CONFIG.md");
-    let fields = config_fields(&src);
+    let fields = all_fields(&src);
     assert!(
-        fields.len() >= 21,
-        "expected >= 21 Config fields, got {fields:?}"
+        fields.len() >= 30,
+        "expected >= 30 sectioned fields, got {fields:?}"
     );
     let missing: Vec<_> = fields
         .iter()
-        .filter(|f| !doc.contains(&format!("`{f}`")))
+        .filter(|f| {
+            !(doc.contains(&format!("`{f}`"))
+                || doc.contains(&format!(".{f}`"))
+                || doc.contains(&format!("`{f}."))
+                || doc.contains(&format!(".{f}.")))
+        })
         .collect();
     assert!(
         missing.is_empty(),
@@ -95,7 +119,7 @@ fn config_doc_covers_every_field() {
 #[test]
 fn config_doc_examples_parse_with_known_keys_only() {
     let src = repo_file("src/config.rs");
-    let known: HashSet<String> = config_fields(&src).into_iter().collect();
+    let known: HashSet<String> = struct_fields(&src, "Config").into_iter().collect();
     let doc = repo_file("docs/CONFIG.md");
     for (i, block) in toml_blocks(&doc).iter().enumerate() {
         let table: toml::Table = toml::from_str(block)
