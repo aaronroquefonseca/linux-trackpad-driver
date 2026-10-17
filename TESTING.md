@@ -273,7 +273,7 @@ sudo systemctl restart linux-trackpad-driver.service
       release fires below press point (`sensitivity - margin`), no chatter
       at the edge. Try `margin = 0` (chattery, expected) vs `margin = 10`
       (sticky release, expected), then restore `margin = 5`.
-- [ ] Haptic levels: `haptic = 0` (silent click), `5` (default),
+- [ ] Haptic levels: `haptic = 0` (silent click), `2` (default),
       `40` (strong). Each press still emits its action; only feel changes.
 - [ ] `quiet_click = true`: softer waveform at same strength.
 - [ ] Force levels: set `force_offset = 30`, `force_1 = "middle"` (rest `none`).
@@ -430,7 +430,7 @@ Copy into the PR/issue reply, one row per check.
 | 4a | proxy attach | `grabbed ... uinput up` | | |
 | 4b | click_1..5 | L/R/M/none/none | | |
 | 4c | hysteresis | clean edge, margin 5 | | |
-| 4d | haptic 0/5/40 | silent/default/strong | | |
+| 4d | haptic 0/2/40 | silent/default/strong | | |
 | 4e | quiet_click | softer waveform | | |
 | 4f | force level | 2nd action + haptic, clean release | | |
 | 4g | stop releases grab | passthrough, no stuck keys | | |
