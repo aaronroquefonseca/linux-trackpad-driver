@@ -18,8 +18,12 @@ fi
 rm -rf /tmp/aur-fixtures /tmp/aur-out /tmp/aur-out2 /tmp/aur-src
 mkdir -p /tmp/aur-fixtures
 VER="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
-git archive --format=tar --prefix="linux-trackpad-driver-${VER}/" HEAD \
-  | gzip -n > "/tmp/aur-fixtures/source-${VER}.tar.gz"
+# Workspace snapshot in tag-tarball layout (checkout may be a .git-less
+# archive export, so never rely on `git` here; exclude build output to keep
+# the fixture hermetic and identical locally vs CI).
+tar --mtime='@0' --exclude='./target' --exclude='./.git' \
+  --transform "s,^\\./,linux-trackpad-driver-${VER}/," \
+  -cf - . | gzip -n > "/tmp/aur-fixtures/source-${VER}.tar.gz"
 cargo build --locked --release
 for arch in x86_64 aarch64; do
   stage="/tmp/aur-fixtures/stage/linux-trackpad-driver-v${VER}-${arch}-unknown-linux-gnu"
