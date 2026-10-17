@@ -56,7 +56,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-          fetch-depth: 1
+          # Full history: the ancestry check pins the release commit to main.
+          fetch-depth: 0
       - id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -71,64 +72,55 @@ jobs:
           else
             raw_tag="$INPUT_TAG"
           fi
-          [[ "$raw_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            || { echo "::error::bad tag '$raw_tag' (want vX.Y.Z)"; exit 1; }
-          version="${raw_tag#v}"
           work="$(mktemp -d)"
           trap 'rm -rf -- "$work"' EXIT
           # Public + final, or stop before any download: drafts and
           # prereleases never reach AUR stable.
           gh release view "$raw_tag" --repo "$GH_REPO" \
             --json tagName,isDraft,isPrerelease > "$work/release.json"
-          ./packaging/release/check-release-json.sh "$raw_tag" "$work/release.json"
+          api_commit="$(gh api "repos/${GH_REPO}/commits/${raw_tag}" --jq .sha)"
           mkdir -p "$work/assets"
           gh release download "$raw_tag" --repo "$GH_REPO" --dir "$work/assets" \
             --pattern 'SHA256SUMS' \
+            --pattern 'BUILD_COMMIT' \
             --pattern 'linux-trackpad-driver-v*.tar.gz'
-          out="$(./packaging/release/verify-assets.sh "$version" "$work/assets")"
-          bin_x86="$(printf '%s\n' "$out" | sed -n 's/^BIN_X86_64_SHA=//p')"
-          bin_arm="$(printf '%s\n' "$out" | sed -n 's/^BIN_AARCH64_SHA=//p')"
-          [[ "$bin_x86" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad x86_64 digest"; exit 1; }
-          [[ "$bin_arm" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad aarch64 digest"; exit 1; }
           # Stable source is the GitHub tag archive (no upload needed). Its
           # bytes only exist after the tag push, so digest it here.
           curl --fail --show-error --location --retry 3 --retry-all-errors \
             -o "$work/source.tar.gz" \
             "https://github.com/${GH_REPO}/archive/refs/tags/${raw_tag}.tar.gz"
-          source_sha="$(sha256sum -- "$work/source.tar.gz" | awk '{print $1}')"
-          [[ "$source_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad source digest"; exit 1; }
-          # Tag commit must match: the archive has to be exactly what the
-          # release points at, and the tag must still point there (tags that
-          # moved since the release build fail closed).
-          api_commit="$(gh api "repos/${GH_REPO}/commits/${raw_tag}" --jq .sha)"
-          [[ "$api_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad tag commit"; exit 1; }
-          ls_remote="$(git ls-remote "https://github.com/${GH_REPO}.git" "refs/tags/${raw_tag}^{}" "refs/tags/${raw_tag}")"
-          peeled="$(printf '%s\n' "$ls_remote" | awk '$2 ~ /\^\{\}$/ {print $1}')"
-          tag_commit="${peeled:-$(printf '%s\n' "$ls_remote" | awk '$2 !~ /\^\{\}$/ {print $1}' | head -n 1)}"
-          [[ "$tag_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot resolve tag $raw_tag"; exit 1; }
-          [ "$tag_commit" = "$api_commit" ] \
-            || { echo "::error::tag $raw_tag moved (upstream $tag_commit != release $api_commit)"; exit 1; }
-          # Source tree must carry the release version (ties tag commit to
-          # tarball bytes beyond the renderer layout check).
-          mkdir -p "$work/src"
-          tar -xzf "$work/source.tar.gz" -C "$work/src"
-          src_cargo="$work/src/linux-trackpad-driver-${version}/Cargo.toml"
-          [ -f "$src_cargo" ] || { echo "::error::source archive lacks Cargo.toml"; exit 1; }
-          src_ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$src_cargo" | head -n 1)"
-          [ "$src_ver" = "$version" ] \
-            || { echo "::error::source Cargo.toml $src_ver != tag $version"; exit 1; }
+          # Pin current upstream main for the ancestry check below.
+          git fetch origin main:refs/remotes/origin/main
+          # All trust checks (publicity, manifest, BUILD_COMMIT binding,
+          # moved-tag, main ancestry, source version) live in the tested
+          # script; the workflow only moves bytes and records outputs.
+          out="$(./packaging/release/verify-stable-release.sh \
+            --tag "$raw_tag" --release-json "$work/release.json" \
+            --assets-dir "$work/assets" --source-tarball "$work/source.tar.gz" \
+            --api-commit "$api_commit" \
+            --origin-url "https://github.com/${GH_REPO}.git" \
+            --checkout-dir "$GITHUB_WORKSPACE" --main-ref origin/main)"
+          tag="$(printf '%s\n' "$out" | sed -n 's/^TAG=//p')"
+          version="$(printf '%s\n' "$out" | sed -n 's/^VERSION=//p')"
+          commit="$(printf '%s\n' "$out" | sed -n 's/^COMMIT=//p')"
+          bin_x86="$(printf '%s\n' "$out" | sed -n 's/^BIN_X86_64_SHA=//p')"
+          bin_arm="$(printf '%s\n' "$out" | sed -n 's/^BIN_AARCH64_SHA=//p')"
+          source_sha="$(printf '%s\n' "$out" | sed -n 's/^SOURCE_SHA=//p')"
+          [ -n "$tag" ] && [ -n "$version" ] && [ -n "$commit" ] \
+            && [ -n "$bin_x86" ] && [ -n "$bin_arm" ] && [ -n "$source_sha" ] \
+            || { echo "::error::verify script returned incomplete outputs"; exit 1; }
           {
-            echo "tag=$raw_tag"
+            echo "tag=$tag"
             echo "version=$version"
-            echo "commit=$api_commit"
+            echo "commit=$commit"
             echo "bin-x86=$bin_x86"
             echo "bin-aarch64=$bin_arm"
             echo "source-sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
-          echo "verify: $raw_tag public+final, assets + source bound to $api_commit"
+          echo "verify: $tag bound to $commit, ready to render"
           mkdir -p aur-input
           cp "$work/assets"/linux-trackpad-driver-*.tar.gz "$work/source.tar.gz" aur-input/
-          cp "$work/assets/SHA256SUMS" aur-input/
+          cp "$work/assets/SHA256SUMS" "$work/assets/BUILD_COMMIT" aur-input/
           printf '%s' "$version" > aur-input/VERSION
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -183,6 +175,9 @@ jobs:
         with:
           name: aur-rendered
           path: aur-out/
+          # .SRCINFO files are hidden; without this the push job would
+          # download a tree missing its mandatory metadata.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
 
@@ -213,8 +208,11 @@ jobs:
         with:
           name: aur-rendered
           path: aur-rendered
-      - name: install git (push needs a clone, never the checkout tree)
-        run: pacman -Syu --noconfirm --needed git
+      - name: install git + ssh (push clones and authenticates, never the checkout tree)
+        run: |
+          pacman -Syu --noconfirm --needed git openssh
+          command -v git
+          command -v ssh
       - name: push source + bin repos (master, append-only)
         env:
           AUR_KNOWN_HOSTS: aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN

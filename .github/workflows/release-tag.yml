@@ -190,16 +190,24 @@ jobs:
         uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
         with:
           config: cliff.toml
-          args: --tag ${{ env.TAG }} --strip all --output dist/CHANGELOG-${{ env.TAG }}.md
+          # --current scopes the excerpt to this tag only (without it the
+          # action emits every previous release too). Full CHANGELOG.md
+          # generation keeps full history (docs/RELEASING.md).
+          args: --tag ${{ env.TAG }} --current --strip all --output dist/CHANGELOG-${{ env.TAG }}.md
       - name: SHA256SUMS (explicit assets, never self)
         run: |
           set -euo pipefail
           cd dist
+          # Immutable build metadata: the exact commit these assets were built
+          # from, checksummed with everything else. aur-stable refuses to
+          # publish unless it matches the release commit (moved tags fail).
+          printf '%s' "$COMMIT" > BUILD_COMMIT
           sha256sum -- \
             "linux-trackpad-driver-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
             "linux-trackpad-driver-${TAG}-aarch64-unknown-linux-gnu.tar.gz" \
             ./*.deb \
-            "CHANGELOG-${TAG}.md" > SHA256SUMS
+            "CHANGELOG-${TAG}.md" \
+            BUILD_COMMIT > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

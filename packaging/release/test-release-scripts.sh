@@ -156,6 +156,7 @@ mk_draft_dist() { # dir
   echo arm > "$1/linux-trackpad-driver-v9.9.9-aarch64-unknown-linux-gnu.tar.gz"
   echo notes > "$1/CHANGELOG-v9.9.9.md"
   echo deb > "$1/fake_9.9.9_amd64.deb"
+  printf 'c%.0s' $(seq 40) > "$1/BUILD_COMMIT"
   ( cd "$1" && sha256sum -- * > SHA256SUMS )
 }
 FAKEBIN="$TMP_BASE/fakebin"; mkdir -p "$FAKEBIN"
@@ -251,7 +252,82 @@ fi
 [ -s "$TMP_BASE/gh-calls" ] && { echo "FAIL: no gh calls on missing asset" >&2; exit 1; }
 ok "missing asset fails before any gh call"
 
-# 6. workflow contracts ---------------------------------------------------------
+# 6. stable verification binds artifacts to the release commit ---------------
+SV="$TMP_BASE/sverify"; mkdir -p "$SV"
+git init -q -b main "$SV/upstream"
+( cd "$SV/upstream" \
+  && printf '[package]\nname = "linux-trackpad-driver"\nversion = "9.9.9"\n' > Cargo.toml \
+  && git add Cargo.toml \
+  && git -c user.email=t@t -c user.name=t commit -qm "release 9.9.9" \
+  && git tag v9.9.9 )
+SHA_A="$(git --git-dir="$SV/upstream/.git" rev-parse HEAD)"
+git clone -q "$SV/upstream" "$SV/checkout" 2>/dev/null
+mk_sv_assets() { # dir version build_sha
+  mkdir -p "$1"
+  echo "x86 $2 $3" > "$1/linux-trackpad-driver-v$2-x86_64-unknown-linux-gnu.tar.gz"
+  echo "arm $2 $3" > "$1/linux-trackpad-driver-v$2-aarch64-unknown-linux-gnu.tar.gz"
+  printf '%s' "$3" > "$1/BUILD_COMMIT"
+  ( cd "$1" && sha256sum -- linux-trackpad-driver-v*.tar.gz BUILD_COMMIT > SHA256SUMS )
+}
+mk_src_tar() { # out version
+  rm -rf "$SV/srctree" && mkdir -p "$SV/srctree/linux-trackpad-driver-$2"
+  printf '[package]\nname = "linux-trackpad-driver"\nversion = "%s"\n' "$2" \
+    > "$SV/srctree/linux-trackpad-driver-$2/Cargo.toml"
+  tar -C "$SV/srctree" -czf "$1" "linux-trackpad-driver-$2"
+}
+sv_json() { # out tag draft prerelease
+  printf '{"tagName":"%s","isDraft":%s,"isPrerelease":%s}' "$2" "$3" "$4" > "$1"
+}
+run_sv() { # assets json src api build-extra-args...
+  "$REL/verify-stable-release.sh" --tag "$SV_TAG" --release-json "$1" \
+    --assets-dir "$2" --source-tarball "$3" --api-commit "$4" \
+    --origin-url "$SV/upstream" --checkout-dir "$SV/checkout" --main-ref origin/main
+}
+SV_TAG="v9.9.9"
+mk_sv_assets "$SV/a-ok" 9.9.9 "$SHA_A"
+mk_src_tar "$SV/src-ok.tar.gz" 9.9.9
+sv_json "$SV/j-ok.json" v9.9.9 false false
+SV_OUT="$(run_sv "$SV/j-ok.json" "$SV/a-ok" "$SV/src-ok.tar.gz" "$SHA_A")" \
+  || { echo "FAIL: matching release verifies" >&2; exit 1; }
+printf '%s\n' "$SV_OUT" | grep -q "^COMMIT=$SHA_A\$" \
+  || { echo "FAIL: verified commit reported" >&2; exit 1; }
+ok "matching release verifies and reports its commit"
+# Reviewer repro: binaries built from A, tag + source moved to B.
+( cd "$SV/upstream" && echo moved > moved.txt && git add moved.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "later" \
+  && git tag -f v9.9.9 >/dev/null )
+SHA_B="$(git --git-dir="$SV/upstream/.git" rev-parse HEAD)"
+mk_src_tar "$SV/src-b.tar.gz" 9.9.9
+expect_fail "moved tag (binaries A, source B) refused" \
+  run_sv "$SV/j-ok.json" "$SV/a-ok" "$SV/src-b.tar.gz" "$SHA_B"
+# BUILD_COMMIT missing or tampered fails before any push.
+SV_NOBC="$SV/a-nobc"; mk_sv_assets "$SV_NOBC" 9.9.9 "$SHA_A"; rm "$SV_NOBC/BUILD_COMMIT"
+expect_fail "missing BUILD_COMMIT refused" \
+  run_sv "$SV/j-ok.json" "$SV_NOBC" "$SV/src-ok.tar.gz" "$SHA_A"
+SV_TAMP="$SV/a-tamp"; mk_sv_assets "$SV_TAMP" 9.9.9 "$SHA_A"
+printf 'd%.0s' $(seq 40) > "$SV_TAMP/BUILD_COMMIT"
+expect_fail "tampered BUILD_COMMIT refused" \
+  run_sv "$SV/j-ok.json" "$SV_TAMP" "$SV/src-ok.tar.gz" "$SHA_A"
+# Tag on a side branch never reaches main.
+( cd "$SV/upstream" && git checkout -q -b side "$SHA_A" \
+  && echo side > side.txt && git add side.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "side" \
+  && git tag v9.9.8 && git checkout -q main )
+SHA_S="$(git --git-dir="$SV/upstream/.git" rev-parse side)"
+SV_TAG="v9.9.8"
+mk_sv_assets "$SV/a-side" 9.9.8 "$SHA_S"
+sv_json "$SV/j-side.json" v9.9.8 false false
+expect_fail "side-branch release refused" \
+  run_sv "$SV/j-side.json" "$SV/a-side" "$SV/src-ok.tar.gz" "$SHA_S"
+SV_TAG="v9.9.9"
+sv_json "$SV/j-draft.json" v9.9.9 true false
+expect_fail "draft release refused by stable verify" \
+  run_sv "$SV/j-draft.json" "$SV/a-ok" "$SV/src-ok.tar.gz" "$SHA_A"
+mk_src_tar "$SV/src-drift.tar.gz" 9.9.8
+expect_fail "source version drift refused" \
+  run_sv "$SV/j-ok.json" "$SV/a-ok" "$SV/src-drift.tar.gz" "$SHA_A"
+
+# 7. workflow contracts ---------------------------------------------------------
 WF="$REPO_ROOT/.github/workflows"
 for required in release-tag.yml aur-stable.yml aur-git.yml; do
   [ -f "$WF/$required" ] || { echo "FAIL: missing $WF/$required" >&2; exit 1; }
@@ -287,7 +363,7 @@ assert_grep "$WF/release-tag.yml" 'manage-draft-release.sh' "draft logic lives i
 assert_grep "$WF/release-tag.yml" 'LICENSE-APACHE' "release tarball stages both licenses"
 assert_grep "$REL/publish-aur.sh" 'aur\.archlinux\.org ssh-ed25519' "AUR host key pinned, no ssh-keyscan"
 
-# 6. real makepkg payload check for the prebuilt variant -------------------------
+# 8. real makepkg payload check for the prebuilt variant -------------------------
 if [ "$(id -u)" -eq 0 ]; then
   echo "skip: makepkg payload check needs a non-root user (CI runs it as builder)"
 else

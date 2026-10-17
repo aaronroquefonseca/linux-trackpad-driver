@@ -42,6 +42,7 @@ files=(
   "$DIST/linux-trackpad-driver-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
   "$NOTES"
   "$SUMS"
+  "$DIST/BUILD_COMMIT"
 )
 for deb in "$DIST"/*.deb; do
   files+=("$deb")
