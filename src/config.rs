@@ -12,6 +12,7 @@
 //! (`u8` fields would make e.g. `sensitivity = 300` an unrepresentable
 //! value that never reaches validation.)
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -108,49 +109,18 @@ pub struct Config {
     pub slide_4: ActionBinding,
     #[serde(default = "default_action_none")]
     pub slide_5: ActionBinding,
-    /// Finger-count spoofing: virtual count reported to the computer when
-    /// the real touching count is N under a status (`0` = passthrough,
-    /// report the real count; `1..=5` = spoof). Fifteen keys cover
-    /// slide/click/force × 1..5 (e.g. `spoof_click_2 = 3`: a real
-    /// two-finger press reports three contacts). The uinput touch stream
-    /// (slots, `BTN_TOOL_*`) always uses the spoofed count; action
-    /// selection uses the real count unless [`Config::spoof_select`].
-    /// All default `0` (passthrough: zero behavior change).
+    /// Finger-count spoofing (`[spoof]` table): virtual count reported
+    /// to the computer when the real touching count is N under a
+    /// status. Sparse tables — set only needed rows, omitted rows are
+    /// passthrough (report the real count); an explicit `0` also means
+    /// passthrough, `1..=5` spoofs (e.g. `[spoof.click]` with `2 = 3`:
+    /// a real two-finger press reports three contacts). The uinput
+    /// touch stream (slots, `BTN_TOOL_*`) always uses the spoofed
+    /// count; action selection uses the real count unless
+    /// [`SpoofConfig::select`]. All tables default empty (passthrough:
+    /// zero behavior change).
     #[serde(default)]
-    pub spoof_slide_1: u16,
-    #[serde(default)]
-    pub spoof_slide_2: u16,
-    #[serde(default)]
-    pub spoof_slide_3: u16,
-    #[serde(default)]
-    pub spoof_slide_4: u16,
-    #[serde(default)]
-    pub spoof_slide_5: u16,
-    #[serde(default)]
-    pub spoof_click_1: u16,
-    #[serde(default)]
-    pub spoof_click_2: u16,
-    #[serde(default)]
-    pub spoof_click_3: u16,
-    #[serde(default)]
-    pub spoof_click_4: u16,
-    #[serde(default)]
-    pub spoof_click_5: u16,
-    #[serde(default)]
-    pub spoof_force_1: u16,
-    #[serde(default)]
-    pub spoof_force_2: u16,
-    #[serde(default)]
-    pub spoof_force_3: u16,
-    #[serde(default)]
-    pub spoof_force_4: u16,
-    #[serde(default)]
-    pub spoof_force_5: u16,
-    /// When true, `click_N`/`force_N`/`slide_N` selection uses the spoofed
-    /// count instead of the real one. Default false: spoofing only changes
-    /// what the computer sees, never which action fires.
-    #[serde(default)]
-    pub spoof_select: bool,
+    pub spoof: SpoofConfig,
     /// Level-transition mode on a force edge over an active click:
     /// `"continuous"` (default, current behavior: level-1 keys stay held,
     /// force keys join) or `"cut"` (release ALL level-1/slide keys first
@@ -207,6 +177,48 @@ fn default_combo_stagger_ms() -> u16 {
     50
 }
 
+/// Sparse finger-count spoof table: TOML integer keys (`2 = 3`) arrive
+/// as strings, so this parses them to `u8`. Unknown key shapes fail
+/// here; out-of-range keys/values fail in [`Config::validate`].
+fn deserialize_spoof_table<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<u8, u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, u16>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(k, v)| {
+            k.parse::<u8>()
+                .map_err(serde::de::Error::custom)
+                .map(|key| (key, v))
+        })
+        .collect()
+}
+
+/// Finger-count spoofing (`[spoof]` table). Sparse: set only needed
+/// rows (`[spoof.slide]` / `[spoof.click]` / `[spoof.force]` with
+/// `N = V`, N = real count `1..=5`, V = virtual `0..=5` where `0` =
+/// passthrough). Omitted rows are passthrough. `select` swaps action
+/// selection to the spoofed count (default false: wire only).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SpoofConfig {
+    /// Slide-status map: real count → virtual count.
+    #[serde(default, deserialize_with = "deserialize_spoof_table")]
+    pub slide: BTreeMap<u8, u16>,
+    /// Standard-press map: real count → virtual count.
+    #[serde(default, deserialize_with = "deserialize_spoof_table")]
+    pub click: BTreeMap<u8, u16>,
+    /// Force-level map: real count → virtual count.
+    #[serde(default, deserialize_with = "deserialize_spoof_table")]
+    pub force: BTreeMap<u8, u16>,
+    /// When true, `click_N`/`force_N`/`slide_N` selection uses the
+    /// spoofed count instead of the real one.
+    #[serde(default)]
+    pub select: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -236,22 +248,7 @@ impl Default for Config {
             slide_3: default_action_none(),
             slide_4: default_action_none(),
             slide_5: default_action_none(),
-            spoof_slide_1: 0,
-            spoof_slide_2: 0,
-            spoof_slide_3: 0,
-            spoof_slide_4: 0,
-            spoof_slide_5: 0,
-            spoof_click_1: 0,
-            spoof_click_2: 0,
-            spoof_click_3: 0,
-            spoof_click_4: 0,
-            spoof_click_5: 0,
-            spoof_force_1: 0,
-            spoof_force_2: 0,
-            spoof_force_3: 0,
-            spoof_force_4: 0,
-            spoof_force_5: 0,
-            spoof_select: false,
+            spoof: SpoofConfig::default(),
             transition_mode: default_transition_mode(),
             combo_stagger_ms: default_combo_stagger_ms(),
         }
@@ -527,25 +524,20 @@ impl Config {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid {key}: {e}"))?;
         }
-        for (key, value) in [
-            ("spoof_slide_1", self.spoof_slide_1),
-            ("spoof_slide_2", self.spoof_slide_2),
-            ("spoof_slide_3", self.spoof_slide_3),
-            ("spoof_slide_4", self.spoof_slide_4),
-            ("spoof_slide_5", self.spoof_slide_5),
-            ("spoof_click_1", self.spoof_click_1),
-            ("spoof_click_2", self.spoof_click_2),
-            ("spoof_click_3", self.spoof_click_3),
-            ("spoof_click_4", self.spoof_click_4),
-            ("spoof_click_5", self.spoof_click_5),
-            ("spoof_force_1", self.spoof_force_1),
-            ("spoof_force_2", self.spoof_force_2),
-            ("spoof_force_3", self.spoof_force_3),
-            ("spoof_force_4", self.spoof_force_4),
-            ("spoof_force_5", self.spoof_force_5),
+        for (table, map) in [
+            ("spoof.slide", &self.spoof.slide),
+            ("spoof.click", &self.spoof.click),
+            ("spoof.force", &self.spoof.force),
         ] {
-            if value > 5 {
-                anyhow::bail!("invalid {key} {value} (want 0..=5, 0 = passthrough)");
+            for (real, virtual_n) in map {
+                if !(1..=5).contains(real) {
+                    anyhow::bail!("invalid {table}.{real} (want real count 1..=5)");
+                }
+                if *virtual_n > 5 {
+                    anyhow::bail!(
+                        "invalid {table}.{real} {virtual_n} (want 0..=5, 0 = passthrough)"
+                    );
+                }
             }
         }
         match self.transition_mode.as_str() {
@@ -634,30 +626,19 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("invalid slide_{n}: {e}"))
     }
 
-    /// Raw spoof cell for (`status`, real count `n`): `0` = passthrough.
-    /// `status` is `slide`/`click`/`force`; anything else returns `0`.
-    /// Values above 5 can only come from an unvalidated `Config` (validation
-    /// rejects them): debug builds assert, release falls back to `0`
-    /// (passthrough) rather than emitting a bogus count.
+    /// Raw spoof cell for (`status`, real count `n`): `0` = passthrough
+    /// (omitted row). `status` is `slide`/`click`/`force`; anything else
+    /// returns `0`. Values above 5 can only come from an unvalidated
+    /// `Config` (validation rejects them): debug builds assert, release
+    /// falls back to `0` (passthrough) rather than emitting a bogus count.
     pub fn spoof_cell(&self, status: &str, n: u8) -> u16 {
-        let cell = match (status, n) {
-            ("slide", 1) => self.spoof_slide_1,
-            ("slide", 2) => self.spoof_slide_2,
-            ("slide", 3) => self.spoof_slide_3,
-            ("slide", 4) => self.spoof_slide_4,
-            ("slide", 5) => self.spoof_slide_5,
-            ("click", 1) => self.spoof_click_1,
-            ("click", 2) => self.spoof_click_2,
-            ("click", 3) => self.spoof_click_3,
-            ("click", 4) => self.spoof_click_4,
-            ("click", 5) => self.spoof_click_5,
-            ("force", 1) => self.spoof_force_1,
-            ("force", 2) => self.spoof_force_2,
-            ("force", 3) => self.spoof_force_3,
-            ("force", 4) => self.spoof_force_4,
-            ("force", 5) => self.spoof_force_5,
-            _ => 0,
+        let map = match status {
+            "slide" => &self.spoof.slide,
+            "click" => &self.spoof.click,
+            "force" => &self.spoof.force,
+            _ => return 0,
         };
+        let cell = map.get(&n).copied().unwrap_or(0);
         if cell > 5 {
             debug_assert!(
                 false,
@@ -681,9 +662,9 @@ impl Config {
     }
 
     /// Count used for `*_N` action selection: the spoofed count when
-    /// [`Config::spoof_select`] is on, else the real count.
+    /// [`SpoofConfig::select`] is on, else the real count.
     pub fn select_count(&self, status: &str, real: u8) -> u8 {
-        if self.spoof_select {
+        if self.spoof.select {
             self.spoofed_count(status, real)
         } else {
             real
@@ -798,26 +779,10 @@ mod tests {
         for s in [&c.slide_1, &c.slide_2, &c.slide_3, &c.slide_4, &c.slide_5] {
             assert_eq!(s.action, "none");
         }
-        for v in [
-            c.spoof_slide_1,
-            c.spoof_slide_2,
-            c.spoof_slide_3,
-            c.spoof_slide_4,
-            c.spoof_slide_5,
-            c.spoof_click_1,
-            c.spoof_click_2,
-            c.spoof_click_3,
-            c.spoof_click_4,
-            c.spoof_click_5,
-            c.spoof_force_1,
-            c.spoof_force_2,
-            c.spoof_force_3,
-            c.spoof_force_4,
-            c.spoof_force_5,
-        ] {
-            assert_eq!(v, 0);
-        }
-        assert!(!c.spoof_select);
+        assert!(c.spoof.slide.is_empty());
+        assert!(c.spoof.click.is_empty());
+        assert!(c.spoof.force.is_empty());
+        assert!(!c.spoof.select);
         assert_eq!(c.transition_mode, "continuous");
         assert!(!c.is_cut_transition());
         c.validate().unwrap();
@@ -1097,23 +1062,41 @@ mod tests {
     #[test]
     fn rejects_spoof_outside_0_5() {
         for v in [6, 9, 255] {
+            let mut spoof = SpoofConfig::default();
+            spoof.click.insert(2, v);
             let bad = Config {
-                spoof_click_2: v,
+                spoof,
                 ..Config::default()
             };
             assert!(
                 bad.validate().is_err(),
-                "spoof_click_2 = {v} must be rejected"
+                "spoof.click 2 = {v} must be rejected"
             );
         }
         for v in [0, 1, 3, 5] {
+            let mut spoof = SpoofConfig::default();
+            spoof.click.insert(2, v);
+            spoof.slide.insert(1, v);
+            spoof.force.insert(5, v);
             let ok = Config {
-                spoof_click_2: v,
-                spoof_slide_1: v,
-                spoof_force_5: v,
+                spoof,
                 ..Config::default()
             };
             assert!(ok.validate().is_ok(), "spoof = {v} must be accepted");
+        }
+        // Real-count keys outside 1..=5 are rejected, even with a
+        // passthrough value.
+        for bad_key in [0, 6, 255] {
+            let mut spoof = SpoofConfig::default();
+            spoof.click.insert(bad_key, 3);
+            let bad = Config {
+                spoof,
+                ..Config::default()
+            };
+            assert!(
+                bad.validate().is_err(),
+                "spoof key {bad_key} must be rejected"
+            );
         }
     }
 
@@ -1122,21 +1105,64 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.spoofed_count("click", 2), 2);
         assert_eq!(c.select_count("click", 2), 2);
+        let mut spoof = SpoofConfig::default();
+        spoof.click.insert(2, 3);
         let c = Config {
-            spoof_click_2: 3,
+            spoof,
             ..Config::default()
         };
         c.validate().unwrap();
-        // Wire sees 3; selection still sees the real 2 unless spoof_select.
+        // Wire sees 3; selection still sees the real 2 unless select.
         assert_eq!(c.spoofed_count("click", 2), 3);
         assert_eq!(c.select_count("click", 2), 2);
         assert_eq!(c.spoofed_count("click", 1), 1);
         assert_eq!(c.spoofed_count("force", 2), 2);
         let c = Config {
-            spoof_select: true,
+            spoof: SpoofConfig {
+                select: true,
+                ..c.spoof.clone()
+            },
             ..c
         };
         assert_eq!(c.select_count("click", 2), 3);
+    }
+
+    #[test]
+    fn spoof_sparse_toml_omitted_is_passthrough() {
+        let c: Config = toml::from_str(
+            r#"
+[spoof.click]
+2 = 3
+[spoof.slide]
+2 = 3
+"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.spoofed_count("click", 2), 3);
+        assert_eq!(c.spoofed_count("click", 1), 1);
+        assert_eq!(c.spoofed_count("slide", 2), 3);
+        assert_eq!(c.spoofed_count("slide", 1), 1);
+        assert_eq!(c.spoofed_count("force", 2), 2);
+        assert!(!c.spoof.select);
+        // Explicit 0 equals omitted: passthrough.
+        let c: Config = toml::from_str("[spoof.click]\n2 = 0\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.spoofed_count("click", 2), 2);
+        // Out-of-range value and key fail (value via validate, key via
+        // validate for struct-built maps; TOML parse rejects non-u8 keys).
+        let c: Config = toml::from_str("[spoof.click]\n2 = 6\n").unwrap();
+        assert!(c.validate().is_err());
+        let bad: std::result::Result<Config, _> = toml::from_str("[spoof.click]\nfoo = 3\n");
+        assert!(bad.is_err());
+        let unknown: std::result::Result<Config, _> =
+            toml::from_str("[spoof.click]\n2 = 3\n[spoof.bogus]\n1 = 2\n");
+        assert!(unknown.is_err());
+        // Legacy flat keys are gone (breaking, pre-v1): unknown field.
+        let legacy: std::result::Result<Config, _> = toml::from_str("spoof_click_2 = 3\n");
+        assert!(legacy.is_err());
+        let legacy: std::result::Result<Config, _> = toml::from_str("spoof_select = true\n");
+        assert!(legacy.is_err());
     }
 
     #[test]
@@ -1275,11 +1301,19 @@ force_5 = "none"
 slide_1 = "left"
 slide_2 = "ctrl+c"
 slide_3 = "empty"
-spoof_click_2 = 3
-spoof_slide_1 = 2
-spoof_force_1 = 1
-spoof_select = true
 transition_mode = "cut"
+
+[spoof.click]
+2 = 3
+
+[spoof.slide]
+1 = 2
+
+[spoof.force]
+1 = 1
+
+[spoof]
+select = true
 "#;
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();

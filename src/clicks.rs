@@ -67,13 +67,14 @@
 //!   silent, so `slide_* = empty` is keys-nothing + haptic-nothing
 //!   (valid-but-silent — prefer `none`; old configs keep working).
 //!   `none` never latches, never pulses (default = current behavior).
-//! - Finger-count spoofing (`spoof_<slide|click|force>_<1..5>`, `0` =
-//!   passthrough default): the uinput touch stream (slots, `BTN_TOOL_*`)
-//!   reports the spoofed count via [`spoof_contacts`] (real centroid,
-//!   requested contacts on a tiny fixed pattern: pair ±18 x, 3+ on a
-//!   24-unit ring from straight up). Action selection keeps the real count
-//!   unless `spoof_select = true` (then selection uses the spoofed count
-//!   too, and the edge's `finger_count` reports it).
+//! - Finger-count spoofing (`[spoof.slide]` / `[spoof.click]` /
+//!   `[spoof.force]` sparse tables, omitted = passthrough default): the
+//!   uinput touch stream (slots, `BTN_TOOL_*`) reports the spoofed count
+//!   via [`spoof_contacts`] (real centroid, requested contacts on a tiny
+//!   fixed pattern: pair ±18 x, 3+ on a 24-unit ring from straight up).
+//!   Action selection keeps the real count unless `[spoof] select = true`
+//!   (then selection uses the spoofed count too, and the edge's
+//!   `finger_count` reports it).
 //! - Level-transition mode (`transition_mode`, global): `"continuous"`
 //!   (default) holds level-1 keys while force keys join (shared codes down
 //!   once, up once); `"cut"` releases ALL level-1/slide keys first (with
@@ -317,7 +318,7 @@ pub struct ClickMachine {
     slide_active: Option<ClickEvent>,
     /// Real touching count (clamped 1..=5) the slide latch selected on.
     /// Compared against the real count (not the spoof-aware select count)
-    /// so a `spoof_select` remap never re-fires every frame.
+    /// so a `[spoof] select` remap never re-fires every frame.
     slide_real: Option<u8>,
     last_press_at: Option<Instant>,
     last_release_at: Option<Instant>,
@@ -513,7 +514,7 @@ impl ClickMachine {
 
         // Phase 2: parse before mutating. `n` is the real touching count
         // of the edge frame, clamped 1..=5; each level selects on its
-        // spoof-aware count (`spoof_select` swaps real→virtual, default
+        // spoof-aware count (`[spoof] select` swaps real→virtual, default
         // real — zero behavior change unless opted in).
         let contacting = fingers.iter().filter(|f| touch_present(f)).count();
         let n = (contacting.clamp(1, 5)) as u8;
@@ -1799,10 +1800,15 @@ mod tests {
 
     #[test]
     fn spoof_select_switches_action_lookup() {
+        let mut click = std::collections::BTreeMap::new();
+        click.insert(2u8, 3u16);
         let base = Config {
             click_2: "right".into(),
             click_3: "middle".into(),
-            spoof_click_2: 3,
+            spoof: crate::config::SpoofConfig {
+                click,
+                ..Default::default()
+            },
             ..Config::default()
         };
         // Default: selection uses the real count (2 → right), even though
@@ -1816,10 +1822,8 @@ mod tests {
         assert_eq!(ev.finger_count, 2);
         assert_eq!(ev.action.kind, ActionKind::Keys(vec!["right".to_string()]));
         // Opt-in: selection uses the spoofed count (3 → middle).
-        let cfg = Config {
-            spoof_select: true,
-            ..base
-        };
+        let mut cfg = base.clone();
+        cfg.spoof.select = true;
         let mut m = ClickMachine::new();
         let ev = m
             .update(&[finger(1, 200), finger(2, 200)], 0, &cfg)
@@ -1832,11 +1836,16 @@ mod tests {
 
     #[test]
     fn spoof_select_slide_uses_virtual_count() {
+        let mut slide = std::collections::BTreeMap::new();
+        slide.insert(1u8, 3u16);
         let cfg = Config {
             slide_1: "left".into(),
             slide_3: "middle".into(),
-            spoof_slide_1: 3,
-            spoof_select: true,
+            spoof: crate::config::SpoofConfig {
+                slide,
+                select: true,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let mut m = ClickMachine::new();
