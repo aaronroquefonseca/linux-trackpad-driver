@@ -38,6 +38,19 @@ sudo systemctl enable --now linux-trackpad-driver.service
 
 Verify with `ltd doctor` (below).
 
+## Distribution packages (planned, not yet published)
+
+Release automation (signed tags → draft GitHub Release → AUR) is implemented
+but not yet armed: no tags, releases, or AUR packages exist. Once the first
+release is published, this section will carry the install lines for:
+
+- `linux-trackpad-driver` — AUR source build,
+- `linux-trackpad-driver-bin` — AUR prebuilt binaries,
+- `linux-trackpad-driver-git` — AUR VCS snapshot of `main`,
+- `.deb` — attached to each GitHub Release (x86_64).
+
+Until then, build from source as above. Details: [`docs/RELEASING.md`](docs/RELEASING.md).
+
 ## Supported hardware and testing status
 
 | Device | USB VID:PID | BT VID:PID |
