@@ -1,150 +1,135 @@
 # linux-trackpad-driver
 
 Userspace Rust driver for the Apple Magic Trackpad 2 (Lightning + USB-C) on Linux.
-Core-init always on (USB feature reports, BT bring-up, reconnect, suspend re-init);
-enhanced click proxy (pressure → haptic + remappable actions) is opt-in.
-Generic-trackpad support is planned via capability tiers; Apple first.
+Device setup always runs (USB feature reports, Bluetooth bring-up, reconnect,
+suspend re-init). The pressure click engine (clicks, haptics, force levels,
+touch actions) is on by default and configured in one file.
 
-## Status (2026-10-14, in active development)
+Currently, only Apple Magic Trackpad 2 support is implemented. Support for
+other trackpads is planned.
 
-- `main`: core-init (USB `02 01` / `21 01` / capped `99 F2 0x23` polling,
-  BT single-node, `run`/`reconnect` CLI, lock socket, discovery) + full TOML
-  schema + 9B multitouch parser + udev/systemd + mock harness + CI. ~98 tests green.
-- Open PRs: `reconnect-bt` (reconnect hardening, in review), `uinput-proxy`
-  (click proxy, in progress). Next: `suspend-hook`, `force-click`.
-- See `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`, `docs/TASKS.md`, `docs/RESEARCH.md`.
+## Features
 
-## Hardware
+- Configurable USB polling rate (up to ~110 Hz).
+- Adjustable click sensitivity and haptic feedback.
+- Two pressure levels (normal and Force Touch) with independent actions.
+- Configurable 1–5 finger clicks and keyboard shortcuts.
+- Touch-without-press actions (slide mode).
+- Finger-count remapping for gesture support.
+- Adjustable pointer speed.
+- Automatic reconnection and suspend/resume handling.
+- Fully userspace: no custom kernel modules, no DKMS.
+
+## Install
+
+```sh
+git clone https://github.com/aaronroquefonseca/linux-trackpad-driver
+cd linux-trackpad-driver
+cargo build --locked --release
+sudo install -m755 target/release/ltd /usr/bin/ltd
+```
+
+Then install the rules, units, hook and default config — exact commands in
+[`INSTALL.md`](INSTALL.md) — and enable:
+
+```sh
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+Verify with `ltd doctor` (below).
+
+## Supported hardware and testing status
 
 | Device | USB VID:PID | BT VID:PID |
 |---|---|---|
 | Magic Trackpad 2 (Lightning) | `05ac:0265` | `004c:0265` |
 | Magic Trackpad 2 (USB-C) | `05ac:0324` | `004c:0324` |
 
-Polling: device-capped at ~110 Hz (`99 F2 XX`, ≈`3850/XX`; default `XX=0x23`).
-Higher requests are clamped, never sent. BT has no rate tuning (USB-first).
+- Personally tested: USB-C model over USB only.
+- Lightning model: supported in the implementation, not yet verified on hardware.
+- Bluetooth: implemented but not yet tested with this rewrite. The original
+driver had good Bluetooth compatibility, so it is expected to work — but
+bugs are possible. See issue #42.
 
-## Install
+Polling is an Apple-trackpad USB setting (default 110 Hz, usable 16–110).
+It is independent of the click engine and ignored on Bluetooth and other pads.
 
-### Arch Linux (AUR)
+## Configuration
 
-```sh
-yay -S linux-trackpad-driver-git
-# or: paru -S linux-trackpad-driver-git
-sudo systemctl enable --now linux-trackpad-driver.service
+Full reference: [`config/default.toml`](config/default.toml) and
+[`docs/CONFIG.md`](docs/CONFIG.md). The shipped defaults use a light press
+(threshold 30) with soft feedback (strength 2, quiet waveform) — my
+preference. If clicks feel too eager or too faint, try the firmer classic
+values: `sensitivity = 64`, `haptic = 5`, `quiet_click = false`.
+
+You only need the lines you want to change; omitted keys fall back to the
+documented defaults. The key gate:
+
+```toml
+schema_version = 1
+enhanced_clicks = true   # false: kernel passthrough, device setup still runs
 ```
 
-Verify:
+`[device]` settings work on their own; `[pointer]`, `[click]`,
+`[haptics]`, `[force]`, `[slide]` and `[spoof]` need `enhanced_clicks = true`.
+Proxy failure always falls back to passthrough; device setup never depends
+on the click engine.
+
+Apply changes with:
 
 ```sh
-ltd doctor
-systemctl status linux-trackpad-driver.service
-journalctl -u linux-trackpad-driver.service --since "5 min ago"
+sudo systemctl restart linux-trackpad-driver
 ```
 
-The AUR package (`packaging/arch/PKGBUILD`) ships the full file set:
-`/usr/bin/ltd`, the udev rules, all three units (main service, reconnect
-template, resume service), the system-sleep hook, and
-`/etc/linux-trackpad-driver/config.toml` (a conffile via `backup=`,
-preserved on upgrade). Post-install reloads udev + systemd and
-re-triggers hidraw `add`; the daemon is never auto-started — enabling
-is one explicit step.
+(Restart is required for now; live reload is planned.)
 
-### Debian / Ubuntu (.deb)
-
-```sh
-sudo dpkg -i linux-trackpad-driver_0.1.0_amd64.deb
-sudo apt-get install -f   # only if dpkg reports missing dependencies
-```
-
-Post-install steps (the package only reloads daemons; enabling is an
-explicit admin step by policy — see `debian/README.Debian`):
-
-```sh
-sudo systemctl daemon-reload
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw --action=add
-sudo systemctl enable --now linux-trackpad-driver.service
-```
-
-Then verify with `ltd doctor` (below).
-
-### Fedora / other distros (from source)
-
-```sh
-cargo build --locked --release
-sudo install -m755 target/release/ltd /usr/bin/ltd
-```
-
-Then install the rules, units, hook, and default config manually — exact
-commands in [`INSTALL.md`](INSTALL.md) — and enable:
-
-```sh
-sudo systemctl enable --now linux-trackpad-driver.service
-```
-
-## First run: `ltd doctor` checklist
-
-```sh
-ltd doctor
-ltd doctor -c /etc/linux-trackpad-driver/config.toml
-```
-
-`ltd doctor` is read-only: sysfs device scan + config validate + daemon
-socket dial. It never sends feature reports, never grabs, never changes
-hardware state. Exit 0 = config valid and a trackpad node seen; exit 1
-otherwise. Each checklist question maps to one line plus a manual
-follow-up:
-
-| Question | `ltd doctor` line | Manual follow-up |
-|---|---|---|
-| Is a device seen? | `[ok] device seen: /dev/hidrawN …` | `ls /sys/class/hidraw`, `dmesg \| grep -i hid` |
-| Is the hidraw node there? | `(present …)` per node | `ls -l /dev/hidrawN` |
-| Is the driver bound yet? | `(driver bound …)` per node | fresh `add` may need a second: probe/bind race is normal |
-| Did the udev rule fire? | — (rule hands off to systemd) | `udevadm monitor --udev --subsystem-match=hidraw`, then replug; `systemctl status 'linux-trackpad-driver-reconnect@hidrawN.service'` |
-| Is the daemon active? | `[ok] daemon socket live …` / `[..] socket absent …` | `systemctl is-active linux-trackpad-driver.service` |
-| How to read logs? | — | `journalctl -u linux-trackpad-driver.service --since "5 min ago"` |
-
-## Troubleshooting
-
-| Symptom | Check | Fix |
-|---|---|---|
-| `doctor`: no trackpad seen | cable seated? BT paired? `ls /sys/class/hidraw`; `dmesg \| grep -i hid` | replug / finish BT pairing, re-run `ltd doctor` |
-| `doctor`: config invalid | line names the key + accepted range | edit `/etc/linux-trackpad-driver/config.toml` (unknown keys are rejected — usually a typo); re-run `ltd doctor -c <file>` first |
-| Permission denied on a manual run | `getfacl /dev/hidrawN`; `groups` | `sudo -E ltd …` (keeps `$LTD_SOCKET`/`$LTD_CONFIG`); or on `input`-grouped distros `sudo usermod -aG input $USER` + re-login. The system daemon runs as root and needs nothing extra. |
-| Udev rule not firing | `udevadm monitor --udev --subsystem-match=hidraw` while replugging; `udevadm test /sys/class/hidraw/hidrawN` | `sudo udevadm control --reload-rules` + `sudo udevadm trigger --subsystem-match=hidraw --action=add`; confirm the rules file exists under `/usr/lib/udev/rules.d/` (packaged) or `/etc/udev/rules.d/` (manual). Note: reconnect without a live daemon disengages unless `-f` — start the main service first. |
-| Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | hidraw coexists with `hid-magicmouse` on BT: the kernel keeps emitting evdev unless suppressed. Prefer USB, or set `enhanced_clicks = true` so the proxy grabs the node (grab suppresses the kernel duplicate). |
-| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup. |
-
-Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).
+Upgrading from a pre-v1 config: the flat layout was replaced by sections,
+so old files fail with `unknown field`. Rewrite yours against the shipped
+default — values carry over one-to-one.
 
 ## Usage
 
 ```sh
-sudo ltd run                          # daemon: init + idle (passthrough via libinput)
+sudo ltd run                                   # daemon: setup + click engine
 sudo ltd run -c /etc/linux-trackpad-driver/config.toml
-sudo ltd reconnect /dev/hidrawN       # udev entry / manual re-init
+sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init
 sudo ltd reconnect /dev/hidrawN -f -p 90 -d
-ltd doctor                            # read-only first-run checklist (scan + config + socket)
+ltd doctor                                     # read-only checklist
 ```
 
-Config: [`config/default.toml`](config/default.toml). Key gate:
+## Troubleshooting
 
-```toml
-enhanced_clicks = false   # default OFF: pure passthrough, init only
-```
+`ltd doctor` is read-only: device scan + config validate + daemon socket
+dial. Exit 0 means the config is valid and a trackpad node was seen — it
+does not by itself mean the daemon is running; check
+`systemctl is-active linux-trackpad-driver.service` for that.
 
-Set `true` to enable the click proxy (pressure thresholds, haptics,
-1–5 finger action maps, force second level). Proxy failure always falls back
-to passthrough; init never depends on clicks. The proxy resolves its
-physical node itself (`INSTALL.md` → Environment overrides);
-`LTD_EVDEV_NODE` pins it explicitly, `LTD_UINPUT_NODE` overrides uinput.
+| Symptom | Check | Fix |
+|---|---|---|
+| `doctor`: no trackpad seen | cable seated? BT paired? `ls /sys/class/hidraw`; `dmesg \| grep -i hid` | replug / finish BT pairing, re-run `ltd doctor` |
+| `doctor`: config invalid | line names the key + accepted range | edit `/etc/linux-trackpad-driver/config.toml` (unknown keys are rejected — usually a typo); validate with `ltd doctor -c <file>` first |
+| Edited config, nothing changed | service restarted? | `sudo systemctl restart linux-trackpad-driver.service` (required for now) |
+| Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | on BT the kernel node stays live alongside hidraw; the proxy is designed to grab the node and suppress the duplicate when `enhanced_clicks = true` (the default) — this path is not yet hardware-verified with this rewrite |
+| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup |
 
-## Capability tiers
+Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).
 
-L0 (no pressure/haptic) / L1a (area-proxy) / L1b (true force) /
-L2s (standard `0x0E` haptics) / L2p (proprietary haptic: Apple, Sensel…).
-Apple MT2 = L2p with L1a-class arbitrary pressure units. Details: `docs/RESEARCH.md`.
+## Device support tiers and future compatibility
+
+Planned tiers for future trackpads (only Apple Magic Trackpad 2 is
+implemented today):
+
+- **L0** — basic trackpads without pressure detection: pointer speed and
+finger-count remapping.
+- **L1** — pressure detection, no software-controlled haptic feedback:
+pressure clicks, force levels and touch actions work; haptic settings stay
+configured but inactive.
+- **L2** — pressure plus software-controlled haptic feedback: everything
+works. Apple uses a proprietary channel; ChromeOS forcepads define the
+open standard variant (planned).
+
+Unsupported features remain configured but inactive. Details:
+`docs/RESEARCH.md`.
 
 ## Development
 
@@ -152,14 +137,11 @@ Apple MT2 = L2p with L1a-class arbitrary pressure units. Details: `docs/RESEARCH
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-Conventional Commits, small PRs, review policy in `docs/ROADMAP.md`.
-Reference implementation (read-only, never copied):
-`/home/aaronroque/Projects/AppleTrackpadUserSpaceApp` (outside this repo).
+Conventional Commits, small focused PRs (squash-merged), two reviewers on
+substantial changes. Capability research: `docs/RESEARCH.md`.
 
 ## License
 
 Dual-licensed under MIT OR Apache-2.0 — see [`LICENSE-MIT`](LICENSE-MIT)
-and [`LICENSE-APACHE`](LICENSE-APACHE). `Cargo.toml` declares
-`license = "MIT OR Apache-2.0"` to match. No per-file license headers:
-the repo-level license files + `Cargo.toml` SPDX expression are
-authoritative.
+and [`LICENSE-APACHE`](LICENSE-APACHE). No per-file license headers: the
+repo-level license files + `Cargo.toml` SPDX expression are authoritative.
