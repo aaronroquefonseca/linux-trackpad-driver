@@ -46,3 +46,18 @@ jobs:
         run: dpkg-buildpackage -S -us -uc -d
       - name: lintian (advisory)
         run: lintian --tag-display-limit 0 ../*.dsc || echo "::warning ::lintian reported tags"
+  aur:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install build tools
+        run: pacman -Syu --noconfirm --needed base-devel rust git
+      - name: packaging validation (templates, renderer, offline build)
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -s /bin/bash -c "cd \"$GITHUB_WORKSPACE\" && packaging/arch/check-aur.sh"

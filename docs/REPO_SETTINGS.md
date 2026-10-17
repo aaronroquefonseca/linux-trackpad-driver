@@ -11,13 +11,14 @@ Settings → Branches / Rules / Actions / Security as noted.
 - [ ] Require status checks to pass before merging:
   - [ ] `ci` (fmt + clippy + test)
   - [ ] `deb` (packaging validation)
+  - [ ] `aur` (AUR template/render/offline-build validation)
 - [ ] Require branches to be up to date before merging.
 - [ ] Do not allow bypassing the above settings (no bypass list).
 - [ ] Block force pushes and deletions on `main`.
 
 ## CI
 
-- [ ] `.github/workflows/ci.yml` `ci` + `deb` jobs required (see above).
+- [ ] `.github/workflows/ci.yml` `ci` + `deb` + `aur` jobs required (see above).
 - [ ] Dependabot alerts enabled (cargo); `Cargo.lock` committed.
 
 ## Releases
