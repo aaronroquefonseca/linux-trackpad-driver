@@ -488,13 +488,13 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     log::info!("lock acquired at {sock}");
     log::info!(
         "config: polling {} Hz, enhanced_clicks={}",
-        cfg.polling_rate,
+        cfg.device.polling_rate,
         cfg.enhanced_clicks
     );
-    if cfg.polling_rate > EFFECTIVE_CAP_HZ as u32 {
+    if cfg.device.polling_rate > EFFECTIVE_CAP_HZ as u32 {
         log::warn!(
             "requested {} Hz above device cap; clamped to ~110 Hz (X=0x23)",
-            cfg.polling_rate
+            cfg.device.polling_rate
         );
     }
 
@@ -517,9 +517,12 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         Ok(devs) => {
             log::info!("found {} trackpad node(s)", devs.len());
             for dev in &devs {
-                if let Err(e) =
-                    init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, &ready_hub)
-                {
+                if let Err(e) = init_node_with_config(
+                    dev,
+                    cfg.device.polling_rate,
+                    cfg.enhanced_clicks,
+                    &ready_hub,
+                ) {
                     log::error!("init failed for {}: {e:#}", dev.devnode);
                 }
             }
@@ -702,7 +705,7 @@ pub fn run_reconnect(
         Transport::Usb => {
             // Rate validation lives here only: disengage + BT discard the
             // rate, so they must not reject it.
-            let polling_hz = polling_override.unwrap_or(cfg.polling_rate);
+            let polling_hz = polling_override.unwrap_or(cfg.device.polling_rate);
             validate_polling_rate(polling_hz)?;
             // Node is present (deferred above); still check the driver bind —
             // retrying writes + read-back verify cover a lagging bind.
@@ -739,7 +742,7 @@ pub fn run_reconnect(
 /// suspend). Per-node failures are collected in the report, never fatal to
 /// siblings; only a failed scan is an `Err`.
 pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeReport> {
-    let polling_hz = polling_override.unwrap_or(cfg.polling_rate);
+    let polling_hz = polling_override.unwrap_or(cfg.device.polling_rate);
     validate_polling_rate(polling_hz)?;
     let sock = lock::socket_path();
     if lock::daemon_socket_present(&sock) {
@@ -886,7 +889,12 @@ impl ResumeWatch {
         for dev in &current {
             let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
                 debug_assert!(_added.iter().any(|d| d.devnode == dev.devnode));
-                match init_node_with_config(dev, cfg.polling_rate, cfg.enhanced_clicks, ready_hub) {
+                match init_node_with_config(
+                    dev,
+                    cfg.device.polling_rate,
+                    cfg.enhanced_clicks,
+                    ready_hub,
+                ) {
                     Ok(_) => {
                         log::info!("resume tick: initialized newly appeared {}", dev.devnode);
                         actions.push(TickAction::Initialized(dev.devnode.clone()));
@@ -911,7 +919,7 @@ impl ResumeWatch {
                 }
                 continue;
             }
-            let verify = resume::verify_node_polling(&dev.devnode, cfg.polling_rate);
+            let verify = resume::verify_node_polling(&dev.devnode, cfg.device.polling_rate);
             if !resume::needs_reinit(&verify) {
                 self.known[pos].unreadable_streak = 0;
                 actions.push(TickAction::UpToDate(dev.devnode.clone()));
@@ -948,8 +956,12 @@ impl ResumeWatch {
             } else {
                 self.known[pos].unreadable_streak = 0;
             }
-            match resume::resume_usb_node(&dev.devnode, cfg.polling_rate, Some(ready_hub), &verify)
-            {
+            match resume::resume_usb_node(
+                &dev.devnode,
+                cfg.device.polling_rate,
+                Some(ready_hub),
+                &verify,
+            ) {
                 Ok(resume::ResumeAction::Reinitialized) => {
                     actions.push(TickAction::Reinitialized(dev.devnode.clone()))
                 }

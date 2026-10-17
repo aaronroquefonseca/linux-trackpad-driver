@@ -720,7 +720,7 @@ where
                 // without input reports. Advance deadlines from the last
                 // live latch, after polling so disconnect always wins.
                 if self.pending_force.is_some() || self.pending_buttons.is_some() {
-                    let pressure = cfg.sensitivity.clamp(1, 255) as u8;
+                    let pressure = cfg.click.sensitivity.clamp(1, 255) as u8;
                     self.flush_cut_pending(pressure, now);
                     self.flush_pending_buttons(now);
                     self.uinput.sync();
@@ -765,7 +765,7 @@ where
         // Haptic pressure byte = the press threshold (old-service parity:
         // `pressure=sensitivity`, `intensity=haptic`; never the strength
         // echoed as pressure).
-        let haptic_pressure = cfg.sensitivity.clamp(1, 255) as u8;
+        let haptic_pressure = cfg.click.sensitivity.clamp(1, 255) as u8;
         // Touch slots first (post-update latch is visible to buttons below;
         // the spoof map follows the live status: force > first > slide).
         self.emit_touch_frame(&frame, cfg);
@@ -854,7 +854,7 @@ where
                 self.pending_force = Some(PendingForcePress {
                     ev: ev.clone(),
                     released_at: now,
-                    stagger: Self::combo_stagger(ev, cfg.combo_stagger_ms),
+                    stagger: Self::combo_stagger(ev, cfg.force.combo_stagger_ms),
                     mods_at: None,
                 });
             } else {
@@ -897,10 +897,14 @@ where
                 self.fire_release(
                     clicks::ClickLevel::Force,
                     haptic_pressure,
-                    cfg.force_quiet_click,
+                    cfg.haptics.force_quiet_click,
                 );
             }
-            self.fire_release(clicks::ClickLevel::First, haptic_pressure, cfg.quiet_click);
+            self.fire_release(
+                clicks::ClickLevel::First,
+                haptic_pressure,
+                cfg.haptics.quiet_click,
+            );
         } else if force_gone {
             // Back to the first-level hold: force keys up, first keys stay
             // (continuous). In cut mode the first keys were released at the
@@ -910,7 +914,7 @@ where
             self.fire_release(
                 clicks::ClickLevel::Force,
                 haptic_pressure,
-                cfg.force_quiet_click,
+                cfg.haptics.force_quiet_click,
             );
             if cfg.is_cut_transition() {
                 if let Some(ev) = self.machine.active().cloned() {
@@ -995,7 +999,7 @@ where
 
     /// Slides never pulse. Only fresh mixed actions have a timed division.
     fn press_slide(&mut self, ev: &ClickEvent, cfg: &Config, now: std::time::Instant) {
-        self.down_keys_timed(ev, Self::combo_stagger(ev, cfg.combo_stagger_ms), now);
+        self.down_keys_timed(ev, Self::combo_stagger(ev, cfg.force.combo_stagger_ms), now);
     }
 
     /// Emit extras first and capture each new button's deadline. Existing
@@ -1537,7 +1541,7 @@ where
             if clicks::touch_present(f) {
                 self.uinput
                     .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id));
-                let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.speed);
+                let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.pointer.speed);
                 if first_xy.is_none() {
                     first_xy = Some((sx, sy));
                 }
@@ -3082,9 +3086,9 @@ mod tests {
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_ORIENTATION, -2));
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_TRACKING_ID, 5));
         assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
-        // click_1 = left → BTN_LEFT down; haptic fired (default 5).
+        // click_1 = left → BTN_LEFT down; haptic fired (default 2, quiet).
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(30, 2, true)]);
     }
 
     #[test]
@@ -3094,7 +3098,10 @@ mod tests {
         let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            haptic: 0,
+            haptics: crate::config::HapticsConfig {
+                haptic: 0,
+                ..Config::default().haptics
+            },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
@@ -3110,7 +3117,10 @@ mod tests {
         let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "none".into(),
+            click: crate::config::ClickConfig {
+                click_1: "none".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
@@ -3129,7 +3139,7 @@ mod tests {
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         // Speed is a single source: the per-frame Config, not a snapshot.
         let cfg = Config {
-            speed: 200,
+            pointer: crate::config::PointerConfig { speed: 200 },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
@@ -3970,7 +3980,10 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "ctrl+c".into(),
+            click: crate::config::ClickConfig {
+                click_1: "ctrl+c".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
@@ -3999,7 +4012,10 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_2: "right".into(),
+            click: crate::config::ClickConfig {
+                click_2: "right".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
@@ -4019,7 +4035,10 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "empty".into(),
+            click: crate::config::ClickConfig {
+                click_1: "empty".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
@@ -4177,11 +4196,17 @@ mod tests {
 
     fn force_cfg() -> Config {
         Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "forward".into(),
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         }
     }
@@ -4222,10 +4247,10 @@ mod tests {
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
         assert!(!sinks.pointer.has(EV_KEY, BTN_EXTRA, 1));
-        // Force supersedes in reporting; haptic falls back to standard 5.
+        // Force supersedes in reporting; haptic falls back to standard 2, quiet.
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(64, 5, false), (64, 5, false)]
+            &[(64, 2, true), (64, 2, false)]
         );
     }
 
@@ -4238,11 +4263,9 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
-        let cfg = Config {
-            force_haptic: Some(9),
-            force_quiet_click: true,
-            ..force_cfg()
-        };
+        let mut cfg = force_cfg();
+        cfg.haptics.force_haptic = Some(9);
+        cfg.haptics.force_quiet_click = true;
         px.handle_frame(&cfg).unwrap();
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(ev.is_force());
@@ -4250,7 +4273,7 @@ mod tests {
         assert!(ev.quiet);
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(64, 5, false), (64, 9, true)]
+            &[(64, 2, true), (64, 9, true)]
         );
     }
 
@@ -4294,10 +4317,8 @@ mod tests {
             ))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
-        let cfg = Config {
-            force_2: "right".into(),
-            ..force_cfg()
-        };
+        let mut cfg = force_cfg();
+        cfg.force.force_2 = "right".into();
         px.handle_frame(&cfg).unwrap();
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(ev.is_force());
@@ -4312,10 +4333,16 @@ mod tests {
         let frames = vec![Ok(Some(frame(vec![finger(1, 255, 0, 0)], 0)))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            sensitivity: 255,
-            margin: 5,
-            force_offset: 255,
-            force_1: "forward".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 255,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 255,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
@@ -4340,12 +4367,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            click_1: "ctrl+c".into(),
-            force_1: "ctrl+v".into(),
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                click_1: "ctrl+c".into(),
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "ctrl+v".into(),
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         // Spaced: the full-release frame must clear the release debounce.
@@ -4402,11 +4435,17 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            force_1: "left".into(),
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "left".into(),
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         // Spaced: the release frame must clear the release debounce.
@@ -4422,7 +4461,7 @@ mod tests {
         // Both levels pulsed: first DOWN then force DOWN (force path live).
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(64, 5, false), (64, 5, false)]
+            &[(64, 2, true), (64, 2, false)]
         );
     }
 
@@ -4440,10 +4479,8 @@ mod tests {
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         // Split waveforms: force UP loud, first UP quiet — pins both the
         // release order (force UP before first UP) and each level's flag.
-        let cfg = Config {
-            quiet_click: true,
-            ..force_cfg()
-        };
+        let mut cfg = force_cfg();
+        cfg.haptics.quiet_click = true;
         // Spaced: the release frame must clear the release debounce.
         let t0 = std::time::Instant::now();
         let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
@@ -4482,15 +4519,13 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
-        let cfg = Config {
-            force_haptic: Some(0),
-            ..force_cfg()
-        };
+        let mut cfg = force_cfg();
+        cfg.haptics.force_haptic = Some(0);
         px.handle_frame(&cfg).unwrap();
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
         assert!(ev.is_force());
         assert_eq!(ev.haptic, 0);
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 2, true)]);
         // Keys still held on both levels despite the silent force edge.
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
@@ -4508,20 +4543,18 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
-        let cfg = Config {
-            force_haptic: Some(9),
-            force_quiet_click: true,
-            ..force_cfg()
-        };
+        let mut cfg = force_cfg();
+        cfg.haptics.force_haptic = Some(9);
+        cfg.haptics.force_quiet_click = true;
         let t0 = std::time::Instant::now();
         let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
         assert!(!first.is_force());
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 2, true)]);
         let ev = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
         assert!(ev.is_force());
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(64, 5, false), (64, 9, true)]
+            &[(64, 2, true), (64, 9, true)]
         );
     }
 
@@ -4531,15 +4564,23 @@ mod tests {
     /// haptic pulse bytes + order are).
     fn owner_cfg() -> Config {
         Config {
-            sensitivity: 30,
-            margin: 5,
-            haptic: 2,
-            quiet_click: true,
-            force_offset: 130,
-            force_haptic: Some(1),
-            force_quiet_click: false,
-            force_1: "forward".into(),
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                sensitivity: 30,
+                margin: 5,
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 2,
+                quiet_click: true,
+                force_haptic: Some(1),
+                force_quiet_click: false,
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 130,
+                force_1: "forward".into(),
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         }
     }
@@ -4879,11 +4920,11 @@ mod tests {
 
     #[test]
     fn hover_pressure_drives_slot_without_click() {
-        // contact=false but pressure 50 (> touch floor 10): the slot is
+        // contact=false but pressure 20 (> touch floor 10): the slot is
         // emitted (cursor tracks) while the click latch stays idle.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let mut hover = finger(1, 50, 30, 40);
+        let mut hover = finger(1, 20, 30, 40);
         hover.contact = false;
         let frames = vec![Ok(Some(frame(vec![hover], 0)))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
@@ -4905,12 +4946,18 @@ mod tests {
         let frames = vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            sensitivity: 80,
-            haptic: 7,
+            click: crate::config::ClickConfig {
+                sensitivity: 80,
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 7,
+                ..Config::default().haptics
+            },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(80, 7, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(80, 7, true)]);
     }
 
     #[test]
@@ -4927,7 +4974,18 @@ mod tests {
             Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
-        let cfg = Config::default();
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 5,
+                quiet_click: false,
+                ..Config::default().haptics
+            },
+            ..Config::default()
+        };
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
         assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
@@ -4962,7 +5020,10 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            haptic: 0,
+            haptics: crate::config::HapticsConfig {
+                haptic: 0,
+                ..Config::default().haptics
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -5953,7 +6014,10 @@ mod tests {
     #[test]
     fn empty_click_wire_pure() {
         let cfg = Config {
-            click_1: "empty".into(),
+            click: crate::config::ClickConfig {
+                click_1: "empty".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let (sinks, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
@@ -5972,7 +6036,10 @@ mod tests {
     #[test]
     fn none_click_wire_pure() {
         let cfg = Config {
-            click_1: "none".into(),
+            click: crate::config::ClickConfig {
+                click_1: "none".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let (sinks, haptic) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
@@ -5995,7 +6062,10 @@ mod tests {
         // turning one press into a character run) while the pointer node
         // carries touch framing only, never the combo codes.
         let cfg = Config {
-            click_1: "ctrl+c".into(),
+            click: crate::config::ClickConfig {
+                click_1: "ctrl+c".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let (sinks, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
@@ -6037,7 +6107,10 @@ mod tests {
         // the combo codes on extras (+ touch framing on the pointer node),
         // each paired down/up once.
         let cfg = Config {
-            click_1: "ctrl+refresh".into(),
+            click: crate::config::ClickConfig {
+                click_1: "ctrl+refresh".into(),
+                ..Config::default().click
+            },
             ..Config::default()
         };
         let (sinks, _) = drive_click_sequence(press_hold_release_liftoff(), &cfg);
@@ -6210,10 +6283,8 @@ mod tests {
         px.handle_frame_at(&armed, spaced_at(t0, 0)).unwrap();
         px.handle_frame_at(&armed, spaced_at(t0, 1)).unwrap();
         assert!(sinks.extras.has(EV_KEY, BTN_EXTRA, 1));
-        let off = Config {
-            force_offset: 0,
-            ..armed
-        };
+        let mut off = armed;
+        off.force.force_offset = 0;
         px.handle_frame_at(&off, spaced_at(t0, 2)).unwrap();
         px.handle_frame_at(&off, spaced_at(t0, 3)).unwrap();
         let got = wire_events(&sinks.pointer);
@@ -6329,7 +6400,10 @@ mod tests {
 
     fn slide_cfg() -> Config {
         Config {
-            slide_1: "left".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         }
     }
@@ -6339,27 +6413,38 @@ mod tests {
         slide.insert(5u8, 1u16);
         Config {
             enhanced_clicks: true,
-            polling_rate: 110,
-            sensitivity: 30,
-            margin: 5,
-            haptic: 2,
-            quiet_click: true,
-            speed: 100,
-            click_4: "none".into(),
-            click_5: "none".into(),
-            force_offset: 130,
-            force_haptic: Some(1),
-            force_quiet_click: false,
-            force_1: "super+left".into(),
-            force_2: "back".into(),
-            force_3: "forward".into(),
-            force_4: "alt+f4".into(),
-            force_5: "none".into(),
-            transition_mode: "cut".into(),
-            slide_5: "super+left".into(),
             spoof: crate::config::SpoofConfig {
                 slide,
                 ..Default::default()
+            },
+            device: crate::config::DeviceConfig { polling_rate: 110 },
+            pointer: crate::config::PointerConfig { speed: 100 },
+            click: crate::config::ClickConfig {
+                sensitivity: 30,
+                margin: 5,
+                click_4: "none".into(),
+                click_5: "none".into(),
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 2,
+                quiet_click: true,
+                force_haptic: Some(1),
+                force_quiet_click: false,
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 130,
+                force_1: "super+left".into(),
+                force_2: "back".into(),
+                force_3: "forward".into(),
+                force_4: "alt+f4".into(),
+                force_5: "none".into(),
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
+            slide: crate::config::SlideConfig {
+                slide_5: "super+left".into(),
+                ..Config::default().slide
             },
             ..Config::default()
         }
@@ -6386,10 +6471,13 @@ mod tests {
         for shared in [false, true] {
             let mut cfg: Config = toml::from_str(&format!(
                 r#"
+                schema_version = 1
+                [click]
                 sensitivity = 30
+                click_1 = {{ action = "super+left", stagger_ms = 100 }}
+                [force]
                 force_offset = 130
                 transition_mode = "continuous"
-                click_1 = {{ action = "super+left", stagger_ms = 100 }}
                 force_1 = {{ action = "ctrl+{}", stagger_ms = 50 }}
             "#,
                 if shared { "left" } else { "right" }
@@ -6409,7 +6497,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             px.handle_frame_at(&cfg, t0).unwrap();
             px.handle_frame_at(&cfg, ms_after(t0, 10)).unwrap();
-            cfg.force_offset = 0;
+            cfg.force.force_offset = 0;
             px.handle_frame_at(&cfg, ms_after(t0, 60)).unwrap();
             px.handle_frame_at(&cfg, ms_after(t0, 99)).unwrap();
             assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
@@ -6430,10 +6518,13 @@ mod tests {
     fn binding_timing_cut_cancels_first_pending_buttons_before_zero_override_floor() {
         let cfg: Config = toml::from_str(
             r#"
+            schema_version = 1
+            [click]
             sensitivity = 30
+            click_1 = { action = "super+left", stagger_ms = 50 }
+            [force]
             force_offset = 130
             transition_mode = "cut"
-            click_1 = { action = "super+left", stagger_ms = 50 }
             force_1 = { action = "ctrl+right", stagger_ms = 0 }
         "#,
         )
@@ -6481,20 +6572,24 @@ mod tests {
     fn binding_timing_session_teardown_cancels_explicit_overrides() {
         for level in ["click", "force", "slide"] {
             for teardown in ["disarm", "detach", "disconnect"] {
-                let cfg: Config = toml::from_str(&format!(
-                    r#"
-                    sensitivity = 30
-                    force_offset = 130
-                    {level}_1 = {{ action = "super+left", stagger_ms = 50 }}
-                    {}
-                "#,
-                    if level == "click" {
-                        ""
-                    } else {
-                        "click_1 = \"none\""
+                let mut cfg = Config::default();
+                cfg.click.sensitivity = 30;
+                cfg.force.force_offset = 130;
+                let binding = crate::config::ActionBinding {
+                    action: "super+left".into(),
+                    stagger_ms: Some(50),
+                };
+                match level {
+                    "click" => cfg.click.click_1 = binding,
+                    "force" => {
+                        cfg.click.click_1 = "none".into();
+                        cfg.force.force_1 = binding;
                     }
-                ))
-                .unwrap();
+                    _ => {
+                        cfg.click.click_1 = "none".into();
+                        cfg.slide.slide_1 = binding;
+                    }
+                }
                 let sinks = TestSinks::new();
                 let haptic = Arc::new(FakeHaptic::new());
                 let mut px = drive_ready_proxy(
@@ -6557,10 +6652,26 @@ mod tests {
                     "click" => "click_1",
                     _ => "force_1",
                 };
+                let transition = if path == "cut" { "cut" } else { "continuous" };
+                let click_part = if key == "click_1" {
+                    format!("{key} = {binding}")
+                } else if path != "cut" {
+                    "click_1 = \"none\"".to_string()
+                } else {
+                    String::new()
+                };
+                let force_part = if key == "force_1" {
+                    format!("{key} = {binding}")
+                } else {
+                    String::new()
+                };
+                let slide_part = if key == "slide_1" {
+                    format!("{key} = {binding}")
+                } else {
+                    String::new()
+                };
                 let mut cfg: Config = toml::from_str(&format!(
-                    "sensitivity = 30\nforce_offset = 130\n{key} = {binding}\ntransition_mode = \"{}\"\n{}",
-                    if path == "cut" { "cut" } else { "continuous" },
-                    if key != "click_1" && path != "cut" { "click_1 = \"none\"" } else { "" }
+                    "schema_version = 1\n[click]\nsensitivity = 30\n{click_part}\n[force]\nforce_offset = 130\ntransition_mode = \"{transition}\"\n{force_part}\n[slide]\n{slide_part}\n",
                 )).unwrap();
                 cfg.validate().unwrap();
                 let sinks = TestSinks::new();
@@ -6613,7 +6724,7 @@ mod tests {
                     );
                     if ms == 10 {
                         // A later config/edge cannot retime captured pending work.
-                        cfg.combo_stagger_ms = 500;
+                        cfg.force.combo_stagger_ms = 500;
                     }
                 }
                 px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
@@ -6649,9 +6760,22 @@ mod tests {
                 ("back", BTN_SIDE),
                 ("super+back", 125),
             ] {
+                let binding = format!("{{ action = \"{action}\", stagger_ms = 500 }}");
+                let (click_part, force_part, slide_part) = match level {
+                    "click" => (format!("click_1 = {binding}"), String::new(), String::new()),
+                    "force" => (
+                        "click_1 = \"none\"".to_string(),
+                        format!("force_1 = {binding}"),
+                        String::new(),
+                    ),
+                    _ => (
+                        "click_1 = \"none\"".to_string(),
+                        String::new(),
+                        format!("slide_1 = {binding}"),
+                    ),
+                };
                 let cfg: Config = toml::from_str(&format!(
-                    "sensitivity = 30\nforce_offset = 130\n{level}_1 = {{ action = \"{action}\", stagger_ms = 500 }}\n{}",
-                    if level == "click" { "" } else { "click_1 = \"none\"" }
+                    "schema_version = 1\n[click]\nsensitivity = 30\n{click_part}\n[force]\nforce_offset = 130\n{force_part}\n[slide]\n{slide_part}\n",
                 )).unwrap();
                 let sinks = TestSinks::new();
                 let haptic = Arc::new(FakeHaptic::new());
@@ -6686,10 +6810,13 @@ mod tests {
     fn binding_timing_independent_levels_keep_distinct_deadlines_and_shared_modifiers() {
         let cfg: Config = toml::from_str(
             r#"
+            schema_version = 1
+            [click]
             sensitivity = 30
+            click_1 = { action = "super+left", stagger_ms = 120 }
+            [force]
             force_offset = 130
             transition_mode = "continuous"
-            click_1 = { action = "super+left", stagger_ms = 120 }
             force_1 = { action = "super+right", stagger_ms = 50 }
         "#,
         )
@@ -6734,23 +6861,25 @@ mod tests {
     fn binding_timing_same_text_is_selected_by_real_or_spoofed_count() {
         for level in ["click", "force", "slide"] {
             for spoof in [false, true] {
+                let (click_part, force_part, slide_part) = match level {
+                    "click" => (
+                        "click_1 = { action = \"super+left\", stagger_ms = 0 }\nclick_2 = { action = \"super+left\", stagger_ms = 50 }".to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    "force" => (
+                        "click_2 = \"none\"".to_string(),
+                        "force_1 = { action = \"super+left\", stagger_ms = 0 }\nforce_2 = { action = \"super+left\", stagger_ms = 50 }".to_string(),
+                        String::new(),
+                    ),
+                    _ => (
+                        "click_2 = \"none\"".to_string(),
+                        String::new(),
+                        "slide_1 = { action = \"super+left\", stagger_ms = 0 }\nslide_2 = { action = \"super+left\", stagger_ms = 50 }".to_string(),
+                    ),
+                };
                 let cfg: Config = toml::from_str(&format!(
-                    r#"
-                    sensitivity = 30
-                    force_offset = 130
-                    {}
-                    {level}_1 = {{ action = "super+left", stagger_ms = 0 }}
-                    {level}_2 = {{ action = "super+left", stagger_ms = 50 }}
-                    [spoof.{level}]
-                    2 = 1
-                    [spoof]
-                    actions_follow_spoof = {spoof}
-                "#,
-                    if level == "click" {
-                        ""
-                    } else {
-                        "click_2 = \"none\""
-                    }
+                    "schema_version = 1\n[click]\nsensitivity = 30\n{click_part}\n[force]\nforce_offset = 130\n{force_part}\n[slide]\n{slide_part}\n[spoof]\nactions_follow_spoof = {spoof}\n[spoof.{level}]\n2 = 1\n",
                 ))
                 .unwrap();
                 let sinks = TestSinks::new();
@@ -6800,12 +6929,16 @@ mod tests {
         for force_delay in [0, 50, 500] {
             let cfg: Config = toml::from_str(&format!(
                 r#"
+                schema_version = 1
+                [click]
                 sensitivity = 30
+                click_1 = {{ action = "left+super", stagger_ms = 0 }}
+                [force]
                 force_offset = 130
                 transition_mode = "continuous"
-                slide_1 = {{ action = "super+left", stagger_ms = 120 }}
-                click_1 = {{ action = "left+super", stagger_ms = 0 }}
                 force_1 = {{ action = "ctrl+left", stagger_ms = {force_delay} }}
+                [slide]
+                slide_1 = {{ action = "super+left", stagger_ms = 120 }}
             "#
             ))
             .unwrap();
@@ -6847,8 +6980,12 @@ mod tests {
     #[test]
     fn binding_timing_lift_at_deadline_cancels_and_retouch_gets_fresh_deadline() {
         for lift_ms in [10, 50] {
-            let cfg: Config =
-                toml::from_str(r#"click_1 = { action = "super+left", stagger_ms = 50 }"#).unwrap();
+            let cfg: Config = toml::from_str(
+                r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+            )
+            .unwrap();
             let sinks = TestSinks::new();
             let haptic = Arc::new(FakeHaptic::new());
             let mut px = drive_ready_proxy(
@@ -6906,7 +7043,7 @@ mod tests {
         );
         let cfg = five_slide_cfg();
         assert!(!cfg.spoof.actions_follow_spoof);
-        assert_eq!(cfg.combo_stagger_ms, 50);
+        assert_eq!(cfg.force.combo_stagger_ms, 50);
         let t0 = std::time::Instant::now();
         let ev = px.handle_frame_at(&cfg, t0).unwrap().unwrap();
         assert!(ev.is_slide());
@@ -6957,11 +7094,9 @@ mod tests {
             );
             px.set_pump_ready(true);
             px.attach(&usb_ready("/dev/hidraw1"));
-            let cfg = Config {
-                combo_stagger_ms: delay,
-                slide_5: "left+super".into(),
-                ..five_slide_cfg()
-            };
+            let mut cfg = five_slide_cfg();
+            cfg.force.combo_stagger_ms = delay;
+            cfg.slide.slide_5 = "left+super".into();
             let t0 = std::time::Instant::now();
             px.handle_frame_at(&cfg, t0).unwrap();
             if delay > 0 {
@@ -6990,10 +7125,8 @@ mod tests {
             let sinks = TestSinks::new();
             let haptic = Arc::new(FakeHaptic::new());
             let mut px = drive_ready_proxy(&sinks, &haptic, vec![slide_report(5, 10, 0)]);
-            let cfg = Config {
-                slide_5: action.into(),
-                ..five_slide_cfg()
-            };
+            let mut cfg = five_slide_cfg();
+            cfg.slide.slide_5 = action.into();
             px.handle_frame_at(&cfg, std::time::Instant::now()).unwrap();
             match action {
                 "super+a" => {
@@ -7084,10 +7217,8 @@ mod tests {
             &haptic,
             vec![slide_report(5, 10, 0), slide_report(5, 60, 0)],
         );
-        let cfg = Config {
-            click_5: "super+right".into(),
-            ..five_slide_cfg()
-        };
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = "super+right".into();
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, t0).unwrap();
         // A different action gets its normal immediate click behavior,
@@ -7116,10 +7247,8 @@ mod tests {
                 slide_report(5, 10, 0),
             ],
         );
-        let cfg = Config {
-            slide_4: "alt+right".into(),
-            ..five_slide_cfg()
-        };
+        let mut cfg = five_slide_cfg();
+        cfg.slide.slide_4 = "alt+right".into();
         let t0 = std::time::Instant::now();
         for ms in [0, 20, 40] {
             px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
@@ -7145,12 +7274,10 @@ mod tests {
             &haptic,
             vec![slide_report(5, 10, 0), slide_report(4, 10, 0)],
         );
-        let cfg = Config {
-            slide_4: crate::config::ActionBinding {
-                action: "left+super".into(),
-                stagger_ms: Some(0),
-            },
-            ..five_slide_cfg()
+        let mut cfg = five_slide_cfg();
+        cfg.slide.slide_4 = crate::config::ActionBinding {
+            action: "left+super".into(),
+            stagger_ms: Some(0),
         };
         let t0 = std::time::Instant::now();
         px.handle_frame_at(&cfg, t0).unwrap();
@@ -7200,10 +7327,8 @@ mod tests {
             let sinks = TestSinks::new();
             let haptic = Arc::new(FakeHaptic::new());
             let mut px = drive_ready_proxy(&sinks, &haptic, vec![slide_report(5, 10, 0)]);
-            let cfg = Config {
-                click_5: "left+super".into(),
-                ..five_slide_cfg()
-            };
+            let mut cfg = five_slide_cfg();
+            cfg.click.click_5 = "left+super".into();
             let t0 = std::time::Instant::now();
             px.handle_frame_at(&cfg, t0).unwrap();
             if handoff_at > 50 {
@@ -7239,10 +7364,8 @@ mod tests {
                 slide_report(0, 0, 0),
             ],
         );
-        let cfg = Config {
-            click_5: "super+left".into(),
-            ..five_slide_cfg()
-        };
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = "super+left".into();
         let t0 = std::time::Instant::now();
         for ms in [0, 10, 11, 50, 100] {
             px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
@@ -7274,10 +7397,8 @@ mod tests {
                 &haptic,
                 vec![slide_report(5, 10, 0), slide_report(5, 60, 0), lifted],
             );
-            let cfg = Config {
-                click_5: "super+left".into(),
-                ..five_slide_cfg()
-            };
+            let mut cfg = five_slide_cfg();
+            cfg.click.click_5 = "super+left".into();
             let t0 = std::time::Instant::now();
             for ms in [0, 10, 15] {
                 px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
@@ -7328,10 +7449,8 @@ mod tests {
                 slide_report(5, 60, 0),
             ],
         );
-        let cfg = Config {
-            click_5: "super+left".into(),
-            ..five_slide_cfg()
-        };
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = "super+left".into();
         let t0 = std::time::Instant::now();
         for ms in [0, 10, 15, 20, 49] {
             px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
@@ -7362,11 +7481,9 @@ mod tests {
                 &haptic,
                 vec![slide_report(5, 60, 0), slide_report(5, 200, 0)],
             );
-            let cfg = Config {
-                click_5: "super+left".into(),
-                force_5: "super+left".into(),
-                ..five_slide_cfg()
-            };
+            let mut cfg = five_slide_cfg();
+            cfg.click.click_5 = "super+left".into();
+            cfg.force.force_5 = "super+left".into();
             let t0 = std::time::Instant::now();
             for ms in [0, 10] {
                 px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
@@ -7442,11 +7559,9 @@ mod tests {
                 slide_report(5, 200, 0),
             ],
         );
-        let cfg = Config {
-            click_5: "super+left".into(),
-            force_5: "super+left".into(),
-            ..five_slide_cfg()
-        };
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = "super+left".into();
+        cfg.force.force_5 = "super+left".into();
         let t0 = std::time::Instant::now();
         for ms in [0, 10, 20, 24] {
             px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
@@ -7481,31 +7596,27 @@ mod tests {
                 slide_report(5, 200, 0),
             ],
         );
-        let cfg = Config {
-            click_5: crate::config::ActionBinding {
-                action: "super+left".into(),
-                stagger_ms: Some(0),
-            },
-            force_5: crate::config::ActionBinding {
-                action: "ctrl+left".into(),
-                stagger_ms: Some(50),
-            },
-            transition_mode: "continuous".into(),
-            slide_5: crate::config::ActionBinding {
-                action: "super+left".into(),
-                stagger_ms: Some(120),
-            },
-            ..five_slide_cfg()
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = crate::config::ActionBinding {
+            action: "super+left".into(),
+            stagger_ms: Some(0),
+        };
+        cfg.force.force_5 = crate::config::ActionBinding {
+            action: "ctrl+left".into(),
+            stagger_ms: Some(50),
+        };
+        cfg.force.transition_mode = "continuous".into();
+        cfg.slide.slide_5 = crate::config::ActionBinding {
+            action: "super+left".into(),
+            stagger_ms: Some(120),
         };
         let t0 = std::time::Instant::now();
         for ms in [0, 10, 20] {
             px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
         }
         assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
-        let disarmed = Config {
-            force_offset: 0,
-            ..cfg.clone()
-        };
+        let mut disarmed = cfg.clone();
+        disarmed.force.force_offset = 0;
         px.handle_frame_at(&disarmed, ms_after(t0, 40)).unwrap();
         assert_eq!(key_values(&sinks.extras, 29), vec![1, 0]);
         px.handle_frame_at(&disarmed, ms_after(t0, 119)).unwrap();
@@ -7612,8 +7723,14 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            slide_1: "left".into(),
-            click_1: "right".into(),
+            click: crate::config::ClickConfig {
+                click_1: "right".into(),
+                ..Config::default().click
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
@@ -7675,8 +7792,8 @@ mod tests {
         assert_eq!(transitions(&left), 1);
         // One down-pulse / one up-pulse, both from the absorbed press (the
         // slide edge stays silent; the handoff press fires its own pulse).
-        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
-        assert_eq!(haptic.releases.lock().unwrap().as_slice(), &[(64, false)]);
+        assert_eq!(haptic.calls.lock().unwrap().as_slice(), &[(30, 2, true)]);
+        assert_eq!(haptic.releases.lock().unwrap().as_slice(), &[(30, true)]);
     }
 
     #[test]
@@ -7695,8 +7812,11 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            slide_1: "left".into(),
-            slide_2: "left".into(),
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                slide_2: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -7728,8 +7848,14 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            slide_1: "left+ctrl".into(),
-            click_1: "ctrl+left".into(),
+            click: crate::config::ClickConfig {
+                click_1: "ctrl+left".into(),
+                ..Config::default().click
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left+ctrl".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -7766,13 +7892,22 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            slide_1: "left".into(),
-            click_1: "left".into(),
-            force_1: "right".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "right".into(),
+                force_offset: 20,
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -7822,12 +7957,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "empty".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "empty".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -7838,7 +7979,7 @@ mod tests {
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
         assert_eq!(
             haptic.calls.lock().unwrap().as_slice(),
-            &[(64, 5, false), (64, 5, false)]
+            &[(64, 2, true), (64, 2, false)]
         );
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
@@ -7859,12 +8000,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         assert!(!cfg.is_cut_transition());
@@ -7897,12 +8044,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -7979,12 +8132,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "forward".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "forward".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8018,12 +8177,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8075,13 +8240,19 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 30,
-            margin: 5,
-            force_offset: 130,
-            transition_mode: "cut".into(),
-            combo_stagger_ms: 0,
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 30,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 130,
+                transition_mode: "cut".into(),
+                combo_stagger_ms: 0,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8141,12 +8312,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8201,13 +8378,19 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
-            combo_stagger_ms: 0,
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                combo_stagger_ms: 0,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8236,13 +8419,19 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
-            combo_stagger_ms: 120,
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                combo_stagger_ms: 120,
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8292,12 +8481,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8359,12 +8554,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8440,12 +8641,18 @@ mod tests {
         px.set_pump_ready(true);
         px.attach(&usb_ready("/dev/hidraw1"));
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "super+left".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "super+left".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8489,12 +8696,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "cut".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         let t0 = std::time::Instant::now();
@@ -8555,12 +8768,18 @@ mod tests {
         ];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         let cfg = Config {
-            click_1: "left".into(),
-            force_1: "left+super".into(),
-            sensitivity: 64,
-            margin: 5,
-            force_offset: 20,
-            transition_mode: "continuous".into(),
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "left+super".into(),
+                force_offset: 20,
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
             ..Config::default()
         };
         assert!(!cfg.is_cut_transition());
@@ -8592,12 +8811,18 @@ mod tests {
             ];
             let mut px = drive_ready_proxy(&sinks, &haptic, frames);
             let cfg = Config {
-                click_1: "left".into(),
-                force_1: force.into(),
-                sensitivity: 64,
-                margin: 5,
-                force_offset: 20,
-                transition_mode: "cut".into(),
+                click: crate::config::ClickConfig {
+                    click_1: "left".into(),
+                    sensitivity: 64,
+                    margin: 5,
+                    ..Config::default().click
+                },
+                force: crate::config::ForceConfig {
+                    force_1: force.into(),
+                    force_offset: 20,
+                    transition_mode: "cut".into(),
+                    ..Config::default().force
+                },
                 ..Config::default()
             };
             let t0 = std::time::Instant::now();
@@ -8635,10 +8860,13 @@ mod tests {
         let mut click = std::collections::BTreeMap::new();
         click.insert(2u8, 3u16);
         let cfg = Config {
-            click_2: "right".into(),
             spoof: crate::config::SpoofConfig {
                 click,
                 ..Default::default()
+            },
+            click: crate::config::ClickConfig {
+                click_2: "right".into(),
+                ..Config::default().click
             },
             ..Config::default()
         };
@@ -8671,12 +8899,15 @@ mod tests {
         let mut click = std::collections::BTreeMap::new();
         click.insert(2u8, 3u16);
         let cfg = Config {
-            click_2: "right".into(),
-            click_3: "middle".into(),
             spoof: crate::config::SpoofConfig {
                 click,
                 actions_follow_spoof: true,
                 ..Default::default()
+            },
+            click: crate::config::ClickConfig {
+                click_2: "right".into(),
+                click_3: "middle".into(),
+                ..Config::default().click
             },
             ..Config::default()
         };
@@ -8697,10 +8928,13 @@ mod tests {
         let mut slide = std::collections::BTreeMap::new();
         slide.insert(1u8, 2u16);
         let cfg = Config {
-            slide_1: "left".into(),
             spoof: crate::config::SpoofConfig {
                 slide,
                 ..Default::default()
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "left".into(),
+                ..Config::default().slide
             },
             ..Config::default()
         };
