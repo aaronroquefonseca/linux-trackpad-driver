@@ -94,13 +94,13 @@
 //!   force; omission preserves their immediate behavior.
 //!   A press edge hands off: identical slide/press key sets merge with no
 //!   wire flutter, differing sets release slide keys first (one SYN).
-//! - Finger-count spoofing (`spoof_<slide|click|force>_<1..5>`, `0` =
-//!   passthrough): the touch frame (slots, `BTN_TOOL_*`, `BTN_TOUCH`) is
-//!   built from virtual contacts ([`crate::clicks::spoof_contacts`]) under
-//!   whichever status holds (force > first > slide-or-idle-touch). Key
-//!   selection still uses the real count unless `spoof_select = true`.
-//!   Defaults are all passthrough: the wire is byte-identical unless opted
-//!   in.
+//! - Finger-count spoofing (`[spoof.slide]` / `[spoof.click]` /
+//!   `[spoof.force]` sparse tables, omitted = passthrough): the touch
+//!   frame (slots, `BTN_TOOL_*`, `BTN_TOUCH`) is built from virtual
+//!   contacts ([`crate::clicks::spoof_contacts`]) under whichever status
+//!   holds (force > first > slide-or-idle-touch). Key selection still
+//!   uses the real count unless `[spoof] select = true`. Defaults are
+//!   all passthrough: the wire is byte-identical unless opted in.
 //! - Shared codes across levels (`ctrl` in both chords, `left` in both maps)
 //!   are reference-held: down once, retained while either level holds, a
 //!   single up on final release — no phantom release+press mid-hold.
@@ -1498,8 +1498,8 @@ where
     /// inside the 0..253 / 0..1020 axis ranges.
     ///
     /// Spoofing: the emitted contacts follow the live status map (force
-    /// held → `spoof_force_*`, first held → `spoof_click_*`, otherwise
-    /// `spoof_slide_*`) via [`clicks::spoof_contacts`]. All maps default
+    /// held → `[spoof.force]`, first held → `[spoof.click]`, otherwise
+    /// `[spoof.slide]`) via [`clicks::spoof_contacts`]. All maps default
     /// to passthrough, so the frame below is the real one unless opted in.
     fn emit_touch_frame(&mut self, frame: &TouchFrame, cfg: &Config) {
         use std::borrow::Cow;
@@ -6330,6 +6330,8 @@ mod tests {
     }
 
     fn five_slide_cfg() -> Config {
+        let mut slide = std::collections::BTreeMap::new();
+        slide.insert(5u8, 1u16);
         Config {
             enhanced_clicks: true,
             polling_rate: 110,
@@ -6350,7 +6352,10 @@ mod tests {
             force_5: "none".into(),
             transition_mode: "cut".into(),
             slide_5: "super+left".into(),
-            spoof_slide_5: 1,
+            spoof: crate::config::SpoofConfig {
+                slide,
+                ..Default::default()
+            },
             ..Config::default()
         }
     }
@@ -6726,11 +6731,13 @@ mod tests {
                     r#"
                     sensitivity = 30
                     force_offset = 130
+                    {}
                     {level}_1 = {{ action = "super+left", stagger_ms = 0 }}
                     {level}_2 = {{ action = "super+left", stagger_ms = 50 }}
-                    spoof_{level}_2 = 1
-                    spoof_select = {spoof}
-                    {}
+                    [spoof.{level}]
+                    2 = 1
+                    [spoof]
+                    select = {spoof}
                 "#,
                     if level == "click" {
                         ""
@@ -6890,7 +6897,7 @@ mod tests {
             ],
         );
         let cfg = five_slide_cfg();
-        assert!(!cfg.spoof_select);
+        assert!(!cfg.spoof.select);
         assert_eq!(cfg.combo_stagger_ms, 50);
         let t0 = std::time::Instant::now();
         let ev = px.handle_frame_at(&cfg, t0).unwrap().unwrap();
@@ -8605,7 +8612,7 @@ mod tests {
 
     #[test]
     fn spoof_wire_reports_virtual_count_selection_stays_real() {
-        // spoof_click_2 = 3: two real fingers press click_2 (right), but
+        // [spoof.click] 2 = 3: two real fingers press click_2 (right), but
         // the wire carries three contacts (TRIPLETAP, three slots).
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
@@ -8614,9 +8621,14 @@ mod tests {
             0,
         )))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let mut click = std::collections::BTreeMap::new();
+        click.insert(2u8, 3u16);
         let cfg = Config {
             click_2: "right".into(),
-            spoof_click_2: 3,
+            spoof: crate::config::SpoofConfig {
+                click,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
@@ -8637,7 +8649,7 @@ mod tests {
 
     #[test]
     fn spoof_select_switches_wire_and_action_together() {
-        // spoof_select = true: the spoofed count also selects click_3.
+        // [spoof] select = true: the spoofed count also selects click_3.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(
@@ -8645,11 +8657,16 @@ mod tests {
             0,
         )))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let mut click = std::collections::BTreeMap::new();
+        click.insert(2u8, 3u16);
         let cfg = Config {
             click_2: "right".into(),
             click_3: "middle".into(),
-            spoof_click_2: 3,
-            spoof_select: true,
+            spoof: crate::config::SpoofConfig {
+                click,
+                select: true,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();
@@ -8666,9 +8683,14 @@ mod tests {
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0)))];
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let mut slide = std::collections::BTreeMap::new();
+        slide.insert(1u8, 2u16);
         let cfg = Config {
             slide_1: "left".into(),
-            spoof_slide_1: 2,
+            spoof: crate::config::SpoofConfig {
+                slide,
+                ..Default::default()
+            },
             ..Config::default()
         };
         let ev = px.handle_frame(&cfg).unwrap().unwrap();

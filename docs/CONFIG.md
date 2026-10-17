@@ -55,27 +55,16 @@ restart.
 | `slide_3` | string or action object | see Action values | `"none"` | 3-finger slide action (same handoff/release semantics as `slide_1`). |
 | `slide_4` | string or action object | see Action values | `"none"` | 4-finger slide action (same handoff/release semantics as `slide_1`). |
 | `slide_5` | string or action object | see Action values | `"none"` | 5-finger slide action (same handoff/release semantics as `slide_1`). |
-| `spoof_slide_1` | integer | `0..=5` (`0` = passthrough) | `0` | Virtual finger count the computer sees when 1 finger really touches while sliding (no press latch). `0` = report the real count. Virtual contacts keep the real centroid with the requested count on a tiny fixed pattern (pair ±18 x, 3+ evenly on a 24-unit ring). Slots, `BTN_TOOL_*`, and `BTN_TOUCH` follow the virtual count; action selection still uses the real count unless `spoof_select = true`. |
-| `spoof_slide_2` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 2 while sliding. |
-| `spoof_slide_3` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 3 while sliding. |
-| `spoof_slide_4` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 4 while sliding. |
-| `spoof_slide_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_slide_1`, for a real count of 5 while sliding. |
-| `spoof_click_1` | integer | `0..=5` (`0` = passthrough) | `0` | Virtual finger count the computer sees when 1 finger really touches under a standard press latch (same pattern/selection rules as `spoof_slide_1`). E.g. `spoof_click_2 = 3`: a real two-finger press reports three contacts. |
-| `spoof_click_2` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 2 under a standard press latch. |
-| `spoof_click_3` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 3 under a standard press latch. |
-| `spoof_click_4` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 4 under a standard press latch. |
-| `spoof_click_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_click_1`, for a real count of 5 under a standard press latch. |
-| `spoof_force_1` | integer | `0..=5` (`0` = passthrough) | `0` | Virtual finger count the computer sees when 1 finger really touches while the force level holds (same pattern/selection rules as `spoof_slide_1`). |
-| `spoof_force_2` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 2 while the force level holds. |
-| `spoof_force_3` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 3 while the force level holds. |
-| `spoof_force_4` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 4 while the force level holds. |
-| `spoof_force_5` | integer | `0..=5` (`0` = passthrough) | `0` | Same as `spoof_force_1`, for a real count of 5 while the force level holds. |
-| `spoof_select` | bool | `true\|false` | `false` | When `true`, `click_N`/`force_N`/`slide_N` selection uses the spoofed count instead of the real one (the edge's finger count reports it too). `false` (default): spoofing only changes what the computer sees, never which action fires. |
+| `spoof` | table | sparse `[spoof.slide]` / `[spoof.click]` / `[spoof.force]` maps + `select` bool | empty (= all passthrough) | Parent table for finger-count spoofing (what the computer sees). Set only needed rows; omitted rows are passthrough (report the real count). Virtual contacts keep the real centroid with the requested count on a tiny fixed pattern (pair ±18 x, 3+ evenly on a 24-unit ring). Slots, `BTN_TOOL_*`, and `BTN_TOUCH` follow the virtual count. |
+| `spoof.slide` | map `1..=5 → 0..=5` (`0` = passthrough) | real → virtual count | empty | Virtual finger count the computer sees while sliding (no press latch). E.g. `[spoof.slide]` with `2 = 3`: a real two-finger slide reports three contacts. Action selection still uses the real count unless `spoof.select = true`. |
+| `spoof.click` | map `1..=5 → 0..=5` (`0` = passthrough) | real → virtual count | empty | Virtual finger count the computer sees under a standard press latch (same pattern/selection rules as `spoof.slide`). E.g. `[spoof.click]` with `2 = 3`: a real two-finger press reports three contacts. |
+| `spoof.force` | map `1..=5 → 0..=5` (`0` = passthrough) | real → virtual count | empty | Virtual finger count the computer sees while the force level holds (same pattern/selection rules as `spoof.slide`). |
+| `spoof.select` | bool | `true\|false` | `false` | When `true`, `click_N`/`force_N`/`slide_N` selection uses the spoofed count instead of the real one (the edge's finger count reports it too). `false` (default): spoofing only changes what the computer sees, never which action fires. |
 | `transition_mode` | string enum | `continuous\|cut` | `"continuous"` | Force-edge behavior over an active click. `continuous` (default, current behavior): level-1 keys stay held, force keys join (shared codes down once, up once). `cut`: release ALL level-1/slide wire keys first (with SYN), then press the force combo fresh — shared codes show up+SYN+down, so `force_1 = left+super` starts a window drag instead of extending a held left; easing back below the force release re-presses the still-latched level-1 keys. Cut intentionally releases and restarts `LEFT` even while the physical button remains held. A force edge that absorbs a same-action slide handoff skips the cut (seamless merge wins for that frame). Tradeoff: continuous keeps drags alive across the force edge; cut restarts the gesture (dumb consumers may read the shared-code flutter as click-release-click). |
 | `combo_stagger_ms` | integer (ms) | `0..=500` | `50` | Fallback gap for fresh mixed slides and cut-force fresh presses when the selected binding omits `stagger_ms`. Extras go down + SYN, then pointer buttons after the gap. Deadlines advance on idle polls; contacts/motion keep flowing. `0` means no timed wait. Cut retains its separate 5 ms release floor. Ordinary clicks, continuous force and single-group actions stay immediate unless a mixed binding explicitly overrides timing. See Per-binding timing. |
 
 For a silent five-finger window drag, use `slide_5 = "super+left"`,
-`spoof_slide_5 = 1`, `spoof_select = false`, `click_5 = "none"`, and
+`[spoof.slide]` with `5 = 1`, `[spoof] select = false`, `click_5 = "none"`, and
 `force_5 = "none"`. Real five fingers select the action while one contact
 is emitted; Super is reported before left by `combo_stagger_ms` (default
 50 ms). Slide down/release never request haptics. Pressing through the
@@ -89,7 +78,7 @@ hold and deadline, including when the button has not yet landed.
 
 - `false` (default): device works via init alone — plain kernel/libinput
   passthrough. The proxy still subscribes but short-circuits to passthrough;
-  all `click_*` / `force_*` / `slide_*` / `spoof_*` / `sensitivity` /
+  all `click_*` / `force_*` / `slide_*` / `[spoof]` / `sensitivity` /
   `margin` / `haptic` / `quiet_click` / `speed` / `transition_mode` tuning
   is parsed but **not acted on**.
 - `true`: proxy grabs the physical node once the pump is ready (real
@@ -128,7 +117,7 @@ force_4 = "alt+f4"
 ```
 
 These bindings can use the same key string with different timing. The selected
-real/virtual finger count (according to `spoof_select`) selects **both** action
+real/virtual finger count (according to `[spoof] select`) selects **both** action
 and timing. No Apple-specific section or nested configuration is needed.
 
 - **Positive override:** a fresh mixed action reports its extras group
@@ -238,9 +227,11 @@ force_offset = 20
 force_1 = "left+super"
 slide_1 = "left"
 slide_2 = "middle"
-spoof_click_2 = 3
 transition_mode = "cut"
 combo_stagger_ms = 50
+
+[spoof.click]
+2 = 3
 ```
 
 ### Opt-in flat-config use cases
@@ -313,8 +304,12 @@ force_3 = "forward"
 force_4 = "alt+f4"
 force_5 = "none"
 slide_5 = { action = "super+left", stagger_ms = 50 }
-spoof_slide_5 = 1
-spoof_select = false
+
+[spoof.slide]
+5 = 1
+
+[spoof]
+select = false
 ```
 
 Force-drag starts from a window's interior by holding Super before left; cut
