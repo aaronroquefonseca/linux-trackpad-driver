@@ -517,9 +517,12 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         Ok(devs) => {
             log::info!("found {} trackpad node(s)", devs.len());
             for dev in &devs {
-                if let Err(e) =
-                    init_node_with_config(dev, cfg.device.polling_rate, cfg.enhanced_clicks, &ready_hub)
-                {
+                if let Err(e) = init_node_with_config(
+                    dev,
+                    cfg.device.polling_rate,
+                    cfg.enhanced_clicks,
+                    &ready_hub,
+                ) {
                     log::error!("init failed for {}: {e:#}", dev.devnode);
                 }
             }
@@ -886,7 +889,12 @@ impl ResumeWatch {
         for dev in &current {
             let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
                 debug_assert!(_added.iter().any(|d| d.devnode == dev.devnode));
-                match init_node_with_config(dev, cfg.device.polling_rate, cfg.enhanced_clicks, ready_hub) {
+                match init_node_with_config(
+                    dev,
+                    cfg.device.polling_rate,
+                    cfg.enhanced_clicks,
+                    ready_hub,
+                ) {
                     Ok(_) => {
                         log::info!("resume tick: initialized newly appeared {}", dev.devnode);
                         actions.push(TickAction::Initialized(dev.devnode.clone()));
@@ -948,8 +956,12 @@ impl ResumeWatch {
             } else {
                 self.known[pos].unreadable_streak = 0;
             }
-            match resume::resume_usb_node(&dev.devnode, cfg.device.polling_rate, Some(ready_hub), &verify)
-            {
+            match resume::resume_usb_node(
+                &dev.devnode,
+                cfg.device.polling_rate,
+                Some(ready_hub),
+                &verify,
+            ) {
                 Ok(resume::ResumeAction::Reinitialized) => {
                     actions.push(TickAction::Reinitialized(dev.devnode.clone()))
                 }

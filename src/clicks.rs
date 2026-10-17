@@ -1398,7 +1398,6 @@ mod tests {
                 quiet_click: true,
                 force_haptic: Some(1),
                 force_quiet_click: false,
-                ..Config::default().haptics
             },
             force: crate::config::ForceConfig {
                 force_offset: 130,

@@ -3139,10 +3139,7 @@ mod tests {
         let mut px = drive_ready_proxy(&sinks, &haptic, frames);
         // Speed is a single source: the per-frame Config, not a snapshot.
         let cfg = Config {
-            pointer: crate::config::PointerConfig {
-                speed: 200,
-                ..Config::default().pointer
-            },
+            pointer: crate::config::PointerConfig { speed: 200 },
             ..Config::default()
         };
         px.handle_frame(&cfg).unwrap();
@@ -4577,7 +4574,6 @@ mod tests {
                 quiet_click: true,
                 force_haptic: Some(1),
                 force_quiet_click: false,
-                ..Config::default().haptics
             },
             force: crate::config::ForceConfig {
                 force_offset: 130,
@@ -6421,14 +6417,8 @@ mod tests {
                 slide,
                 ..Default::default()
             },
-            device: crate::config::DeviceConfig {
-                polling_rate: 110,
-                ..Config::default().device
-            },
-            pointer: crate::config::PointerConfig {
-                speed: 100,
-                ..Config::default().pointer
-            },
+            device: crate::config::DeviceConfig { polling_rate: 110 },
+            pointer: crate::config::PointerConfig { speed: 100 },
             click: crate::config::ClickConfig {
                 sensitivity: 30,
                 margin: 5,
@@ -6441,7 +6431,6 @@ mod tests {
                 quiet_click: true,
                 force_haptic: Some(1),
                 force_quiet_click: false,
-                ..Config::default().haptics
             },
             force: crate::config::ForceConfig {
                 force_offset: 130,
