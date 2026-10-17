@@ -99,7 +99,8 @@
 //!   frame (slots, `BTN_TOOL_*`, `BTN_TOUCH`) is built from virtual
 //!   contacts ([`crate::clicks::spoof_contacts`]) under whichever status
 //!   holds (force > first > slide-or-idle-touch). Key selection still
-//!   uses the real count unless `[spoof] select = true`. Defaults are
+//!   uses the real count (default, recommended) unless
+//!   `[spoof] actions_follow_spoof = true`. Defaults are
 //!   all passthrough: the wire is byte-identical unless opted in.
 //! - Shared codes across levels (`ctrl` in both chords, `left` in both maps)
 //!   are reference-held: down once, retained while either level holds, a
@@ -6737,7 +6738,7 @@ mod tests {
                     [spoof.{level}]
                     2 = 1
                     [spoof]
-                    select = {spoof}
+                    actions_follow_spoof = {spoof}
                 "#,
                     if level == "click" {
                         ""
@@ -6897,7 +6898,7 @@ mod tests {
             ],
         );
         let cfg = five_slide_cfg();
-        assert!(!cfg.spoof.select);
+        assert!(!cfg.spoof.actions_follow_spoof);
         assert_eq!(cfg.combo_stagger_ms, 50);
         let t0 = std::time::Instant::now();
         let ev = px.handle_frame_at(&cfg, t0).unwrap().unwrap();
@@ -8648,8 +8649,8 @@ mod tests {
     }
 
     #[test]
-    fn spoof_select_switches_wire_and_action_together() {
-        // [spoof] select = true: the spoofed count also selects click_3.
+    fn spoof_actions_follow_spoof_switches_wire_and_action_together() {
+        // [spoof] actions_follow_spoof = true: the spoofed count also selects click_3.
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
         let frames = vec![Ok(Some(frame(
@@ -8664,7 +8665,7 @@ mod tests {
             click_3: "middle".into(),
             spoof: crate::config::SpoofConfig {
                 click,
-                select: true,
+                actions_follow_spoof: true,
                 ..Default::default()
             },
             ..Config::default()
