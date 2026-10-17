@@ -171,7 +171,8 @@ jobs:
           done
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
           useradd -m builder
-          chown -R builder:builder "$GITHUB_WORKSPACE" "${RUNNER_TEMP:-/tmp}"
+          # Workspace only: never chown RUNNER_TEMP/tmp (runner internals).
+          chown -R builder:builder "$GITHUB_WORKSPACE"
           # shellcheck disable=SC2016 # $0..$4 expand in the su'd shell, not here.
           su builder -s /bin/bash -c 'cd "$0" && packaging/arch/render-aur.sh \
             --version "$1" \

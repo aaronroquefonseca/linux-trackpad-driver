@@ -315,4 +315,19 @@ for name, wf, job in (("stable", stable, "push"), ("git", gitwf, "snapshot")):
         and maps[0]["step"].startswith("push"),
     )
 
+# --- ownership boundary: render steps must never chown runner internals ---
+for wf_name in ("aur-git", "aur-stable"):
+    text = (WF / f"{wf_name}.yml").read_text()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if "chown" not in line or line.startswith("#"):
+            continue
+        check(
+            f"{wf_name} chown stays inside workspace",
+            "RUNNER_TEMP" not in line
+            and "/tmp" not in line
+            and "$TMP" not in line
+            and "TMPDIR" not in line,
+        )
+
 print("workflow-auth: all contract checks passed")
