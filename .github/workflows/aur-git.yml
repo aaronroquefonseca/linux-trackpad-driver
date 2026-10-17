@@ -43,12 +43,18 @@ concurrency:
 
 jobs:
   snapshot:
+    # Execution trust before checkout: the helper below runs from the
+    # checkout, so a branch-owned replacement must never execute, let alone
+    # authorize the push. Both main pushes and main manual retries pass.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     container:
       image: archlinux:base
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Exact main-event revision (push tip or main dispatch tip).
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
       - id: gate
@@ -104,7 +110,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: push -git repo (master, append-only)
-        if: steps.gate.outputs.publish == 'true'
+        # Credentialed step: independently re-enforces main ref, toggle, and
+        # the trusted publish signal. A replaced branch helper can neither
+        # execute (job skipped off-main) nor self-authorize here.
+        if: >-
+          steps.gate.outputs.publish == 'true' &&
+          github.ref == 'refs/heads/main' &&
+          vars.ENABLE_AUR_GIT == 'true' &&
+          (github.event_name == 'push' || inputs.publish == true)
         env:
           # Secret is scoped to this gated step only: metadata generation
           # above never sees publication credentials.

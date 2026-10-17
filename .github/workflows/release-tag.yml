@@ -230,6 +230,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Exact tagged commit from preflight (never the dispatch branch):
+          # write-token steps only execute trusted release code.
+          ref: ${{ needs.preflight.outputs.commit }}
           persist-credentials: false
           fetch-depth: 1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

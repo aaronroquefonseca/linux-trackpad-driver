@@ -44,17 +44,27 @@ concurrency:
 
 jobs:
   verify:
+    # Execution trust before any checkout or script: manual dispatches run
+    # only on main. The release.published path stays allowed — its artifacts
+    # still face the commit binding + main ancestry checks below. Artifact
+    # ancestry alone never authorizes the execution tree.
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.gate.outputs.tag }}
       version: ${{ steps.gate.outputs.version }}
       commit: ${{ steps.gate.outputs.commit }}
+      exec-sha: ${{ steps.gate.outputs.exec-sha }}
       bin-x86: ${{ steps.gate.outputs.bin-x86 }}
       bin-aarch64: ${{ steps.gate.outputs.bin-aarch64 }}
       source-sha: ${{ steps.gate.outputs.source-sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Trusted execution tree (main), never the dispatch ref and never
+          # the validated artifact tag commit: code trust and artifact trust
+          # are separate boundaries.
+          ref: main
           persist-credentials: false
           # Full history: the ancestry check pins the release commit to main.
           fetch-depth: 0
@@ -113,6 +123,7 @@ jobs:
             echo "tag=$tag"
             echo "version=$version"
             echo "commit=$commit"
+            echo "exec-sha=$(git rev-parse HEAD)"
             echo "bin-x86=$bin_x86"
             echo "bin-aarch64=$bin_arm"
             echo "source-sha=$source_sha"
@@ -131,12 +142,15 @@ jobs:
 
   render:
     needs: verify
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     container:
       image: archlinux:base
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Exact execution tree recorded by verify, not the event ref.
+          ref: ${{ needs.verify.outputs.exec-sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -183,26 +197,26 @@ jobs:
 
   push:
     needs: [verify, render]
-    # Explicit arming: needs the repo variable AND a trusted publish signal
-    # (release.published event, or a manual dispatch with publish=true that
-    # re-verified the release is already public). Everything else stops at
-    # verify/render artifacts.
+    # Credentialed job: independently requires the toggle AND a trusted
+    # publish signal (release event, or a main-ref manual dispatch with
+    # publish=true). Helper outputs alone never authorize this job.
     if: >-
       vars.ENABLE_AUR_STABLE == 'true' &&
+      needs.verify.outputs.tag != '' &&
       (github.event_name == 'release' ||
-       inputs.publish == true) &&
-      needs.verify.outputs.tag != ''
+       (github.ref == 'refs/heads/main' && inputs.publish == true))
     runs-on: ubuntu-latest
     container:
       image: archlinux:base
     env:
-      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
       TAG: ${{ needs.verify.outputs.tag }}
       VERSION: ${{ needs.verify.outputs.version }}
       COMMIT: ${{ needs.verify.outputs.commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Exact execution tree recorded by verify, not the event ref.
+          ref: ${{ needs.verify.outputs.exec-sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -215,6 +229,9 @@ jobs:
           command -v ssh
       - name: push source + bin repos (master, append-only)
         env:
+          # Secret scoped to this gated step only: nothing earlier in this
+          # job (checkout, download, setup) sees publication credentials.
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           AUR_KNOWN_HOSTS: aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
         run: |
           set -euo pipefail
