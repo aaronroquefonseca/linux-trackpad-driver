@@ -88,6 +88,8 @@
 //!   third key set while fingers slide below the press threshold. Touch is
 //!   silent: slide edges never fire a haptic pulse (down or release), not
 //!   even for keys/`empty` — only the button levels (click/force) buzz.
+//!   Fresh mixed slides emit extras + SYN first, then pointer buttons
+//!   `combo_stagger_ms` later on the monotonic pump clock.
 //!   A press edge hands off: identical slide/press key sets merge with no
 //!   wire flutter, differing sets release slide keys first (one SYN).
 //! - Finger-count spoofing (`spoof_<slide|click|force>_<1..5>`, `0` =
@@ -476,6 +478,22 @@ pub struct ClickProxy<G, U, H, S> {
     /// (liftoff/ease-off), the pending press is dropped: its keys never
     /// went down, so there is nothing to release and nothing dangles.
     pending_force: Option<PendingForcePress>,
+    /// Buttons from a fresh mixed slide combo. Only emitted keys live in
+    /// `held_*`; pending keys carry separate ownership so cancellation
+    /// cannot release a never-pressed button or revive an old action.
+    pending_buttons: Option<PendingSlideButtons>,
+}
+
+struct PendingSlideButtons {
+    mods_at: std::time::Instant,
+    /// A same-action handoff transfers ownership; continuous levels can
+    /// also share a pending button without bypassing the original gap.
+    keys: Vec<PendingButton>,
+}
+
+struct PendingButton {
+    pair: (u16, u16),
+    owners: Vec<ClickLevel>,
 }
 
 /// One staged cut-press key group (modifiers or buttons): wire pairs in
@@ -523,6 +541,7 @@ where
             pressed_haptic: false,
             force_haptic: false,
             pending_force: None,
+            pending_buttons: None,
         }
     }
 
@@ -671,7 +690,8 @@ where
     /// One poll step: `poll_frame` errors are logged + dropped (`Ok(None)`),
     /// never propagated (the read loop must not abort on a bad frame).
     /// Gate-off, pump-unready, or passthrough short-circuits without touching
-    /// hardware. Exactly one `SYN` is emitted per handled frame.
+    /// hardware. Each handled frame ends with `SYN`; staged combos may
+    /// also sync their modifier group or a deadline on an idle poll.
     /// Timed with `Instant::now` (old-service 50 ms press / 30 ms release
     /// debounce); tests needing deterministic edges use
     /// [`ClickProxy::handle_frame_at`].
@@ -691,7 +711,18 @@ where
         }
         let frame = match self.source.poll_frame() {
             Ok(Some(f)) => f,
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                // The nonblocking pump polls every IDLE_SLEEP (2 ms), even
+                // without input reports. Advance deadlines from the last
+                // live latch, after polling so disconnect always wins.
+                if self.pending_force.is_some() || self.pending_buttons.is_some() {
+                    let pressure = cfg.sensitivity.clamp(1, 255) as u8;
+                    self.flush_cut_pending(cfg, pressure, now);
+                    self.flush_slide_buttons(cfg, now);
+                    self.uinput.sync();
+                }
+                return Ok(None);
+            }
             Err(e) => {
                 // Persistent disconnect (unplug/replug reusing the same
                 // hidraw name: the fd is dead but no Detached will ever
@@ -734,6 +765,14 @@ where
         // Touch slots first (post-update latch is visible to buttons below;
         // the spoof map follows the live status: force > first > slide).
         self.emit_touch_frame(&frame, cfg);
+        // A slide handed to a press can still be inside that press's
+        // release debounce on clean liftoff. Cancel staged work outright:
+        // idle polls must never turn that stale latch into a late down.
+        if (self.pending_buttons.is_some() || self.pending_force.is_some())
+            && !frame.fingers.iter().any(clicks::touch_present)
+        {
+            self.release_held(ClickMachine::physical_button(frame.clicks));
+        }
         // Slide re-select: a count change onto a different action ends the
         // old session (keys up, never a pulse — slide is silent) before
         // the new count presses. An identical key set merges instead
@@ -748,7 +787,7 @@ where
                 if was_slide.is_some() {
                     self.release_slide_held(ClickMachine::physical_button(frame.clicks));
                 }
-                self.press_level(ev, haptic_pressure);
+                self.press_slide(ev, cfg, now);
             }
         }
         // Press order: first then force; reporters see force (supersedes,
@@ -820,6 +859,7 @@ where
             // `press_level` never syncs itself; exactly one trailing SYN
             // per handled frame — except a cut-mode force edge, which
             // already synced once after the level-1 release.
+            self.flush_slide_buttons(cfg, now);
             self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
             self.uinput.sync();
             return Ok(edges.primary());
@@ -869,6 +909,9 @@ where
         } else if slide_gone {
             self.release_slide_held(ClickMachine::physical_button(frame.clicks));
         }
+        // Releases and replacements above must cancel before any deadline
+        // is serviced, including a liftoff arriving exactly at the deadline.
+        self.flush_slide_buttons(cfg, now);
         self.emit_btn_left(frame.clicks, !frame.fingers.is_empty());
         self.uinput.sync();
         Ok(None)
@@ -907,34 +950,21 @@ where
             || self.held_slide.contains(&pair)
     }
 
-    /// Press one level's edge: keys down (deduplicated across levels, see
-    /// [`ClickProxy::is_down`]) plus that level's own haptic pulse. The
-    /// slide level never pulses (touch is silent): keys (or nothing for
-    /// `empty`/`none`) go down, no down-pulse, no release debt. Edges
-    /// arrive staged old-exact (first frame one, force frame two), so each
-    /// button pulse lands on its own frame. Never syncs: the caller emits
-    /// buttons + a single `SYN` per frame. `pressure` is the actuator
-    /// pressure byte (the press threshold, old-service parity); the event
-    /// carries the intensity + waveform.
+    /// Press a click/force edge: keys down (deduplicated across levels,
+    /// see [`ClickProxy::is_down`]) plus that level's own haptic pulse.
+    /// Slides use `press_slide` and never request haptics. Edges arrive
+    /// staged old-exact (first frame one, force frame two), so each button
+    /// pulse lands on its own frame. Never syncs: the caller emits SYN.
+    /// `pressure` is the actuator pressure byte (the press threshold,
+    /// old-service parity); the event carries the intensity + waveform.
     fn press_level(&mut self, ev: &ClickEvent, pressure: u8) {
         use crate::config::ActionKind;
+        debug_assert_ne!(ev.level, ClickLevel::Slide);
         let name = match ev.level {
             ClickLevel::First => "click",
             ClickLevel::Force => "force",
             ClickLevel::Slide => "slide",
         };
-        // Slide = just touching: keys still flow, pulses never do.
-        if matches!(ev.level, ClickLevel::Slide) {
-            if let ActionKind::Keys(keys) = &ev.action.kind {
-                self.down_keys(keys, ev.level);
-            } else {
-                log::debug!(
-                    "proxy: {name}_{} silent (slide never pulses)",
-                    ev.finger_count
-                );
-            }
-            return;
-        }
         match &ev.action.kind {
             ActionKind::None => {
                 log::debug!("proxy: {name}_{} = none (swallowed)", ev.finger_count);
@@ -958,9 +988,8 @@ where
     /// codes (modifiers, combos) emit before pointer-routed buttons, stable
     /// within each route — the compositor must see e.g. super held when
     /// left lands (window-drag), regardless of config order (`left+super`
-    /// vs `super+left`). Simultaneous within one frame (continuous mode and
-    /// all non-cut presses keep this); the cut fresh-press staggers instead
-    /// (see [`ClickProxy::down_keys_staggered`]).
+    /// vs `super+left`). Presses remain simultaneous unless inheriting a
+    /// slide's pending buttons; cut fresh-presses stage separately.
     fn down_keys(&mut self, keys: &[String], level: ClickLevel) {
         let mut pairs = Self::resolve_keys(keys);
         // Stable: extras first, pointer buttons second.
@@ -968,7 +997,80 @@ where
             u8::from(matches!(split_route(ty, code), SplitRoute::Pointer))
         });
         for pair in pairs {
-            self.emit_key_down(pair, level);
+            if !self.defer_slide_button(pair, level) {
+                self.emit_key_down(pair, level);
+            }
+        }
+    }
+
+    /// Fresh mixed slides establish extras first; only pointer buttons
+    /// wait. Single-group slides retain their immediate, silent behavior.
+    fn press_slide(&mut self, ev: &ClickEvent, cfg: &Config, now: std::time::Instant) {
+        let (mods, buttons) = Self::partition_combo_keys(ev);
+        for pair in &mods {
+            self.emit_key_down(*pair, ClickLevel::Slide);
+        }
+        if !mods.is_empty() && !buttons.is_empty() {
+            self.uinput.sync();
+            self.pending_buttons = Some(PendingSlideButtons {
+                mods_at: now,
+                keys: buttons
+                    .into_iter()
+                    .map(|pair| PendingButton {
+                        pair,
+                        owners: vec![ClickLevel::Slide],
+                    })
+                    .collect(),
+            });
+        } else {
+            for pair in buttons {
+                self.emit_key_down(pair, ClickLevel::Slide);
+            }
+        }
+        self.flush_slide_buttons(cfg, now);
+    }
+
+    /// Register shared ownership without letting a press handoff shortcut
+    /// a slide's modifier-to-button gap. Pending keys are not wire-held.
+    fn defer_slide_button(&mut self, pair: (u16, u16), level: ClickLevel) -> bool {
+        if let Some(pending) = &mut self.pending_buttons {
+            if let Some(key) = pending.keys.iter_mut().find(|key| key.pair == pair) {
+                if !key.owners.contains(&level) {
+                    key.owners.push(level);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cancel_slide_buttons(&mut self, level: ClickLevel) {
+        if let Some(pending) = &mut self.pending_buttons {
+            for key in &mut pending.keys {
+                key.owners.retain(|owner| *owner != level);
+            }
+            pending.keys.retain(|key| !key.owners.is_empty());
+            if pending.keys.is_empty() {
+                self.pending_buttons = None;
+            }
+        }
+    }
+
+    fn flush_slide_buttons(&mut self, cfg: &Config, now: std::time::Instant) {
+        if self
+            .pending_buttons
+            .as_ref()
+            .is_some_and(|p| now.saturating_duration_since(p.mods_at) >= Self::combo_stagger(cfg))
+        {
+            let pending = self
+                .pending_buttons
+                .take()
+                .expect("pending buttons checked");
+            for key in pending.keys {
+                for level in key.owners {
+                    self.emit_key_down(key.pair, level);
+                }
+            }
         }
     }
 
@@ -980,8 +1082,7 @@ where
     /// established before the button that starts the move-drag.
     /// Single-group actions behave exactly like [`ClickProxy::down_keys`]
     /// (no stray `SYN`). Only the cut fresh-press stages this way (see
-    /// [`ClickProxy::flush_cut_pending`); continuous and all other presses
-    /// stay simultaneous.
+    /// [`ClickProxy::flush_cut_pending`]); slides use `press_slide`.
     fn down_keys_staggered(&mut self, keys: &[String], level: ClickLevel) {
         let pairs = Self::resolve_keys(keys);
         let (mods, btns): (Vec<_>, Vec<_>) = pairs
@@ -1070,10 +1171,10 @@ where
         self.set_haptic_flag(ev.level, fired);
     }
 
-    /// Split a force action's keys into (modifiers, buttons): extras-routed
+    /// Split an action's keys into (modifiers, buttons): extras-routed
     /// first group, pointer-routed second. Non-key actions yield two empty
     /// groups (cut never stores those; defensive).
-    fn partition_cut_keys(ev: &ClickEvent) -> (KeyGroup, KeyGroup) {
+    fn partition_combo_keys(ev: &ClickEvent) -> (KeyGroup, KeyGroup) {
         use crate::config::ActionKind;
         match &ev.action.kind {
             ActionKind::Keys(keys) => Self::resolve_keys(keys)
@@ -1129,7 +1230,7 @@ where
             if now.saturating_duration_since(released_at) < CUT_REPRESS_GAP {
                 return;
             }
-            let (mods, btns) = Self::partition_cut_keys(&ev);
+            let (mods, btns) = Self::partition_combo_keys(&ev);
             if mods.is_empty() || btns.is_empty() {
                 self.press_cut_combo(&ev, pressure);
                 self.pending_force = None;
@@ -1148,8 +1249,8 @@ where
         // modifiers — same frame when the stagger is 0.
         let mods_at = self.pending_force.as_ref().and_then(|p| p.mods_at);
         if let Some(t) = mods_at {
-            if now.saturating_duration_since(t) >= Self::cut_stagger(cfg) {
-                let (_, btns) = Self::partition_cut_keys(&ev);
+            if now.saturating_duration_since(t) >= Self::combo_stagger(cfg) {
+                let (_, btns) = Self::partition_combo_keys(&ev);
                 for pair in &btns {
                     self.emit_key_down(*pair, ev.level);
                 }
@@ -1159,10 +1260,9 @@ where
         // Else: stagger not elapsed — the buttons wait for a later frame.
     }
 
-    /// Effective button stagger for the cut fresh-press: the configured
-    /// `combo_stagger_ms` (the 5 ms release→modifiers floor already applied
-    /// upstream, so `0` keeps release→press ≥5 ms).
-    fn cut_stagger(cfg: &Config) -> std::time::Duration {
+    /// Configured modifier-to-button gap for mixed slides and cut force
+    /// fresh-presses. Cut's independent 5 ms release floor applies first.
+    fn combo_stagger(cfg: &Config) -> std::time::Duration {
         std::time::Duration::from_millis(u64::from(cfg.combo_stagger_ms))
     }
 
@@ -1234,6 +1334,16 @@ where
         if matches!(level, ClickLevel::Slide) {
             return;
         }
+        if let Some(pending) = &mut self.pending_buttons {
+            for key in &mut pending.keys {
+                if key.owners.contains(&ClickLevel::Slide) {
+                    key.owners.retain(|owner| *owner != ClickLevel::Slide);
+                    if !key.owners.contains(&level) {
+                        key.owners.push(level);
+                    }
+                }
+            }
+        }
         let moving: Vec<(u16, u16)> = std::mem::take(&mut self.held_slide);
         let target = match level {
             ClickLevel::First => &mut self.held_first,
@@ -1286,6 +1396,8 @@ where
     /// Detach/pump-loss pass `false` (no frame in hand): every up is
     /// forced there so no key-up is ever lost.
     fn release_held(&mut self, phys_down: bool) {
+        self.pending_buttons = None;
+        self.pending_force = None;
         let first = std::mem::take(&mut self.held_first);
         let slide = std::mem::take(&mut self.held_slide);
         let mut left_up = false;
@@ -1341,6 +1453,7 @@ where
     /// same frame would flutter a phantom extra click. The caller
     /// reconciles via [`ClickProxy::emit_btn_left`] right after.
     fn release_slide_held(&mut self, phys_down: bool) {
+        self.cancel_slide_buttons(ClickLevel::Slide);
         let mut dropped_left = false;
         for (ty, code) in self.held_slide.drain(..) {
             if self.held_first.contains(&(ty, code)) || self.held_force.contains(&(ty, code)) {
@@ -1363,6 +1476,8 @@ where
     /// Release force-held keys, retaining codes the first level still holds
     /// (no up-emit for those — the wire stays down until full release).
     fn release_force_held(&mut self) {
+        self.cancel_slide_buttons(ClickLevel::Force);
+        self.pending_force = None;
         let mut dropped_left = false;
         for (ty, code) in self.held_force.drain(..) {
             if self.held_first.contains(&(ty, code)) {
@@ -1392,6 +1507,7 @@ where
     /// reconciliation after the fresh press is then a no-op (wire already
     /// down again), never a flutter.
     fn cut_first_wire(&mut self) {
+        self.cancel_slide_buttons(ClickLevel::First);
         for (ty, code) in std::mem::take(&mut self.held_first) {
             self.uinput.emit(ty, code, 0);
             if (ty, code) == (EV_KEY, BTN_LEFT) {
@@ -6252,6 +6368,487 @@ mod tests {
             slide_1: "left".into(),
             ..Config::default()
         }
+    }
+
+    fn five_slide_cfg() -> Config {
+        Config {
+            enhanced_clicks: true,
+            polling_rate: 110,
+            sensitivity: 30,
+            margin: 5,
+            haptic: 2,
+            quiet_click: true,
+            speed: 100,
+            click_4: "none".into(),
+            click_5: "none".into(),
+            force_offset: 130,
+            force_haptic: Some(1),
+            force_quiet_click: false,
+            force_1: "super+left".into(),
+            force_2: "back".into(),
+            force_3: "forward".into(),
+            force_4: "alt+f4".into(),
+            force_5: "none".into(),
+            transition_mode: "cut".into(),
+            slide_5: "super+left".into(),
+            spoof_slide_5: 1,
+            ..Config::default()
+        }
+    }
+
+    fn slide_report(n: u8, pressure: u8, x: i32) -> Result<Option<TouchFrame>> {
+        Ok(Some(frame(
+            (1..=n).map(|id| finger(id, pressure, x, 20)).collect(),
+            u8::from(pressure >= 30),
+        )))
+    }
+
+    fn ms_after(t0: std::time::Instant, ms: u64) -> std::time::Instant {
+        t0 + std::time::Duration::from_millis(ms)
+    }
+
+    fn assert_no_haptics(haptic: &FakeHaptic) {
+        assert!(haptic.calls.lock().unwrap().is_empty());
+        assert!(haptic.releases.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slide_mixed_five_to_one_staggers_while_motion_and_idle_polls_continue() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(5, 10, 90),
+                Ok(None),
+                Ok(None),
+                slide_report(0, 0, 0),
+            ],
+        );
+        let cfg = five_slide_cfg();
+        assert!(!cfg.spoof_select);
+        assert_eq!(cfg.combo_stagger_ms, 50);
+        let t0 = std::time::Instant::now();
+        let ev = px.handle_frame_at(&cfg, t0).unwrap().unwrap();
+        assert!(ev.is_slide());
+        assert_eq!(ev.finger_count, 5, "selection must use real fingers");
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        assert!(wire_events(&sinks.extras).ends_with(&[(EV_SYN, SYN_REPORT, 0)]));
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOOL_FINGER, 1));
+        assert!(!sinks.pointer.has(EV_KEY, BTN_TOOL_QUINTTAP, 1));
+        assert_eq!(
+            wire_events(&sinks.pointer)
+                .iter()
+                .filter(|&&(ty, code, value)| ty == EV_ABS
+                    && code == ABS_MT_TRACKING_ID
+                    && value >= 0)
+                .count(),
+            1,
+            "exactly one virtual contact"
+        );
+        px.handle_frame_at(&cfg, ms_after(t0, 49)).unwrap();
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_POSITION_X, 90));
+        px.handle_frame_at(&cfg, ms_after(t0, 49)).unwrap();
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        let mark = wire_events(&sinks.pointer).len();
+        px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+        assert_eq!(
+            &wire_events(&sinks.pointer)[mark..],
+            &[(EV_KEY, BTN_LEFT, 1), (EV_SYN, SYN_REPORT, 0)],
+            "deadline must progress without another touch report"
+        );
+        px.handle_frame_at(&cfg, ms_after(t0, 51)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_no_haptics(&haptic);
+    }
+
+    #[test]
+    fn slide_mixed_custom_and_zero_staggers_preserve_report_order() {
+        for delay in [0, 1, 120, 500] {
+            // One log captures both groups' chronological SYN boundaries.
+            let wire = Arc::new(FakeUinput::new());
+            let mut px = ClickProxy::new(
+                settings(true),
+                FakeGrab::ok(),
+                SharedUinput(Arc::clone(&wire)),
+                FakeHaptic::new(),
+                ScriptSource::new(vec![slide_report(5, 10, 0)]),
+            );
+            px.set_pump_ready(true);
+            px.attach(&usb_ready("/dev/hidraw1"));
+            let cfg = Config {
+                combo_stagger_ms: delay,
+                slide_5: "left+super".into(),
+                ..five_slide_cfg()
+            };
+            let t0 = std::time::Instant::now();
+            px.handle_frame_at(&cfg, t0).unwrap();
+            if delay > 0 {
+                px.handle_frame_at(&cfg, ms_after(t0, u64::from(delay - 1)))
+                    .unwrap();
+                assert!(key_values(&wire, BTN_LEFT).is_empty());
+                px.handle_frame_at(&cfg, ms_after(t0, u64::from(delay)))
+                    .unwrap();
+            }
+            assert_eq!(key_values(&wire, BTN_LEFT), vec![1]);
+            let events = wire_events(&wire);
+            let super_at = events.iter().position(|e| *e == (EV_KEY, 125, 1)).unwrap();
+            let left_at = events
+                .iter()
+                .position(|e| *e == (EV_KEY, BTN_LEFT, 1))
+                .unwrap();
+            assert!(super_at < left_at);
+            assert!(events[super_at + 1..left_at].contains(&(EV_SYN, SYN_REPORT, 0)));
+            assert!(events.ends_with(&[(EV_SYN, SYN_REPORT, 0)]));
+        }
+    }
+
+    #[test]
+    fn slide_single_group_actions_stay_immediate_and_silent() {
+        for action in ["super+a", "left", "empty"] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let mut px = drive_ready_proxy(&sinks, &haptic, vec![slide_report(5, 10, 0)]);
+            let cfg = Config {
+                slide_5: action.into(),
+                ..five_slide_cfg()
+            };
+            px.handle_frame_at(&cfg, std::time::Instant::now()).unwrap();
+            match action {
+                "super+a" => {
+                    assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+                    assert_eq!(key_values(&sinks.extras, 30), vec![1]);
+                    assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+                }
+                "left" => assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]),
+                "empty" => {
+                    assert!(key_values(&sinks.extras, 125).is_empty());
+                    assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                wire_events(&sinks.extras)
+                    .iter()
+                    .filter(|e| e.0 == EV_SYN)
+                    .count(),
+                1
+            );
+            assert_no_haptics(&haptic);
+        }
+    }
+
+    #[test]
+    fn slide_mixed_count_change_or_liftoff_cancels_even_at_deadline() {
+        for n in [0, 4] {
+            for cancel_at in [10, 50, 60] {
+                let sinks = TestSinks::new();
+                let haptic = Arc::new(FakeHaptic::new());
+                let mut px = drive_ready_proxy(
+                    &sinks,
+                    &haptic,
+                    vec![slide_report(5, 10, 0), slide_report(n, 10, 0)],
+                );
+                let cfg = five_slide_cfg();
+                let t0 = std::time::Instant::now();
+                px.handle_frame_at(&cfg, t0).unwrap();
+                px.handle_frame_at(&cfg, ms_after(t0, cancel_at)).unwrap();
+                px.handle_frame_at(&cfg, ms_after(t0, 500)).unwrap();
+                assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+                assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+                assert_no_haptics(&haptic);
+            }
+        }
+    }
+
+    #[test]
+    fn slide_mixed_press_into_none_keeps_click_and_force_silent() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(5, 200, 0),
+                slide_report(5, 200, 0),
+                slide_report(0, 0, 0),
+            ],
+        );
+        let cfg = five_slide_cfg();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        let first = px.handle_frame_at(&cfg, ms_after(t0, 10)).unwrap().unwrap();
+        assert!(first.is_none() && first.level == ClickLevel::First);
+        // A force `none` is latched but deliberately absent from primary().
+        assert!(px
+            .handle_frame_at(&cfg, ms_after(t0, 11))
+            .unwrap()
+            .is_none());
+        let force = px.machine.force_active().unwrap();
+        assert!(force.is_none() && force.is_force());
+        px.handle_frame_at(&cfg, ms_after(t0, 100)).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 500)).unwrap();
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_no_haptics(&haptic);
+    }
+
+    #[test]
+    fn slide_mixed_different_press_cancels_pending_button_and_shares_modifier() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![slide_report(5, 10, 0), slide_report(5, 60, 0)],
+        );
+        let cfg = Config {
+            click_5: "super+right".into(),
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        // A different action gets its normal immediate click behavior,
+        // even when replacement arrives exactly at the old deadline.
+        px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 100)).unwrap();
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        assert_eq!(key_values(&sinks.pointer, BTN_RIGHT), vec![1]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1]);
+        px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+        px.handle_frame_at(&cfg, ms_after(t0, 110)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_RIGHT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn slide_mixed_replacement_and_return_start_a_fresh_deadline() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(4, 10, 0),
+                slide_report(5, 10, 0),
+            ],
+        );
+        let cfg = Config {
+            slide_4: "alt+right".into(),
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        for ms in [0, 20, 40] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+        }
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1]);
+        assert_eq!(key_values(&sinks.extras, 56), vec![1, 0]);
+        for ms in [50, 70, 89] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+            assert!(key_values(&sinks.pointer, BTN_RIGHT).is_empty());
+        }
+        px.handle_frame_at(&cfg, ms_after(t0, 90)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert_no_haptics(&haptic);
+    }
+
+    #[test]
+    fn slide_mixed_identical_count_reselect_keeps_deadline() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![slide_report(5, 10, 0), slide_report(4, 10, 0)],
+        );
+        let cfg = Config {
+            slide_4: "left+super".into(),
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 20)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+    }
+
+    #[test]
+    fn slide_mixed_session_teardown_cancels_pending_buttons() {
+        for teardown in ["disarm", "detach", "disconnect"] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let mut px = drive_ready_proxy(&sinks, &haptic, vec![slide_report(5, 10, 0)]);
+            let cfg = five_slide_cfg();
+            let t0 = std::time::Instant::now();
+            px.handle_frame_at(&cfg, t0).unwrap();
+            match teardown {
+                "disarm" => px.set_pump_ready(false),
+                "detach" => px.detach(&detached("/dev/hidraw1", Transport::Usb)),
+                "disconnect" => {
+                    px.replace_source(ScriptSource::new(vec![Err(crate::pump::DisconnectError(
+                        "test unplug".into(),
+                    )
+                    .into())]));
+                    px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(px.is_passthrough());
+            assert!(!px.grab().is_grabbed());
+            px.replace_source(ScriptSource::new(vec![]));
+            px.set_pump_ready(true);
+            px.attach(&usb_ready("/dev/hidraw1"));
+            px.handle_frame_at(&cfg, ms_after(t0, 500)).unwrap();
+            assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+            assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+            assert_no_haptics(&haptic);
+        }
+    }
+
+    #[test]
+    fn slide_mixed_same_action_handoff_before_or_after_button_is_seamless() {
+        for handoff_at in [10, 60] {
+            let sinks = TestSinks::new();
+            let haptic = Arc::new(FakeHaptic::new());
+            let mut px = drive_ready_proxy(&sinks, &haptic, vec![slide_report(5, 10, 0)]);
+            let cfg = Config {
+                click_5: "left+super".into(),
+                ..five_slide_cfg()
+            };
+            let t0 = std::time::Instant::now();
+            px.handle_frame_at(&cfg, t0).unwrap();
+            if handoff_at > 50 {
+                px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+            }
+            px.replace_source(ScriptSource::new(vec![slide_report(5, 60, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, handoff_at)).unwrap();
+            if handoff_at < 50 {
+                assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+                px.handle_frame_at(&cfg, ms_after(t0, 50)).unwrap();
+            }
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+            assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+            px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+            px.handle_frame_at(&cfg, ms_after(t0, 100)).unwrap();
+            assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+            assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+            assert_eq!(haptic.calls.lock().unwrap().len(), 1);
+            assert_eq!(haptic.releases.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn slide_mixed_handoff_then_rapid_liftoff_cannot_finish_a_debounced_press() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(5, 60, 0),
+                slide_report(0, 0, 0),
+            ],
+        );
+        let cfg = Config {
+            click_5: "super+left".into(),
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        for ms in [0, 10, 11, 50, 100] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+        }
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+    }
+
+    #[test]
+    fn slide_mixed_cut_after_handoff_cancels_old_deadline_and_stages_force() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(5, 60, 0),
+                slide_report(5, 200, 0),
+            ],
+        );
+        let cfg = Config {
+            click_5: "super+left".into(),
+            force_5: "super+left".into(),
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        for ms in [0, 10, 20, 24] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+        }
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        px.handle_frame_at(&cfg, ms_after(t0, 25)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1]);
+        for ms in [50, 74] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+            assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        }
+        px.handle_frame_at(&cfg, ms_after(t0, 75)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert_eq!(haptic.calls.lock().unwrap().len(), 2);
+        px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+        px.handle_frame_at(&cfg, ms_after(t0, 100)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn slide_mixed_continuous_force_shares_pending_button_and_retains_first_owner() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                slide_report(5, 10, 0),
+                slide_report(5, 60, 0),
+                slide_report(5, 200, 0),
+                slide_report(5, 200, 0),
+            ],
+        );
+        let cfg = Config {
+            click_5: "super+left".into(),
+            force_5: "ctrl+left".into(),
+            transition_mode: "continuous".into(),
+            combo_stagger_ms: 120,
+            ..five_slide_cfg()
+        };
+        let t0 = std::time::Instant::now();
+        for ms in [0, 10, 20] {
+            px.handle_frame_at(&cfg, ms_after(t0, ms)).unwrap();
+        }
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        let disarmed = Config {
+            force_offset: 0,
+            ..cfg.clone()
+        };
+        px.handle_frame_at(&disarmed, ms_after(t0, 40)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 29), vec![1, 0]);
+        px.handle_frame_at(&disarmed, ms_after(t0, 119)).unwrap();
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        px.handle_frame_at(&disarmed, ms_after(t0, 120)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        px.replace_source(ScriptSource::new(vec![slide_report(0, 0, 0)]));
+        px.handle_frame_at(&disarmed, ms_after(t0, 150)).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
     }
 
     #[test]
