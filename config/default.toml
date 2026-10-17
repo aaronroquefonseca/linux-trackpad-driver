@@ -95,7 +95,7 @@ force_offset = 0
 # Soft waveform for the force level.
 force_quiet_click = false
 
-# Force-level actions (same value set as click_*).
+# Force-level actions (same strings or inline action objects as click_*).
 force_1 = "none"
 force_2 = "none"
 force_3 = "none"
@@ -157,11 +157,24 @@ spoof_select = false
 # -------------------------------------------------------------------------
 transition_mode = "continuous"
 
-# Modifier-to-button gap for fresh mixed slide combos and cut force
-# fresh-presses, in milliseconds (0..=500, default 50). Extras go down +
-# SYN first; pointer buttons follow after this real-time gap, including
-# when touch reports pause (the pump checks every 2 ms). No input is
-# blocked while waiting. 0 emits both groups in the same poll; cut force
-# presses still keep the separate 5 ms release floor. Ordinary click
-# presses and single-group slides keep their immediate behavior.
+# Fallback modifier-to-button gap for fresh mixed slides and cut-force
+# fresh presses that OMIT binding timing (milliseconds, 0..=500, default 50).
+# Ordinary clicks/continuous force stay immediate when timing is omitted.
+# All 15 click_N/force_N/slide_N actions also accept inline objects:
+#   slide_5 = { action = "super+left", stagger_ms = 50 }
+#   force_1 = { action = "super+left", stagger_ms = 50 }
+#   click_4 = { action = "super+left", stagger_ms = 0 }
+# Replace the relevant assignment above to try one; these are opt-in edits.
+# `action` is required; only `stagger_ms` is optional (integer 0..=500 ms).
+# A string and { action = "..." } preserve the same applicable defaults.
+# A positive override works on any mixed click/force/slide action: extras
+# go down + SYN, then pointer buttons after the gap, without blocking input.
+# 0 means no timed wait (extras first in the same poll, not cross-node
+# simultaneity). Slide/cut retain an inter-group SYN; ordinary click and
+# continuous force use the trailing frame SYN. Cut always keeps its separate
+# 5 ms release/repress floor. Keyboard-only (alt+f4) and pointer-only actions
+# have no division to delay. These are held actions: same-action handoffs
+# retain the original pending deadline; slides never fire haptics.
+# See docs/CONFIG.md for flat examples: Back/Forward on force_2/force_3,
+# opt-in Alt+F4, GNOME window menu/force drag, and silent five-finger drag.
 combo_stagger_ms = 50
