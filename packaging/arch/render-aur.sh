@@ -5,9 +5,11 @@
 # --bin-aarch64-sha256, --out DIR. Optional --*-tarball FILE verifies the
 # digest against a downloaded artifact and checks its interior layout.
 # Outputs: $OUT/{linux-trackpad-driver,linux-trackpad-driver-bin,
-# linux-trackpad-driver-git}/{PKGBUILD,.SRCINFO,ltd.install}.
+# linux-trackpad-driver-git}/{PKGBUILD,.SRCINFO,ltd.install}, staged in a
+# temp dir and swapped in only after all three variants succeed.
 # Fails closed on bad version/digest, missing inputs, leftover placeholders,
-# or unexpected tarball contents. Deterministic: same inputs -> same bytes
+# or unexpected tarball contents; a failed run leaves prior output untouched.
+# Deterministic: same inputs -> same bytes
 # (no timestamps; .SRCINFO via `makepkg --printsrcinfo`).
 set -euo pipefail
 
@@ -96,30 +98,36 @@ check_tarball() { # kind, file, want_sha, arch_or_empty
 
 command -v makepkg >/dev/null 2>&1 || fail "makepkg not found"
 
-rm -rf -- "$OUT"
-mkdir -p -- "$OUT/linux-trackpad-driver" "$OUT/linux-trackpad-driver-bin" "$OUT/linux-trackpad-driver-git"
+# Stage the whole tree, then swap it in only after all three variants
+# render: a failed run leaves any prior output untouched and never leaves
+# a half-written tree (the old `rm -rf $OUT` first did both wrong).
+STAGE="$WORK_DIR/out"
+mkdir -p -- "$STAGE/linux-trackpad-driver" "$STAGE/linux-trackpad-driver-bin" "$STAGE/linux-trackpad-driver-git"
 
 sed -e "s/@PKGVER@/${VERSION}/g" -e "s/@SOURCE_SHA256@/${SOURCE_SHA}/g" \
-  "$SCRIPT_DIR/PKGBUILD-stable.in" > "$OUT/linux-trackpad-driver/PKGBUILD"
+  "$SCRIPT_DIR/PKGBUILD-stable.in" > "$STAGE/linux-trackpad-driver/PKGBUILD"
 sed -e "s/@PKGVER@/${VERSION}/g" -e "s/@SHA256_X86_64@/${BIN_X86_SHA}/g" \
   -e "s/@SHA256_AARCH64@/${BIN_ARM_SHA}/g" \
-  "$SCRIPT_DIR/PKGBUILD-bin.in" > "$OUT/linux-trackpad-driver-bin/PKGBUILD"
-cp -- "$SCRIPT_DIR/PKGBUILD-git" "$OUT/linux-trackpad-driver-git/PKGBUILD"
+  "$SCRIPT_DIR/PKGBUILD-bin.in" > "$STAGE/linux-trackpad-driver-bin/PKGBUILD"
+cp -- "$SCRIPT_DIR/PKGBUILD-git" "$STAGE/linux-trackpad-driver-git/PKGBUILD"
 for d in linux-trackpad-driver linux-trackpad-driver-bin linux-trackpad-driver-git; do
-  cp -- "$SCRIPT_DIR/ltd.install" "$OUT/$d/ltd.install"
+  cp -- "$SCRIPT_DIR/ltd.install" "$STAGE/$d/ltd.install"
 done
 
 if grep -RnE '@(PKGVER|SOURCE_SHA256|SHA256_X86_64|SHA256_AARCH64)@' \
-    "$OUT/linux-trackpad-driver/PKGBUILD" "$OUT/linux-trackpad-driver-bin/PKGBUILD" >/dev/null; then
+    "$STAGE/linux-trackpad-driver/PKGBUILD" "$STAGE/linux-trackpad-driver-bin/PKGBUILD" >/dev/null; then
   fail "placeholder leaked into rendered stable/bin PKGBUILD"
 fi
 if grep -n "^sha256sums.*SKIP" \
-    "$OUT/linux-trackpad-driver/PKGBUILD" "$OUT/linux-trackpad-driver-bin/PKGBUILD" >/dev/null; then
+    "$STAGE/linux-trackpad-driver/PKGBUILD" "$STAGE/linux-trackpad-driver-bin/PKGBUILD" >/dev/null; then
   fail "SKIP leaked into rendered stable/bin sha256sums (immutable archives need real digests)"
 fi
 
 for d in linux-trackpad-driver linux-trackpad-driver-bin linux-trackpad-driver-git; do
-  ( cd "$OUT/$d" && makepkg --printsrcinfo > .SRCINFO )
+  ( cd "$STAGE/$d" && makepkg --printsrcinfo > .SRCINFO )
 done
+
+rm -rf -- "$OUT"
+mv -- "$STAGE" "$OUT"
 
 echo "render-aur: wrote $OUT/{linux-trackpad-driver,linux-trackpad-driver-bin,linux-trackpad-driver-git}/"

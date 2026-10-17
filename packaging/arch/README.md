@@ -33,7 +33,9 @@ packaging/arch/render-aur.sh --version 0.1.0 \
 
 - Fails closed: bad `X.Y.Z`, non-hex/`SKIP` digests, missing inputs,
   digest mismatch, unexpected tarball contents, leftover placeholders,
-  missing `makepkg`. No output dir is left half-written (`rm -rf` first).
+  missing `makepkg`. Renders into a temp staging dir and swaps it over the
+  output dir only after all three variants succeed, so a failed run leaves
+  prior output untouched and never a half-written tree.
 - Output: `dist/aur/{linux-trackpad-driver,linux-trackpad-driver-bin,
   linux-trackpad-driver-git}/{PKGBUILD,.SRCINFO,ltd.install}`,
   `.SRCINFO` via `makepkg --printsrcinfo`. Deterministic (re-run diffs clean).

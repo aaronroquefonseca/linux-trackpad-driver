@@ -146,6 +146,23 @@ for unit in linux-trackpad-driver-reconnect@.service linux-trackpad-driver-resum
     echo "renderer accepted source missing systemd/$unit" >&2; exit 1
   fi
 done
+# Regression: a render that fails mid-way must preserve prior output
+# (staged swap, not rm-then-write).
+mkdir -p "$RDIR/fakebin" "$RDIR/keep/linux-trackpad-driver"
+printf '#!/bin/sh\nexit 1\n' > "$RDIR/fakebin/makepkg"
+chmod +x "$RDIR/fakebin/makepkg"
+echo 'sentinel-prior-output' > "$RDIR/keep/linux-trackpad-driver/PKGBUILD"
+if PATH="$RDIR/fakebin:$PATH" packaging/arch/render-aur.sh --version "$VER" \
+  --source-sha256 "$S_SHA" --bin-x86_64-sha256 "$X_SHA" \
+  --bin-aarch64-sha256 "$A_SHA" --out "$RDIR/keep" \
+  --source-tarball "/tmp/aur-fixtures/source-${VER}.tar.gz" \
+  --bin-x86_64-tarball "/tmp/aur-fixtures/bin-${VER}-x86_64.tar.gz" \
+  --bin-aarch64-tarball "/tmp/aur-fixtures/bin-${VER}-aarch64.tar.gz" 2>/dev/null; then
+  echo 'renderer succeeded with failing makepkg' >&2; exit 1
+fi
+grep -q sentinel-prior-output "$RDIR/keep/linux-trackpad-driver/PKGBUILD" \
+  || { echo 'failed render destroyed prior output' >&2; exit 1; }
+test ! -e "$RDIR/keep/linux-trackpad-driver/.SRCINFO"
 
 rm -rf /tmp/aur-src
 mkdir -p /tmp/aur-src
