@@ -46,6 +46,27 @@ jobs:
         run: dpkg-buildpackage -S -us -uc -d
       - name: lintian (advisory)
         run: lintian --tag-display-limit 0 ../*.dsc || echo "::warning ::lintian reported tags"
+  release-scripts:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: install build tools
+        run: pacman -Syu --noconfirm --needed base-devel git
+      - name: script syntax + offline publishing guards
+        run: |
+          set -euo pipefail
+          bash -n packaging/release/check-version-sync.sh
+          bash -n packaging/release/check-release-json.sh
+          bash -n packaging/release/verify-assets.sh
+          bash -n packaging/release/publish-aur.sh
+          bash -n packaging/release/test-release-scripts.sh
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -s /bin/bash -c "cd \"$GITHUB_WORKSPACE\" && packaging/release/test-release-scripts.sh"
   aur:
     runs-on: ubuntu-latest
     container: archlinux:base
