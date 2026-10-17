@@ -38,6 +38,38 @@ jobs:
             case "$src" in target/*) continue;; esac
             test -e "$src" || { echo "missing install source: $src"; exit 1; }
           done < debian/linux-trackpad-driver.install
+      - name: staging layout (dh_install fixture)
+        run: |
+          set -euo pipefail
+          # dh_install treats the .install destination as a directory, so the
+          # config file must be installed via debian/rules, never via .install.
+          if grep -Ev '^[[:space:]]*(#|$)' debian/linux-trackpad-driver.install | grep -q 'etc/linux-trackpad-driver/config.toml'; then
+            echo 'config must be installed via debian/rules, not .install file-to-file rename' >&2
+            exit 1
+          fi
+          grep -q 'install -Dm644 config/default.toml debian/linux-trackpad-driver/etc/linux-trackpad-driver/config.toml' debian/rules
+          STAGE=$(mktemp -d)
+          trap 'rm -rf "$STAGE"' EXIT
+          mkdir -p "$STAGE/fixture"
+          cp -a debian config udev systemd "$STAGE/fixture/"
+          mkdir -p "$STAGE/fixture/target/release"
+          printf '#!/bin/sh\nexit 0\n' > "$STAGE/fixture/target/release/ltd"
+          chmod +x "$STAGE/fixture/target/release/ltd"
+          cd "$STAGE/fixture"
+          dh_install
+          install -Dm644 config/default.toml debian/linux-trackpad-driver/etc/linux-trackpad-driver/config.toml
+          PKG=debian/linux-trackpad-driver
+          test -f "$PKG/etc/linux-trackpad-driver/config.toml"
+          test ! -e "$PKG/etc/linux-trackpad-driver/config.toml/default.toml"
+          test ! -d "$PKG/etc/linux-trackpad-driver/config.toml"
+          cmp config/default.toml "$PKG/etc/linux-trackpad-driver/config.toml"
+          test "$(stat -c %a "$PKG/etc/linux-trackpad-driver/config.toml")" = 644
+          test -f "$PKG/lib/systemd/system/linux-trackpad-driver.service"
+          test -f "$PKG/lib/systemd/system/linux-trackpad-driver-reconnect@.service"
+          test -f "$PKG/lib/systemd/system/linux-trackpad-driver-resume.service"
+          test -f "$PKG/lib/systemd/system-sleep/ltd-resume"
+          test -f "$PKG/lib/udev/rules.d/99-linux-trackpad-driver.rules"
+          test -f "$PKG/usr/bin/ltd"
       - name: changelog + control syntax
         run: |
           dpkg-parsechangelog -l debian/changelog

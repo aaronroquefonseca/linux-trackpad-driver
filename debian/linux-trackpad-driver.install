@@ -4,4 +4,3 @@ systemd/linux-trackpad-driver.service lib/systemd/system
 systemd/linux-trackpad-driver-reconnect@.service lib/systemd/system
 systemd/linux-trackpad-driver-resume.service lib/systemd/system
 systemd/system-sleep/ltd-resume lib/systemd/system-sleep
-config/default.toml etc/linux-trackpad-driver/config.toml
