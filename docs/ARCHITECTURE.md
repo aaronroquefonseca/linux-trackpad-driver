@@ -112,7 +112,8 @@ incl. nested, unknown version errors.
 ## Udev / systemd / suspend
 
 - udev: `ACTION=="add", SUBSYSTEM=="hidraw"`, VID:PID-gated
-  (`05ac`/`004c` × `0265`/`0324`), runs `reconnect /dev/%k`. No bind/unbind tricks.
+  (`05ac`/`004c` × `0265`/`0324`), requests `linux-trackpad-driver-reconnect@%k.service`
+  via `SYSTEMD_WANTS` (the service runs `reconnect /dev/%I`). No bind/unbind tricks.
 - systemd: `Type=simple`, `Restart=on-failure`, `RuntimeDirectory=`.
 - suspend/resume: re-run init sequence on resume (USB restarts from multitouch
   enable — report `0x02` shrinks 21→8 bytes across power transitions);

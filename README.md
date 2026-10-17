@@ -143,6 +143,16 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 Conventional Commits, small focused PRs (squash-merged), two reviewers on
 substantial changes. Capability research: `docs/RESEARCH.md`.
 
+## Hardware safety and disclaimer
+
+This is an unofficial, reverse-engineered driver, not affiliated with or endorsed by Apple.
+
+The driver exposes low-level hardware settings, including values beyond those available through Apple's standard configuration interface. These settings have been functionally tested, but their long-term effects, particularly at extreme values, have not been fully evaluated. Hardware damage or excessive wear cannot be ruled out.
+
+The default settings are recommended. Adjust hardware-related values gradually and use extreme settings with caution.
+
+This software is provided **as is, without warranty**. To the extent permitted by applicable law, the authors and contributors disclaim liability for hardware damage, data loss, or other damages arising from its use. See the MIT and Apache-2.0 licenses for the applicable terms.
+
 ## License
 
 Dual-licensed under MIT OR Apache-2.0 — see [`LICENSE-MIT`](LICENSE-MIT)
