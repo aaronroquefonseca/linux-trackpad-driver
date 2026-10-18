@@ -1,9 +1,9 @@
 name: Release (tag)
 
 # Tag `vX.Y.Z` -> build matrix (x86_64 + aarch64) -> x86_64 .deb (debian/) +
-# per-arch binary tarballs (binary + systemd units + udev rules + default
-# config + licenses) + full-history git-cliff CHANGELOG excerpt + SHA256SUMS
-# -> draft GitHub Release. A human publishes the draft; the stable AUR
+# x86_64 .rpm (packaging/fedora/) + per-arch binary tarballs (binary +
+# systemd units + udev rules + default config + licenses) + full-history
+# git-cliff CHANGELOG excerpt + SHA256SUMS -> draft GitHub Release. A human publishes the draft; the stable AUR
 # pipeline (aur-stable.yml) only runs after that manual publish step.
 #
 # Activation: set repo variable ENABLE_RELEASE_PUBLISH=true (Settings >
@@ -165,8 +165,63 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # x86_64 only: an aarch64 RPM would need QEMU cross or a native ARM
+  # runner — not cheap in this job family. aarch64 ships as tarball.
+  build-rpm:
+    needs: preflight
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      COMMIT: ${{ needs.preflight.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Exact tagged commit resolved once in preflight: a dispatch tag
+          # must not silently build whatever main points at.
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: install rpm tooling
+        run: dnf install -y rpm-build systemd-rpm-macros cargo rustc
+      - name: version gate (tag == spec == cargo)
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::bad tag '$TAG' (want vX.Y.Z)"; exit 1; }
+          ./packaging/release/check-version-sync.sh "$VERSION"
+          spec_ver="$(sed -n 's/^Version:[[:space:]]*//p' packaging/fedora/linux-trackpad-driver.spec | head -n 1)"
+          [ "$spec_ver" = "$VERSION" ] \
+            || { echo "::error::spec Version $spec_ver != tag version $VERSION"; exit 1; }
+      - name: build binary RPM from tag tree
+        run: |
+          set -euo pipefail
+          # Binary RPM from the tagged source via the in-tree .spec, mirroring
+          # the .deb job: version sync is verified in preflight/gate
+          # (fail-closed), the tarball uses the Source0 tag-archive layout.
+          top="$(mktemp -d)"
+          trap 'rm -rf -- "$top"' EXIT
+          mkdir -p "$top/SOURCES" dist
+          tar --mtime='@0' --exclude='./target' --exclude='./.git' \
+            --transform "s,^\\./,linux-trackpad-driver-${VERSION}/," \
+            -cf - . | gzip -n > "$top/SOURCES/linux-trackpad-driver-${VERSION}.tar.gz"
+          rpmbuild -bb \
+            --define "_topdir $top" \
+            --define "_sourcedir $top/SOURCES" \
+            packaging/fedora/linux-trackpad-driver.spec
+          cp "$top"/RPMS/*/*.rpm dist/
+          ls dist/*.rpm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-x86_64-rpm
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   assemble:
-    needs: [preflight, build]
+    needs: [preflight, build, build-rpm]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
@@ -206,6 +261,7 @@ jobs:
             "linux-trackpad-driver-${TAG}-x86_64-unknown-linux-gnu.tar.gz" \
             "linux-trackpad-driver-${TAG}-aarch64-unknown-linux-gnu.tar.gz" \
             ./*.deb \
+            ./*.rpm \
             "CHANGELOG-${TAG}.md" \
             BUILD_COMMIT > SHA256SUMS
           cat SHA256SUMS

@@ -1,17 +1,15 @@
-# linux-trackpad-driver.spec — Fedora/COPR RPM packaging for `ltd`.
+# linux-trackpad-driver.spec — Fedora/RHEL RPM packaging for `ltd`.
 #
 # Version policy: keep `Version:` in sync with Cargo.toml (and
 # debian/changelog head; cf. packaging/release/check-version-sync.sh).
-# The release process bumps it to the vX.Y.Z tag version before building
-# the SRPM that CI uploads (.github/workflows/copr.yml).
+# The release process builds the tagged Source0 tarball and the binary
+# RPM in .github/workflows/release-tag.yml.
 #
 # Source layout: this spec expects the GitHub tag archive
 #   https://github.com/aaronroquefonseca/linux-trackpad-driver/archive/refs/tags/v%{version}.tar.gz
 # unpacked as linux-trackpad-driver-%{version}/ (see %prep -n below).
-# Until the COPR project exists, builds are local/SRPM-only:
-#   ./packaging/fedora/check-fedora.sh   # parse + file-list validation
-# COPR submission (copr-cli build) remains a manual owner step — the COPR
-# project is not created yet and CI holds no COPR_API_TOKEN secret.
+# Local validation:
+#   ./packaging/fedora/check-fedora.sh   # parse + file-list + SRPM build
 
 Name:           linux-trackpad-driver
 Version:        0.1.0
@@ -88,6 +86,6 @@ echo 'To start the driver:  systemctl enable --now %{name}.service'
 
 %changelog
 * Wed Oct 14 2026 Aarón Roque Fonseca <aaronroquefonseca@gmail.com> - 0.1.0-1
-- Initial Fedora/COPR packaging: ltd binary, udev rules, systemd units
+- Initial Fedora packaging: ltd binary, udev rules, systemd units
   (main, reconnect@, resume, system-sleep hook), default system config.
   Units ship disabled; scriptlets reload daemon/udev only.

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# check-fedora.sh — CI/local validation for Fedora/COPR packaging.
+# check-fedora.sh — CI/local validation for Fedora/RHEL RPM packaging.
 #
 # Runs anywhere with bash + rpm tooling; systemd-rpm-macros and rpmlint
 # are optional (macro fallbacks are defined inline, rpmlint is advisory).
-# Exits nonzero on any failure. Mirrors the `copr` job in
-# .github/workflows/copr.yml.
+# Exits nonzero on any failure. Mirrors the `build-rpm` job in
+# .github/workflows/release-tag.yml.
 #
 # Checks: spec Version matches Cargo.toml/Cargo.lock/debian/changelog head;
 # License tags name MIT and Apache-2.0; every installed source exists in the
