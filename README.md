@@ -171,7 +171,10 @@ sudo ltd run -c /etc/linux-trackpad-driver/config.toml
 sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init
 sudo ltd reconnect /dev/hidrawN -f -p 90 -d
 ltd doctor                                     # read-only checklist
+ltd --version                                  # package version (alias: -V)
 ```
+
+`ltd --version` needs no root privileges or configuration and does not access hardware.
 
 ## Troubleshooting
 
