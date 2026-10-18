@@ -48,11 +48,16 @@ git tag -s vX.Y.Z && git push origin vX.Y.Z
    - `debian/changelog` (new stanza, `dch -v X.Y.Z-1`).
    - No AUR template edits: stable/bin digests render at publish time,
      `-git` needs no bump (`pkgver()` is dynamic).
-2. Update the changelog: `git-cliff --tag vX.Y.Z --strip all -o CHANGELOG.md`.
-   Notes style is the git-cliff excerpt from Conventional Commits (see
-   `cliff.toml`); this differs from projects using PR-linked notes
-   generators — the mechanism is not claimed identical, both yield coherent
-   per-release notes.
+2. Prepare only the new release section:
+   ```sh
+   git-cliff --unreleased --strip all | head -100
+   git-cliff --unreleased --tag vX.Y.Z --strip all > /tmp/release-details.md
+   ```
+   Insert that section above the existing entries in `CHANGELOG.md`, then
+   write **5–10 manual user-facing bullets** under `### Highlights`, above
+   the generated `### Details`. Follow the Highlights process below.
+   Preserve every published section byte-for-byte, including `## [0.1.0]`.
+   Never regenerate the full file with `-o CHANGELOG.md` for past tags.
 3. Run gates locally:
    ```sh
    cargo fmt --all -- --check
@@ -81,8 +86,10 @@ git tag -s vX.Y.Z && git push origin vX.Y.Z
    The release stays held until the tag page shows "Verified" and step 9
    is done by a human.
 7. Review the **draft** GitHub Release auto-created by `release-tag.yml`
-   (artifacts + SHA256SUMS + git-cliff notes): verify, then publish it
-   manually. The workflow never publishes a Release itself — draft only.
+   (artifacts + SHA256SUMS + git-cliff Details): copy the reviewed Highlights
+   from `CHANGELOG.md` above Details, verify the notes and assets, then
+   publish it manually. If the build is rerun, reapply Highlights after the
+   final draft refresh. The workflow only creates or refreshes drafts.
    Publishing is what arms the AUR stable leg; a published release is
    immutable to automation (reruns fail closed instead of rewriting it).
 8. Watch `aur-stable.yml` push both AUR repos (or noop-log if already
@@ -90,6 +97,73 @@ git tag -s vX.Y.Z && git push origin vX.Y.Z
    to downgrade the AUR master.
 9. Announce only after the tag signature verifies on GitHub
    (tag page shows "Verified").
+
+## Commit discipline
+
+Squash-merge PRs into `main` and use the PR title as the squash commit
+subject. CI runs commitlint on the title (including title edits); individual
+work-in-progress commits are not linted. Before merging, check the final
+squash subject and body in GitHub so the validated title reaches history.
+
+Use `<type>(<scope>): <description>` with a **required scope** identifying
+the affected area, for example `fix(proxy): restore release clicks`.
+Allowed types are `feat`, `fix`, `sec`, `docs`, `test`, `perf`, `refactor`,
+`ci`, `build`, `chore`, `revert`, and `style`. Use `sec(scope): ...` for
+security fixes so they appear in Security.
+
+For incompatible behavior, use `feat(config)!: ...` or `fix(proxy)!: ...`
+(the scoped form of `feat!` / `fix!`) and explain the migration in a
+`BREAKING CHANGE:` footer in the squash body. Breaking entries render first
+with `[!BREAKING]`, even if their type or scope normally matches a noise
+filter. Other process-only subjects/scopes beginning with `coordinator`,
+`wave`, `status`, `merged`, `dispatched`, `verdict`, `relay`, or `settled`,
+and `chore(merge)` commits, are omitted from Details. Reserve these for
+coordination; describe user changes with an area scope.
+
+## Highlights process
+
+For each future release, a maintainer reviews the generated Details and
+writes 5–10 concise Highlights describing user benefits, visible fixes,
+security changes, and any required migration. Combine related commits,
+link useful PRs, and omit internal coordination. Review the bullets against
+the diff and keep them above Details in both `CHANGELOG.md` and the draft
+GitHub Release. The generator supplies Details only; it cannot write or
+preserve manual Highlights when a draft is refreshed.
+
+Use this layout for the new section (replace the illustrative bullets with
+5–10 reviewed bullets):
+
+```markdown
+## [X.Y.Z] - YYYY-MM-DD
+
+### Highlights
+
+- Describe a user-visible improvement and its impact.
+- Explain any compatibility change and how to migrate.
+
+### Details
+
+#### Breaking Changes
+
+- Generated entry (scope) ([short-sha](commit-url)) [!BREAKING]
+
+#### Features
+
+- Generated entry (scope) ([short-sha](commit-url))
+
+Full diff: https://github.com/aaronroquefonseca/linux-trackpad-driver/compare/vA...vB
+```
+
+Details groups are Breaking Changes, Security, Features, Bug Fixes,
+Documentation, Tests, Performance, Refactoring, Continuous Integration,
+and Miscellaneous; empty groups are omitted. Entries link to their commits
+and existing `(#N)` references link to PRs. The per-release Full diff line
+compares the previous tag with the new tag (`HEAD` in unreleased previews).
+The first release has no comparison link because no previous tag exists.
+
+Keep published history unchanged: these conventions apply only to new
+release sections. In particular, do not retrofit Highlights, links, noise
+filtering, or group ordering into the published `0.1.0` entry.
 
 ## Dry runs (no toggles, no pushes)
 

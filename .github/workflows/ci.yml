@@ -3,8 +3,41 @@ name: CI
 on:
   push:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
+  commitlint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: install commitlint
+        run: |
+          npm install --prefix "$RUNNER_TEMP/commitlint" --no-save --package-lock=false \
+            @commitlint/cli@19.8.1 @commitlint/config-conventional@19.8.1
+      - name: validate squash commit title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          cat > "$RUNNER_TEMP/commitlint/commitlint.config.cjs" <<'EOF'
+          module.exports = {
+            extends: ['@commitlint/config-conventional'],
+            defaultIgnores: false,
+            rules: {
+              'scope-empty': [2, 'never'],
+              'type-enum': [2, 'always', [
+                'build', 'chore', 'ci', 'docs', 'feat', 'fix',
+                'perf', 'refactor', 'revert', 'sec', 'style', 'test',
+              ]],
+            },
+          };
+          EOF
+          printf '%s\n' "$PR_TITLE" | "$RUNNER_TEMP/commitlint/node_modules/.bin/commitlint" \
+            --config "$RUNNER_TEMP/commitlint/commitlint.config.cjs" --verbose
   ci:
     runs-on: ubuntu-latest
     steps:

@@ -1,8 +1,8 @@
-# git-cliff config — CHANGELOG.md generated from Conventional Commits.
-#   Preview:  git-cliff --unreleased --strip all
-#   Release:  git-cliff --tag vX.Y.Z --strip all -o CHANGELOG.md
-#   Excerpt:  git-cliff --tag vX.Y.Z --strip all --output excerpt.md
-# (release-tag.yml runs the excerpt form per tag; see docs/RELEASING.md.)
+# git-cliff config — future release Details from Conventional Commits.
+# Preview: git-cliff --unreleased --strip all
+# New section: git-cliff --unreleased --tag vX.Y.Z --strip all > /tmp/release-details.md
+# Insert manual Highlights above Details; preserve published CHANGELOG.md sections.
+# release-tag.yml generates a per-tag excerpt; see docs/RELEASING.md.
 [changelog]
 header = """\
 # Changelog\n
@@ -13,16 +13,22 @@ body = """\
     ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
     ## [unreleased]
-{% endif %}\
+{% endif %}
+    ### Details
 {% for group, commits in commits | group_by(attribute="group") %}
-    ### {{ group | striptags | trim | upper_first }}
-    {% for commit in commits %}
+    #### {{ group | striptags | trim | upper_first }}\n
+    {% for commit in commits %}\
         - {{ commit.message | upper_first | trim }}\
-          {% if commit.scope %} ({{ commit.scope }}){% endif %}\
+          {% if commit.scope %} ({{ commit.scope }}){% endif %} \
+          ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/{{ commit.id }}))\
           {% if commit.breaking %} [!BREAKING]{% endif %}
-    {% endfor %}
-{% endfor %}\n
+    {% endfor %}\
+{% endfor %}
+{% if previous.version %}\
+    Full diff: https://github.com/aaronroquefonseca/linux-trackpad-driver/compare/{{ previous.version }}...{% if version %}{{ version }}{% else %}HEAD{% endif %}
+{% endif %}\n
 """
+# The per-release footer lives in body so --strip all retains comparison links.
 trim = true
 render_always = true
 
@@ -32,23 +38,32 @@ filter_unconventional = true
 require_conventional = false
 split_commits = false
 commit_preprocessors = [
-  # Allow `scope!:` breaking markers and normalize `Merge X` noise away.
-  { pattern = "^(Merge)\\s.*", replace = "chore(merge): \\1" },
+  # Normalize git-generated reverts, keeping the original scope when available.
+  { pattern = '^Revert "\w+\(([^)]+)\)!?: (.+)"', replace = 'revert($1): $2' },
+  { pattern = '^Revert "(.+)"', replace = 'revert(repo): $1' },
+  { pattern = '^Merge\s.*', replace = 'chore(merge): $0' },
+  { pattern = '\(#([0-9]+)\)', replace = '([#$1](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/$1))' },
 ]
 commit_parsers = [
-  { message = "^feat", group = "Features" },
-  { message = "^fix", group = "Bug Fixes" },
-  { message = "^docs", group = "Documentation" },
-  { message = "^test", group = "Tests" },
-  { message = "^ci", group = "Continuous Integration" },
-  { message = "^perf", group = "Performance" },
-  { message = "^refactor", group = "Refactoring" },
-  { message = '^chore\(merge\)', group = "Merges", skip = true },
-  { message = "^chore", group = "Miscellaneous" },
-  { message = ".*", group = "Miscellaneous" },
+  # Match breaking changes before noise filters and type groups.
+  { field = "breaking", pattern = "true", group = "<!-- 0 -->Breaking Changes" },
+  { message = '^(coordinator|wave|status|merged|dispatched|verdict|relay|settled)', skip = true },
+  # Process scopes such as docs(coordinator) occur in the existing history.
+  { message = '^[a-z]+\((coordinator|wave|status|merged|dispatched|verdict|relay|settled)[^)]*\)!?:', skip = true },
+  { message = '^chore\(merge\)', skip = true },
+  # Numeric HTML comments control group_by's alphabetical ordering.
+  { message = "^sec", group = "<!-- 1 -->Security" },
+  { message = "^feat", group = "<!-- 2 -->Features" },
+  { message = "^fix", group = "<!-- 3 -->Bug Fixes" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Tests" },
+  { message = "^perf", group = "<!-- 6 -->Performance" },
+  { message = "^refactor", group = "<!-- 7 -->Refactoring" },
+  { message = "^ci", group = "<!-- 8 -->Continuous Integration" },
+  { message = ".*", group = "<!-- 9 -->Miscellaneous" },
 ]
-protect_breaking_commits = false
+protect_breaking_commits = true
 filter_commits = false
 tag_pattern = "v[0-9]*"
-topo_order = false
+topo_order = true
 sort_commits = "newest"
