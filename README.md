@@ -70,16 +70,13 @@ sudo apt install ./linux-trackpad-driver_*_amd64.deb
 Then enable and verify as above
 (`sudo systemctl enable --now linux-trackpad-driver.service`, `ltd doctor`).
 
-### Fedora / RHEL (COPR — upcoming)
+### Fedora / RHEL (`.rpm`)
 
-COPR packaging is staged in [`packaging/fedora/`](packaging/fedora/) and
-validated in CI, but the COPR project does not exist yet, so no builds are
-published. Planned (project name TBD — the command below is a placeholder
-and will not work until the project is created):
+`.rpm` files (`x86_64`) are attached to each
+[GitHub Release](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases):
 
 ```sh
-sudo dnf copr enable TBD-OWNER/linux-trackpad-driver  # placeholder: owner/project TBD
-sudo dnf install linux-trackpad-driver
+sudo dnf install ./linux-trackpad-driver-*.rpm
 ```
 
 Then enable and verify as above

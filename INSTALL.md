@@ -15,15 +15,22 @@ First-run check (read-only — scan + config + socket, never touches HW):
 ltd doctor
 ```
 
-## Fedora / RHEL (COPR — planned)
+## Fedora / RHEL (`.rpm` from GitHub Releases)
 
-No COPR repo exists yet (project name TBD) — COPR project creation and the
-first submit are still manual owner steps. Until then, Fedora/RHEL installs
-use the generic source build above (`cargo build --release`, then install
-the binary, rules, units, hook and default config with the commands in each
-section below). No Fedora dependency list is given here on purpose: package
-names are unverified, and the driver itself links no extra system libraries
-(all dependencies in `Cargo.toml` are pure Rust plus `libc`).
+Fedora/RHEL installs use the `.rpm` attached to each
+[GitHub Release](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases)
+(`x86_64`):
+
+```sh
+sudo dnf install ./linux-trackpad-driver-*.rpm
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+For other arches, or to inspect every step, use the generic source build
+below (`cargo build --release`, then install the binary, rules, units, hook
+and default config with the commands in each section below). No Fedora
+dependency list is given here on purpose: the driver itself links no extra
+system libraries (all dependencies in `Cargo.toml` are pure Rust plus `libc`).
 
 ## udev rules
 
