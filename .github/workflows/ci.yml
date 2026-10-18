@@ -101,10 +101,12 @@ jobs:
             --transform "s,^\\./,linux-trackpad-driver-${VERSION}/," \
             -cf - . | gzip -n > "$TOP/SOURCES/linux-trackpad-driver-${VERSION}.tar.gz"
           rpmbuild -bb --define "_topdir $TOP" --define "_sourcedir $TOP/SOURCES" packaging/fedora/linux-trackpad-driver.spec
-          RPM="$(find "$TOP/RPMS" -type f -name '*.rpm' -print -quit)"
+          # rpmbuild may also generate -debuginfo and -debugsource RPMs.
+          # Validate the installable package, never an arbitrary first match.
+          RPM="$(find "$TOP/RPMS" -type f -name "linux-trackpad-driver-${VERSION}-*.x86_64.rpm" -print -quit)"
           test -n "$RPM"
-          rpm -qpl "$RPM" | grep -q '/usr/bin/ltd'
-          rpm -qpl "$RPM" | grep -q '/etc/linux-trackpad-driver/config.toml'
+          rpm -qpl "$RPM" | grep -Fxq '/usr/bin/ltd'
+          rpm -qpl "$RPM" | grep -Fxq '/etc/linux-trackpad-driver/config.toml'
           rpm -qp --scripts "$RPM"
           rpm -qpl "$RPM"
   release-scripts:
