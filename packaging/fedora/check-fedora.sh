@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check-fedora.sh — CI/local validation for Fedora/RHEL RPM packaging.
 #
-# Runs anywhere with bash + rpm tooling; systemd-rpm-macros and rpmlint
+# Runs anywhere with bash + python3 + rpm tooling; systemd-rpm-macros and rpmlint
 # are optional (macro fallbacks are defined inline, rpmlint is advisory).
 # Exits nonzero on any failure. Mirrors the `build-rpm` job in
 # .github/workflows/release-tag.yml.
@@ -10,8 +10,8 @@
 # License tags name MIT and Apache-2.0; every installed source exists in the
 # tree; the payload matches debian/*.install member-for-member (modulo
 # install-root prefixes) with the config shipped via %config(noreplace) as
-# debian/rules does (never via a .install rename); scriptlets never
-# enable/start units; `rpmspec -q` parses; `rpmbuild -bs` produces an SRPM
+# debian/rules does (never via a .install rename); expanded scriptlets never
+# activate units; `rpmspec -q` parses; `rpmbuild -bs` produces an SRPM
 # from a tree snapshot (proves Source0 layout + spec end to end).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -76,15 +76,9 @@ for member in 'ltd' \
     || fail "spec missing payload member: $member"
 done
 
-# 5. Policy: units ship disabled — scriptlets must never enable/start.
-#    Only scan scriptlet bodies (%post/%preun/%postun), skipping comments:
-#    %description/README text legitimately shows the enable command.
-if awk '/^%(post|preun|postun)( |$)/{in_s=1; next} /^%/{in_s=0} in_s' "$SPEC" \
-    | grep -vE '^[[:space:]]*#' | grep -nE 'systemctl +(enable|start)'; then
-  fail 'spec scriptlets must never enable/start units'
-fi
-
-# 6. Parse check. systemd-rpm-macros may be absent (e.g. Ubuntu CI runner):
+# 5–6. Parse and activation-policy check. Query actual scriptlet tags after
+#    macro expansion; a literal spec scan misses preset-applying RPM helpers.
+#    systemd-rpm-macros may be absent (e.g. Ubuntu CI runner):
 #    define its path macros with standard values so the parse is hermetic.
 if command -v rpmspec >/dev/null 2>&1; then
   rpmspec -q \
@@ -92,6 +86,8 @@ if command -v rpmspec >/dev/null 2>&1; then
     -D "_udevrulesdir /usr/lib/udev/rules.d" \
     -D "_licensedir /usr/share/licenses" \
     "$SPEC" >/dev/null || fail "rpmspec -q failed to parse $SPEC"
+  python3 packaging/fedora/check-activation.py --spec "$SPEC" \
+    || fail 'expanded scriptlets must keep activation opt-in'
 else
   echo 'check-fedora: warning: rpmspec not found, parse check skipped' >&2
 fi
