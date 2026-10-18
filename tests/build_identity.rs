@@ -59,6 +59,18 @@ impl Fixture {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
+    fn build_script(&self) -> std::path::PathBuf {
+        let script = self._temp.path().join("build-script");
+        let out = Command::new("rustc")
+            .args(["--edition=2021", "build.rs", "-o"])
+            .arg(&script)
+            .current_dir(&self.root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        script
+    }
+
     fn git(&self, args: &[&str]) -> String {
         git(&self.root, args)
     }
@@ -218,19 +230,39 @@ fn archive_does_not_borrow_parent_repository() {
 }
 
 #[test]
+#[cfg(unix)]
+fn non_unicode_explicit_metadata_is_rejected() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let f = Fixture::new();
+    let script = f.build_script();
+    for name in ["LTD_BUILD_CHANNEL", "LTD_BUILD_COMMIT", "LTD_BUILD_DATE"] {
+        let out = Command::new(&script)
+            .env("CARGO_MANIFEST_DIR", &f.root)
+            .env("OUT_DIR", f._temp.path())
+            .env_remove("LTD_BUILD_CHANNEL")
+            .env_remove("LTD_BUILD_COMMIT")
+            .env_remove("LTD_BUILD_DATE")
+            .env(name, OsString::from_vec(b"private-metadata-\xff".to_vec()))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted non-Unicode {name}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(&format!("{name} must be valid Unicode")));
+        assert!(!stderr.contains("private-metadata"), "{stderr}");
+        assert!(!String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("cargo:rustc-env=LTD_BUILD_DETAILS="));
+    }
+}
+
+#[test]
 fn missing_git_is_honest_and_explicit_metadata_still_works() {
     let f = Fixture::new();
     fs::create_dir(f.root.join(".git")).unwrap();
     // Compile the dependency-free build script directly, then run it without
     // Git. Hiding Git from Cargo itself would also hide the compiler/linker.
-    let script = f._temp.path().join("build-script");
-    let out = Command::new("rustc")
-        .args(["--edition=2021", "build.rs", "-o"])
-        .arg(&script)
-        .current_dir(&f.root)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{out:?}");
+    let script = f.build_script();
     for commit in [None, Some("18d66664196334e80cb318b23098b412c8c29d8f")] {
         let mut cmd = Command::new(&script);
         cmd.env("PATH", "")

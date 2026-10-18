@@ -1,7 +1,11 @@
 use std::{env, path::Path, process::Command};
 
 fn metadata(name: &str) -> Option<String> {
-    env::var(name).ok()
+    match env::var(name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => panic!("{name} must be valid Unicode"),
+    }
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
