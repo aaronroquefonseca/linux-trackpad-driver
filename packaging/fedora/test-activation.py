@@ -77,6 +77,12 @@ fi
             self.assertIn("systemd-update-helper install-system-units", expanded)
             self.assertNotIn("%systemd_post ", expanded)
             self.check_cli("--spec", mutated, "automatic activation: systemd-update-helper install-system-units")
+            for section in ("preuntrans", "postuntrans"):
+                with self.subTest(section=section):
+                    mutated.write_text(SPEC.read_text().replace(
+                        "\n%files\n", f"\n%{section}\n"
+                        "systemctl --system start %{name}.service\n\n%files\n", 1))
+                    self.check_cli("--spec", mutated, "automatic activation: systemctl start")
 
     def test_built_rpm_scriptlets(self):
         lifecycle = "%post\n" + SPEC.read_text().split("\n%post\n", 1)[1].split("\n%files\n", 1)[0]
@@ -92,13 +98,27 @@ Never installed; only RPM metadata is queried.
 mkdir -p %{buildroot}/usr/share/activation-policy-fixture
 touch %{buildroot}/usr/share/activation-policy-fixture/payload
 """
-        for mutation in ("", "%systemd_post %{name}.service\n",
-                         "systemctl --no-reload preset %{name}.service\n"):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+        cases = [
+            ("post", "", None),
+            ("post", "%systemd_post %{name}.service\n", "systemd-update-helper install-system-units"),
+            ("post", "systemctl --no-reload preset %{name}.service\n", "systemctl preset"),
+        ]
+        for section in ("preuntrans", "postuntrans"):
+            cases.extend([
+                (section, "systemctl --system start %{name}.service\n", "systemctl start"),
+                (section, "systemctl --system stop %{name}.service\n"
+                 "systemctl --no-reload disable %{name}.service\n", None),
+            ])
+        for section, mutation, forbidden in cases:
+            with self.subTest(section=section, mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 top = Path(directory)
                 spec = top / "fixture.spec"
-                spec.write_text(header + lifecycle.replace("%post\n", "%post\n" + mutation, 1)
+                scriptlets = (lifecycle.replace("%post\n", "%post\n" + mutation, 1)
+                              if section == "post" else lifecycle + f"\n%{section}\n" + mutation)
+                spec.write_text(header + scriptlets
                                 + "\n%files\n/usr/share/activation-policy-fixture/payload\n")
+                expected = f"automatic activation: {forbidden}" if forbidden else None
+                self.check_cli("--spec", spec, expected)
                 build = subprocess.run(["rpmbuild", "-bb", "--define", f"_topdir {top}", str(spec)],
                                        capture_output=True, text=True)
                 self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
@@ -107,12 +127,11 @@ touch %{buildroot}/usr/share/activation-policy-fixture/payload
                 self.assertIn("remove-system-units", scripts)
                 if mutation.startswith("%systemd_post"):
                     self.assertIn("systemd-update-helper install-system-units", scripts)
-                    forbidden = "automatic activation: systemd-update-helper install-system-units"
-                elif mutation:
-                    forbidden = "automatic activation: systemctl preset"
-                else:
-                    forbidden = None
-                self.check_cli("--rpm", rpm, forbidden)
+                if section in ("preuntrans", "postuntrans"):
+                    body = subprocess.check_output(
+                        ["rpm", "-qp", "--queryformat", f"%{{{section.upper()}}}", str(rpm)], text=True)
+                    self.assertEqual(mutation.replace("%{name}", "activation-policy-fixture").strip(), body.strip())
+                self.check_cli("--rpm", rpm, expected)
 
 
 if __name__ == "__main__":
