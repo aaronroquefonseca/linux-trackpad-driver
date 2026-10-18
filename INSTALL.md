@@ -15,11 +15,11 @@ First-run check (read-only — scan + config + socket, never touches HW):
 ltd doctor
 ```
 
-## Fedora / RHEL (`.rpm` from GitHub Releases)
+## Fedora (`.rpm` from GitHub Releases)
 
-Fedora/RHEL installs use the `.rpm` attached to each
-[GitHub Release](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases)
-(`x86_64`):
+RPMs for Fedora (`x86_64`) are intended to ship with future
+[GitHub Releases](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases).
+The existing `v0.1.0` release does not contain an RPM:
 
 ```sh
 sudo dnf install ./linux-trackpad-driver-*.rpm
