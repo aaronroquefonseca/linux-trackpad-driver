@@ -5,6 +5,7 @@ pub mod clicks;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
+pub mod doctor;
 pub mod evdev;
 pub mod evdev_generic;
 #[cfg(test)]

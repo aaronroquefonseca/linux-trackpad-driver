@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-use crate::{config, daemon, discovery, lock};
+use crate::{config, daemon, discovery, doctor, lock};
 
 /// Parsed `run` invocation.
 #[derive(Debug, PartialEq, Eq)]
@@ -102,13 +102,13 @@ pub struct DoctorNode {
 ///
 /// Returns `(report, ok)`: `ok` is false when the config is invalid or no
 /// trackpad node was seen. The socket state is informational only — a
-/// stopped daemon is the expected pre-enable state, not a failure.
+/// lack of an observed listener is not a failure.
 pub fn doctor_report(
     config_source: &str,
     config_error: Option<&str>,
     nodes: &[DoctorNode],
     socket_path: &str,
-    socket_live: bool,
+    socket_status: &doctor::SocketStatus,
 ) -> (String, bool) {
     let mut out = format!("{}\n", crate::build_identity::IDENTITY);
     let mut ok = true;
@@ -139,12 +139,16 @@ pub fn doctor_report(
             }
         }
     }
-    if socket_live {
-        out.push_str(&format!("[ok] daemon socket live ({socket_path})\n"));
-    } else {
-        out.push_str(&format!(
-            "[..] daemon socket absent ({socket_path}); enable with: systemctl enable --now linux-trackpad-driver.service\n"
-        ));
+    match socket_status {
+        doctor::SocketStatus::Listening => out.push_str(&format!(
+            "[ok] listening stream socket observed ({socket_path}; /proc/net/unix, current network namespace)\n"
+        )),
+        doctor::SocketStatus::NotObserved => out.push_str(&format!(
+            "[..] no listening stream socket observed ({socket_path}; /proc/net/unix, current network namespace); this does not establish service status\n"
+        )),
+        doctor::SocketStatus::Unknown(reason) => out.push_str(&format!(
+            "[..] socket status unknown ({socket_path}): {reason}\n"
+        )),
     }
     (out, ok)
 }
@@ -385,16 +389,9 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Doctor(doc) => {
-            // Read-only by construction: sysfs scan + stat checks + socket
-            // dial only. Never sends feature reports, never grabs.
-            let source = doc
-                .config_path
-                .clone()
-                .or_else(config::config_path_from_env)
-                .unwrap_or_else(|| "<built-in defaults>".to_string());
-            let config_error = config::load_or_default_with_env(doc.config_path.as_deref())
-                .err()
-                .map(|e| format!("{e:#}"));
+            // Read-only: config + sysfs/stat + kernel socket metadata.
+            let (source, result) = doctor::check_config(doc.config_path.as_deref());
+            let config_error = result.err().map(|e| format!("{e:#}"));
             let nodes: Vec<DoctorNode> = match discovery::scan_trackpads() {
                 Ok(devs) => devs
                     .iter()
@@ -413,8 +410,9 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
                 }
             };
             let sock = lock::socket_path();
-            let live = lock::daemon_socket_present(&sock);
-            let (report, ok) = doctor_report(&source, config_error.as_deref(), &nodes, &sock, live);
+            let status = doctor::socket_status(&sock);
+            let (report, ok) =
+                doctor_report(&source, config_error.as_deref(), &nodes, &sock, &status);
             print!("{report}");
             if ok {
                 Ok(ExitCode::SUCCESS)
@@ -587,32 +585,55 @@ mod tests {
             None,
             &[doctor_node()],
             "/run/linux-trackpad-driver/driver.sock",
-            true,
+            &doctor::SocketStatus::Listening,
         );
         assert!(ok);
         assert_eq!(report.lines().next(), Some(crate::build_identity::IDENTITY));
         assert!(report.contains("[ok] config valid"));
         assert!(report.contains("/dev/hidraw2"));
         assert!(report.contains("05ac:0324"));
-        assert!(report.contains("daemon socket live"));
+        assert!(report.contains("listening stream socket observed"));
     }
 
     #[test]
-    fn doctor_report_no_device_fails_but_socket_absent_only_warns() {
-        let (report, ok) = doctor_report("<built-in defaults>", None, &[], "/sock", false);
+    fn doctor_report_no_device_fails_but_unobserved_socket_only_warns() {
+        let (report, ok) = doctor_report(
+            "<built-in defaults>",
+            None,
+            &[],
+            "/sock",
+            &doctor::SocketStatus::NotObserved,
+        );
         assert!(!ok);
         assert!(report.contains("[FAIL] no trackpad seen"));
-        assert!(report.contains("[..] daemon socket absent"));
+        assert!(report.contains("[..] no listening stream socket observed"));
 
-        // Socket absent alone is not a failure (expected pre-enable state).
+        // Lack of an observed socket alone is not a failure.
         let (_, ok) = doctor_report(
             "<built-in defaults>",
             None,
             &[doctor_node()],
             "/sock",
-            false,
+            &doctor::SocketStatus::NotObserved,
         );
         assert!(ok);
+    }
+
+    #[test]
+    fn doctor_report_unknown_socket_does_not_claim_absence_or_advise_enable() {
+        let (report, ok) = doctor_report(
+            "/etc/config.toml; on disk",
+            None,
+            &[doctor_node()],
+            "/sock",
+            &doctor::SocketStatus::Unknown("cannot read /proc/net/unix".into()),
+        );
+        assert!(ok);
+        assert!(report.contains("socket status unknown"));
+        assert!(report.contains("cannot read /proc/net/unix"));
+        assert!(!report.contains("absent"));
+        assert!(!report.contains("systemctl enable"));
+        assert!(!report.contains("socket live"));
     }
 
     #[test]
@@ -622,14 +643,20 @@ mod tests {
             Some("invalid polling_rate 500 (want 1..=110)"),
             &[],
             "/sock",
-            false,
+            &doctor::SocketStatus::NotObserved,
         );
         assert!(!ok);
         assert!(report.contains("[FAIL] config invalid"));
 
         let mut gone = doctor_node();
         gone.node_present = false;
-        let (_, ok) = doctor_report("<built-in defaults>", None, &[gone], "/sock", true);
+        let (_, ok) = doctor_report(
+            "<built-in defaults>",
+            None,
+            &[gone],
+            "/sock",
+            &doctor::SocketStatus::Listening,
+        );
         assert!(!ok);
     }
 

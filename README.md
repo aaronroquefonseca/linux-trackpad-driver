@@ -192,10 +192,28 @@ with the same identity, and daemon startup logs it too. See
 
 ## Troubleshooting
 
-`ltd doctor` is read-only: device scan + config validate + daemon socket
-dial. Exit 0 means the config is valid and a trackpad node was seen — it
-does not by itself mean the daemon is running; check
-`systemctl is-active linux-trackpad-driver.service` for that.
+Run `ltd doctor` as your ordinary user; no sudo is needed. It reads device
+metadata, validates config, and checks `/proc/net/unix` for an exact-path
+listening stream socket without connecting or requiring socket write access.
+`LTD_SOCKET` selects a custom socket path. Socket output is an observation in
+the caller's network namespace, not proof of daemon identity or responsiveness.
+No observed listener does not establish that the service is stopped (for
+example, it may be in another namespace). Unavailable or malformed metadata
+and unsupported paths, such as relative socket paths, report **unknown**.
+Kernel pathnames can also outlive an unlink or refer to another mount
+namespace; this diagnostic does not authenticate the process or resolve such
+pathname aliases.
+
+Config selection is `-c <file>` first, then nonempty `LTD_CONFIG`, then
+`/etc/linux-trackpad-driver/config.toml`. If the environment-selected or
+installed file is missing, doctor reports built-in defaults and the missing
+path; a missing explicit file or an invalid/unreadable selected file is an
+error. Files are checked **on disk**, so edits may differ from the running
+daemon's config until restart. `ltd doctor -c <file>` validates a specific file.
+
+Exit 0 means the config is valid and a trackpad node was seen. Socket status
+is informational; check `systemctl is-active linux-trackpad-driver.service`
+for service status.
 
 | Symptom | Check | Fix |
 |---|---|---|

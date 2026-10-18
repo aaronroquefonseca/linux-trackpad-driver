@@ -105,7 +105,11 @@ incl. nested, unknown version errors.
 - `ltd reconnect <hidraw-dev> [-f] [-p Hz] [-d]` — udev entry; idempotent;
   `-f` proceeds when daemon socket absent; `-d` disengage path.
 - `ltd resume [-p Hz] [-c config]` — re-run init after suspend (also via sleep hook).
-- `ltd doctor [-c config]` — read-only checklist: device scan + config validate + socket dial.
+- `ltd doctor [-c config]` — ordinary-user, read-only checklist: device metadata,
+  on-disk config validation, and listening stream socket metadata from
+  `/proc/net/unix` in the caller's network namespace (no socket connection).
+  Doctor alone falls back to the installed `/etc/linux-trackpad-driver/config.toml`
+  when neither `-c` nor nonempty `$LTD_CONFIG` selects a file.
 - Single-instance lock via `/run/linux-trackpad-driver/driver.sock`
   (`$LTD_SOCKET` overrides for tests/unprivileged runs).
 
