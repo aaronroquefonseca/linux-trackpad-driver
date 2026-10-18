@@ -153,6 +153,13 @@ re-bind/replug, proxy grabs evdev), so a failed enhanced path may need
 re-bind/replug — that BT path is not yet hardware-verified (issue #42).
 Device setup never depends on the click engine.
 
+A pointer uinput write failure releases the physical grab, retires both
+virtual nodes (including held keys and contacts), and marks the proxy session
+unattached. An extras-only failure retires the extras keyboard node and
+continues pointer motion/buttons; shortcuts are dropped until that node is
+created again. Partial writes and interrupted writes are completed before a
+frame is considered delivered.
+
 Apply changes with:
 
 ```sh
