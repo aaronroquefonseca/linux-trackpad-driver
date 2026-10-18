@@ -68,7 +68,7 @@ echo '%{name}: units are installed disabled (see README.md).'
 %systemd_preun %{name}.service %{name}-resume.service
 
 %postun
-%systemd_postun
+%systemd_postun %{name}.service %{name}-resume.service
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules || :
 fi
