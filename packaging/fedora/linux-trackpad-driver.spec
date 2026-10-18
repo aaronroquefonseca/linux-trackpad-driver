@@ -51,7 +51,7 @@ install -Dm644 systemd/%{name}-resume.service %{buildroot}%{_unitdir}/%{name}-re
 install -Dm755 systemd/system-sleep/ltd-resume %{buildroot}%{_prefix}/lib/systemd/system-sleep/ltd-resume
 
 %post
-# Do not use %systemd_post: it can apply systemd presets on first install,
+# Do not apply systemd presets during install; presets could enable units.
 # potentially enabling a unit. Keep activation strictly opt-in.
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || :
