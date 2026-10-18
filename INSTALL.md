@@ -59,6 +59,13 @@ systemctl status linux-trackpad-driver.service
   tests/unprivileged runs).
 - Reconnect template: `Type=oneshot`, runs `ltd reconnect /dev/%I`.
 
+## Config
+
+Switching between `-git`/stable/`-bin` removes the old package first, so pacman
+parks your config at `config.toml.pacsave` and installs a fresh default. Copy it
+back (`sudo cp /etc/linux-trackpad-driver/config.toml.pacsave /etc/linux-trackpad-driver/config.toml`)
+and restart (`sudo systemctl restart linux-trackpad-driver.service`).
+
 ## Suspend/resume re-init
 
 Trackpad 2 USB drops out of multitouch mode across suspend (report `0x02`
