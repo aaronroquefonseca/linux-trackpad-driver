@@ -60,7 +60,6 @@ if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules || true
 fi
 echo '%{name}: units are installed disabled (see README.md).'
-echo 'To start the driver:  systemctl enable --now %{name}.service'
 
 %preun
 # Mirror debian/prerm: removal only disables, never starts anything.
