@@ -16,7 +16,8 @@
 //! - Old-service debounce on the timed path ([`ClickMachine::update_at`]):
 //!   press swallowed within [`PRESS_DEBOUNCE_MS`] (50 ms) of the last
 //!   release, release held within [`RELEASE_DEBOUNCE_MS`] (30 ms) of the
-//!   press edge. The force level is undebounced (old parity).
+//!   press edge. Observed releases finish on idle polls once the window
+//!   expires; idle time alone never releases a still-pressed contact.
 //! - Finger-count at the press edge selects `click_1..=click_5` via the
 //!   existing [`crate::config::parse_click_action`].
 //! - Force second level: `force_offset > 0` arms force press at
@@ -637,46 +638,7 @@ impl ClickMachine {
             }
         }
 
-        // Release latches with no remaining bits (force first so a full
-        // release clears both; first-level release implies force is gone too
-        // since force release >= first release). The first level holds
-        // while inside the release debounce window, unless force was
-        // latched at entry (old releases ForcePressed immediately, no
-        // 30 ms hold). The force level holds inside the same window anchored
-        // at its last held frame instead (DEVIATION: old drops it
-        // undebounced — a single noisy frame then ends an intentional hold
-        // and its emitted keys, e.g. super in a drag chord, flap; clean
-        // liftoff still releases outright).
-        let force_hold_debounced = self.force_active.is_some()
-            && !self.force_pressed.values().any(|&p| p)
-            && now.is_some_and(|t| {
-                self.last_force_hold_at.is_some_and(|h| {
-                    t.saturating_duration_since(h).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
-                })
-            });
-        if self.force_active.is_some()
-            && !self.force_pressed.values().any(|&p| p)
-            && !force_hold_debounced
-        {
-            self.force_active = None;
-        }
-        let release_debounced = !force_latched_at_entry
-            && self.active.is_some()
-            && now.is_some_and(|t| {
-                self.last_press_at.is_some_and(|p| {
-                    t.saturating_duration_since(p).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
-                })
-            });
-        if self.active.is_some() && !self.pressed.values().any(|&p| p) && !release_debounced {
-            self.active = None;
-            self.force_active = None;
-            for v in self.force_pressed.values_mut() {
-                *v = false;
-            }
-            if let Some(t) = now {
-                self.last_release_at = Some(t);
-            }
-        }
+        self.release_unpressed(now, force_latched_at_entry);
 
         // Slide releases: liftoff clears outright; a press edge that
         // actually fires hands off (the proxy releases slide keys first
@@ -754,6 +716,61 @@ impl ClickMachine {
             }
         }
         Ok(out)
+    }
+
+    /// Advance only releases already observed by the last successful frame.
+    /// Pressure bits are never changed here: idle time cannot release an
+    /// ongoing hold, retry a suppressed press, or create force/slide edges.
+    /// Returns whether a pressure latch ended, so the proxy can emit key-ups
+    /// before servicing any pending key-down deadlines.
+    pub(crate) fn advance_releases_at(&mut self, now: Instant) -> bool {
+        let was_first = self.active.is_some();
+        let was_force = self.force_active.is_some();
+        self.release_unpressed(Some(now), was_force);
+        (was_first && self.active.is_none()) || (was_force && self.force_active.is_none())
+    }
+
+    fn release_unpressed(&mut self, now: Option<Instant>, force_latched_at_entry: bool) {
+        // Release latches with no remaining bits (force first so a full
+        // release clears both; first-level release implies force is gone too
+        // since force release >= first release). The first level holds
+        // while inside the release debounce window, unless force was
+        // latched at entry (old releases ForcePressed immediately, no
+        // 30 ms hold). The force level holds inside the same window anchored
+        // at its last held frame instead (DEVIATION: old drops it
+        // undebounced — a single noisy frame then ends an intentional hold
+        // and its emitted keys, e.g. super in a drag chord, flap; clean
+        // liftoff still releases outright).
+        let force_hold_debounced = self.force_active.is_some()
+            && !self.force_pressed.values().any(|&p| p)
+            && now.is_some_and(|t| {
+                self.last_force_hold_at.is_some_and(|h| {
+                    t.saturating_duration_since(h).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
+                })
+            });
+        if self.force_active.is_some()
+            && !self.force_pressed.values().any(|&p| p)
+            && !force_hold_debounced
+        {
+            self.force_active = None;
+        }
+        let release_debounced = !force_latched_at_entry
+            && self.active.is_some()
+            && now.is_some_and(|t| {
+                self.last_press_at.is_some_and(|p| {
+                    t.saturating_duration_since(p).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
+                })
+            });
+        if self.active.is_some() && !self.pressed.values().any(|&p| p) && !release_debounced {
+            self.active = None;
+            self.force_active = None;
+            for v in self.force_pressed.values_mut() {
+                *v = false;
+            }
+            if let Some(t) = now {
+                self.last_release_at = Some(t);
+            }
+        }
     }
 
     /// End a staged press cancelled by the proxy on genuine liftoff.
