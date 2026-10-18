@@ -7,7 +7,7 @@
 # cannot infer the repository), GH_TOKEN via `gh` auth as usual.
 #
 # DIR holds the release files: both per-arch tarballs, CHANGELOG-<TAG>.md,
-# at least one .deb, at least one .rpm, and SHA256SUMS. Rerun-safe: refreshing an existing draft
+# at least one .deb, optional .rpm, and SHA256SUMS. Rerun-safe: refreshing an existing draft
 # re-uploads with --clobber; an existing PUBLISHED (or prerelease) release
 # fails closed before anything is mutated. Verifies the release is still a
 # draft afterwards.
@@ -48,6 +48,8 @@ for deb in "$DIST"/*.deb; do
   files+=("$deb")
 done
 for rpm in "$DIST"/*.rpm; do
+  # RPMs are optional: without nullglob an empty match stays literal.
+  [ -e "$rpm" ] || continue
   files+=("$rpm")
 done
 for f in "${files[@]}"; do
