@@ -157,6 +157,7 @@ mk_draft_dist() { # dir
   echo arm > "$1/linux-trackpad-driver-v9.9.9-aarch64-unknown-linux-gnu.tar.gz"
   echo notes > "$1/CHANGELOG-v9.9.9.md"
   echo deb > "$1/fake_9.9.9_amd64.deb"
+  echo rpm > "$1/fake_9.9.9_x86_64.rpm"
   printf 'c%.0s' $(seq 40) > "$1/BUILD_COMMIT"
   ( cd "$1" && sha256sum -- * > SHA256SUMS )
 }
@@ -229,6 +230,21 @@ ok "creation stays a draft"
 [ "$(cat "$TMP_BASE/gh-state")" = "draft" ] \
   || { echo "FAIL: created release ends as draft" >&2; exit 1; }
 ok "created release ends as draft"
+grep -q -- "\.deb" "$TMP_BASE/gh-calls" \
+  || { echo "FAIL: creation uploads .deb" >&2; exit 1; }
+ok "creation uploads .deb"
+grep -q -- "\.rpm" "$TMP_BASE/gh-calls" \
+  || { echo "FAIL: creation uploads .rpm" >&2; exit 1; }
+ok "creation uploads .rpm"
+# RPMs are optional: a dist without any .rpm must still create the draft.
+DNORPM="$TMP_BASE/dnorpm"; mk_draft_dist "$DNORPM"; rm "$DNORPM"/*.rpm
+( cd "$DNORPM" && sha256sum -- * > SHA256SUMS )
+run_draft missing "$DNORPM" >/dev/null 2>&1 \
+  || { echo "FAIL: draft creation without rpm" >&2; exit 1; }
+ok "draft creation without rpm succeeds"
+grep -q -- "\.deb" "$TMP_BASE/gh-calls" \
+  || { echo "FAIL: rpm-less creation still uploads .deb" >&2; exit 1; }
+ok "rpm-less creation still uploads .deb"
 run_draft draft "$DWORK" >/dev/null 2>&1 \
   || { echo "FAIL: draft refresh" >&2; exit 1; }
 grep -q "upload $DRAFT_TAG" "$TMP_BASE/gh-calls" \

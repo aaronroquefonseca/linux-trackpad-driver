@@ -15,6 +15,23 @@ First-run check (read-only — scan + config + socket, never touches HW):
 ltd doctor
 ```
 
+## Fedora / RHEL (`.rpm` from GitHub Releases)
+
+Fedora/RHEL installs use the `.rpm` attached to each
+[GitHub Release](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases)
+(`x86_64`):
+
+```sh
+sudo dnf install ./linux-trackpad-driver-*.rpm
+sudo systemctl enable --now linux-trackpad-driver.service
+```
+
+For other arches, or to inspect every step, use the generic source build
+below (`cargo build --release`, then install the binary, rules, units, hook
+and default config with the commands in each section below). No Fedora
+dependency list is given here on purpose: the driver itself links no extra
+system libraries (all dependencies in `Cargo.toml` are pure Rust plus `libc`).
+
 ## udev rules
 
 ```sh
