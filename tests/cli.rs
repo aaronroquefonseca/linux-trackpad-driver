@@ -11,6 +11,10 @@ fn version_succeeds_without_loading_config() {
         for flag in ["--version", "-V"] {
             let output = Command::new(env!("CARGO_BIN_EXE_ltd"))
                 .arg(flag)
+                .current_dir(dir.path())
+                .env("PATH", "")
+                .env("LTD_BUILD_CHANNEL", "ignored-at-runtime")
+                .env("LTD_BUILD_COMMIT", "ignored-at-runtime")
                 .env("LTD_CONFIG", config)
                 .output()
                 .unwrap();
@@ -18,7 +22,12 @@ fn version_succeeds_without_loading_config() {
             assert_eq!(output.status.code(), Some(0), "{flag}: {output:?}");
             assert_eq!(
                 output.stdout,
-                format!("ltd {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+                format!(
+                    "ltd {} ({})\n",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("LTD_BUILD_DETAILS")
+                )
+                .as_bytes()
             );
             assert!(output.stderr.is_empty(), "{flag}: {output:?}");
         }

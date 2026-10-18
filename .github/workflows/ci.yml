@@ -5,6 +5,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
+# Match the checked-out source (including PR merge commits), even in RPM archives.
+env:
+  LTD_BUILD_CHANNEL: development
+  LTD_BUILD_COMMIT: ${{ github.sha }}
+
 jobs:
   commitlint:
     if: github.event_name == 'pull_request'

@@ -72,6 +72,15 @@ libm); `makedepends=cargo` (+ `git` for `-git`); mutual
 `conflicts` across all three, `provides=(linux-trackpad-driver)` on `-bin`
 and `-git`. Config behavior untouched.
 
+## Embedded binary identity
+
+`-git` builds embed the `development` channel, the checkout commit (12 digits),
+and `dirty` for local changes. Stable source builds embed `stable` and may use
+`commit unknown` because tag archives lack Git history. A verified
+`LTD_BUILD_COMMIT` can supply the source commit without Git. The `-bin` package
+preserves the release binary's identity. This does not alter `pkgver()` or the
+Cargo semantic version. See [the metadata contract](../../docs/RELEASING.md#embedded-build-identity).
+
 ## VCS versioning
 
 `pkgver()` tries `git describe --long --tags` (strips `v`), else falls back

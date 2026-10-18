@@ -39,6 +39,7 @@ activation is an explicit administrator choice.
 %autosetup -n %{name}-%{version}
 
 %build
+export LTD_BUILD_CHANNEL="${LTD_BUILD_CHANNEL:-stable}"
 cargo build --locked --release
 
 %install

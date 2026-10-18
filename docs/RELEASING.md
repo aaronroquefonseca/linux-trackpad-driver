@@ -33,6 +33,54 @@ git tag -s vX.Y.Z && git push origin vX.Y.Z
      download + checksum assets, render via render-aur.sh, push both AUR repos
 ```
 
+## Embedded build identity
+
+Cargo embeds identity at compile time; `--version` / `-V`, the first line of
+`doctor`, and the daemon startup log share it. `Cargo.toml` remains the semantic
+release version; snapshots do not change it or package versions/tags/assets.
+
+Build inputs (environment variables, never runtime CLI flags):
+
+| Variable | Contract |
+|---|---|
+| `LTD_BUILD_CHANNEL` | `development` (default), `stable`, or `nightly` |
+| `LTD_BUILD_COMMIT` | Real source commit, 12–64 hex digits; displayed as 12 lowercase digits. Explicit `unknown` disables Git fallback. Otherwise use checkout HEAD, then `unknown`. |
+| `LTD_BUILD_DATE` | Required only for `nightly`: explicit calendar date `YYYY-MM-DD`. Rejected for other channels. Never taken from the clock. |
+
+Invalid explicit metadata fails the build. Example for a future dated snapshot:
+
+```sh
+LTD_BUILD_CHANNEL=nightly LTD_BUILD_DATE=2026-10-18 \
+  LTD_BUILD_COMMIT=18d66664196334e80cb318b23098b412c8c29d8f cargo build --locked
+# ltd 0.1.0 (nightly 2026-10-18, commit 18d666641963)
+```
+
+No nightly workflow or package is provided. AUR `-git` explicitly selects
+`development`; stable AUR source builds select `stable`. Debian and Fedora
+packaging default to `stable`, with an environment override for development
+builds. Release jobs supply the exact preflight-resolved tag commit to all
+binary, Debian, and RPM builds, including source archives without `.git`.
+Regular CI supplies its checked-out commit and uses `development`.
+
+Stable tag archives have no Git history and may correctly print
+`ltd 0.1.0 (stable, commit unknown)`. Packagers can supply the verified source
+commit with `LTD_BUILD_COMMIT`; never derive it from a tarball checksum or an
+unrelated parent repository. Prebuilt packages preserve their binary's identity.
+
+Git discovery requires `.git` in the package root (directory or worktree file).
+Tracked edits, staged changes, and non-ignored untracked files add `, dirty`,
+even when a commit override is supplied. Ignored output is excluded; the
+build script only emits Cargo metadata and writes no source files. Without
+working Git, dirt cannot be determined and only supplied metadata is available;
+`dirty` reports detected local changes, rather than certifying a clean tree.
+For archive builds, packagers are responsible for the supplied commit's accuracy.
+
+Cargo re-runs the small metadata probe on every build so a new commit, dirty
+change, clean transition, or environment override updates the binary without
+`cargo clean`. This also recompiles the crate, trading a small rebuild cost for
+fresh identity. No runtime Git calls, build paths, or wall-clock timestamps are
+included in the identity.
+
 ## Prerequisites
 
 - GPG signing key configured (`git config user.signingkey <KEYID>`).

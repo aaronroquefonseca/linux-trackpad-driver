@@ -173,10 +173,22 @@ sudo ltd run -c /etc/linux-trackpad-driver/config.toml
 sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init
 sudo ltd reconnect /dev/hidrawN -f -p 90 -d
 ltd doctor                                     # read-only checklist
-ltd --version                                  # package version (alias: -V)
+ltd --version                                  # embedded build identity (alias: -V)
 ```
 
-`ltd --version` needs no root privileges or configuration and does not access hardware.
+`ltd --version` needs no root privileges or configuration and does not access hardware
+or Git at runtime. It works outside the source checkout. For example:
+
+```text
+ltd 0.1.0 (stable, commit b32946218ca3)
+ltd 0.1.0 (development, commit 18d666641963)
+```
+
+Local Cargo builds and AUR `-git` use `development`; release packages use
+`stable`. Local changes add `, dirty` before the closing parenthesis. When
+source metadata is unavailable, the commit is `unknown`. `ltd doctor` starts
+with the same identity, and daemon startup logs it too. See
+[build metadata](docs/RELEASING.md#embedded-build-identity) for archive builds.
 
 ## Troubleshooting
 
