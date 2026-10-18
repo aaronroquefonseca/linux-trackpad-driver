@@ -15,6 +15,16 @@ First-run check (read-only — scan + config + socket, never touches HW):
 ltd doctor
 ```
 
+## Fedora / RHEL (COPR — planned)
+
+No COPR repo exists yet (project name TBD) — COPR project creation and the
+first submit are still manual owner steps. Until then, Fedora/RHEL installs
+use the generic source build above (`cargo build --release`, then install
+the binary, rules, units, hook and default config with the commands in each
+section below). No Fedora dependency list is given here on purpose: package
+names are unverified, and the driver itself links no extra system libraries
+(all dependencies in `Cargo.toml` are pure Rust plus `libc`).
+
 ## udev rules
 
 ```sh
