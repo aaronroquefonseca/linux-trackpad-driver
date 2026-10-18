@@ -78,6 +78,35 @@ jobs:
         run: dpkg-buildpackage -S -us -uc -d
       - name: lintian (advisory)
         run: lintian --tag-display-limit 0 ../*.dsc || echo "::warning ::lintian reported tags"
+  fedora:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install RPM build tools
+        run: dnf install -y rpm-build systemd-rpm-macros cargo rustc gcc
+      - name: Validate Fedora packaging
+        run: |
+          set -euo pipefail
+          bash -n packaging/fedora/check-fedora.sh
+          ./packaging/fedora/check-fedora.sh
+      - name: Build binary RPM and inspect payload
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^Version:[[:space:]]*//p' packaging/fedora/linux-trackpad-driver.spec | head -n 1)"
+          TOP="$(mktemp -d)"
+          trap 'rm -rf "$TOP"' EXIT
+          mkdir -p "$TOP/SOURCES"
+          tar --mtime='@0' --exclude='./target' --exclude='./.git' \
+            --transform "s,^\\./,linux-trackpad-driver-${VERSION}/," \
+            -cf - . | gzip -n > "$TOP/SOURCES/linux-trackpad-driver-${VERSION}.tar.gz"
+          rpmbuild -bb --define "_topdir $TOP" --define "_sourcedir $TOP/SOURCES" packaging/fedora/linux-trackpad-driver.spec
+          RPM="$(find "$TOP/RPMS" -type f -name '*.rpm' -print -quit)"
+          test -n "$RPM"
+          rpm -qpl "$RPM" | grep -q '/usr/bin/ltd'
+          rpm -qpl "$RPM" | grep -q '/etc/linux-trackpad-driver/config.toml'
+          rpm -qp --scripts "$RPM"
+          rpm -qpl "$RPM"
   release-scripts:
     runs-on: ubuntu-latest
     container: archlinux:base
