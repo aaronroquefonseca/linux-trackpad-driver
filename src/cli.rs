@@ -1,4 +1,4 @@
-//! CLI parsing + dispatch for `ltd run` / `ltd reconnect`.
+//! CLI parsing + dispatch for `ltd`.
 //!
 //! Pure parse functions (no I/O) so unit tests cover arg handling.
 //! `dispatch` performs I/O and returns a process [`ExitCode`].
@@ -39,6 +39,7 @@ pub struct DoctorArgs {
 /// Top-level command after parsing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    Version,
     Run(RunArgs),
     Reconnect(ReconnectArgs),
     Resume(ResumeArgs),
@@ -65,7 +66,7 @@ impl From<String> for ParseFailure {
 fn top_usage(prog: &str) -> ParseFailure {
     ParseFailure {
         message: format!(
-            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-p Hz] [-c config]\n  {prog} doctor [-c config]"
+            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-p Hz] [-c config]\n  {prog} doctor [-c config]\n  {prog} --version | -V"
         ),
         is_help: true,
     }
@@ -159,6 +160,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
     };
     match cmd.as_str() {
         "-h" | "--help" | "help" => Err(top_usage(prog)),
+        "--version" | "-V" => {
+            if let Some(other) = rest.get(1) {
+                return Err(format!("{cmd}: unexpected argument '{other}'").into());
+            }
+            Ok(Command::Version)
+        }
         "run" => {
             let mut config_path: Option<String> = None;
             let mut i = 1;
@@ -322,6 +329,10 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
         Err(failure) => return Err(anyhow::Error::msg(failure.message)),
     };
     match cmd {
+        Command::Version => {
+            println!("ltd {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Run(run) => {
             // Like reconnect/resume: $LTD_CONFIG (set by the main unit) wins
             // over defaults so the daemon, the hook, and the tick verify
