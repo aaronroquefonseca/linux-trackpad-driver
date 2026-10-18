@@ -214,26 +214,28 @@ BT /dev/hidrawN: single-node path, no init dance — device ready
 (no `02 01` / `21 01` / `99 F2` reports on BT, ever).
 
 - [ ] With `enhanced_clicks=false`: pointer works via kernel
-      passthrough. Log shows passthrough intact at debug level, no unbind.
+      passthrough. Log shows `proxy: gate off, passthrough` at debug level;
+      both hidraw and physical evdev nodes remain present.
 - [ ] Double-input check: slow diagonal drag in `evtest` on the physical
       node — each physical motion produces exactly one event stream.
       Duplicated streams = finding (paste `evtest` excerpt + `dmesg` tail).
 - [ ] With `enhanced_clicks=true`: the proxy attaches per device `Ready`
       (see README Troubleshooting + `docs/CONFIG.md` gate semantics).
-      USB proxy failure falls back to passthrough; on BT a failed enhanced
-      path may need re-bind/replug. Record the attach line, then set the
-      gate back to `false` and replug:
-
-```sh
-sudo ltd reconnect /dev/hidrawN -d
-# replug or: echo -n "<HID_ID>" | sudo tee /sys/bus/hid/drivers/magicmouse/bind
-```
+      Check for `proxy: grabbed` after source/virtual pointer setup. The
+      physical evdev node and hidraw node must remain present: suppression
+      uses a reversible evdev grab, never a driver unbind.
+- [ ] Stop the daemon: native input resumes after its grab closes. With
+      the daemon stopped, run BT `reconnect` (including `-f`) and `resume`:
+      native input remains available, and driver bindings stay intact.
+- [ ] With the enhanced gate off, restart the daemon and repeat reconnect
+      and resume: native input remains available throughout. Bluetooth is
+      still experimental; record model/kernel/compositor and results for #42.
 
 ## 4. Click-proxy matrix (`enhanced_clicks = true`)
 
-Gate on, daemon restarted. Proxy attaches per `Ready`; USB proxy failure
-falls back to passthrough (init unaffected; on BT a failed enhanced path
-may need re-bind/replug — see README Troubleshooting).
+Gate on, daemon restarted. Proxy attaches per `Ready`; failed attachment
+leaves native input available on USB and BT. Neither init nor the one-shot
+helpers unbind the Bluetooth driver (see README Troubleshooting).
 
 ```sh
 sudo sed -i 's/^enhanced_clicks *=.*/enhanced_clicks = true/' /etc/linux-trackpad-driver/config.toml

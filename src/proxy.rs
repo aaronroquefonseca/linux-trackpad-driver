@@ -3321,6 +3321,70 @@ mod tests {
     }
 
     #[test]
+    fn bt_ready_only_suppresses_with_a_ready_proxy_and_releases_on_detach() {
+        // Run the daemon's real BT Ready fan-out into a fake proxy. A gate,
+        // source/output readiness or grab failure must leave native input available;
+        // a successful session suppresses only through its owned evdev grab.
+        for (enhanced, pump_ready, sink_ready, grab_fails, should_grab) in [
+            (false, true, true, false, false),
+            (true, false, true, false, false),
+            (true, true, false, false, false),
+            (true, true, true, true, false),
+            (true, true, true, false, true),
+        ] {
+            let grab = Arc::new(if grab_fails {
+                FakeGrab::failing()
+            } else {
+                FakeGrab::ok()
+            });
+            let mut px = ClickProxy::new(
+                settings(enhanced),
+                SharedGrab(Arc::clone(&grab)),
+                GatedUinput::new(sink_ready),
+                FakeHaptic::new(),
+                ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 10, 100, 200)], 0)))]),
+            );
+            px.set_pump_ready(pump_ready);
+            let px = Arc::new(Mutex::new(px));
+            let hub = crate::init::DeviceReadyHub::new();
+            let capture = Arc::clone(&px);
+            hub.subscribe(move |ev| match ev.kind {
+                ReadyKind::Ready => capture.lock().unwrap().attach(ev),
+                ReadyKind::Detached => capture.lock().unwrap().detach(ev),
+            });
+            let dev = crate::discovery::DiscoveredDevice {
+                devnode: "/dev/fake-bt-trackpad".into(),
+                vendor_id: 0x004c,
+                product_id: 0x0324,
+                transport: Transport::Bluetooth,
+            };
+            crate::daemon::init_node(&dev, 110, &hub).unwrap();
+            assert_eq!(grab.is_grabbed(), should_grab);
+            {
+                let mut px = px.lock().unwrap();
+                assert_eq!(px.is_attached(), should_grab);
+                assert_eq!(px.is_passthrough(), !should_grab);
+                px.handle_frame(&Config::default()).unwrap();
+                assert_eq!(
+                    px.uinput().inner.has(EV_ABS, ABS_MT_TRACKING_ID, 1),
+                    should_grab
+                );
+                assert_eq!(px.uinput().inner.has(EV_KEY, BTN_TOUCH, 1), should_grab);
+            }
+            // A hardware-only helper must also leave an active grab alone.
+            let node = tempfile::NamedTempFile::new().unwrap();
+            assert_eq!(
+                crate::resume::resume_bt_node(node.path().to_str().unwrap()),
+                crate::resume::ResumeAction::UpToDate
+            );
+            assert_eq!(grab.is_grabbed(), should_grab);
+            hub.emit(&detached(&dev.devnode, Transport::Bluetooth));
+            assert!(!grab.is_grabbed());
+            assert!(px.lock().unwrap().is_passthrough());
+        }
+    }
+
+    #[test]
     fn grab_waits_for_sink_ready() {
         let grab = Arc::new(FakeGrab::ok());
         let sink = GatedUinput::new(false);

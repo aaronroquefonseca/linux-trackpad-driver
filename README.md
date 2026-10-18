@@ -147,11 +147,11 @@ enhanced_clicks = true   # false: kernel passthrough, device setup still runs
 
 `[device]` settings work on their own; `[pointer]`, `[click]`,
 `[haptics]`, `[force]`, `[slide]` and `[spoof]` need `enhanced_clicks = true`.
-USB proxy failure falls back to passthrough (grab released); on Bluetooth
-with `enhanced_clicks = true` the HID driver is unbound (sticky until
-re-bind/replug, proxy grabs evdev), so a failed enhanced path may need
-re-bind/replug — that BT path is not yet hardware-verified (issue #42).
-Device setup never depends on the click engine.
+USB proxy failure falls back to passthrough (grab released). Bluetooth keeps
+native input available until an enhanced proxy session successfully grabs the
+physical evdev node; failed attach and one-shot setup leave driver bindings
+untouched. Bluetooth remains experimental and has not been hardware-verified
+with this rewrite (issue #42). Device setup never depends on the click engine.
 
 Apply changes with:
 
@@ -220,7 +220,7 @@ for service status.
 | `doctor`: no trackpad seen | cable seated? BT paired? `ls /sys/class/hidraw`; `dmesg \| grep -i hid` | replug / finish BT pairing, re-run `ltd doctor` |
 | `doctor`: config invalid | line names the key + accepted range | edit `/etc/linux-trackpad-driver/config.toml` (unknown keys are rejected — usually a typo); validate with `ltd doctor -c <file>` first |
 | Edited config, nothing changed | service restarted? | `sudo systemctl restart linux-trackpad-driver.service` (required for now) |
-| Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | on BT the kernel node stays live alongside hidraw; with `enhanced_clicks = true` (the default) the driver unbinds the BT HID driver (sticky until re-bind/replug) and the proxy grabs evdev to suppress the duplicate — a failed enhanced path may need re-bind/replug; this path is not yet hardware-verified with this rewrite (issue #42) |
+| Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | the enhanced proxy suppresses duplicates with a reversible evdev grab after its source and virtual pointer are ready; init, reconnect and resume never unbind the HID driver. Check for the `proxy: grabbed` log; BT remains experimental (issue #42) |
 | Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup |
 
 Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).

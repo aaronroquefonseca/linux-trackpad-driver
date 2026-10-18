@@ -46,12 +46,16 @@ report email above — never post sensitive diagnostics publicly.
 If the USB proxy path fails, it releases the evdev grab and the device
 falls back to kernel passthrough (`src/proxy.rs`).
 
-On Bluetooth with `enhanced_clicks = true`, the driver may unbind the
-HID driver for our VID:PID (`attempt_driver_unbind` in `src/init.rs`).
-That unbind is sticky until re-bind/reconnect — there is no guaranteed
-automatic recovery, and a failed enhanced path may need re-bind/replug
-to restore input. The Bluetooth path is not yet hardware-verified with
-this rewrite (issue #42).
+On Bluetooth, initialization, reconnect and resume never unbind the HID
+driver. The enhanced proxy suppresses duplicate physical events with its
+reversible evdev grab after the source and virtual pointer are ready.
+Failed attachment leaves native input available; detach or source disconnect
+releases the grab. Reconnect and resume one-shots own no proxy and leave
+Bluetooth driver bindings alone, including when the daemon is absent.
+An older release may already have unbound the device; reconnecting the
+trackpad restores the kernel interfaces in that case. The Bluetooth path
+remains experimental and is not yet hardware-verified with this rewrite
+(issue #42).
 
 ## Privileges and attack surface
 
