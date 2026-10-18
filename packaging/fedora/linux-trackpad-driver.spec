@@ -10,30 +10,30 @@
 # unpacked as linux-trackpad-driver-%{version}/ (see %prep -n below).
 # Local validation:
 #   ./packaging/fedora/check-fedora.sh   # parse + file-list + SRPM build
+# The CI Fedora job additionally builds and installs a binary RPM.
 
 Name:           linux-trackpad-driver
 Version:        0.1.0
 Release:        1%{?dist}
-Summary:        Linux driver core-init for Apple Magic Trackpad 2 (USB/BT)
+Summary:        Userspace driver enhancing Apple Magic Trackpad 2 functionality
 License:        MIT OR Apache-2.0
 URL:            https://github.com/aaronroquefonseca/linux-trackpad-driver
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
 BuildRequires:  rustc
+BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
 Requires:       systemd
 
 %description
-Userspace Rust driver for the Apple Magic Trackpad 2 (Lightning
-05ac:0265/004c:0265, USB-C 05ac:0324/004c:0324) over USB, with Bluetooth
-single-node attach, hotplug reconnect via udev plus systemd, and
-suspend/resume re-init via a system-sleep hook.
+Userspace Linux driver currently supporting Apple Magic Trackpad 2 (Lightning
+and USB-C). Features configurable USB polling, pressure-sensitive clicks,
+adjustable haptic feedback, multi-finger action mappings, and pointer speed.
 
-Ships the ltd binary, udev rules, systemd units (main service, reconnect
-template, resume service, system-sleep hook), and a default system config.
-Units ship disabled by design; opt in explicitly (see README.md):
-  systemctl enable --now linux-trackpad-driver.service
+Ships the ltd binary, udev rules, systemd units, a resume hook, and a system
+configuration file. The service is not enabled or started at installation;
+activation is an explicit administrator choice.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -49,14 +49,13 @@ install -Dm644 systemd/%{name}.service %{buildroot}%{_unitdir}/%{name}.service
 install -Dm644 systemd/%{name}-reconnect@.service %{buildroot}%{_unitdir}/%{name}-reconnect@.service
 install -Dm644 systemd/%{name}-resume.service %{buildroot}%{_unitdir}/%{name}-resume.service
 install -Dm755 systemd/system-sleep/ltd-resume %{buildroot}%{_prefix}/lib/systemd/system-sleep/ltd-resume
-install -Dm644 LICENSE-MIT %{buildroot}%{_licensedir}/%{name}/LICENSE-MIT
-install -Dm644 LICENSE-APACHE %{buildroot}%{_licensedir}/%{name}/LICENSE-APACHE
 
 %post
-# Policy (mirrors debian/postinst): NEVER enable or start the daemon on
-# install — only reload daemon + udev. Enabling is one explicit admin step:
-#   systemctl enable --now linux-trackpad-driver.service
-%systemd_post
+# Do not use %systemd_post: it can apply systemd presets on first install,
+# potentially enabling a unit. Keep activation strictly opt-in.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
 if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules || true
 fi
@@ -71,6 +70,9 @@ echo 'To start the driver:  systemctl enable --now %{name}.service'
 
 %postun
 %systemd_postun
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || :
+fi
 
 %files
 %license LICENSE-MIT LICENSE-APACHE
@@ -81,8 +83,6 @@ echo 'To start the driver:  systemctl enable --now %{name}.service'
 %{_unitdir}/%{name}-reconnect@.service
 %{_unitdir}/%{name}-resume.service
 %{_prefix}/lib/systemd/system-sleep/ltd-resume
-%{_licensedir}/%{name}/LICENSE-MIT
-%{_licensedir}/%{name}/LICENSE-APACHE
 
 %changelog
 * Wed Oct 14 2026 Aarón Roque Fonseca <aaronroquefonseca@gmail.com> - 0.1.0-1
