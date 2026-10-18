@@ -60,7 +60,7 @@ pub fn hub() -> DeviceReadyHub {
 /// - same node + live proxy → ignore (duplicate);
 /// - same node + dead proxy → teardown + full re-attach;
 /// - another node active → ignore (sibling).
-pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
+pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl Fn(&str) -> bool {
     use crate::proxy::{
         AsyncHaptic, ClickProxy, DualSink, ProxySettings, RealGrab, RealHaptic, RealUinput,
         UinputSink,
@@ -326,14 +326,35 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) {
             ReadyKind::Detached => m.detach(event),
         }
     });
-    // Keep the manager alive for the daemon lifetime: the hub holds only
-    // the closure (which holds an Arc), so leak one Arc here. The pump
-    // thread + proxy die with the process.
-    std::mem::forget(manager);
     log::debug!(
         "click proxy subscribed (enhanced_clicks={})",
         cfg.enhanced_clicks
     );
+    // Query actual proxy health, independent of hardware polling state.
+    // Siblings wait while an owner exists; a dead owner retries its own
+    // node first, using the existing teardown/re-attach path.
+    move |devnode| {
+        let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+        let live = manager
+            .proxy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_attached();
+        session_needs_attach(
+            manager.cfg.enhanced_clicks,
+            active.as_deref(),
+            devnode,
+            live,
+        )
+    }
+}
+
+fn session_needs_attach(enhanced: bool, active: Option<&str>, devnode: &str, live: bool) -> bool {
+    enhanced
+        && matches!(
+            attach_decision(active, devnode, live),
+            AttachDecision::Adopt | AttachDecision::Reattach
+        )
 }
 
 /// Attach decision for a `Ready` event against manager state.
@@ -509,7 +530,7 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("installing signal handler: {e}"))?;
 
     let ready_hub = hub();
-    subscribe_click_proxy(cfg, &ready_hub);
+    let needs_attach = subscribe_click_proxy(cfg, &ready_hub);
     let initial: Vec<DiscoveredDevice> = match discovery::scan_trackpads() {
         Ok(devs) if devs.is_empty() => {
             log::info!("no supported trackpads found; idling until signal");
@@ -517,16 +538,6 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         }
         Ok(devs) => {
             log::info!("found {} trackpad node(s)", devs.len());
-            for dev in &devs {
-                if let Err(e) = init_node_with_config(
-                    dev,
-                    cfg.device.polling_rate,
-                    cfg.enhanced_clicks,
-                    &ready_hub,
-                ) {
-                    log::error!("init failed for {}: {e:#}", dev.devnode);
-                }
-            }
             devs
         }
         Err(e) => {
@@ -538,17 +549,19 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     // Belt-and-braces resume detection: the system-sleep hook (`ltd resume`)
     // is the primary post-sleep re-init (immediate); this tick covers
     // add/change/remove that arrive with no sleep hook (re-verify polling
-    // via GET_FEATURE, multitouch-first re-init on mismatch), at most
-    // RESUME_REVERIFY_INTERVAL_SECS of cross-process re-attach latency.
-    // Initial init above always runs first; ticks never reorder it.
-    let mut watch = ResumeWatch::new(&initial);
+    // via GET_FEATURE, multitouch-first re-init on mismatch), plus
+    // independent retry of missing/dead enhanced sessions. Each pass is
+    // bounded by the existing hardware init/attach budgets.
+    // Start empty so failed hardware init remains pending on later passes.
+    let mut watch = ResumeWatch::new(&[]);
+    watch.tick_with_scan(cfg, &ready_hub, initial, &needs_attach);
     let mut last_tick = std::time::Instant::now();
     while running.load(Ordering::SeqCst) {
         // 100 ms poll: prompt shutdown without burning CPU in the idle loop.
         std::thread::sleep(std::time::Duration::from_millis(100));
         if last_tick.elapsed().as_secs() >= resume::RESUME_REVERIFY_INTERVAL_SECS {
             last_tick = std::time::Instant::now();
-            watch.tick(cfg, &ready_hub);
+            watch.tick(cfg, &ready_hub, &needs_attach);
         }
     }
     log::info!("shutdown complete");
@@ -797,7 +810,9 @@ pub enum TickAction {
     /// Known USB node unreadable several passes running; assuming armed,
     /// nothing sent (reprobe every [`resume::UNREADABLE_RETRY_EVERY_TICKS`]).
     AssumedArmed(String),
-    /// Node vanished → `Detached` emitted (remove path).
+    /// Hardware is initialized but the enhanced session needs attachment.
+    AttachmentRetried(String),
+    /// Node vanished or was replaced → `Detached` emitted (remove path).
     Detached(String),
 }
 
@@ -805,7 +820,8 @@ pub enum TickAction {
 /// list plus per-node unreadable streaks; each [`ResumeWatch::tick`] diffs a
 /// fresh scan against it:
 ///
-/// - added node → full [`init_node_with_config`] (same ordering as boot init);
+/// - added/replaced node or previously failed init → full
+///   [`init_node_with_config`] (same ordering as boot init);
 /// - still-present known USB node → one `GET_FEATURE` re-verify, threaded
 ///   into [`resume::resume_usb_node`] (no double read); multitouch-first
 ///   re-init on mismatch, [`resume::needs_reinit`] as the decision;
@@ -815,9 +831,12 @@ pub enum TickAction {
 ///   must not cause a re-init + `Ready` storm every pass;
 /// - still-present known BT node → slow-cadence coexistence re-apply only
 ///   (every [`BT_REAPPLY_EVERY_TICKS`]; the hook is primary, this backstops
-///   hook-missed sleeps; never emits — re-emitting `Ready` every pass would
-///   spam clicks);
-/// - vanished node → `Detached` emit so clicks releases it.
+///   hook-missed sleeps; no hardware-driven `Ready`);
+/// - vanished/replaced instance → `Detached` emit so clicks releases it;
+/// - initialized hardware with a missing/dead enhanced session → bounded
+///   attachment-only `Ready`, independent of USB verify / BT policy work.
+///
+/// Healthy sessions and siblings do not receive retry events.
 ///
 /// Removal `Detached`s emit before the scan loop so a same-window
 /// renumber self-heals (stale session torn down, then the new node
@@ -832,9 +851,74 @@ pub struct ResumeWatch {
 struct NodeState {
     dev: DiscoveredDevice,
     unreadable_streak: u32,
+    initialized: bool,
+    identity: Option<NodeIdentity>,
+}
+
+/// devtmpfs instance identity, not just the reusable hidraw path/rdev.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeIdentity {
+    filesystem: u64,
+    inode: u64,
+    device: u64,
+}
+
+fn node_identity(devnode: &str) -> Option<NodeIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(devnode).ok()?;
+    Some(NodeIdentity {
+        filesystem: meta.dev(),
+        inode: meta.ino(),
+        device: meta.rdev(),
+    })
+}
+
+// Small I/O seam: lifecycle regressions inject hardware outcomes without
+// opening trackpads, grabbing evdev or creating virtual devices.
+trait WatchHardware {
+    fn identity(&self, devnode: &str) -> Option<NodeIdentity> {
+        node_identity(devnode)
+    }
+    fn initialize(&self, dev: &DiscoveredDevice) -> Result<()>;
+    fn verify(&self, devnode: &str) -> Result<bool>;
+    fn resume(&self, devnode: &str, verify: &Result<bool>) -> Result<resume::ResumeAction>;
+    fn reapply_bt(&self, devnode: &str);
+}
+
+struct LiveWatchHardware<'a> {
+    cfg: &'a Config,
+    hub: &'a DeviceReadyHub,
+}
+
+impl WatchHardware for LiveWatchHardware<'_> {
+    fn initialize(&self, dev: &DiscoveredDevice) -> Result<()> {
+        init_node_with_config(
+            dev,
+            self.cfg.device.polling_rate,
+            self.cfg.enhanced_clicks,
+            self.hub,
+        )?;
+        Ok(())
+    }
+    fn verify(&self, devnode: &str) -> Result<bool> {
+        resume::verify_node_polling(devnode, self.cfg.device.polling_rate)
+    }
+    fn resume(&self, devnode: &str, verify: &Result<bool>) -> Result<resume::ResumeAction> {
+        resume::resume_usb_node(
+            devnode,
+            self.cfg.device.polling_rate,
+            Some(self.hub),
+            verify,
+        )
+    }
+    fn reapply_bt(&self, devnode: &str) {
+        let _ = init::apply_bt_coexistence(devnode, self.cfg.enhanced_clicks);
+    }
 }
 
 impl ResumeWatch {
+    /// Seed with successfully initialized devices only. Production starts
+    /// empty and processes its boot scan through the same retry path.
     pub fn new(initial: &[DiscoveredDevice]) -> Self {
         Self {
             known: initial
@@ -842,13 +926,20 @@ impl ResumeWatch {
                 .map(|dev| NodeState {
                     dev: dev.clone(),
                     unreadable_streak: 0,
+                    initialized: true,
+                    identity: node_identity(&dev.devnode),
                 })
                 .collect(),
             ticks: 0,
         }
     }
 
-    pub fn tick(&mut self, cfg: &Config, ready_hub: &DeviceReadyHub) -> Vec<TickAction> {
+    pub fn tick(
+        &mut self,
+        cfg: &Config,
+        ready_hub: &DeviceReadyHub,
+        needs_attach: &dyn Fn(&str) -> bool,
+    ) -> Vec<TickAction> {
         self.ticks += 1;
         let current = match discovery::scan_trackpads() {
             Ok(devs) => devs,
@@ -857,7 +948,7 @@ impl ResumeWatch {
                 return Vec::new();
             }
         };
-        self.tick_with_scan(cfg, ready_hub, current)
+        self.tick_with_scan(cfg, ready_hub, current, needs_attach)
     }
 
     /// One pass over an injected scan (production passes the live scan
@@ -867,46 +958,82 @@ impl ResumeWatch {
         cfg: &Config,
         ready_hub: &DeviceReadyHub,
         current: Vec<DiscoveredDevice>,
+        needs_attach: &dyn Fn(&str) -> bool,
+    ) -> Vec<TickAction> {
+        self.tick_with_hardware(
+            cfg,
+            ready_hub,
+            current,
+            needs_attach,
+            &LiveWatchHardware {
+                cfg,
+                hub: ready_hub,
+            },
+        )
+    }
+
+    fn tick_with_hardware(
+        &mut self,
+        cfg: &Config,
+        ready_hub: &DeviceReadyHub,
+        current: Vec<DiscoveredDevice>,
+        needs_attach: &dyn Fn(&str) -> bool,
+        hardware: &dyn WatchHardware,
     ) -> Vec<TickAction> {
         let mut actions = Vec::new();
         // Nodes recorded Detached mid-pass (present in the scan but gone by
         // the wait) are dropped from the stored snapshot below — trusting
         // the fresher wait over the stale scan. They re-enter as added nodes
         // if they come back.
-        let known_devs: Vec<DiscoveredDevice> = self.known.iter().map(|k| k.dev.clone()).collect();
-        // Removals emit BEFORE the scan loop: a same-window renumber
-        // (hidraw8→hidraw12) surfaces as one removal plus one addition,
-        // and the new node's Ready must not be rejected as a sibling of
-        // a stale session that is about to be torn down. Emit-then-adopt
-        // self-heals within this tick; the reverse order bricks the new
-        // node (Ready rejected, then Detached clears, no Ready ever).
-        let (_added, removed) = resume::diff_scan(&known_devs, &current);
-        for old in &removed {
-            log::info!("resume tick: {} vanished; emitting Detached", old.devnode);
-            ready_hub.emit(&init::detached(&old.devnode, old.transport));
-            actions.push(TickAction::Detached(old.devnode.clone()));
+        let mut next: Vec<NodeState> = current
+            .into_iter()
+            .map(|dev| {
+                let identity = hardware.identity(&dev.devnode);
+                let prior = self.known.iter().find(|k| {
+                    // Missing metadata alone does not prove a replacement.
+                    k.dev == dev
+                        && !(k.identity.is_some() && identity.is_some() && k.identity != identity)
+                });
+                NodeState {
+                    unreadable_streak: prior.map_or(0, |k| k.unreadable_streak),
+                    initialized: prior.is_some_and(|k| k.initialized),
+                    identity: identity.or_else(|| prior.and_then(|k| k.identity)),
+                    dev,
+                }
+            })
+            .collect();
+        // Retire old instances BEFORE any Ready, including replacements
+        // reusing the same node name entirely between two scans.
+        for old in &self.known {
+            let survives = next.iter().any(|n| {
+                n.dev == old.dev
+                    && !(old.identity.is_some()
+                        && n.identity.is_some()
+                        && old.identity != n.identity)
+            });
+            if !survives {
+                ready_hub.emit(&init::detached(&old.dev.devnode, old.dev.transport));
+                actions.push(TickAction::Detached(old.dev.devnode.clone()));
+            }
         }
         let mut detached: Vec<String> = Vec::new();
-        for dev in &current {
-            let Some(pos) = self.known.iter().position(|k| k.dev.devnode == dev.devnode) else {
-                debug_assert!(_added.iter().any(|d| d.devnode == dev.devnode));
-                match init_node_with_config(
-                    dev,
-                    cfg.device.polling_rate,
-                    cfg.enhanced_clicks,
-                    ready_hub,
-                ) {
-                    Ok(_) => {
-                        log::info!("resume tick: initialized newly appeared {}", dev.devnode);
+        let mut ready_sent: Vec<String> = Vec::new();
+        for state in &mut next {
+            let dev = &state.dev;
+            if !state.initialized {
+                match hardware.initialize(dev) {
+                    Ok(()) => {
+                        state.initialized = true;
+                        // Mode-switch init can itself replace the node;
+                        // remember the instance accepted by the sequence.
+                        state.identity = hardware.identity(&dev.devnode).or(state.identity);
+                        ready_sent.push(dev.devnode.clone());
                         actions.push(TickAction::Initialized(dev.devnode.clone()));
                     }
-                    Err(e) => log::error!(
-                        "resume tick: init failed for newly appeared {}: {e:#}",
-                        dev.devnode
-                    ),
+                    Err(e) => log::error!("resume tick: init failed for {}: {e:#}", dev.devnode),
                 }
                 continue;
-            };
+            }
             if dev.transport != Transport::Usb {
                 // Known BT: steady state, no hub traffic — except a
                 // slow-cadence coexistence re-apply (the hook's one-shot is
@@ -916,19 +1043,19 @@ impl ResumeWatch {
                         "resume tick: re-applying BT coexistence for {}",
                         dev.devnode
                     );
-                    let _ = init::apply_bt_coexistence(&dev.devnode, cfg.enhanced_clicks);
+                    hardware.reapply_bt(&dev.devnode);
                 }
                 continue;
             }
-            let verify = resume::verify_node_polling(&dev.devnode, cfg.device.polling_rate);
+            let verify = hardware.verify(&dev.devnode);
             if !resume::needs_reinit(&verify) {
-                self.known[pos].unreadable_streak = 0;
+                state.unreadable_streak = 0;
                 actions.push(TickAction::UpToDate(dev.devnode.clone()));
                 continue;
             }
             if verify.is_err() {
-                let prior = self.known[pos].unreadable_streak;
-                self.known[pos].unreadable_streak = prior + 1;
+                let prior = state.unreadable_streak;
+                state.unreadable_streak = prior + 1;
                 match resume::unreadable_disposition(prior) {
                     resume::UnreadableDisposition::Suppress => {
                         if prior == 1 {
@@ -955,15 +1082,12 @@ impl ResumeWatch {
                     }
                 }
             } else {
-                self.known[pos].unreadable_streak = 0;
+                state.unreadable_streak = 0;
             }
-            match resume::resume_usb_node(
-                &dev.devnode,
-                cfg.device.polling_rate,
-                Some(ready_hub),
-                &verify,
-            ) {
+            match hardware.resume(&dev.devnode, &verify) {
                 Ok(resume::ResumeAction::Reinitialized) => {
+                    state.identity = hardware.identity(&dev.devnode).or(state.identity);
+                    ready_sent.push(dev.devnode.clone());
                     actions.push(TickAction::Reinitialized(dev.devnode.clone()))
                 }
                 Ok(resume::ResumeAction::Detached) => {
@@ -982,23 +1106,26 @@ impl ResumeWatch {
                 }
             }
         }
-        // Rebuild from the fresh scan, preserving streaks of survivors and
-        // dropping mid-pass detachments (list-skew fix).
-        self.known = current
-            .into_iter()
-            .filter(|d| !detached.contains(&d.devnode))
-            .map(|dev| {
-                let unreadable_streak = self
-                    .known
-                    .iter()
-                    .find(|k| k.dev.devnode == dev.devnode)
-                    .map_or(0, |k| k.unreadable_streak);
-                NodeState {
-                    dev,
-                    unreadable_streak,
-                }
-            })
-            .collect();
+        // Reconcile sessions separately: hardware success does not imply
+        // an attached proxy session. At most one Ready per node
+        // per 30 s pass, including init/re-init emits. Healthy owners and
+        // siblings produce no additional hub traffic; gate-off never retries.
+        next.retain(|s| !detached.contains(&s.dev.devnode));
+        for state in &next {
+            if cfg.enhanced_clicks
+                && state.initialized
+                && !ready_sent.contains(&state.dev.devnode)
+                && needs_attach(&state.dev.devnode)
+            {
+                let event = match state.dev.transport {
+                    Transport::Usb => init::usb_ready(&state.dev.devnode),
+                    Transport::Bluetooth => init::init_bluetooth(&state.dev.devnode),
+                };
+                ready_hub.emit(&event);
+                actions.push(TickAction::AttachmentRetried(state.dev.devnode.clone()));
+            }
+        }
+        self.known = next;
         actions
     }
 }
@@ -1007,6 +1134,349 @@ impl ResumeWatch {
 mod tests {
     use super::*;
     use crate::init::Recorder;
+
+    use crate::init::ReadyKind;
+    use crate::proxy::{ClickProxy, GrabDevice, LogHaptic, ProxySettings, UinputSink};
+    use crate::pump::{HidrawSource, ScriptReader, ScriptStep};
+    use std::cell::Cell;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct TestGrab {
+        fail: AtomicBool,
+        grabbed: AtomicBool,
+    }
+    impl GrabDevice for TestGrab {
+        fn grab(&self) -> Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("transient grab failure");
+            }
+            self.grabbed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn ungrab(&self) {
+            self.grabbed.store(false, Ordering::SeqCst);
+        }
+        fn is_grabbed(&self) -> bool {
+            self.grabbed.load(Ordering::SeqCst)
+        }
+    }
+    struct TestSink;
+    impl UinputSink for TestSink {
+        fn emit(&self, _: u16, _: u16, _: i32) {}
+    }
+    type TestProxy = ClickProxy<TestGrab, TestSink, LogHaptic, HidrawSource<ScriptReader>>;
+    struct TestSession {
+        proxy: TestProxy,
+        active: Option<String>,
+        attempts: usize,
+        events: Vec<ReadyKind>,
+    }
+    impl TestSession {
+        fn subscribe(hub: &DeviceReadyHub, fail: bool) -> Arc<Mutex<Self>> {
+            let session = Arc::new(Mutex::new(Self {
+                proxy: TestProxy::new(
+                    ProxySettings { enhanced: true },
+                    TestGrab::default(),
+                    TestSink,
+                    LogHaptic,
+                    HidrawSource::new("fixture", ScriptReader::default()),
+                ),
+                active: None,
+                attempts: 0,
+                events: Vec::new(),
+            }));
+            session
+                .lock()
+                .unwrap()
+                .proxy
+                .grab()
+                .fail
+                .store(fail, Ordering::SeqCst);
+            let capture = Arc::clone(&session);
+            hub.subscribe(move |event| {
+                let mut s = capture.lock().unwrap();
+                s.events.push(event.kind);
+                if event.kind == ReadyKind::Detached {
+                    if s.active.as_deref() == Some(&event.devnode) {
+                        s.proxy.detach(event);
+                        s.proxy.set_pump_ready(false);
+                        s.active = None;
+                    }
+                    return;
+                }
+                if !session_needs_attach(
+                    true,
+                    s.active.as_deref(),
+                    &event.devnode,
+                    s.proxy.is_attached(),
+                ) {
+                    return;
+                }
+                s.attempts += 1;
+                // Disposable replacement source, mirroring the manager's
+                // fresh-FD wiring after a failed grab or dead source.
+                s.proxy
+                    .replace_source(HidrawSource::new(&event.devnode, ScriptReader::default()));
+                s.proxy.set_pump_ready(true);
+                s.proxy.attach(event);
+                if s.proxy.is_attached() {
+                    s.active = Some(event.devnode.clone());
+                }
+            });
+            session
+        }
+        fn needs_attach(&self, node: &str) -> bool {
+            session_needs_attach(true, self.active.as_deref(), node, self.proxy.is_attached())
+        }
+    }
+
+    struct TestHardware<'a> {
+        hub: &'a DeviceReadyHub,
+        init_fails: Cell<bool>,
+        verify: Cell<Option<bool>>,
+        inits: Cell<usize>,
+        reinits: Cell<usize>,
+    }
+    impl<'a> TestHardware<'a> {
+        fn new(hub: &'a DeviceReadyHub) -> Self {
+            Self {
+                hub,
+                init_fails: Cell::new(false),
+                verify: Cell::new(Some(true)),
+                inits: Cell::new(0),
+                reinits: Cell::new(0),
+            }
+        }
+        fn ready(&self, dev: &DiscoveredDevice) {
+            self.hub.emit(&match dev.transport {
+                Transport::Usb => init::usb_ready(&dev.devnode),
+                Transport::Bluetooth => init::init_bluetooth(&dev.devnode),
+            });
+        }
+    }
+    impl WatchHardware for TestHardware<'_> {
+        fn initialize(&self, dev: &DiscoveredDevice) -> Result<()> {
+            self.inits.set(self.inits.get() + 1);
+            if self.init_fails.get() {
+                anyhow::bail!("transient init failure");
+            }
+            self.ready(dev);
+            Ok(())
+        }
+        fn verify(&self, _: &str) -> Result<bool> {
+            self.verify
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("unreadable firmware"))
+        }
+        fn resume(&self, devnode: &str, _: &Result<bool>) -> Result<resume::ResumeAction> {
+            self.reinits.set(self.reinits.get() + 1);
+            self.hub.emit(&init::usb_ready(devnode));
+            Ok(resume::ResumeAction::Reinitialized)
+        }
+        fn reapply_bt(&self, _: &str) {}
+    }
+
+    fn enhanced_config() -> Config {
+        Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn failed_attachment_recovers_with_unchanged_usb_or_bt_hardware() {
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, true);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            // Boot init succeeds, but the physical grab fails. No second
+            // attempt in the same pass; the scan name never changes.
+            watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            assert_eq!(session.lock().unwrap().attempts, 1);
+            assert!(session.lock().unwrap().proxy.is_passthrough());
+            session
+                .lock()
+                .unwrap()
+                .proxy
+                .grab()
+                .fail
+                .store(false, Ordering::SeqCst);
+            let actions =
+                watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            assert!(actions.contains(&TickAction::AttachmentRetried(dev.devnode.clone())));
+            assert!(session.lock().unwrap().proxy.is_attached());
+            assert_eq!(session.lock().unwrap().attempts, 2);
+            // Healthy sessions stay quiet for subsequent passes.
+            for _ in 0..5 {
+                watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            }
+            assert_eq!(session.lock().unwrap().attempts, 2);
+            assert_eq!(session.lock().unwrap().events.len(), 2);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.reinits.get(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_initial_hardware_init_remains_pending_until_success() {
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, false);
+        let hardware = TestHardware::new(&hub);
+        hardware.init_fails.set(true);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let dev = fixture_devs().remove(0);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        for _ in 0..3 {
+            watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        }
+        assert_eq!(hardware.inits.get(), 3, "one init attempt per pass");
+        assert!(session.lock().unwrap().events.is_empty());
+        hardware.init_fails.set(false);
+        watch.tick_with_hardware(&cfg, &hub, vec![dev], &health, &hardware);
+        assert!(session.lock().unwrap().proxy.is_attached());
+        assert_eq!(hardware.inits.get(), 4);
+    }
+
+    #[test]
+    fn unchanged_scan_recovers_a_self_released_source_session() {
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, false);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            {
+                let mut s = session.lock().unwrap();
+                s.proxy.replace_source(HidrawSource::new(
+                    &dev.devnode,
+                    ScriptReader::new(vec![ScriptStep::IoError(libc::ENODEV)]),
+                ));
+                s.proxy.handle_frame(&cfg).unwrap();
+                assert!(!s.proxy.is_attached());
+                assert!(!s.proxy.grab().is_grabbed());
+                assert_eq!(s.active.as_deref(), Some(dev.devnode.as_str()));
+            }
+            watch.tick_with_hardware(&cfg, &hub, vec![dev], &health, &hardware);
+            assert!(session.lock().unwrap().proxy.is_attached());
+            assert_eq!(session.lock().unwrap().attempts, 2);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.reinits.get(), 0);
+        }
+    }
+
+    #[test]
+    fn same_name_replacement_detaches_before_init_even_if_proxy_still_looks_live() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("hidraw");
+        std::fs::write(&path, []).unwrap();
+        let mut dev = fixture_devs().remove(0);
+        dev.devnode = path.to_string_lossy().into_owned();
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, false);
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        let first = node_identity(&dev.devnode).unwrap();
+        let steady = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(steady, vec![TickAction::UpToDate(dev.devnode.clone())]);
+        assert_eq!(session.lock().unwrap().attempts, 1);
+        assert_eq!(hardware.inits.get(), 1);
+        // Keep the old inode alive under a different name so the fixture
+        // cannot accidentally reuse it; the scan never sees an absence.
+        std::fs::rename(&path, fixture.path().join("retired")).unwrap();
+        std::fs::write(&path, []).unwrap();
+        assert_ne!(Some(first), node_identity(&dev.devnode));
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Detached(dev.devnode.clone()),
+                TickAction::Initialized(dev.devnode)
+            ]
+        );
+        let s = session.lock().unwrap();
+        assert_eq!(
+            s.events,
+            vec![ReadyKind::Ready, ReadyKind::Detached, ReadyKind::Ready]
+        );
+        assert!(s.proxy.is_attached());
+        assert_eq!(hardware.inits.get(), 2);
+    }
+
+    #[test]
+    fn persistent_attachment_failures_are_limited_to_one_attempt_per_pass() {
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, true);
+        let hardware = TestHardware::new(&hub);
+        // Exercise unreadable cooldown too: suppressed hardware init must
+        // not suppress independent session recovery.
+        hardware.verify.set(None);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let dev = fixture_devs().remove(0);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        for pass in 1..=6 {
+            watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            assert_eq!(session.lock().unwrap().attempts, pass);
+        }
+        assert_eq!(hardware.inits.get(), 1);
+        assert_eq!(hardware.reinits.get(), 1);
+        assert!(session.lock().unwrap().proxy.is_passthrough());
+    }
+
+    #[test]
+    fn gate_off_and_owned_siblings_do_not_receive_attachment_retries() {
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let devs = fixture_devs();
+        let mut watch = ResumeWatch::new(&devs);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&events);
+        hub.subscribe(move |ev| capture.lock().unwrap().push(ev.clone()));
+        let health_queries = Cell::new(0);
+        // Gate-off must not request session work, or emit Ready.
+        let disabled = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        watch.tick_with_hardware(
+            &disabled,
+            &hub,
+            devs.clone(),
+            &|_| {
+                health_queries.set(health_queries.get() + 1);
+                true
+            },
+            &hardware,
+        );
+        assert_eq!(health_queries.get(), 0);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(hardware.inits.get(), 0);
+        assert_eq!(hardware.reinits.get(), 0);
+        for live in [false, true] {
+            let needs_attach =
+                |node: &str| session_needs_attach(true, Some(&devs[0].devnode), node, live);
+            assert!(!needs_attach(&devs[1].devnode));
+        }
+        // Healthy owner blocks duplicates for itself and all siblings.
+        watch.tick_with_hardware(
+            &enhanced_config(),
+            &hub,
+            devs.clone(),
+            &|node| session_needs_attach(true, Some(&devs[0].devnode), node, true),
+            &hardware,
+        );
+        assert!(events.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn bt_reapply_fires_every_nth_tick_only() {
@@ -1046,7 +1516,7 @@ mod tests {
             transport: Transport::Usb,
         }]);
         let cfg = Config::default();
-        let actions = watch.tick(&cfg, &hub);
+        let actions = watch.tick(&cfg, &hub, &|_| false);
         assert_eq!(
             actions,
             vec![TickAction::Detached("/dev/hidraw-nope".into())]
@@ -1055,7 +1525,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].kind, crate::init::ReadyKind::Detached);
         // Second tick: steady state, no repeat traffic.
-        let actions = watch.tick(&cfg, &hub);
+        let actions = watch.tick(&cfg, &hub, &|_| false);
         assert!(actions.is_empty());
         assert_eq!(seen.len(), 1);
     }
@@ -1082,7 +1552,7 @@ mod tests {
             product_id: 0x0324,
             transport: Transport::Bluetooth,
         }];
-        let actions = watch.tick_with_scan(&cfg, &hub, current);
+        let actions = watch.tick_with_scan(&cfg, &hub, current, &|_| false);
         // Removal first, then adoption — the order that heals.
         assert_eq!(
             actions,
@@ -1107,6 +1577,7 @@ mod tests {
                 product_id: 0x0324,
                 transport: Transport::Bluetooth,
             }],
+            &|_| false,
         );
         assert!(actions.is_empty());
         assert_eq!(seen.len(), 2, "stale Detached must fire exactly once");

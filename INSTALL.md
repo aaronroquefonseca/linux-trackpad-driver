@@ -122,9 +122,15 @@ systemctl status linux-trackpad-driver-resume.service
   emit `Detached`.
 - Re-attach path: the `ltd resume` one-shot re-arms hardware only (its hub
   would reach zero listeners, so it emits nothing). Clicks re-attaches on
-  the daemon hub: the tick re-inits a drifted node and emits `Ready` after
-  the sequence, or fully inits a re-enumerated node — at most ~30 s after
-  the hook when the hook path misses.
+  the daemon hub: each 30 s pass also checks enhanced-session health.
+  Failed attachments and sessions released after source loss retry even
+  when USB polling still matches or a Bluetooth node keeps its name.
+  These attachment-only retries send no hardware init reports. Failed
+  hardware init remains pending; a replaced devnode instance is detached
+  before fresh init, including when its name is reused between scans.
+  Healthy sessions and siblings receive no attachment retries; gate-off
+  keeps native passthrough. Recovery starts on a later pass, with init and
+  attachment work adding to the scan interval.
 
 No udev `change` rule is needed: resume re-enumeration already emits `add`,
 which the rules above hand to the reconnect template; the hook + daemon

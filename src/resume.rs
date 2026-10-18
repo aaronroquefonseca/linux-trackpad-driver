@@ -18,12 +18,12 @@
 //!
 //! Clicks contract: re-init emits `Ready` on the [`DeviceReadyHub`] *after*
 //! the sequence succeeds, so the clicks pipeline re-attaches without ever
-//! reordering init. Those emits only happen on a live daemon hub (boot init,
-//! tick): the one-shot's hub would be a per-process orphan reaching zero
-//! listeners, so cross-process re-attach is tick-mediated (≤
-//! [`RESUME_REVERIFY_INTERVAL_SECS`] latency) plus the udev `add` path for
-//! re-enumerated nodes. A node that vanished emits `Detached` instead, never
-//! `Ready`.
+//! reordering init. The daemon also retries missing/dead enhanced sessions
+//! without repeating hardware init, even when polling matches or BT keeps
+//! its name. Those emits only happen on a live daemon hub: the one-shot
+//! owns no listeners. Cross-process re-attach starts on a later daemon
+//! pass ([`RESUME_REVERIFY_INTERVAL_SECS`], plus init/attach work). A node
+//! that vanished emits `Detached` instead, never `Ready`.
 
 use anyhow::Result;
 
