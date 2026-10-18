@@ -114,6 +114,8 @@ jobs:
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       COMMIT: ${{ needs.preflight.outputs.commit }}
+      LTD_BUILD_CHANNEL: stable
+      LTD_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -176,6 +178,8 @@ jobs:
       TAG: ${{ needs.preflight.outputs.tag }}
       VERSION: ${{ needs.preflight.outputs.version }}
       COMMIT: ${{ needs.preflight.outputs.commit }}
+      LTD_BUILD_CHANNEL: stable
+      LTD_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

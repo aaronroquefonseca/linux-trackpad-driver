@@ -483,6 +483,7 @@ pub fn init_node_with_config(
 /// `run` daemon loop. Holds the socket lock, inits all current devices,
 /// then parks until signal. Clean exit removes the socket.
 pub fn run_daemon(cfg: &Config) -> Result<()> {
+    log::info!("starting {}", crate::build_identity::IDENTITY);
     let sock = lock::socket_path();
     let _lock = SocketLock::acquire(&sock)?;
     log::info!("lock acquired at {sock}");

@@ -1,4 +1,5 @@
 pub mod apple_parse;
+pub mod build_identity;
 pub mod cli;
 pub mod clicks;
 pub mod config;

@@ -3,6 +3,9 @@
 # auto-started (see README.Debian): --no-enable --no-start keeps install
 # consent with the admin.
 
+# Source archives retain their release channel without requiring Git.
+export LTD_BUILD_CHANNEL ?= stable
+
 %:
 	dh $@
 

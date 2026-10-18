@@ -1,6 +1,8 @@
 # Build output
 /target/
 **/target/
+/dist/
+/dist-stage/
 
 # Rust
 **/*.rs.bk

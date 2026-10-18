@@ -110,7 +110,7 @@ pub fn doctor_report(
     socket_path: &str,
     socket_live: bool,
 ) -> (String, bool) {
-    let mut out = String::new();
+    let mut out = format!("{}\n", crate::build_identity::IDENTITY);
     let mut ok = true;
     match config_error {
         None => out.push_str(&format!("[ok] config valid ({config_source})\n")),
@@ -330,7 +330,7 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
     };
     match cmd {
         Command::Version => {
-            println!("ltd {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", crate::build_identity::IDENTITY);
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(run) => {
@@ -590,6 +590,7 @@ mod tests {
             true,
         );
         assert!(ok);
+        assert_eq!(report.lines().next(), Some(crate::build_identity::IDENTITY));
         assert!(report.contains("[ok] config valid"));
         assert!(report.contains("/dev/hidraw2"));
         assert!(report.contains("05ac:0324"));

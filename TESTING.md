@@ -381,7 +381,7 @@ One block per failing/odd row in §9. Include:
 
 ```sh
 # 1. versions + config
-ltd --help | head -5; uname -r; libinput --version
+ltd --version; uname -r; libinput --version
 cat /etc/linux-trackpad-driver/config.toml
 # 2. device identity
 lsusb -d 05ac:0265; lsusb -d 05ac:0324
@@ -443,3 +443,16 @@ Copy into the PR/issue reply, one row per check.
 | 6c | user-run perms | clean EACCES, no panic | | |
 | 6d | unknown node | rejected, nothing sent | | |
 | 6e | -p 5 rejected | below-floor error | | |
+
+## Build identity regression coverage
+
+`cargo test --test build_identity` builds dependency-free temporary Cargo
+projects with the real build script. It covers linked worktrees, commit and
+staged/unstaged/untracked dirty transitions in the same target directory,
+archive isolation from parent repositories, missing Git, explicit channel /
+commit / nightly date metadata, invalid inputs, and incremental overrides.
+`tests/cli.rs` runs `--version` and `-V` outside the checkout with no Git in
+`PATH` and invalid/missing config; doctor identity is checked without hardware
+by the report-rendering unit test. `packaging/arch/check-aur.sh` checks the
+stable source archive's embedded channel during its offline build.
+Checkout fixture tests skip when Git is unavailable; archive tests still run.

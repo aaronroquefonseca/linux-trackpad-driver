@@ -196,6 +196,12 @@ cd "/tmp/aur-src/linux-trackpad-driver-${VER}"
 export RUSTUP_TOOLCHAIN=stable
 cargo fetch --locked --target "$(rustc -vV | sed -n 's|host: ||p')"
 export CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/aur-src/target
-cargo build --frozen --release --all-features
-cargo test --frozen --all-features
+LTD_BUILD_CHANNEL=stable cargo build --frozen --release --all-features
+commit="${LTD_BUILD_COMMIT:-unknown}"
+commit="${commit:0:12}"
+if [ "$("$CARGO_TARGET_DIR/release/ltd" --version)" != "ltd $VER (stable, commit ${commit,,})" ]; then
+  echo "stable archive build identity incorrect (or misleadingly dirty)" >&2
+  exit 1
+fi
+LTD_BUILD_CHANNEL=stable cargo test --frozen --all-features
 echo 'check-aur: OK'
