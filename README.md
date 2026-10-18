@@ -70,10 +70,12 @@ sudo apt install ./linux-trackpad-driver_*_amd64.deb
 Then enable and verify as above
 (`sudo systemctl enable --now linux-trackpad-driver.service`, `ltd doctor`).
 
-### Fedora / RHEL (`.rpm`)
+### Fedora (`.rpm`)
 
-`.rpm` files (`x86_64`) are attached to each
-[GitHub Release](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases):
+Starting with the first release built after RPM packaging was added, `.rpm`
+files (`x86_64`) will be available in
+[GitHub Releases](https://github.com/aaronroquefonseca/linux-trackpad-driver/releases).
+The existing `v0.1.0` release does not contain an RPM.
 
 ```sh
 sudo dnf install ./linux-trackpad-driver-*.rpm

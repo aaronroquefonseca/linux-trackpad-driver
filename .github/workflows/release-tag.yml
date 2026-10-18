@@ -185,7 +185,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: install rpm tooling
-        run: dnf install -y rpm-build systemd-rpm-macros cargo rustc
+        run: dnf install -y rpm-build systemd-rpm-macros cargo rustc gcc
       - name: version gate (tag == spec == cargo)
         run: |
           set -euo pipefail
@@ -211,7 +211,11 @@ jobs:
             --define "_topdir $top" \
             --define "_sourcedir $top/SOURCES" \
             packaging/fedora/linux-trackpad-driver.spec
-          cp "$top"/RPMS/*/*.rpm dist/
+          # Only publish the driver RPM; rpmbuild may also produce separate
+          # -debuginfo and -debugsource packages.
+          rpm="$(find "$top/RPMS" -type f -name "linux-trackpad-driver-${VERSION}-*.x86_64.rpm" -print -quit)"
+          test -n "$rpm"
+          cp "$rpm" dist/
           ls dist/*.rpm
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
