@@ -109,7 +109,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::apple_parse::{FingerContact, TouchFrame, TouchSource};
 use crate::clicks::{self, ClickEvent, ClickLevel, ClickMachine, FrameOutcome};
@@ -200,11 +200,11 @@ pub trait GrabDevice: Send {
 
 /// Emit handle for a VIRTUAL uinput node.
 pub trait UinputSink: Send {
-    fn emit(&self, ev_type: u16, code: u16, value: i32);
-    fn sync(&self) {
-        self.emit(EV_SYN, SYN_REPORT, 0);
+    fn emit(&self, ev_type: u16, code: u16, value: i32) -> Result<()>;
+    fn sync(&self) -> Result<()> {
+        self.emit(EV_SYN, SYN_REPORT, 0)
     }
-    /// True when the uinput node exists (UI_DEV_CREATE done).
+    /// True when the uinput node exists and its output path is healthy.
     /// Attach refuses to grab until this holds: grabbing without an
     /// emit path would swallow the physical device.
     fn is_ready(&self) -> bool {
@@ -554,7 +554,7 @@ where
     }
 
     pub fn is_attached(&self) -> bool {
-        self.attached
+        self.attached && self.uinput.is_ready()
     }
 
     /// True when events flow untouched (gate off, pump unready, grab failed).
@@ -595,8 +595,9 @@ where
         if !ready && self.attached {
             log::info!("proxy: pump lost, releasing grab (passthrough)");
             self.grab.ungrab();
-            self.release_held(false);
-            self.uinput.sync();
+            if let Err(error) = self.release_held(false).and_then(|()| self.uinput.sync()) {
+                self.output_failed(&error);
+            }
             self.machine.reset();
             self.pressed_haptic = false;
             self.force_haptic = false;
@@ -682,8 +683,9 @@ where
             log::info!("proxy: releasing grab ({})", event.devnode);
             self.grab.ungrab();
         }
-        self.release_held(false);
-        self.uinput.sync();
+        if let Err(error) = self.release_held(false).and_then(|()| self.uinput.sync()) {
+            self.output_failed(&error);
+        }
         self.machine.reset();
         self.pressed_haptic = false;
         self.force_haptic = false;
@@ -714,9 +716,50 @@ where
         cfg: &Config,
         now: std::time::Instant,
     ) -> Result<Option<ClickEvent>> {
+        let result = self.handle_frame_inner(cfg, now);
+        if let Err(error) = &result {
+            self.output_failed(error);
+        }
+        result
+    }
+
+    /// Retire the entire failed pointer session. Closing the virtual nodes
+    /// removes their held keys/contacts even when key-up writes cannot land.
+    /// `is_attached` is the health signal consumed by attachment decisions.
+    fn output_failed(&mut self, error: &anyhow::Error) {
+        log::warn!("proxy: output failed, releasing grab and retiring session: {error:#}");
+        self.grab.ungrab();
+        // Best effort for the surviving extras node before destroying both.
+        let _ = self.release_held(false);
+        let _ = self.uinput.sync();
+        self.uinput.destroy();
+        self.machine.reset();
+        self.held_first.clear();
+        self.held_force.clear();
+        self.held_slide.clear();
+        self.btn_left_down = false;
+        self.physical_left_down = false;
+        self.pressed_haptic = false;
+        self.force_haptic = false;
+        self.pending_force = None;
+        self.pending_buttons = None;
+        self.last_pos.clear();
+        self.max_slot = 0;
+        self.pump_ready = false;
+        self.attached = false;
+        self.attached_node = None;
+        self.passthrough = true;
+    }
+
+    fn handle_frame_inner(
+        &mut self,
+        cfg: &Config,
+        now: std::time::Instant,
+    ) -> Result<Option<ClickEvent>> {
         if !self.settings.enhanced || !self.attached || self.passthrough {
             return Ok(None);
         }
+        anyhow::ensure!(self.uinput.is_ready(), "pointer output is unavailable");
         let frame = match self.source.poll_frame() {
             Ok(Some(f)) => f,
             Ok(None) => {
@@ -734,12 +777,12 @@ where
                         self.physical_left_down,
                         cfg,
                         now,
-                    );
+                    )?;
                     let pressure = cfg.click.sensitivity.clamp(1, 255) as u8;
-                    self.flush_cut_pending(pressure, now);
-                    self.flush_pending_buttons(now);
-                    self.emit_btn_left();
-                    self.uinput.sync();
+                    self.flush_cut_pending(pressure, now)?;
+                    self.flush_pending_buttons(now)?;
+                    self.emit_btn_left()?;
+                    self.uinput.sync()?;
                 }
                 return Ok(None);
             }
@@ -786,7 +829,7 @@ where
         let haptic_pressure = cfg.click.sensitivity.clamp(1, 255) as u8;
         // Touch slots first (post-update latch is visible to buttons below;
         // the spoof map follows the live status: force > first > slide).
-        self.emit_touch_frame(&frame, cfg);
+        self.emit_touch_frame(&frame, cfg)?;
         // A slide handed to a press can still be inside that press's
         // release debounce on clean liftoff. Cancel staged work outright:
         // idle polls must never turn that stale latch into a late down.
@@ -796,7 +839,7 @@ where
             && !frame.fingers.iter().any(clicks::touch_present)
         {
             self.machine.cancel_pending_press_at(now);
-            self.release_held(ClickMachine::physical_button(frame.clicks));
+            self.release_held(ClickMachine::physical_button(frame.clicks))?;
         }
         // Slide re-select: a count change onto a different action ends the
         // old session (keys up, never a pulse — slide is silent) before
@@ -810,9 +853,9 @@ where
                 .is_some_and(|old| old.action.kind.is_same_action(&ev.action.kind));
             if !merged {
                 if was_slide.is_some() {
-                    self.release_slide_held(ClickMachine::physical_button(frame.clicks));
+                    self.release_slide_held(ClickMachine::physical_button(frame.clicks))?;
                 }
-                self.press_slide(ev, cfg, now);
+                self.press_slide(ev, cfg, now)?;
             }
         }
         // Press order: first then force; reporters see force (supersedes,
@@ -826,15 +869,15 @@ where
                 &edges,
                 was_slide.clone(),
                 ClickMachine::physical_button(frame.clicks),
-            )
+            )?
         } else {
             None
         };
         // Cut-mode deferred press (two stages, chronological: the deferred
         // edge is older than this frame's own presses).
-        self.flush_cut_pending(haptic_pressure, now);
+        self.flush_cut_pending(haptic_pressure, now)?;
         if let Some(ref ev) = edges.first {
-            self.press_level(ev, haptic_pressure, now);
+            self.press_level(ev, haptic_pressure, now)?;
         }
         if let Some(ref ev) = edges.force {
             // Cut mode: release ALL level-1/slide wire keys first (with
@@ -866,9 +909,9 @@ where
                 // Cut bypasses the physical carve-out (`false`): the visible
                 // break is the entire point of cut, and the user
                 // physically holds the click essentially always.
-                self.release_slide_held(false);
-                self.cut_first_wire();
-                self.uinput.sync();
+                self.release_slide_held(false)?;
+                self.cut_first_wire()?;
+                self.uinput.sync()?;
                 self.pending_force = Some(PendingForcePress {
                     ev: ev.clone(),
                     released_at: now,
@@ -876,7 +919,7 @@ where
                     mods_at: None,
                 });
             } else {
-                self.press_level(ev, haptic_pressure, now);
+                self.press_level(ev, haptic_pressure, now)?;
             }
         }
         if edges.first.is_some() || edges.force.is_some() || edges.slide.is_some() {
@@ -888,9 +931,9 @@ where
             // One trailing SYN per handled frame. Mixed staged presses
             // additionally sync extras before buttons; cut also syncs
             // the first-level release.
-            self.flush_pending_buttons(now);
-            self.emit_btn_left();
-            self.uinput.sync();
+            self.flush_pending_buttons(now)?;
+            self.emit_btn_left()?;
+            self.uinput.sync()?;
             return Ok(edges.primary());
         }
         // A held slide that vanished without a handoff releases its keys.
@@ -901,15 +944,15 @@ where
             ClickMachine::physical_button(frame.clicks),
             cfg,
             now,
-        ) && slide_gone
+        )? && slide_gone
         {
-            self.release_slide_held(ClickMachine::physical_button(frame.clicks));
+            self.release_slide_held(ClickMachine::physical_button(frame.clicks))?;
         }
         // Releases and replacements above must cancel before any deadline
         // is serviced, including a liftoff arriving exactly at the deadline.
-        self.flush_pending_buttons(now);
-        self.emit_btn_left();
-        self.uinput.sync();
+        self.flush_pending_buttons(now)?;
+        self.emit_btn_left()?;
+        self.uinput.sync()?;
         Ok(None)
     }
 
@@ -922,7 +965,7 @@ where
         phys_down: bool,
         cfg: &Config,
         now: std::time::Instant,
-    ) -> bool {
+    ) -> Result<bool> {
         let first_gone = was_first && self.machine.active().is_none();
         let force_gone = was_force && self.machine.force_active().is_none();
         let haptic_pressure = cfg.click.sensitivity.clamp(1, 255) as u8;
@@ -930,7 +973,7 @@ where
             // Full release clears both levels. The physical bit rides
             // along so a still-held hardware button suppresses the
             // latch's left-up (no 0-then-1 flutter in one frame).
-            self.release_held(phys_down);
+            self.release_held(phys_down)?;
             // Old-service release snap: force up-pulse first (when its
             // down pulse fired), then the first-level up-pulse. No 15 ms
             // staging sleep (old inserts one between the two): the pump
@@ -952,7 +995,7 @@ where
             // (continuous). In cut mode the first keys were released at the
             // force edge, so re-press the still-latched level-1 combo (keys
             // only, no haptic: no new edge fired).
-            self.release_force_held();
+            self.release_force_held()?;
             self.fire_release(
                 clicks::ClickLevel::Force,
                 haptic_pressure,
@@ -960,11 +1003,11 @@ where
             );
             if cfg.is_cut_transition() {
                 if let Some(ev) = self.machine.active().cloned() {
-                    self.repress_keys(&ev, now);
+                    self.repress_keys(&ev, now)?;
                 }
             }
         }
-        first_gone || force_gone
+        Ok(first_gone || force_gone)
     }
 
     /// `BTN_LEFT` from held codes only (either latched action contains `left`)
@@ -976,7 +1019,7 @@ where
     /// no-contact button path). Edge triggered: emits only on state change,
     /// so frames where left is and was down stay silent (no `BTN_LEFT=0`
     /// releases for buttons never pressed, no duplicate re-asserts).
-    fn emit_btn_left(&mut self) {
+    fn emit_btn_left(&mut self) -> Result<()> {
         let held_left = self
             .held_first
             .iter()
@@ -985,9 +1028,10 @@ where
             .any(|&(ty, code)| ty == EV_KEY && code == BTN_LEFT);
         let down = held_left || self.physical_left_down;
         if down != self.btn_left_down {
-            self.uinput.emit(EV_KEY, BTN_LEFT, i32::from(down));
+            self.uinput.emit(EV_KEY, BTN_LEFT, i32::from(down))?;
             self.btn_left_down = down;
         }
+        Ok(())
     }
 
     /// True when `(ty, code)` is already down on the wire (held by any
@@ -1008,7 +1052,12 @@ where
     /// the caller always emits the trailing SYN.
     /// `pressure` is the actuator pressure byte (the press threshold,
     /// old-service parity); the event carries the intensity + waveform.
-    fn press_level(&mut self, ev: &ClickEvent, pressure: u8, now: std::time::Instant) {
+    fn press_level(
+        &mut self,
+        ev: &ClickEvent,
+        pressure: u8,
+        now: std::time::Instant,
+    ) -> Result<()> {
         use crate::config::ActionKind;
         debug_assert_ne!(ev.level, ClickLevel::Slide);
         let name = match ev.level {
@@ -1025,16 +1074,23 @@ where
                 self.set_haptic_flag(ev.level, fired);
             }
             ActionKind::Keys(_) => {
-                self.down_keys_timed(ev, Self::combo_stagger(ev, 0), now);
+                self.down_keys_timed(ev, Self::combo_stagger(ev, 0), now)?;
                 let fired = self.fire_haptic(ev, pressure);
                 self.set_haptic_flag(ev.level, fired);
             }
         }
+        Ok(())
     }
 
     /// Slides never pulse. Only fresh mixed actions have a timed division.
-    fn press_slide(&mut self, ev: &ClickEvent, cfg: &Config, now: std::time::Instant) {
-        self.down_keys_timed(ev, Self::combo_stagger(ev, cfg.force.combo_stagger_ms), now);
+    fn press_slide(
+        &mut self,
+        ev: &ClickEvent,
+        cfg: &Config,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        self.down_keys_timed(ev, Self::combo_stagger(ev, cfg.force.combo_stagger_ms), now)?;
+        Ok(())
     }
 
     /// Emit extras first and capture each new button's deadline. Existing
@@ -1045,14 +1101,14 @@ where
         ev: &ClickEvent,
         delay: std::time::Duration,
         now: std::time::Instant,
-    ) {
+    ) -> Result<()> {
         let (mods, buttons) = Self::partition_combo_keys(ev);
         let mixed = !mods.is_empty() && !buttons.is_empty();
         for pair in mods {
-            self.emit_key_down(pair, ev.level);
+            self.emit_key_down(pair, ev.level)?;
         }
         if mixed && (!delay.is_zero() || ev.level == ClickLevel::Slide) {
-            self.uinput.sync();
+            self.uinput.sync()?;
         }
         for pair in buttons {
             if self.defer_pending_button(pair, ev.level) {
@@ -1068,9 +1124,10 @@ where
                         owners: vec![ev.level],
                     });
             } else {
-                self.emit_key_down(pair, ev.level);
+                self.emit_key_down(pair, ev.level)?;
             }
         }
+        Ok(())
     }
 
     /// Register shared ownership without letting a press handoff shortcut
@@ -1099,15 +1156,15 @@ where
         }
     }
 
-    fn flush_pending_buttons(&mut self, now: std::time::Instant) {
+    fn flush_pending_buttons(&mut self, now: std::time::Instant) -> Result<()> {
         let Some(mut pending) = self.pending_buttons.take() else {
-            return;
+            return Ok(());
         };
         let mut waiting = Vec::new();
         for key in pending.keys.drain(..) {
             if now >= key.deadline {
                 for level in key.owners {
-                    self.emit_key_down(key.pair, level);
+                    self.emit_key_down(key.pair, level)?;
                 }
             } else {
                 waiting.push(key);
@@ -1117,6 +1174,7 @@ where
             pending.keys = waiting;
             self.pending_buttons = Some(pending);
         }
+        Ok(())
     }
 
     /// Resolve action tokens to wire pairs (unknown tokens log + skip).
@@ -1134,7 +1192,7 @@ where
     /// One key-down: emit unless already down elsewhere (per-level record
     /// always, so release accounting stays per-level). `BTN_LEFT` goes
     /// through the wire tracker instead of a duplicate down.
-    fn emit_key_down(&mut self, pair: (u16, u16), level: ClickLevel) {
+    fn emit_key_down(&mut self, pair: (u16, u16), level: ClickLevel) -> Result<()> {
         let (ty, code) = pair;
         // Skip the re-emit when another level already holds
         // the code down, but still record it in this level's
@@ -1145,11 +1203,11 @@ where
         // exists to remove.
         if pair == (EV_KEY, BTN_LEFT) {
             if !self.btn_left_down {
-                self.uinput.emit(ty, code, 1);
+                self.uinput.emit(ty, code, 1)?;
                 self.btn_left_down = true;
             }
         } else if !self.is_down(pair) {
-            self.uinput.emit(ty, code, 1);
+            self.uinput.emit(ty, code, 1)?;
         }
         let held = match level {
             ClickLevel::First => &mut self.held_first,
@@ -1162,6 +1220,7 @@ where
         if !held.contains(&pair) {
             held.push(pair);
         }
+        Ok(())
     }
 
     /// The level's own haptic pulse for a cut staged press.
@@ -1197,7 +1256,7 @@ where
     /// (human-scale; `0` lands both stages in one frame, still ≥5 ms after
     /// the release). The haptic pulse fires with stage 1 (earliest feedback
     /// for the threshold crossing).
-    fn flush_cut_pending(&mut self, pressure: u8, now: std::time::Instant) {
+    fn flush_cut_pending(&mut self, pressure: u8, now: std::time::Instant) -> Result<()> {
         if self.machine.force_active().is_none() {
             // Traced at debug with the survived time — a press that never
             // survives the floor shows here, which distinguishes
@@ -1210,14 +1269,14 @@ where
                     CUT_REPRESS_GAP.as_millis()
                 );
             }
-            return;
+            return Ok(());
         }
         let Some((ev, released_at, stagger)) = self
             .pending_force
             .as_ref()
             .map(|p| (p.ev.clone(), p.released_at, p.stagger))
         else {
-            return;
+            return Ok(());
         };
         let mods_done = self
             .pending_force
@@ -1227,18 +1286,18 @@ where
         // actions finish here via [`ClickProxy::press_level`].
         if !mods_done {
             if now.saturating_duration_since(released_at) < CUT_REPRESS_GAP {
-                return;
+                return Ok(());
             }
             let (mods, btns) = Self::partition_combo_keys(&ev);
             if mods.is_empty() || btns.is_empty() {
-                self.press_level(&ev, pressure, now);
+                self.press_level(&ev, pressure, now)?;
                 self.pending_force = None;
-                return;
+                return Ok(());
             }
             for pair in &mods {
-                self.emit_key_down(*pair, ev.level);
+                self.emit_key_down(*pair, ev.level)?;
             }
-            self.uinput.sync();
+            self.uinput.sync()?;
             self.pulse_cut_haptic(&ev, pressure);
             if let Some(pending) = self.pending_force.as_mut() {
                 pending.mods_at = Some(now);
@@ -1251,12 +1310,13 @@ where
             if now.saturating_duration_since(t) >= stagger {
                 let (_, btns) = Self::partition_combo_keys(&ev);
                 for pair in &btns {
-                    self.emit_key_down(*pair, ev.level);
+                    self.emit_key_down(*pair, ev.level)?;
                 }
                 self.pending_force = None;
             }
         }
         // Else: stagger not elapsed — the buttons wait for a later frame.
+        Ok(())
     }
 
     /// Selected binding override, otherwise this path's legacy fallback.
@@ -1268,12 +1328,13 @@ where
     /// Re-press the still-latched level-1 combo after a cut-mode force
     /// release (keys only, no haptic: no new edge fired). Records into
     /// `held_first` so the eventual full release owns the key-ups.
-    fn repress_keys(&mut self, ev: &ClickEvent, now: std::time::Instant) {
+    fn repress_keys(&mut self, ev: &ClickEvent, now: std::time::Instant) -> Result<()> {
         use crate::config::ActionKind;
         if let ActionKind::Keys(_) = &ev.action.kind {
             debug_assert!(matches!(ev.level, ClickLevel::First));
-            self.down_keys_timed(ev, Self::combo_stagger(ev, 0), now);
+            self.down_keys_timed(ev, Self::combo_stagger(ev, 0), now)?;
         }
+        Ok(())
     }
 
     /// Record which button level fired its down pulse (so the release owes
@@ -1300,8 +1361,10 @@ where
         edges: &FrameOutcome,
         was_slide: Option<ClickEvent>,
         phys_down: bool,
-    ) -> Option<ClickLevel> {
-        let slide = was_slide?;
+    ) -> Result<Option<ClickLevel>> {
+        let Some(slide) = was_slide else {
+            return Ok(None);
+        };
         let slide_kind = &slide.action.kind;
         // Set compare (order-/dup-insensitive wire identity): `ctrl+left`
         // merges a `left+ctrl` hold with no flutter.
@@ -1315,13 +1378,13 @@ where
             .is_some_and(|e| e.action.kind.is_same_action(slide_kind));
         if force_same {
             self.absorb_slide_into(ClickLevel::Force);
-            Some(ClickLevel::Force)
+            Ok(Some(ClickLevel::Force))
         } else if first_same {
             self.absorb_slide_into(ClickLevel::First);
-            Some(ClickLevel::First)
+            Ok(Some(ClickLevel::First))
         } else {
-            self.release_slide_held(phys_down);
-            None
+            self.release_slide_held(phys_down)?;
+            Ok(None)
         }
     }
 
@@ -1394,7 +1457,7 @@ where
     /// right after, so the wire stays at exactly one down/up pair.
     /// Detach/pump-loss pass `false` (no frame in hand): every up is
     /// forced there so no key-up is ever lost.
-    fn release_held(&mut self, phys_down: bool) {
+    fn release_held(&mut self, phys_down: bool) -> Result<()> {
         self.pending_buttons = None;
         self.pending_force = None;
         let first = std::mem::take(&mut self.held_first);
@@ -1404,7 +1467,7 @@ where
             if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
                 continue; // physical still holds it; wire stays down
             }
-            self.uinput.emit(ty, code, 0);
+            self.uinput.emit(ty, code, 0)?;
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 left_up = true;
             }
@@ -1416,7 +1479,7 @@ where
             if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
                 continue; // physical still holds it; wire stays down
             }
-            self.uinput.emit(ty, code, 0);
+            self.uinput.emit(ty, code, 0)?;
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 left_up = true;
             }
@@ -1428,7 +1491,7 @@ where
             if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
                 continue; // physical still holds it; wire stays down
             }
-            self.uinput.emit(ty, code, 0);
+            self.uinput.emit(ty, code, 0)?;
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 left_up = true;
             }
@@ -1440,9 +1503,10 @@ where
         // would auto-repeat downstream). Skipped while physical still
         // holds: the wire correctly stays down.
         if self.btn_left_down && !left_up && !phys_down {
-            self.uinput.emit(EV_KEY, BTN_LEFT, 0);
+            self.uinput.emit(EV_KEY, BTN_LEFT, 0)?;
         }
         self.btn_left_down = phys_down && self.btn_left_down;
+        Ok(())
     }
 
     /// Release slide-held keys, retaining codes another level still holds
@@ -1451,7 +1515,7 @@ where
     /// physical button holds it (`phys_down`): emitting 0-then-1 in the
     /// same frame would flutter a phantom extra click. The caller
     /// reconciles via [`ClickProxy::emit_btn_left`] right after.
-    fn release_slide_held(&mut self, phys_down: bool) {
+    fn release_slide_held(&mut self, phys_down: bool) -> Result<()> {
         self.cancel_pending_buttons(ClickLevel::Slide);
         let mut dropped_left = false;
         for (ty, code) in self.held_slide.drain(..) {
@@ -1461,7 +1525,7 @@ where
             if phys_down && (ty, code) == (EV_KEY, BTN_LEFT) {
                 continue; // physical still holds it; wire stays down
             }
-            self.uinput.emit(ty, code, 0);
+            self.uinput.emit(ty, code, 0)?;
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 dropped_left = true;
             }
@@ -1470,11 +1534,12 @@ where
         if dropped_left {
             self.btn_left_down = false;
         }
+        Ok(())
     }
 
     /// Release force-held keys, retaining codes the first level still holds
     /// (no up-emit for those — the wire stays down until full release).
-    fn release_force_held(&mut self) {
+    fn release_force_held(&mut self) -> Result<()> {
         self.cancel_pending_buttons(ClickLevel::Force);
         self.pending_force = None;
         let mut dropped_left = false;
@@ -1482,7 +1547,7 @@ where
             if self.held_first.contains(&(ty, code)) {
                 continue;
             }
-            self.uinput.emit(ty, code, 0);
+            self.uinput.emit(ty, code, 0)?;
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 dropped_left = true;
             }
@@ -1493,6 +1558,7 @@ where
         if dropped_left {
             self.btn_left_down = false;
         }
+        Ok(())
     }
 
     /// Cut-mode release of level-1 wire keys on a force edge: every
@@ -1505,14 +1571,15 @@ where
     /// this and the force press; the edge-frame [`ClickProxy::emit_btn_left`]
     /// reconciliation after the fresh press is then a no-op (wire already
     /// down again), never a flutter.
-    fn cut_first_wire(&mut self) {
+    fn cut_first_wire(&mut self) -> Result<()> {
         self.cancel_pending_buttons(ClickLevel::First);
         for (ty, code) in std::mem::take(&mut self.held_first) {
-            self.uinput.emit(ty, code, 0);
+            self.uinput.emit(ty, code, 0)?;
             if (ty, code) == (EV_KEY, BTN_LEFT) {
                 self.btn_left_down = false;
             }
         }
+        Ok(())
     }
 
     /// Emit Type-B MT slots for one frame. No trailing `SYN`: the caller
@@ -1541,7 +1608,7 @@ where
     /// held → `[spoof.force]`, first held → `[spoof.click]`, otherwise
     /// `[spoof.slide]`) via [`clicks::spoof_contacts`]. All maps default
     /// to passthrough, so the frame below is the real one unless opted in.
-    fn emit_touch_frame(&mut self, frame: &TouchFrame, cfg: &Config) {
+    fn emit_touch_frame(&mut self, frame: &TouchFrame, cfg: &Config) -> Result<()> {
         use std::borrow::Cow;
         use std::collections::HashSet;
         let real_touching = frame
@@ -1572,43 +1639,43 @@ where
         // skipped with no contacts (last position stands, as on hardware).
         let mut first_xy: Option<(i32, i32)> = None;
         for (slot, f) in fingers.iter().take(16).enumerate() {
-            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32);
+            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
             if clicks::touch_present(f) {
                 self.uinput
-                    .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id));
+                    .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id))?;
                 let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.pointer.speed);
                 if first_xy.is_none() {
                     first_xy = Some((sx, sy));
                 }
-                self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx);
-                self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy);
+                self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx)?;
+                self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy)?;
                 self.uinput
-                    .emit(EV_ABS, ABS_MT_PRESSURE, TOUCH_PRESSURE_NORM);
+                    .emit(EV_ABS, ABS_MT_PRESSURE, TOUCH_PRESSURE_NORM)?;
                 self.uinput
-                    .emit(EV_ABS, ABS_MT_TOUCH_MAJOR, TOUCH_SIZE_NORM);
+                    .emit(EV_ABS, ABS_MT_TOUCH_MAJOR, TOUCH_SIZE_NORM)?;
                 self.uinput
-                    .emit(EV_ABS, ABS_MT_TOUCH_MINOR, TOUCH_SIZE_NORM);
+                    .emit(EV_ABS, ABS_MT_TOUCH_MINOR, TOUCH_SIZE_NORM)?;
                 self.uinput.emit(
                     EV_ABS,
                     ABS_MT_ORIENTATION,
                     i32::from(clicks::negate_orientation(f.orientation)),
-                );
+                )?;
             } else {
-                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
                 self.last_pos.remove(&f.id);
             }
         }
         // Terminate slots that existed in earlier frames but not this one.
         if n <= self.max_slot {
             for slot in n..=self.max_slot {
-                self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32);
-                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
+                self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
+                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
             }
         }
         self.max_slot = n.saturating_sub(1);
         if let Some((sx, sy)) = first_xy {
-            self.uinput.emit(EV_ABS, ABS_X, sx);
-            self.uinput.emit(EV_ABS, ABS_Y, sy);
+            self.uinput.emit(EV_ABS, ABS_X, sx)?;
+            self.uinput.emit(EV_ABS, ABS_Y, sy)?;
         }
         // Drop stale motion anchors: ids absent from this frame must not
         // anchor a future delta (stale-anchor jump on id reuse). Evict on
@@ -1624,25 +1691,27 @@ where
             EV_KEY,
             BTN_TOUCH,
             i32::from(any_touch || ClickMachine::physical_button(frame.clicks)),
-        );
-        self.emit_tool_bits(present_count);
+        )?;
+        self.emit_tool_bits(present_count)?;
+        Ok(())
     }
 
     /// `BTN_TOOL_*` classification row from the touching count (old-service
     /// parity: exactly one of FINGER/DOUBLE/TRIPLE/QUAD/QUIN is down for
     /// counts 1/2/3/4/5+; all up when nothing touches). Emitted every
     /// frame — libinput keys touchpad classification off these bits.
-    fn emit_tool_bits(&mut self, present_count: usize) {
+    fn emit_tool_bits(&mut self, present_count: usize) -> Result<()> {
         self.uinput
-            .emit(EV_KEY, BTN_TOOL_FINGER, i32::from(present_count == 1));
+            .emit(EV_KEY, BTN_TOOL_FINGER, i32::from(present_count == 1))?;
         self.uinput
-            .emit(EV_KEY, BTN_TOOL_DOUBLETAP, i32::from(present_count == 2));
+            .emit(EV_KEY, BTN_TOOL_DOUBLETAP, i32::from(present_count == 2))?;
         self.uinput
-            .emit(EV_KEY, BTN_TOOL_TRIPLETAP, i32::from(present_count == 3));
+            .emit(EV_KEY, BTN_TOOL_TRIPLETAP, i32::from(present_count == 3))?;
         self.uinput
-            .emit(EV_KEY, BTN_TOOL_QUADTAP, i32::from(present_count == 4));
+            .emit(EV_KEY, BTN_TOOL_QUADTAP, i32::from(present_count == 4))?;
         self.uinput
-            .emit(EV_KEY, BTN_TOOL_QUINTTAP, i32::from(present_count >= 5));
+            .emit(EV_KEY, BTN_TOOL_QUINTTAP, i32::from(present_count >= 5))?;
+        Ok(())
     }
 
     /// Speed-scaled position: `prev + (cur - prev) * speed/100` per finger.
@@ -1896,7 +1965,7 @@ pub fn split_route(ev_type: u16, code: u16) -> SplitRoute {
 /// Two-node emit handle: owns the pointer sink plus the extras sink and
 /// routes every event via [`split_route`]. `is_ready` reflects the POINTER
 /// node only — the touch path is the emit path grab safety depends on; an
-/// extras-only failure degrades combos (dropped with a log at create time)
+/// extras-only failure retires that node and degrades to pointer-only output
 /// while motion/buttons keep working. `destroy` tears down BOTH nodes.
 pub struct DualSink<P, E> {
     pointer: P,
@@ -1922,25 +1991,48 @@ impl<P: UinputSink, E: UinputSink> UinputSink for DualSink<P, E> {
         self.pointer.is_ready()
     }
 
-    fn emit(&self, ev_type: u16, code: u16, value: i32) {
+    fn emit(&self, ev_type: u16, code: u16, value: i32) -> Result<()> {
         match split_route(ev_type, code) {
             SplitRoute::Pointer => self.pointer.emit(ev_type, code, value),
-            SplitRoute::Extras => self.extras.emit(ev_type, code, value),
+            SplitRoute::Extras => {
+                self.emit_extras(ev_type, code, value);
+                Ok(())
+            }
             SplitRoute::Both => {
-                self.pointer.emit(ev_type, code, value);
-                self.extras.emit(ev_type, code, value);
+                let pointer = self.pointer.emit(ev_type, code, value);
+                self.emit_extras(ev_type, code, value);
+                pointer
             }
         }
     }
 
-    fn sync(&self) {
-        self.pointer.sync();
-        self.extras.sync();
+    fn sync(&self) -> Result<()> {
+        let pointer = self.pointer.sync();
+        // Flush the surviving extras node even if pointer delivery failed.
+        if self.extras.is_ready() {
+            self.handle_extras_result(self.extras.sync());
+        }
+        pointer
     }
 
     fn destroy(&self) {
         self.pointer.destroy();
         self.extras.destroy();
+    }
+}
+
+impl<P, E: UinputSink> DualSink<P, E> {
+    fn emit_extras(&self, ev_type: u16, code: u16, value: i32) {
+        if self.extras.is_ready() {
+            self.handle_extras_result(self.extras.emit(ev_type, code, value));
+        }
+    }
+
+    fn handle_extras_result(&self, result: Result<()>) {
+        if let Err(error) = result {
+            log::warn!("proxy: extras output failed; continuing pointer-only: {error:#}");
+            self.extras.destroy();
+        }
     }
 }
 
@@ -2007,16 +2099,15 @@ pub struct UinputAbsSetup {
 /// a pointer instance plus an extras instance (see [`DualSink`]).
 /// The pointer instance is created BEFORE grab; [`UinputSink::is_ready`]
 /// gates attach on it. Never sets `EV_FF` (see [`pointer_evbits`]).
-/// Emits are `input_event` writes once the fd exists; pre-create emits
-/// are debug-logged only.
+/// Emits are `input_event` writes once created; unavailable output is an error.
 pub struct RealUinput {
     node: String,
     role: UinputRole,
     fd: Mutex<Option<std::fs::File>>,
     created: std::sync::atomic::AtomicBool,
     /// Staged `input_event` bytes, flushed as one `write(2)` per `sync()`
-    /// (one frame = one syscall). Pre-create emits are dropped with a
-    /// debug log, never buffered: without a node there is no consumer.
+    /// (one frame = one syscall). Pre-create emits are dropped with an
+    /// error, never buffered: without a node there is no consumer.
     staging: Mutex<Vec<u8>>,
 }
 
@@ -2252,70 +2343,48 @@ impl RealUinput {
         Self::run_plan(fd, &Self::create_plan_for(role), &setup)
     }
 
-    /// Flush one staged buffer in a single write loop. A short actual
-    /// (`ret != remaining`) without error keeps writing; any error or a
-    /// zero return drops the remainder with a loud log instead of
-    /// looping forever on a dead fd.
-    fn flush_locked(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) {
-        let mut written = 0usize;
-        while written < buf.len() {
-            let ret =
-                unsafe { libc::write(fd, buf[written..].as_ptr().cast(), buf.len() - written) };
-            if ret < 0 {
-                log::warn!(
-                    "proxy: uinput write failed after {written}/{} bytes: {}",
-                    buf.len(),
-                    std::io::Error::last_os_error()
-                );
-                break;
-            }
-            if ret == 0 {
-                log::warn!(
-                    "proxy: uinput write returned 0 with {} bytes left; dropping",
-                    buf.len() - written
-                );
-                break;
-            }
-            written += ret as usize;
-        }
-        if written != buf.len() {
-            log::warn!(
-                "proxy: uinput short write ({written}/{} bytes); remainder dropped",
-                buf.len()
-            );
-        }
-        buf.clear();
+    /// `write_all` completes partial writes, retries EINTR, and treats zero
+    /// writes as WriteZero. A failed frame is never replayed: some events may
+    /// already have reached the consumer, so its virtual node must be retired.
+    fn flush_locked(writer: &mut impl std::io::Write, buf: &[u8]) -> std::io::Result<()> {
+        writer.write_all(buf)
     }
 
     /// Lock order is always fd → staging (matches [`UinputSink::emit`]);
     /// never the reverse.
-    fn flush(&self) {
-        let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+    fn flush(&self) -> Result<()> {
+        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
         let mut staging = self.staging.lock().unwrap_or_else(|e| e.into_inner());
-        if staging.is_empty() {
-            return;
-        }
-        let Some(f) = guard.as_ref() else {
-            log::debug!("uinput flush with no fd; dropping {} bytes", staging.len());
-            staging.clear();
-            return;
+        let result = match guard.as_mut() {
+            Some(f) if self.is_created() => Self::flush_locked(f, &staging)
+                .with_context(|| format!("uinput {:?} write failed", self.role)),
+            _ => Err(anyhow::anyhow!("uinput {:?} output unavailable", self.role)),
         };
-        use std::os::unix::io::AsRawFd;
-        Self::flush_locked(f.as_raw_fd(), &mut staging);
+        staging.clear();
+        if result.is_err() {
+            Self::retire_locked(&mut guard);
+            self.created
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
     }
 
-    /// Destroy the virtual node (detach path). Flushes staged events
-    /// first so no key-up is lost, then releases grab-side state via caller.
-    pub fn destroy(&self) {
-        use std::os::unix::io::AsRawFd;
-        self.flush();
-        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+    fn retire_locked(guard: &mut Option<std::fs::File>) {
         if let Some(f) = guard.as_ref() {
             unsafe {
                 libc::ioctl(f.as_raw_fd(), ui_dev_destroy() as libc::c_ulong);
             }
         }
+        // Closing the fd also removes the virtual node if UI_DEV_DESTROY fails.
         *guard = None;
+    }
+
+    /// Destroy the virtual node (detach path). Flushes staged events
+    /// first so no key-up is lost, then releases grab-side state via caller.
+    pub fn destroy(&self) {
+        let _ = self.flush();
+        let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
+        Self::retire_locked(&mut guard);
         self.created
             .store(false, std::sync::atomic::Ordering::SeqCst);
         log::info!("proxy: uinput node {} destroyed", self.node);
@@ -2334,25 +2403,26 @@ impl UinputSink for RealUinput {
     fn destroy(&self) {
         RealUinput::destroy(self);
     }
-    fn emit(&self, ev_type: u16, code: u16, value: i32) {
+    fn emit(&self, ev_type: u16, code: u16, value: i32) -> Result<()> {
         log::debug!("uinput emit: type={ev_type} code={code} value={value}");
         let guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            log::debug!("uinput emit pre-create; dropping event");
-            return;
-        }
-        drop(guard);
+        anyhow::ensure!(
+            guard.is_some() && self.is_created(),
+            "uinput {:?} output unavailable",
+            self.role
+        );
         self.staging
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend_from_slice(&encode_event(ev_type, code, value));
+        Ok(())
     }
 
     /// Frame boundary: stage the trailing `SYN` and flush the whole
     /// frame in one write.
-    fn sync(&self) {
-        self.emit(EV_SYN, SYN_REPORT, 0);
-        self.flush();
+    fn sync(&self) -> Result<()> {
+        self.emit(EV_SYN, SYN_REPORT, 0)?;
+        self.flush()
     }
 }
 
@@ -2722,8 +2792,9 @@ mod tests {
     }
 
     impl UinputSink for FakeUinput {
-        fn emit(&self, ev_type: u16, code: u16, value: i32) {
+        fn emit(&self, ev_type: u16, code: u16, value: i32) -> Result<()> {
             self.events.lock().unwrap().push((ev_type, code, value));
+            Ok(())
         }
         fn destroy(&self) {
             *self.destroyed.lock().unwrap() = true;
@@ -3026,8 +3097,8 @@ mod tests {
     struct SharedUinput(Arc<FakeUinput>);
 
     impl UinputSink for SharedUinput {
-        fn emit(&self, ev_type: u16, code: u16, value: i32) {
-            self.0.emit(ev_type, code, value);
+        fn emit(&self, ev_type: u16, code: u16, value: i32) -> Result<()> {
+            self.0.emit(ev_type, code, value)
         }
         fn destroy(&self) {
             self.0.destroy();
@@ -3350,8 +3421,8 @@ mod tests {
         fn is_ready(&self) -> bool {
             self.ready.load(std::sync::atomic::Ordering::SeqCst)
         }
-        fn emit(&self, ty: u16, code: u16, val: i32) {
-            self.inner.emit(ty, code, val);
+        fn emit(&self, ty: u16, code: u16, val: i32) -> Result<()> {
+            self.inner.emit(ty, code, val)
         }
     }
 
@@ -3509,12 +3580,12 @@ mod tests {
             SharedUinput(Arc::clone(&ext)),
         );
         // Touch axis + button → pointer only; combo key → extras only.
-        sink.emit(EV_ABS, ABS_MT_SLOT, 0);
-        sink.emit(EV_ABS, ABS_MT_TRACKING_ID, 1);
-        sink.emit(EV_KEY, BTN_LEFT, 1);
-        sink.emit(EV_KEY, 46, 1); // KEY_C
-        sink.emit(EV_KEY, 29, 1); // KEY_LEFTCTRL
-        sink.sync(); // trailing SYN lands on BOTH nodes (each framed)
+        sink.emit(EV_ABS, ABS_MT_SLOT, 0).unwrap();
+        sink.emit(EV_ABS, ABS_MT_TRACKING_ID, 1).unwrap();
+        sink.emit(EV_KEY, BTN_LEFT, 1).unwrap();
+        sink.emit(EV_KEY, 46, 1).unwrap(); // KEY_C
+        sink.emit(EV_KEY, 29, 1).unwrap(); // KEY_LEFTCTRL
+        sink.sync().unwrap(); // trailing SYN lands on BOTH nodes (each framed)
         let p = ptr.events.lock().unwrap().clone();
         let e = ext.events.lock().unwrap().clone();
         assert_eq!(
@@ -3642,10 +3713,522 @@ mod tests {
     #[test]
     fn pre_create_emits_are_dropped_never_buffered() {
         let u = RealUinput::new("/nonexistent-uinput-xyz");
-        u.emit(EV_KEY, BTN_LEFT, 1);
-        u.emit(EV_ABS, ABS_MT_SLOT, 0);
-        u.sync();
+        assert!(u.emit(EV_KEY, BTN_LEFT, 1).is_err());
+        assert!(u.emit(EV_ABS, ABS_MT_SLOT, 0).is_err());
+        assert!(u.sync().is_err());
         assert_eq!(u.staged_len(), 0);
+    }
+
+    // Software-only output failure fixtures. No uinput or evdev device is opened.
+    #[derive(Clone)]
+    struct FaultUinput {
+        inner: Arc<FakeUinput>,
+        // 0 = healthy, 1 = fail emit, 2 = fail sync.
+        failure: Arc<std::sync::atomic::AtomicU8>,
+    }
+
+    impl FaultUinput {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(FakeUinput::new()),
+                failure: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            }
+        }
+
+        fn fail(&self, failure: u8) {
+            self.failure
+                .store(failure, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl UinputSink for FaultUinput {
+        fn is_ready(&self) -> bool {
+            !self.inner.was_destroyed()
+        }
+
+        fn emit(&self, ty: u16, code: u16, value: i32) -> Result<()> {
+            anyhow::ensure!(self.is_ready(), "fake output retired");
+            anyhow::ensure!(
+                self.failure.load(std::sync::atomic::Ordering::SeqCst) != 1,
+                "fake emit failure"
+            );
+            self.inner.emit(ty, code, value)
+        }
+
+        fn sync(&self) -> Result<()> {
+            anyhow::ensure!(
+                self.failure.load(std::sync::atomic::Ordering::SeqCst) != 2,
+                "fake sync failure"
+            );
+            self.emit(EV_SYN, SYN_REPORT, 0)
+        }
+
+        fn destroy(&self) {
+            self.inner.destroy();
+        }
+    }
+
+    fn output_failure_config() -> Config {
+        Config {
+            click: crate::config::ClickConfig {
+                click_1: "ctrl+left".into(),
+                ..Config::default().click
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn pointer_output_failure_releases_grab_and_retires_held_session() {
+        for failure in [1, 2] {
+            let pointer = FaultUinput::new();
+            let extras = FaultUinput::new();
+            let grab = Arc::new(FakeGrab::ok());
+            let frames = (0..3)
+                .map(|x| Ok(Some(frame(vec![finger(1, 200, x, 0)], 0))))
+                .collect();
+            let mut px = ClickProxy::new(
+                settings(true),
+                SharedGrab(Arc::clone(&grab)),
+                DualSink::new(pointer.clone(), extras.clone()),
+                FakeHaptic::new(),
+                ScriptSource::new(frames),
+            );
+            px.set_pump_ready(true);
+            px.attach(&usb_ready("/dev/hidraw1"));
+            let cfg = output_failure_config();
+            let now = std::time::Instant::now();
+            px.handle_frame_at(&cfg, now).unwrap();
+            assert!(grab.is_grabbed());
+            assert!(pointer.inner.has(EV_ABS, ABS_MT_TRACKING_ID, 1));
+            assert!(pointer.inner.has(EV_KEY, BTN_TOUCH, 1));
+            assert!(pointer.inner.has(EV_KEY, BTN_LEFT, 1));
+            assert!(extras.inner.has(EV_KEY, 29, 1));
+
+            pointer.fail(failure);
+            assert!(px.handle_frame_at(&cfg, spaced_at(now, 1)).is_err());
+            assert!(!grab.is_grabbed());
+            assert!(!px.is_attached());
+            assert!(px.is_passthrough());
+            assert!(!px.pump_ready);
+            assert!(pointer.inner.was_destroyed());
+            assert!(extras.inner.was_destroyed());
+            assert!(px.machine.active().is_none());
+            assert!(
+                px.held_first.is_empty() && px.held_force.is_empty() && px.held_slide.is_empty()
+            );
+            assert!(!px.btn_left_down);
+            assert!(px.pending_buttons.is_none() && px.pending_force.is_none());
+            assert!(px.last_pos.is_empty());
+
+            // A failed session stops consuming reports and cannot grab again
+            // until its owner has supplied a fresh output/pump path.
+            let pointer_events = wire_events(&pointer.inner);
+            let extras_events = wire_events(&extras.inner);
+            px.attach(&usb_ready("/dev/hidraw1"));
+            px.handle_frame_at(&cfg, spaced_at(now, 2)).unwrap();
+            assert!(!grab.is_grabbed());
+            assert_eq!(px.source.frames.borrow().len(), 1);
+            assert_eq!(wire_events(&pointer.inner), pointer_events);
+            assert_eq!(wire_events(&extras.inner), extras_events);
+        }
+    }
+
+    #[test]
+    fn idle_staged_output_failure_releases_grab_and_cancels_pending_action() {
+        let pointer = FaultUinput::new();
+        let extras = FaultUinput::new();
+        let mut cfg = output_failure_config();
+        cfg.click.click_1.stagger_ms = Some(100);
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), extras.clone()),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(px.pending_buttons.is_some());
+        assert!(extras.inner.has(EV_KEY, 29, 1));
+        assert!(!pointer.inner.has(EV_KEY, BTN_LEFT, 1));
+        pointer.fail(2);
+        assert!(px.handle_frame_at(&cfg, spaced_at(now, 2)).is_err());
+        assert!(!px.grab.is_grabbed());
+        assert!(!px.is_attached());
+        assert!(px.pending_buttons.is_none());
+        assert!(pointer.inner.was_destroyed() && extras.inner.was_destroyed());
+    }
+
+    #[test]
+    fn idle_pressure_release_preserves_pointer_failure_and_extras_degradation() {
+        for pointer_fails in [false, true] {
+            for failure in [1, 2] {
+                for stagger in [0, 30] {
+                    let pointer = FaultUinput::new();
+                    let extras = FaultUinput::new();
+                    let mut cfg = output_failure_config();
+                    cfg.click.click_1.stagger_ms = Some(stagger);
+                    let mut px = ClickProxy::new(
+                        settings(true),
+                        FakeGrab::ok(),
+                        DualSink::new(pointer.clone(), extras.clone()),
+                        FakeHaptic::new(),
+                        // Pressure drops during release debounce. Keep the
+                        // contact so idle must cancel any pending button.
+                        ScriptSource::new(vec![
+                            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+                            Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+                        ]),
+                    );
+                    px.set_pump_ready(true);
+                    px.attach(&usb_ready("/dev/hidraw1"));
+                    let now = std::time::Instant::now();
+                    px.handle_frame_at(&cfg, now).unwrap();
+                    px.handle_frame_at(&cfg, ms_after(now, 10)).unwrap();
+                    assert!(px.machine.active().is_some());
+                    assert!(extras.inner.has(EV_KEY, 29, 1));
+                    assert_eq!(px.pending_buttons.is_some(), stagger != 0);
+                    if pointer_fails {
+                        pointer.fail(failure);
+                    } else {
+                        extras.fail(failure);
+                    }
+                    let result = px.handle_frame_at(&cfg, ms_after(now, 30));
+                    assert_eq!(result.is_err(), pointer_fails);
+                    assert!(px.machine.active().is_none());
+                    assert!(px.pending_buttons.is_none() && px.pending_force.is_none());
+                    assert_eq!(px.grab.is_grabbed(), !pointer_fails);
+                    assert_eq!(px.is_attached(), !pointer_fails);
+                    assert_eq!(px.is_passthrough(), pointer_fails);
+                    assert_eq!(pointer.inner.was_destroyed(), pointer_fails);
+                    assert!(extras.inner.was_destroyed());
+                    if stagger != 0 {
+                        assert!(key_values(&pointer.inner, BTN_LEFT).is_empty());
+                    } else if !pointer_fails {
+                        assert_eq!(key_values(&pointer.inner, BTN_LEFT), vec![1, 0]);
+                    }
+                    let ended = (wire_events(&pointer.inner), wire_events(&extras.inner));
+                    px.handle_frame_at(&cfg, ms_after(now, 1000)).unwrap();
+                    assert_eq!(
+                        (wire_events(&pointer.inner), wire_events(&extras.inner)),
+                        ended
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idle_force_release_and_cut_restore_propagate_pointer_errors() {
+        for force_on_pointer in [false, true] {
+            for failure in [1, 2] {
+                let pointer = FaultUinput::new();
+                let extras = FaultUinput::new();
+                let mut cfg = Config::default();
+                cfg.click.click_1 = if force_on_pointer { "ctrl" } else { "left" }.into();
+                cfg.force.force_offset = 100;
+                cfg.force.transition_mode = "cut".into();
+                cfg.force.force_1 = if force_on_pointer { "right" } else { "ctrl" }.into();
+                let mut px = ClickProxy::new(
+                    settings(true),
+                    FakeGrab::ok(),
+                    DualSink::new(pointer.clone(), extras.clone()),
+                    FakeHaptic::new(),
+                    ScriptSource::new(vec![slide_report(1, 100, 0), slide_report(1, 200, 0)]),
+                );
+                px.set_pump_ready(true);
+                px.attach(&usb_ready("/dev/hidraw1"));
+                let now = std::time::Instant::now();
+                px.handle_frame_at(&cfg, now).unwrap();
+                px.handle_frame_at(&cfg, ms_after(now, 10)).unwrap();
+                px.handle_frame_at(&cfg, ms_after(now, 15)).unwrap();
+                assert!(px.pending_force.is_none());
+                assert_eq!(
+                    key_values(
+                        &pointer.inner,
+                        if force_on_pointer {
+                            BTN_RIGHT
+                        } else {
+                            BTN_LEFT
+                        }
+                    ),
+                    if force_on_pointer {
+                        vec![1]
+                    } else {
+                        vec![1, 0]
+                    }
+                );
+                px.replace_source(ScriptSource::new(vec![slide_report(1, 100, 0)]));
+                px.handle_frame_at(&cfg, ms_after(now, 16)).unwrap();
+                assert!(px.machine.active().is_some() && px.machine.force_active().is_some());
+                pointer.fail(failure);
+                // At 40 ms idle expires the force latch. Depending on the
+                // routing, pointer failure occurs on force key-up, the cut
+                // first-level re-press, or the trailing frame flush.
+                assert!(px.handle_frame_at(&cfg, ms_after(now, 40)).is_err());
+                assert!(!px.is_attached() && !px.grab.is_grabbed());
+                assert!(px.is_passthrough() && !px.pump_ready);
+                assert!(pointer.inner.was_destroyed() && extras.inner.was_destroyed());
+                assert!(px.machine.active().is_none() && px.machine.force_active().is_none());
+                assert!(px.held_first.is_empty() && px.held_force.is_empty());
+                assert!(!px.physical_left_down);
+            }
+        }
+    }
+
+    #[test]
+    fn extras_output_failure_retires_only_extras_and_keeps_pointer_working() {
+        for failure in [1, 2] {
+            let pointer = FaultUinput::new();
+            let extras = FaultUinput::new();
+            let mut px = ClickProxy::new(
+                settings(true),
+                FakeGrab::ok(),
+                DualSink::new(pointer.clone(), extras.clone()),
+                FakeHaptic::new(),
+                ScriptSource::new(vec![
+                    Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                    Ok(Some(frame(vec![finger(1, 200, 20, 0)], 0))),
+                    Ok(Some(frame(vec![], 0))),
+                    Ok(Some(frame(vec![finger(1, 200, 30, 0)], 0))),
+                ]),
+            );
+            px.set_pump_ready(true);
+            px.attach(&usb_ready("/dev/hidraw1"));
+            let cfg = output_failure_config();
+            let now = std::time::Instant::now();
+            px.handle_frame_at(&cfg, now).unwrap();
+            assert!(extras.inner.has(EV_KEY, 29, 1));
+            extras.fail(failure);
+            // Sync failure happens while holding the shortcut. Emit failure
+            // happens on its key-up. Both must remove the keyboard node.
+            px.handle_frame_at(&cfg, spaced_at(now, 1)).unwrap();
+            px.handle_frame_at(&cfg, spaced_at(now, 2)).unwrap();
+            assert!(extras.inner.was_destroyed());
+            let retired_events = wire_events(&extras.inner);
+            px.handle_frame_at(&cfg, spaced_at(now, 3)).unwrap();
+            assert_eq!(wire_events(&extras.inner), retired_events);
+            assert!(px.grab.is_grabbed() && px.is_attached());
+            assert!(!px.is_passthrough());
+            assert!(!pointer.inner.was_destroyed());
+            assert!(pointer.inner.has(EV_ABS, ABS_MT_POSITION_X, 20));
+            assert!(pointer.inner.has(EV_KEY, BTN_LEFT, 0));
+            assert!(pointer.inner.has(EV_ABS, ABS_MT_TRACKING_ID, -1));
+            assert_eq!(key_values(&pointer.inner, BTN_LEFT), vec![1, 0, 1]);
+        }
+    }
+
+    #[test]
+    fn unavailable_extras_drops_shortcuts_but_allows_pointer_attach_and_release() {
+        let pointer = FaultUinput::new();
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), RealUinput::new_extras("/unused")),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![
+                Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                Ok(Some(frame(vec![], 0))),
+            ]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = output_failure_config();
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(now, 1)).unwrap();
+        assert!(px.is_attached() && px.grab.is_grabbed());
+        assert_eq!(key_values(&pointer.inner, BTN_LEFT), vec![1, 0]);
+        assert_eq!(px.uinput.extras().staged_len(), 0);
+    }
+
+    fn fixture_uinput(file: std::fs::File) -> RealUinput {
+        let sink = RealUinput::new("/unused");
+        *sink.fd.lock().unwrap() = Some(file);
+        sink.created
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        sink
+    }
+
+    #[test]
+    fn real_uinput_enospc_retires_fd_and_reports_unready() {
+        let sink = fixture_uinput(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        );
+        sink.emit(EV_KEY, BTN_LEFT, 1).unwrap();
+        assert_eq!(sink.staged_len(), 24);
+        let error = sink.sync().unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+        assert!(!sink.is_ready());
+        assert!(!sink.fd_open());
+        assert_eq!(sink.staged_len(), 0);
+        assert!(sink.emit(EV_KEY, BTN_LEFT, 0).is_err());
+        assert!(sink.sync().is_err());
+        sink.destroy(); // idempotent after failure
+        assert!(!sink.fd_open());
+    }
+
+    #[test]
+    fn real_pointer_enospc_propagates_to_session_and_allows_fresh_attachment() {
+        let pointer = fixture_uinput(tempfile::tempfile().unwrap());
+        let extras = FaultUinput::new();
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer, extras.clone()),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![
+                Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 200, 10, 0)], 0))),
+            ]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = output_failure_config();
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(extras.inner.has(EV_KEY, 29, 1));
+        assert!(px.btn_left_down && !px.last_pos.is_empty());
+        *px.uinput.pointer().fd.lock().unwrap() = Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        );
+        let error = px.handle_frame_at(&cfg, spaced_at(now, 1)).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+        assert!(!px.is_attached() && !px.grab.is_grabbed());
+        assert!(!px.uinput.pointer().fd_open());
+        assert!(extras.inner.was_destroyed());
+
+        // Session ownership can replace the failed outputs and attach again;
+        // no manager retry/reconciliation policy is implemented here.
+        px.uinput = DualSink::new(
+            fixture_uinput(tempfile::tempfile().unwrap()),
+            FaultUinput::new(),
+        );
+        px.replace_source(ScriptSource::new(vec![Ok(Some(frame(vec![], 0)))]));
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        px.handle_frame_at(&cfg, spaced_at(now, 2)).unwrap();
+        assert!(px.is_attached() && px.grab.is_grabbed());
+        assert!(px.machine.active().is_none());
+        assert!(!px.btn_left_down && px.last_pos.is_empty());
+    }
+
+    #[test]
+    fn teardown_write_failure_also_retires_both_outputs() {
+        for pump_loss in [false, true] {
+            let pointer = FaultUinput::new();
+            let extras = FaultUinput::new();
+            let mut px = ClickProxy::new(
+                settings(true),
+                FakeGrab::ok(),
+                DualSink::new(pointer.clone(), extras.clone()),
+                FakeHaptic::new(),
+                ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]),
+            );
+            px.set_pump_ready(true);
+            px.attach(&usb_ready("/dev/hidraw1"));
+            px.handle_frame(&output_failure_config()).unwrap();
+            pointer.fail(2);
+            if pump_loss {
+                px.set_pump_ready(false);
+            } else {
+                px.detach(&detached("/dev/hidraw1", Transport::Usb));
+            }
+            assert!(!px.is_attached() && !px.grab.is_grabbed());
+            assert!(pointer.inner.was_destroyed() && extras.inner.was_destroyed());
+        }
+    }
+
+    #[test]
+    fn real_uinput_normal_frame_is_batched_and_stays_ready() {
+        use std::io::{Read, Seek};
+        let file = tempfile::tempfile().unwrap();
+        let mut reader = file.try_clone().unwrap();
+        let sink = fixture_uinput(file);
+        sink.emit(EV_KEY, BTN_LEFT, 1).unwrap();
+        assert_eq!(reader.metadata().unwrap().len(), 0);
+        sink.sync().unwrap();
+        reader.rewind().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        let expected = [
+            encode_event(EV_KEY, BTN_LEFT, 1),
+            encode_event(EV_SYN, SYN_REPORT, 0),
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+        assert!(sink.is_ready());
+        assert_eq!(sink.staged_len(), 0);
+        sink.destroy();
+        assert!(!sink.is_ready() && !sink.fd_open());
+    }
+
+    #[test]
+    fn frame_writer_completes_short_writes_and_eintr_without_duplication() {
+        use std::collections::VecDeque;
+        use std::io::{self, Write};
+        struct Writer {
+            steps: VecDeque<io::Result<usize>>,
+            bytes: Vec<u8>,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let n = self.steps.pop_front().expect("unexpected write")?;
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = [
+            encode_event(EV_KEY, BTN_LEFT, 1),
+            encode_event(EV_SYN, SYN_REPORT, 0),
+        ]
+        .concat();
+        let mut writer = Writer {
+            steps: VecDeque::from([
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(24),
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Ok(24),
+            ]),
+            bytes: Vec::new(),
+        };
+        RealUinput::flush_locked(&mut writer, &bytes).unwrap();
+        assert_eq!(writer.bytes, bytes);
+        for failure in [Ok(0), Err(io::Error::from_raw_os_error(libc::ENOSPC))] {
+            writer.steps = VecDeque::from([Ok(24), failure]);
+            writer.bytes.clear();
+            let error = RealUinput::flush_locked(&mut writer, &bytes).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::WriteZero | io::ErrorKind::StorageFull
+            ));
+            assert_eq!(writer.bytes, bytes[..24]);
+            assert!(writer.steps.is_empty(), "must stop on a failed write");
+        }
     }
 
     #[test]
