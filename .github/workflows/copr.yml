@@ -1,0 +1,77 @@
+name: COPR (Fedora)
+
+# Validates packaging/fedora/*.spec on every push/PR; builds an SRPM
+# artifact on v* tags for later manual COPR submission.
+#
+# COPR submission (copr-cli build) is intentionally NOT automated here:
+# the COPR project does not exist yet and CI holds no credentials.
+# TODO(owner): create the COPR project, add the COPR_API_TOKEN secret
+# (COPR API token consumed by `copr-cli`), then add a submit job that
+# uploads the `srpm` artifact via `copr-cli build`. Until then the SRPM
+# artifact is build-only and submission stays a manual owner step.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rpm tooling
+        run: |
+          dnf install -y rpm-build systemd-rpm-macros
+          dnf install -y rpmlint || echo 'rpmlint unavailable; check-fedora.sh treats it as advisory'
+      - name: syntax + packaging validation
+        run: |
+          set -euo pipefail
+          bash -n packaging/fedora/check-fedora.sh
+          ./packaging/fedora/check-fedora.sh
+
+  srpm:
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rpm tooling
+        run: dnf install -y rpm-build systemd-rpm-macros
+      - name: version gate (tag == spec == cargo == changelog)
+        run: |
+          set -euo pipefail
+          raw_tag="${GITHUB_REF_NAME:?}"
+          [[ "$raw_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad tag '$raw_tag' (want vX.Y.Z)"; exit 1; }
+          version="${raw_tag#v}"
+          ./packaging/release/check-version-sync.sh "$version"
+          spec_ver="$(sed -n 's/^Version:[[:space:]]*//p' packaging/fedora/linux-trackpad-driver.spec | head -n 1)"
+          [ "$spec_ver" = "$version" ] || { echo "::error::spec Version $spec_ver != tag version $version"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: build SRPM from tag tree
+        run: |
+          set -euo pipefail
+          top="$(mktemp -d)"
+          trap 'rm -rf -- "$top"' EXIT
+          tar --mtime='@0' --exclude='./target' --exclude='./.git' \
+            --transform "s,^\\./,linux-trackpad-driver-${VERSION}/," \
+            -cf - . | gzip -n > "$top/linux-trackpad-driver-${VERSION}.tar.gz"
+          mkdir -p "$top/SRPMS" srpm-out
+          rpmbuild -bs \
+            --define "_topdir $top" \
+            --define "_sourcedir $top" \
+            --define "_srcrpmdir $top/SRPMS" \
+            packaging/fedora/linux-trackpad-driver.spec
+          cp "$top"/SRPMS/*.src.rpm srpm-out/
+          # TODO(owner): `copr-cli build --nowait <PROJECT> srpm-out/*.src.rpm`
+          # once the COPR project exists and the COPR_API_TOKEN secret is set.
+          # Submission stays manual until then — no token is wired here.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: srpm
+          path: srpm-out/
+          if-no-files-found: error
+          retention-days: 14
