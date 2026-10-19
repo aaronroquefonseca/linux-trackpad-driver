@@ -228,6 +228,11 @@ USB-first scope: BT is bring-up + init verification, no rate tuning.
 
 - [ ] Pair via `bluetoothctl` (`scan on`, `pair <MAC>`, `connect <MAC>`),
       find the BT hidraw node (`HID_ID=0005:0000004C:...` in the §0 loop).
+- [ ] Hotplug rule fires for the BT node (not just the 30 s scan): the HID
+      parent is `0005:004C:...` (see `udevadm info -a -n /dev/hidrawN`), and
+      `udevadm test $(udevadm info -q path -n /dev/hidrawN)` pulls the
+      `linux-trackpad-driver-reconnect@hidrawN.service` instance. USB nodes
+      keep matching via `ATTRS{idVendor}=="05ac"`.
 - [ ] `run` with only BT connected. Expect, and nothing else on the wire:
 
 ```text
