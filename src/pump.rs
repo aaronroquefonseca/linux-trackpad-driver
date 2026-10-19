@@ -7,11 +7,9 @@
 //!   two back-to-back sub-reports (first length byte at offset 1).
 //! - One pump thread per attached session ([`spawn_pump`]), frame rate
 //!   bounded by the device (no throttle; idle steps sleep briefly to
-//!   avoid a busy spin). NOTE: the daemon never flips the stop flag —
-//!   the thread lives until process exit by design. A dead pump
-//!   surfaces through the session teardown paths (grab released,
-//!   passthrough), never through the handle, which is only joined in
-//!   tests.
+//!   avoid a busy spin). NOTE: the daemon stops the thread at shutdown via
+//!   the stop flag and observes the handle with a bounded join
+//!   ([`join_bounded`]), so a worker panic surfaces instead of vanishing.
 //! - Malformed frames are logged + dropped per frame, never abort.
 //!
 //! Decode itself reuses [`crate::apple_parse::parse_frame`] /
@@ -286,6 +284,9 @@ where
 
 /// Spawn a per-node pump thread draining `proxy` until `stop` flips.
 /// Frame rate is device-bounded; idle polls sleep [`IDLE_SLEEP`].
+/// The owner stops the thread at shutdown ([`join_bounded`]): the loop
+/// checks `stop` every step, so the join lands within milliseconds unless
+/// a frame handler is wedged on hardware I/O.
 pub fn spawn_pump<G, U, H, S>(
     name: String,
     proxy: Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
@@ -306,6 +307,55 @@ where
         }
         log::info!("pump {name}: thread stopped");
     })
+}
+
+/// Outcome of a bounded thread join ([`join_bounded`]).
+#[derive(Debug)]
+pub enum WorkerJoin<T> {
+    /// The thread finished; carries its return value.
+    Completed(T),
+    /// The thread panicked; carries a best-effort payload description.
+    Panicked(String),
+    /// The thread did not finish within the bound. The handle is
+    /// detached (dropped): bounded shutdown must never hang the process
+    /// on a wedged worker.
+    TimedOut,
+}
+
+/// Join `handle`, waiting at most `timeout`. A finished thread is joined
+/// (surfacing panics as [`WorkerJoin::Panicked`]); an unfinished one is
+/// detached after the bound expires. Polls [`IDLE_SLEEP`] so shutdown
+/// latency stays near the bound without busy-spinning.
+pub fn join_bounded<T>(handle: std::thread::JoinHandle<T>, timeout: Duration) -> WorkerJoin<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pending = Some(handle);
+    loop {
+        if pending.as_ref().is_some_and(|h| h.is_finished()) {
+            return match pending.take().expect("just checked Some").join() {
+                Ok(value) => WorkerJoin::Completed(value),
+                Err(payload) => WorkerJoin::Panicked(panic_message(&payload)),
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            // Drop detaches: the wedged thread keeps running without its
+            // handle. Process exit reclaims it shortly after.
+            drop(pending.take());
+            return WorkerJoin::TimedOut;
+        }
+        std::thread::sleep(IDLE_SLEEP);
+    }
+}
+
+/// Best-effort panic payload description for worker-failure reporting.
+/// String payloads round-trip; anything else reports a fixed marker.
+pub fn panic_message(payload: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -423,5 +473,58 @@ mod tests {
         let mut src = PumpSource::Idle;
         assert_eq!(src.tier(), crate::apple_parse::CapabilityTier::L2p);
         assert!(src.poll_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn join_bounded_reports_completion() {
+        let handle = std::thread::spawn(|| 42);
+        match join_bounded(handle, Duration::from_secs(5)) {
+            WorkerJoin::Completed(value) => assert_eq!(value, 42),
+            WorkerJoin::Panicked(msg) => panic!("expected completion, got panic: {msg}"),
+            WorkerJoin::TimedOut => panic!("healthy thread must join within the bound"),
+        }
+    }
+
+    #[test]
+    fn join_bounded_reports_panic_payload() {
+        let handle = std::thread::spawn(|| panic!("boom-test-payload"));
+        match join_bounded(handle, Duration::from_secs(5)) {
+            WorkerJoin::Completed(()) => panic!("panicking thread must not report completion"),
+            WorkerJoin::Panicked(msg) => assert!(
+                msg.contains("boom-test-payload"),
+                "payload must surface, got: {msg}"
+            ),
+            WorkerJoin::TimedOut => panic!("dead thread is finished; must not time out"),
+        }
+    }
+
+    #[test]
+    fn join_bounded_times_out_instead_of_hanging() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let start = std::time::Instant::now();
+        match join_bounded(handle, Duration::from_millis(50)) {
+            WorkerJoin::Completed(()) => panic!("blocked thread must not complete"),
+            WorkerJoin::Panicked(msg) => panic!("blocked thread must not panic: {msg}"),
+            WorkerJoin::TimedOut => {}
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "bounded join must not hang: {:?}",
+            start.elapsed()
+        );
+        drop(tx); // let the detached thread exit on its own
+    }
+
+    #[test]
+    fn panic_message_round_trips_strings() {
+        let from_str: Box<dyn std::any::Any + Send> = Box::new("static slice");
+        assert_eq!(panic_message(&from_str), "static slice");
+        let from_string: Box<dyn std::any::Any + Send> = Box::new("owned".to_string());
+        assert_eq!(panic_message(&from_string), "owned");
+        let other: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_message(&other), "non-string panic payload");
     }
 }

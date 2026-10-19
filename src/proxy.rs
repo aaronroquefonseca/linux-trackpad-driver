@@ -562,6 +562,17 @@ where
         self.passthrough
     }
 
+    /// Test hook: fake a live attached session (grabbed + ready) without
+    /// hardware, so shutdown-teardown tests can drive a surviving live
+    /// session through the real release paths.
+    #[cfg(test)]
+    pub(crate) fn test_claim_live(&mut self, node: &str) {
+        self.pump_ready = true;
+        self.attached = true;
+        self.attached_node = Some(node.to_string());
+        self.passthrough = false;
+    }
+
     /// Borrow the touch source (manager swaps hidraw nodes per attach).
     pub fn source_mut(&mut self) -> &mut S {
         &mut self.source
@@ -2394,6 +2405,14 @@ impl RealUinput {
     pub(crate) fn staged_len(&self) -> usize {
         self.staging.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+
+    /// Test hook: fake a created virtual node without opening /dev/uinput.
+    /// `destroy` stays safe (flush errors, nothing to retire).
+    #[cfg(test)]
+    pub(crate) fn test_mark_created(&self) {
+        self.created
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl UinputSink for RealUinput {
@@ -2664,14 +2683,40 @@ where
     }
 }
 
+impl<H> AsyncHaptic<H> {
+    /// Bounded drain for orderly shutdown: disconnect the queue so the
+    /// worker finishes the trailing pulses, then join with `timeout`.
+    /// A stalled worker is detached (with a loud log) rather than hanging
+    /// shutdown; a panicked worker is reported. Idempotent: safe to call
+    /// after a previous shutdown or before drop.
+    pub fn shutdown(&mut self, timeout: std::time::Duration) {
+        self.tx.take();
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        match crate::pump::join_bounded(worker, timeout) {
+            crate::pump::WorkerJoin::Completed(()) => {}
+            crate::pump::WorkerJoin::Panicked(msg) => {
+                log::error!("proxy: haptic worker panicked: {msg}");
+            }
+            crate::pump::WorkerJoin::TimedOut => {
+                log::error!("proxy: haptic worker did not drain within {timeout:?}; detaching");
+            }
+        }
+    }
+}
+
+/// Bound for the actuator drain at shutdown/drop: queued pulses are click
+/// edges only, each a ~10 ms firmware round-trip, so two seconds is
+/// generous; a wedged actuator must never hang process exit.
+pub const HAPTIC_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl<H> Drop for AsyncHaptic<H> {
     fn drop(&mut self) {
         // Disconnect first so the worker drains the queued trailing
-        // up-pulses, then join (bounded: the queue only holds click edges).
-        self.tx.take();
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
+        // up-pulses, then join bounded: a wedged actuator detaches with a
+        // log instead of hanging process exit forever.
+        self.shutdown(HAPTIC_SHUTDOWN_TIMEOUT);
     }
 }
 
@@ -6352,6 +6397,97 @@ mod tests {
         drop(ah); // drain + join before asserting the full stream landed
         assert_eq!(calls.lock().unwrap().len(), 2);
         assert_eq!(releases.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn async_haptic_explicit_shutdown_drains_and_is_idempotent() {
+        // Orderly shutdown drains the queued trailing pulses before
+        // returning, then tolerates repeats and drop without hanging.
+        let rec = Arc::new(FakeHaptic::new());
+        let mut ah = AsyncHaptic::new(SharedHaptic(Arc::clone(&rec)));
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        ah.shutdown(std::time::Duration::from_secs(5));
+        assert_eq!(rec.calls.lock().unwrap().as_slice(), &[(64, 5, false)]);
+        assert_eq!(rec.releases.lock().unwrap().as_slice(), &[(64, false)]);
+        // Idempotent: worker already gone, returns immediately.
+        ah.shutdown(std::time::Duration::from_millis(10));
+        drop(ah);
+    }
+
+    #[test]
+    fn async_haptic_shutdown_is_bounded_when_worker_stalls() {
+        // A wedged actuator (firmware round-trip never returns) must not
+        // hang shutdown: the worker detaches after the bound.
+        struct StallHaptic {
+            gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl HapticSender for StallHaptic {
+            fn click_feedback(&self, _: u8, _: u8, _: bool) -> Result<()> {
+                let (lock, cvar) = &*self.gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = cvar.wait(open).unwrap();
+                }
+                Ok(())
+            }
+            fn release_feedback(&self, _: u8, _: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut ah = AsyncHaptic::new(StallHaptic {
+            gate: Arc::clone(&gate),
+        });
+        ah.click_feedback(64, 5, false).unwrap();
+        let t0 = std::time::Instant::now();
+        ah.shutdown(std::time::Duration::from_millis(50));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "shutdown must give up on a stalled worker: {:?}",
+            t0.elapsed()
+        );
+        // Release the detached worker so it exits on its own.
+        let (lock, cvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn async_haptic_worker_panic_falls_back_to_direct_send() {
+        // A panicking actuator worker must not hang shutdown: the bounded
+        // drain reports it, and later pulses fall back to direct
+        // synchronous delivery instead of queuing into a dead channel.
+        struct PanicOnceHaptic {
+            armed: std::sync::atomic::AtomicBool,
+            direct: Mutex<Vec<(u8, u8, bool)>>,
+        }
+        impl HapticSender for PanicOnceHaptic {
+            fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+                if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("simulated haptic worker panic");
+                }
+                self.direct
+                    .lock()
+                    .unwrap()
+                    .push((pressure, intensity, quiet));
+                Ok(())
+            }
+            fn release_feedback(&self, _down_pressure: u8, _quiet: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut ah = AsyncHaptic::new(PanicOnceHaptic {
+            armed: std::sync::atomic::AtomicBool::new(true),
+            direct: Mutex::new(Vec::new()),
+        });
+        ah.click_feedback(64, 5, false).unwrap(); // enqueued; the worker panics on it
+        ah.shutdown(std::time::Duration::from_secs(5)); // bounded: reports, never hangs
+        ah.click_feedback(64, 5, false).unwrap(); // worker gone: direct fallback
+        assert_eq!(
+            ah.inner().direct.lock().unwrap().as_slice(),
+            &[(64, 5, false)]
+        );
     }
 
     #[test]
