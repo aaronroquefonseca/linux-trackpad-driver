@@ -473,20 +473,59 @@ pub enum ActionKind {
     Keys(Vec<String>),
 }
 
+/// Canonical representative for a key token: aliases resolving to the same
+/// kernel code share one representative so [`ActionKind::is_same_action`]
+/// compares wire identity, not spelling (`super+left` == `meta+left`,
+/// `ctrl+c` == `control+c`). Mirrors [`crate::proxy::key_token_to_code`];
+/// every multi-token arm there has its members listed here. Tokens with
+/// distinct codes (`rctrl` vs `ctrl`, `left` vs `left_arrow`,
+/// `pause` vs `pausecd`) intentionally keep distinct representatives.
+pub fn canonical_key_token(token: &str) -> &str {
+    match token {
+        "control" | "lctrl" => "ctrl",
+        "lshift" => "shift",
+        "lalt" => "alt",
+        "super" | "cmd" | "command" | "win" | "lmeta" => "meta",
+        "escape" => "esc",
+        "return" => "enter",
+        "pgup" => "pageup",
+        "pgdn" => "pagedown",
+        "arrow_up" => "up",
+        "arrow_down" => "down",
+        "volumeup" => "volup",
+        "volumedown" => "voldown",
+        "playpause" => "play",
+        "stopcd" => "stop",
+        "nextsong" => "next",
+        "previous" | "previoussong" => "prev",
+        "browser_back" => "browserback",
+        "browser_forward" => "browserforward",
+        "lock" => "screenlock",
+        _ => token,
+    }
+}
+
 impl ActionKind {
-    /// Wire-identity compare: key sets match as sets (order- and
-    /// duplicate-insensitive, mirroring proxy same-level dedup:
-    /// `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one `left`
-    /// and one `ctrl`). `Empty == Empty`; `None` only equals `None`
-    /// (a latched slide is never `None`, so handoffs only merge real
-    /// holds).
+    /// Wire-identity compare: key sets match as sets of canonical wire
+    /// codes (order- and duplicate-insensitive, mirroring proxy same-level
+    /// dedup: `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one
+    /// `left` and one `ctrl`). Alias spellings resolving to the same code
+    /// also merge (`super+left` == `meta+left`, `ctrl+c` == `control+c`),
+    /// so alias-equivalent handoffs hold continuously instead of taking
+    /// the release/repress path. `Empty == Empty`; `None` only equals
+    /// `None` (a latched slide is never `None`, so handoffs only merge
+    /// real holds).
     pub fn is_same_action(&self, other: &Self) -> bool {
         match (self, other) {
             (ActionKind::None, ActionKind::None) => true,
             (ActionKind::Empty, ActionKind::Empty) => true,
             (ActionKind::Keys(a), ActionKind::Keys(b)) => {
-                a.iter().collect::<std::collections::HashSet<_>>()
-                    == b.iter().collect::<std::collections::HashSet<_>>()
+                a.iter()
+                    .map(|k| canonical_key_token(k))
+                    .collect::<std::collections::HashSet<_>>()
+                    == b.iter()
+                        .map(|k| canonical_key_token(k))
+                        .collect::<std::collections::HashSet<_>>()
             }
             _ => false,
         }
@@ -1276,6 +1315,73 @@ mod tests {
         assert!(keys("empty").is_same_action(&keys("EMPTY")));
         assert!(!keys("empty").is_same_action(&keys("left")));
         assert!(!keys("none").is_same_action(&keys("empty")));
+    }
+
+    #[test]
+    fn same_action_treats_aliases_as_identical() {
+        let keys = |s: &str| parse_click_action(s).unwrap().kind;
+        // Every multi-token arm of proxy `key_token_to_code` merges here.
+        // Combos exercise the handoff path (`super+left` vs `meta+left`);
+        // bare pairs pin the canonical grouping itself.
+        for (a, b) in [
+            ("super+left", "meta+left"),
+            ("cmd+left", "win+left"),
+            ("command+c", "meta+c"),
+            ("lmeta+c", "super+c"),
+            ("ctrl+c", "control+c"),
+            ("ctrl+c", "lctrl+c"),
+            ("shift+x", "lshift+x"),
+            ("alt+f4", "lalt+f4"),
+            ("esc", "escape"),
+            ("enter", "return"),
+            ("pageup", "pgup"),
+            ("pagedown", "pgdn"),
+            ("up", "arrow_up"),
+            ("down", "arrow_down"),
+            ("volup", "volumeup"),
+            ("voldown", "volumedown"),
+            ("play", "playpause"),
+            ("stop", "stopcd"),
+            ("next", "nextsong"),
+            ("prev", "previous"),
+            ("prev", "previoussong"),
+            ("browserback", "browser_back"),
+            ("browserforward", "browser_forward"),
+            ("screenlock", "lock"),
+            // Order/dup-insensitivity survives canonicalization.
+            ("left+super", "meta+left"),
+            ("ctrl+ctrl+c", "control+c"),
+        ] {
+            assert!(
+                keys(a).is_same_action(&keys(b)),
+                "aliases must merge: '{a}' vs '{b}'"
+            );
+            assert!(
+                keys(b).is_same_action(&keys(a)),
+                "aliases must merge (symmetric): '{b}' vs '{a}'"
+            );
+        }
+        // Distinct codes must NOT merge: right-hand modifiers, button-vs-key,
+        // and near-miss media tokens.
+        for (a, b) in [
+            ("ctrl", "rctrl"),
+            ("shift", "rshift"),
+            ("alt", "ralt"),
+            ("meta", "rmeta"),
+            ("super", "rmeta"),
+            ("left", "left_arrow"),
+            ("pause", "pausecd"),
+            ("play", "playcd"),
+            ("play", "pausecd"),
+            ("mute", "micmute"),
+            ("super+left", "meta+right"),
+            ("ctrl+c", "ctrl+v"),
+        ] {
+            assert!(
+                !keys(a).is_same_action(&keys(b)),
+                "distinct codes must not merge: '{a}' vs '{b}'"
+            );
+        }
     }
 
     #[test]
