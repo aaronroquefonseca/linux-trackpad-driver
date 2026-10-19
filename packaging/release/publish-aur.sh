@@ -14,8 +14,9 @@
 #
 # Auth: ssh:// remotes use AUR_SSH_PRIVATE_KEY from the environment (CI job
 # secret), written to a temp file (mode 600) with a pinned known_hosts entry
-# and StrictHostKeyChecking; the key is scrubbed on exit and tracing is
-# disabled while it is handled. Local-path remotes (tests) need no key.
+# and StrictHostKeyChecking; tracing is disabled before the key is read and
+# stays off while it is handled, and the key file is scrubbed on exit.
+# Local-path remotes (tests) need no key.
 set -euo pipefail
 
 PKG=""; DIR=""; MESSAGE=""; EXPECT=""; REMOTE=""
@@ -51,13 +52,13 @@ trap cleanup EXIT
 
 GIT_SSH_OPTS=()
 if [[ "$REMOTE" == ssh://* ]]; then
+  case $- in
+    *x*) set +x; echo "publish-aur: disabled shell tracing while handling the key" >&2 ;;
+  esac
   command -v ssh >/dev/null \
     || { echo "publish-aur: ssh client not found (install openssh)" >&2; exit 1; }
   KEY="${AUR_SSH_PRIVATE_KEY:-}"
   [ -n "$KEY" ] || { echo "publish-aur: AUR_SSH_PRIVATE_KEY is unset" >&2; exit 1; }
-  case $- in
-    *x*) set +x; echo "publish-aur: disabled shell tracing while handling the key" >&2 ;;
-  esac
   ( umask 077; printf '%s\n' "$KEY" > "$WORK_DIR/key" )
   KNOWN="${AUR_KNOWN_HOSTS:-aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN}"
   printf '%s\n' "$KNOWN" > "$WORK_DIR/known_hosts"
