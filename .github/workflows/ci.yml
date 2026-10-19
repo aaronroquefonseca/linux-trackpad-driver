@@ -108,6 +108,38 @@ jobs:
           test -f "$PKG/lib/systemd/system-sleep/ltd-resume"
           test -f "$PKG/lib/udev/rules.d/99-linux-trackpad-driver.rules"
           test -f "$PKG/usr/bin/ltd"
+      - name: license payload (installed copyright content)
+        run: |
+          set -euo pipefail
+          # MIT has no /usr/share/common-licenses entry (Debian Policy 12.5):
+          # the binary package must carry the text itself. Verify what
+          # debhelper actually installs via dh_installdocs (which prefers
+          # debian/<pkg>.copyright over debian/copyright), not a hand-made copy.
+          test -f debian/copyright || { echo 'missing source debian/copyright' >&2; exit 1; }
+          if grep -q 'common-licenses/MIT' debian/copyright; then
+            echo 'debian/copyright must not reference /usr/share/common-licenses/MIT' >&2
+            exit 1
+          fi
+          STAGE=$(mktemp -d)
+          trap 'rm -rf "$STAGE"' EXIT
+          mkdir -p "$STAGE/fixture"
+          cp -a debian config udev systemd "$STAGE/fixture/"
+          mkdir -p "$STAGE/fixture/target/release"
+          printf '#!/bin/sh\nexit 0\n' > "$STAGE/fixture/target/release/ltd"
+          chmod +x "$STAGE/fixture/target/release/ltd"
+          cd "$STAGE/fixture"
+          dh_installdocs
+          INSTALLED="debian/linux-trackpad-driver/usr/share/doc/linux-trackpad-driver/copyright"
+          test -f "$INSTALLED" || { echo "missing installed copyright: $INSTALLED" >&2; exit 1; }
+          if grep -q 'common-licenses/MIT' "$INSTALLED"; then
+            echo 'installed copyright must not reference /usr/share/common-licenses/MIT' >&2
+            exit 1
+          fi
+          for marker in 'Copyright (c) 2026' 'Permission is hereby granted' \
+              'WITHOUT WARRANTY OF ANY KIND' '/usr/share/common-licenses/Apache-2.0'; do
+            grep -q "$marker" "$INSTALLED" \
+              || { echo "installed copyright missing: $marker" >&2; exit 1; }
+          done
       - name: changelog + control syntax
         run: |
           dpkg-parsechangelog -l debian/changelog
