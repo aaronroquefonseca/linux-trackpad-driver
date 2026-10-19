@@ -247,19 +247,27 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
             // Haptics go to the interface-2 sibling when the USB layout
             // exposes one (actuator interface); otherwise the touch node
             // itself, loudly logged as pending HW verify.
+            // Prepare (open) the haptic endpoint BEFORE taking the proxy
+            // mutex: the open can block on kernel activity and the pump
+            // needs that mutex for every frame. The commit below only
+            // swaps Arcs and hands disposal to a background thread.
+            let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
+            let haptic_target = crate::proxy::HapticTarget::prepare(
+                &hnode,
+                event.transport == crate::init::Transport::Bluetooth,
+            );
             {
                 let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
                 px.grab().set_node(&evdev.to_string_lossy());
-                let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
-                px.haptic_mut().inner().set_node(&hnode);
+                // New session: retire any queued pulses from the previous
+                // node and pin the prepared actuator target before the pump
+                // enqueues.
+                px.haptic_mut().retarget_prepared(haptic_target);
                 *self.haptic_node.lock().unwrap_or_else(|e| e.into_inner()) = Some(hnode.clone());
                 log::info!(
                     "pump: haptic node {hnode} (interface {hiface:?}) for {}",
                     event.devnode
                 );
-                px.haptic_mut()
-                    .inner()
-                    .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
                 px.replace_source(PumpSource::Live(source));
                 px.set_pump_ready(true);
                 px.attach(event);
@@ -363,23 +371,53 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         {
             return false;
         }
-        let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
-        let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
-        let live = proxy.is_attached();
-        if live && active.as_deref() == Some(devnode) {
+        // Snapshot live/owner/routing/generation under brief locks; no I/O.
+        // Route resolution and endpoint open happen below outside the proxy
+        // mutex so a blocked open never stalls the pump's frames.
+        let (live, owned, cur_bt, baseline_gen) = {
+            let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+            let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+            let live = proxy.is_attached();
+            let owned = active.as_deref() == Some(devnode);
+            let (_, bt) = proxy.haptic_mut().current_routing();
+            let gen = proxy.haptic_mut().generation();
+            (live, owned, bt, gen)
+        };
+        if live && owned {
             // A later actuator sibling must not require a re-grab of the
             // healthy touch session. Resolve quietly; log only a route change.
+            // Resolution may touch sysfs; keep it outside all live locks.
             let (node, _) = crate::evdev::haptic_node_for_quiet(devnode);
-            let mut target = manager
-                .haptic_node
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if target.as_deref() != Some(node.as_str()) {
-                proxy.haptic_mut().inner().set_node(&node);
-                log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
-                *target = Some(node);
+            let needs = {
+                let tracked = manager
+                    .haptic_node
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tracked.as_deref() != Some(node.as_str())
+            };
+            if needs {
+                // Open outside the proxy mutex; commit generation-fenced
+                // below. A blocked open leaves the pump responsive.
+                let prepared = crate::proxy::HapticTarget::prepare(&node, cur_bt);
+                let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+                let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                let still_owned = proxy.is_attached() && active.as_deref() == Some(devnode);
+                if still_owned
+                    && proxy
+                        .haptic_mut()
+                        .update_route_prepared(prepared, baseline_gen)
+                {
+                    *manager
+                        .haptic_node
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(node.clone());
+                    log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
+                }
             }
         }
+        let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+        let proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        let live = proxy.is_attached();
         session_needs_attach(
             manager.cfg.enhanced_clicks,
             active.as_deref(),
