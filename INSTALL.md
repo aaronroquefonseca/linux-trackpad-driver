@@ -126,8 +126,10 @@ systemctl status linux-trackpad-driver-resume.service
   Failed attachments and sessions released after source or output loss retry even
   when USB polling still matches or a Bluetooth node keeps its name.
   These attachment-only retries send no hardware init reports. Failed
-  hardware init remains pending; a replaced devnode instance is detached
-  before fresh init, including when its name is reused between scans.
+  hardware init or required USB re-init remains pending and blocks
+  attachment until full setup succeeds, even if polling later matches.
+  A replaced devnode instance is detached before fresh init, including
+  when its name is reused between scans.
   Healthy sessions and siblings receive no attachment retries; gate-off
   keeps native passthrough. Recovery starts on a later pass, with init and
   attachment work adding to the scan interval.

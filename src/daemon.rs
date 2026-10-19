@@ -805,6 +805,8 @@ pub struct ResumeWatch {
 struct NodeState {
     dev: DiscoveredDevice,
     unreadable_streak: u32,
+    // A required setup failure invalidates historical success. Pending
+    // setup must complete the full sequence before attachment is allowed.
     initialized: bool,
     identity: Option<NodeIdentity>,
 }
@@ -967,6 +969,7 @@ impl ResumeWatch {
                 match hardware.initialize(dev) {
                     Ok(()) => {
                         state.initialized = true;
+                        state.unreadable_streak = 0;
                         // Mode-switch init can itself replace the node;
                         // remember the instance accepted by the sequence.
                         state.identity = hardware.identity(&dev.devnode).or(state.identity);
@@ -1037,6 +1040,10 @@ impl ResumeWatch {
                     actions.push(TickAction::UpToDate(dev.devnode.clone()))
                 }
                 Err(e) => {
+                    // Polling may match later even if multitouch enable
+                    // failed. Require full setup, not attachment-only
+                    // recovery or another polling-only decision.
+                    state.initialized = false;
                     log::error!("resume tick: re-init failed for {}: {e:#}", dev.devnode);
                 }
             }
@@ -1185,7 +1192,9 @@ mod tests {
     struct TestHardware<'a> {
         hub: &'a DeviceReadyHub,
         init_fails: Cell<bool>,
+        resume_fails: Cell<bool>,
         verify: Cell<Option<bool>>,
+        verifies: Cell<usize>,
         inits: Cell<usize>,
         reinits: Cell<usize>,
     }
@@ -1194,7 +1203,9 @@ mod tests {
             Self {
                 hub,
                 init_fails: Cell::new(false),
+                resume_fails: Cell::new(false),
                 verify: Cell::new(Some(true)),
+                verifies: Cell::new(0),
                 inits: Cell::new(0),
                 reinits: Cell::new(0),
             }
@@ -1216,12 +1227,16 @@ mod tests {
             Ok(())
         }
         fn verify(&self, _: &str) -> Result<bool> {
+            self.verifies.set(self.verifies.get() + 1);
             self.verify
                 .get()
                 .ok_or_else(|| anyhow::anyhow!("unreadable firmware"))
         }
         fn resume(&self, devnode: &str, _: &Result<bool>) -> Result<resume::ResumeAction> {
             self.reinits.set(self.reinits.get() + 1);
+            if self.resume_fails.get() {
+                anyhow::bail!("USB multitouch rearm failed");
+            }
             self.hub.emit(&init::usb_ready(devnode));
             Ok(resume::ResumeAction::Reinitialized)
         }
@@ -1376,6 +1391,114 @@ mod tests {
             assert_eq!(hardware.reinits.get(), 0);
             assert_eq!(session.lock().unwrap().attempts, 2);
         }
+    }
+
+    // Lose an initialized session, require USB rearm, then fail that
+    // required setup. Neither failure path may reacquire the grab.
+    fn failed_usb_rearm_requires_full_initialization(output_loss: bool) {
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, false);
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let dev = fixture_devs().remove(0);
+        assert_eq!(dev.transport, Transport::Usb);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        {
+            let mut s = session.lock().unwrap();
+            if output_loss {
+                s.proxy.uinput().fail.store(true, Ordering::SeqCst);
+                let mut report = vec![0; 12];
+                report[0] = 0x02;
+                s.proxy.replace_source(HidrawSource::new(
+                    &dev.devnode,
+                    ScriptReader::new(vec![ScriptStep::Bytes(report)]),
+                ));
+                assert!(s.proxy.handle_frame(&cfg).is_err());
+                assert!(s.proxy.uinput().destroyed.load(Ordering::SeqCst));
+                s.proxy.uinput().fail.store(false, Ordering::SeqCst);
+            } else {
+                s.proxy.replace_source(HidrawSource::new(
+                    &dev.devnode,
+                    ScriptReader::new(vec![ScriptStep::IoError(libc::ENODEV)]),
+                ));
+                s.proxy.handle_frame(&cfg).unwrap();
+            }
+            assert!(!s.proxy.is_attached());
+            assert!(!s.proxy.grab().is_grabbed());
+        }
+        hardware.verify.set(Some(false));
+        hardware.resume_fails.set(true);
+        hardware.init_fails.set(true);
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        {
+            let s = session.lock().unwrap();
+            assert!(!s.proxy.is_attached(),
+                "failed USB rearm reattached: actions={actions:?}, events={:?}, attempts={}, grabbed={}",
+                s.events, s.attempts, s.proxy.grab().is_grabbed());
+            assert!(!s.proxy.grab().is_grabbed());
+            assert_eq!(s.attempts, 1);
+            assert_eq!(s.events, vec![ReadyKind::Ready]);
+        }
+        assert!(!watch.known[0].initialized);
+        assert_eq!(hardware.reinits.get(), 1);
+        assert_eq!(hardware.verifies.get(), 1);
+
+        // Matching polling alone cannot prove the multitouch-enable step
+        // succeeded. Persistent setup failures must retry the full sequence
+        // once per pass, without Ready events, grabs or verification bypass.
+        hardware.verify.set(Some(true));
+        for pass in 1..=3 {
+            assert!(watch
+                .tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware)
+                .is_empty());
+            assert_eq!(hardware.inits.get(), 1 + pass);
+            assert_eq!(hardware.reinits.get(), 1);
+            assert_eq!(hardware.verifies.get(), 1);
+            let mut s = session.lock().unwrap();
+            let mut short_report = vec![0; 8];
+            short_report[0] = 0x02;
+            s.proxy.replace_source(HidrawSource::new(
+                &dev.devnode,
+                ScriptReader::new(vec![ScriptStep::Bytes(short_report)]),
+            ));
+            assert!(s.proxy.handle_frame(&cfg).unwrap().is_none());
+            assert!(!s.proxy.is_attached());
+            assert!(!s.proxy.grab().is_grabbed());
+            assert!(s.proxy.is_passthrough());
+            assert_eq!(s.attempts, 1);
+            assert_eq!(s.events, vec![ReadyKind::Ready]);
+        }
+        hardware.init_fails.set(false);
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+        assert!(watch.known[0].initialized);
+        {
+            let s = session.lock().unwrap();
+            assert!(s.proxy.is_attached());
+            assert!(s.proxy.grab().is_grabbed());
+            assert_eq!(s.attempts, 2);
+            assert_eq!(s.events, vec![ReadyKind::Ready, ReadyKind::Ready]);
+        }
+        // Successful full setup restores ordinary quiet polling/health
+        // reconciliation; historical failure cannot trigger extra init.
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(actions, vec![TickAction::UpToDate(dev.devnode)]);
+        assert_eq!(hardware.inits.get(), 5);
+        assert_eq!(hardware.reinits.get(), 1);
+        assert_eq!(hardware.verifies.get(), 2);
+        assert_eq!(session.lock().unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn failed_usb_rearm_after_source_loss_blocks_attachment_until_full_setup() {
+        failed_usb_rearm_requires_full_initialization(false);
+    }
+
+    #[test]
+    fn failed_usb_rearm_after_fatal_output_blocks_attachment_until_full_setup() {
+        failed_usb_rearm_requires_full_initialization(true);
     }
 
     #[test]
