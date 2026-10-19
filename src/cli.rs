@@ -28,6 +28,10 @@ pub struct ReconnectArgs {
 pub struct ResumeArgs {
     pub polling_override: Option<u32>,
     pub config_path: Option<String>,
+    /// Explicit manual forcing: re-init even without a live daemon.
+    /// Plain `resume` (hook/unit background form) leaves hardware alone
+    /// when the daemon is stopped.
+    pub force: bool,
 }
 
 /// Parsed `doctor` invocation.
@@ -66,7 +70,7 @@ impl From<String> for ParseFailure {
 fn top_usage(prog: &str) -> ParseFailure {
     ParseFailure {
         message: format!(
-            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-p Hz] [-c config]\n  {prog} doctor [-c config]\n  {prog} --version | -V"
+            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-f] [-p Hz] [-c config]\n  {prog} doctor [-c config]\n  {prog} --version | -V"
         ),
         is_help: true,
     }
@@ -102,10 +106,13 @@ pub struct DoctorNode {
 ///
 /// Returns `(report, ok)`: `ok` is false when the config is invalid or no
 /// trackpad node was seen. The socket state is informational only — a
-/// lack of an observed listener is not a failure.
+/// lack of an observed listener is not a failure. Config warnings
+/// (effectively unreachable thresholds) render as `[warn]` lines and never
+/// fail the report on their own.
 pub fn doctor_report(
     config_source: &str,
     config_error: Option<&str>,
+    config_warnings: &[String],
     nodes: &[DoctorNode],
     socket_path: &str,
     socket_status: &doctor::SocketStatus,
@@ -118,6 +125,9 @@ pub fn doctor_report(
             out.push_str(&format!("[FAIL] config invalid ({config_source}): {e}\n"));
             ok = false;
         }
+    }
+    for warning in config_warnings {
+        out.push_str(&format!("[warn] config: {warning}\n"));
     }
     if nodes.is_empty() {
         out.push_str("[FAIL] no trackpad seen: no 05ac:0265/0324 or 004c:0265/0324 hidraw node\n");
@@ -256,9 +266,14 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
         "resume" => {
             let mut polling_override: Option<u32> = None;
             let mut config_path: Option<String> = None;
+            let mut force = false;
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
+                    "-f" | "--force" => {
+                        force = true;
+                        i += 1;
+                    }
                     "-p" | "--polling-rate" => {
                         i += 1;
                         let v = rest.get(i).ok_or_else(|| {
@@ -277,7 +292,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
                     }
                     "-h" | "--help" => {
                         return Err(ParseFailure {
-                            message: format!("usage: {prog} resume [-p Hz] [-c config]"),
+                            message: format!("usage: {prog} resume [-f] [-p Hz] [-c config]"),
                             is_help: true,
                         });
                     }
@@ -289,6 +304,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
             Ok(Command::Resume(ResumeArgs {
                 polling_override,
                 config_path,
+                force,
             }))
         }
         "doctor" => {
@@ -338,11 +354,16 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(run) => {
-            // Like reconnect/resume: $LTD_CONFIG (set by the main unit) wins
-            // over defaults so the daemon, the hook, and the tick verify
-            // against the same rate. Explicit -c still wins over env.
-            let cfg = config::load_or_default_with_env(run.config_path.as_deref())?;
+            // Shared selection with doctor/reconnect/resume: explicit `-c`
+            // wins, else nonempty `$LTD_CONFIG` (set by the main unit), else
+            // the installed system file, else built-in defaults. The source
+            // is the live settings for this process; on-disk edits need a
+            // restart (doctor reports the on-disk file it validated).
+            let (cfg, source) = config::load_selected_config(run.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
+            log::info!(
+                "config source: {source} (live settings for this process; restart to apply on-disk edits)"
+            );
             match daemon::run_daemon(&cfg) {
                 Ok(()) => Ok(ExitCode::SUCCESS),
                 Err(e) => {
@@ -352,11 +373,14 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Reconnect(rc) => {
-            // No -c on the udev command line: fall back to $LTD_CONFIG (set
-            // by the reconnect template unit) so hotplug honors the system
-            // config, including enhanced_clicks.
-            let cfg = config::load_or_default_with_env(rc.config_path.as_deref())?;
+            // Shared selection with run/resume/doctor (see `run`): no `-c`
+            // on the udev command line falls back to `$LTD_CONFIG` (set by
+            // the reconnect template unit), then the installed system file.
+            let (cfg, source) = config::load_selected_config(rc.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
+            log::info!(
+                "config source: {source} (live settings for this process; restart to apply on-disk edits)"
+            );
             match daemon::run_reconnect(
                 &rc.devnode,
                 rc.force,
@@ -372,11 +396,15 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Resume(rs) => {
-            // System-sleep hook entry: same $LTD_CONFIG fallback as the
-            // reconnect unit (the hook passes no -c either).
-            let cfg = config::load_or_default_with_env(rs.config_path.as_deref())?;
+            // Shared selection with run/reconnect/doctor (see `run`): the
+            // system-sleep hook passes no `-c`, so `$LTD_CONFIG` (exported
+            // by the hook) then the installed system file apply.
+            let (cfg, source) = config::load_selected_config(rs.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
-            match daemon::run_resume(&cfg, rs.polling_override) {
+            log::info!(
+                "config source: {source} (live settings for this process; restart to apply on-disk edits)"
+            );
+            match daemon::run_resume(&cfg, rs.polling_override, rs.force) {
                 Ok(report) if !report.failed() => Ok(ExitCode::SUCCESS),
                 Ok(report) => {
                     log::error!("resume failed for {} node(s)", report.errors.len());
@@ -391,7 +419,10 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
         Command::Doctor(doc) => {
             // Read-only: config + sysfs/stat + kernel socket metadata.
             let (source, result) = doctor::check_config(doc.config_path.as_deref());
-            let config_error = result.err().map(|e| format!("{e:#}"));
+            let (config_error, config_warnings) = match result {
+                Ok(warnings) => (None, warnings),
+                Err(e) => (Some(format!("{e:#}")), Vec::new()),
+            };
             let nodes: Vec<DoctorNode> = match discovery::scan_trackpads() {
                 Ok(devs) => devs
                     .iter()
@@ -411,8 +442,14 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             };
             let sock = lock::socket_path();
             let status = doctor::socket_status(&sock);
-            let (report, ok) =
-                doctor_report(&source, config_error.as_deref(), &nodes, &sock, &status);
+            let (report, ok) = doctor_report(
+                &source,
+                config_error.as_deref(),
+                &config_warnings,
+                &nodes,
+                &sock,
+                &status,
+            );
             print!("{report}");
             if ok {
                 Ok(ExitCode::SUCCESS)
@@ -478,6 +515,7 @@ mod tests {
             Ok(Command::Resume(ResumeArgs {
                 polling_override: None,
                 config_path: None,
+                force: false,
             }))
         );
         assert_eq!(
@@ -485,12 +523,20 @@ mod tests {
             Ok(Command::Resume(ResumeArgs {
                 polling_override: Some(90),
                 config_path: Some("/tmp/x.toml".into()),
+                force: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&argv(&["ltd", "resume", "-f"])),
+            Ok(Command::Resume(ResumeArgs {
+                polling_override: None,
+                config_path: None,
+                force: true,
             }))
         );
         assert!(parse_args(&argv(&["ltd", "resume", "-p"])).is_err());
         assert!(parse_args(&argv(&["ltd", "resume", "-p", "abc"])).is_err());
         assert!(parse_args(&argv(&["ltd", "resume", "-p", "0"])).is_err());
-        assert!(parse_args(&argv(&["ltd", "resume", "-f"])).is_err());
         assert!(
             parse_args(&argv(&["ltd", "resume", "--help"]))
                 .unwrap_err()
@@ -583,6 +629,7 @@ mod tests {
         let (report, ok) = doctor_report(
             "<built-in defaults>",
             None,
+            &[],
             &[doctor_node()],
             "/run/linux-trackpad-driver/driver.sock",
             &doctor::SocketStatus::Listening,
@@ -601,6 +648,7 @@ mod tests {
             "<built-in defaults>",
             None,
             &[],
+            &[],
             "/sock",
             &doctor::SocketStatus::NotObserved,
         );
@@ -612,6 +660,7 @@ mod tests {
         let (_, ok) = doctor_report(
             "<built-in defaults>",
             None,
+            &[],
             &[doctor_node()],
             "/sock",
             &doctor::SocketStatus::NotObserved,
@@ -624,6 +673,7 @@ mod tests {
         let (report, ok) = doctor_report(
             "/etc/config.toml; on disk",
             None,
+            &[],
             &[doctor_node()],
             "/sock",
             &doctor::SocketStatus::Unknown("cannot read /proc/net/unix".into()),
@@ -642,6 +692,7 @@ mod tests {
             "/tmp/bad.toml",
             Some("invalid polling_rate 500 (want 1..=110)"),
             &[],
+            &[],
             "/sock",
             &doctor::SocketStatus::NotObserved,
         );
@@ -653,11 +704,30 @@ mod tests {
         let (_, ok) = doctor_report(
             "<built-in defaults>",
             None,
+            &[],
             &[gone],
             "/sock",
             &doctor::SocketStatus::Listening,
         );
         assert!(!ok);
+    }
+
+    #[test]
+    fn doctor_report_shows_warnings_without_failing() {
+        let warnings = ["[click] sensitivity 255 above nominal device max 253 \
+             (arbitrary units 0..=253; press may never fire)"
+            .to_string()];
+        let (report, ok) = doctor_report(
+            "<built-in defaults>",
+            None,
+            &warnings,
+            &[doctor_node()],
+            "/sock",
+            &doctor::SocketStatus::Listening,
+        );
+        assert!(ok);
+        assert!(report.contains("[ok] config valid"));
+        assert!(report.contains("[warn] config: [click] sensitivity 255"));
     }
 
     #[test]

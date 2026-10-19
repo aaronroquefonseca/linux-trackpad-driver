@@ -4,6 +4,14 @@
 # linux-trackpad-driver-reconnect@hidraw2.service` runs
 # `ltd reconnect /dev/hidraw2`.
 #
+# Activation contract (finding #14): this unit is the AUTOMATIC background
+# form (no -f). Without a live main-service daemon it is an inactive no-op:
+# hardware left alone, exit 0. Installed-but-stopped (socket absent) is
+# therefore off (`disable` alone does not stop a running service), even
+# though udev still queues this unit on hotplug. Explicit manual forcing
+# while the daemon is stopped is `ltd reconnect /dev/HIDRAW -f` (or -d to
+# disengage) run directly — never via this template.
+#
 # Why a unit and not RUN+=: reconnect waits for the node + driver bind and
 # retries reports with backoff — seconds of work that must never block udev.
 [Unit]
@@ -18,3 +26,27 @@ Type=oneshot
 Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
 ExecStart=/usr/bin/ltd reconnect /dev/%I
 Nice=10
+
+# Finding #19 containment, one-shot subset. Same filesystem + privilege
+# restrictions as the main unit. Narrower socket families: one-shots only
+# connect to the daemon's AF_UNIX socket (lock.rs daemon_socket_present);
+# they never open the AF_NETLINK hotplug monitor, so AF_UNIX alone suffices.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# ProtectClock deferred (see main unit + SECURITY.md): pre-v252 RTC-only
+# device allowlist denies hidraw/evdev/uinput.
+ProtectHostname=yes
+ProtectKernelLogs=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+# Deliberately OMITTED (see main unit + SECURITY.md): User=, device rules,
+# CapabilityBoundingSet, SystemCallFilter, ProtectProc, PrivateUsers.
+# Deferred for compat: ProtectClock (pre-v252 RTC allowlist denies devices).
