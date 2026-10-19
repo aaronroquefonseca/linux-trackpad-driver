@@ -676,10 +676,12 @@ where
 
     /// One idempotent teardown for every source-loss path: disconnect
     /// (`set_pump_ready(false)`), explicit detach, output failure,
-    /// shutdown, and attachment rollback. Ends every virtual contact and
-    /// tool bit on the wire (kernel Type-B is stateful: stopping emission
-    /// does not communicate removal), releases held keys, syncs one
-    /// trailing frame, then releases the grab and resets session state.
+    /// shutdown, and attachment rollback. Releases the grab first (native
+    /// input must resume even when the virtual emit path is broken), then
+    /// releases held keys, ends every virtual contact and tool bit on the
+    /// wire (kernel Type-B is stateful: stopping emission does not
+    /// communicate removal), syncs one trailing frame, and resets session
+    /// state.
     /// Safe to call when already down (no duplicate wire traffic): only
     /// sessions with live wire state emit, and state is cleared so a
     /// second call is a no-op. On wire failure the virtual nodes are
@@ -739,9 +741,11 @@ where
     /// Terminate every virtual contact on the wire: each slot written so
     /// far gets `TRACKING_ID = -1`, `BTN_TOUCH` goes to 0, and the full
     /// `BTN_TOOL_*` row clears. No trailing `SYN`: the caller syncs once
-    /// after keys + contacts. Belt-and-braces `BTN_LEFT` fallback covers a
-    /// physical-only hold the key release somehow missed; normally
-    /// [`ClickProxy::release_held`] already emitted it, so this is a no-op.
+    /// after keys + contacts. Pure emission: reset ownership stays in
+    /// [`ClickProxy::teardown_session`] (which runs even when the wire
+    /// fails), and physical-only `BTN_LEFT` is already released by
+    /// [`ClickProxy::release_held`] with `phys_down = false`, so no
+    /// fallback emit belongs here.
     fn release_contacts(&mut self) -> Result<()> {
         for slot in 0..=self.max_slot {
             self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
@@ -749,13 +753,6 @@ where
         }
         self.uinput.emit(EV_KEY, BTN_TOUCH, 0)?;
         self.emit_tool_bits(0)?;
-        if self.btn_left_down {
-            self.uinput.emit(EV_KEY, BTN_LEFT, 0)?;
-            self.btn_left_down = false;
-        }
-        self.last_pos.clear();
-        self.max_slot = 0;
-        self.physical_left_down = false;
         Ok(())
     }
 
@@ -2766,6 +2763,7 @@ mod tests {
     use super::*;
     use crate::apple_parse::{CapabilityTier, FingerContact, PressureUnits, TouchFrame};
     use crate::config::Config;
+    use crate::daemon::PumpManager;
     use crate::init::{detached, usb_ready, Transport};
     use std::cell::RefCell;
 
@@ -4700,6 +4698,25 @@ mod tests {
         vals.windows(2).filter(|w| w[0] != w[1]).count()
     }
 
+    /// Exactly one trailing SYN: successful teardown emits key-ups +
+    /// contact termination with no intermediate sync, then a single frame
+    /// sync. Both the count and the trailing position are pinned.
+    fn assert_single_trailing_syn(tail: &[(u16, u16, i32)], ctx: &str) {
+        let syns = tail
+            .iter()
+            .filter(|&&(ty, code, _)| ty == EV_SYN && code == SYN_REPORT)
+            .count();
+        assert_eq!(
+            syns, 1,
+            "{ctx}: expected exactly one SYN, got {syns}: {tail:?}"
+        );
+        assert_eq!(
+            tail.last(),
+            Some(&(EV_SYN, SYN_REPORT, 0)),
+            "{ctx}: SYN must trail the teardown wire: {tail:?}"
+        );
+    }
+
     #[test]
     fn combo_hold_emits_no_btn_left() {
         // click_1 = ctrl+c must not chord a phantom BTN_LEFT — press frame
@@ -4949,10 +4966,7 @@ mod tests {
                 assert!(!px.btn_left_down, "{label}/{teardown}: BTN_LEFT flag stuck");
                 let evs = sinks.pointer.events.lock().unwrap().clone();
                 let tail = &evs[base_len..];
-                assert!(
-                    tail.contains(&(EV_SYN, SYN_REPORT, 0)),
-                    "{label}/{teardown}: no trailing SYN: {tail:?}"
-                );
+                assert_single_trailing_syn(tail, &format!("{label}/{teardown}"));
                 for slot in 0..slots {
                     assert!(
                         tail.windows(2)
@@ -5044,47 +5058,127 @@ mod tests {
         ] {
             assert_eq!(key_values(&sinks.pointer, tool).last(), Some(&0));
         }
-        assert!(tail.contains(&(EV_SYN, SYN_REPORT, 0)));
+        assert_single_trailing_syn(tail, "disconnect");
         // Dead source never polled again.
         let remaining = px.source.frames.borrow().len();
         px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
         assert_eq!(px.source.frames.borrow().len(), remaining);
     }
 
+    type TestManager =
+        PumpManager<SharedGrab, DualSink<SharedUinput, SharedUinput>, SharedHaptic, ScriptSource>;
+
+    /// Manager under test with fakes: the SAME `finish_attach` / `detach` /
+    /// `Drop` dispatch production uses, with an empty script source as idle.
+    fn test_manager(
+        grab: &Arc<FakeGrab>,
+        sinks: &TestSinks,
+        haptic: &Arc<FakeHaptic>,
+    ) -> TestManager {
+        let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(grab)),
+            sinks.dual(),
+            SharedHaptic(Arc::clone(haptic)),
+            ScriptSource::new(vec![]),
+        )));
+        PumpManager::new(
+            proxy,
+            Config {
+                enhanced_clicks: true,
+                ..Config::default()
+            },
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || ScriptSource::new(vec![]),
+        )
+    }
+
+    /// Poison the manager's proxy mutex the way a panicked pump iteration
+    /// would: lock, panic while holding, rejoin. The next manager op must
+    /// recover the mutex and still tear down.
+    fn poison_manager_proxy(manager: &TestManager) {
+        let proxy = std::sync::Arc::clone(manager.proxy());
+        let _ = std::thread::spawn(move || {
+            let _guard = proxy.lock().unwrap();
+            panic!("test poison");
+        })
+        .join();
+    }
+
     #[test]
-    fn attach_rollback_with_live_contacts_terminates_and_idles() {
-        // Daemon grab-refused rollback runs teardown + source idle +
-        // destroy both. With a live light-touch contact the rollback must
-        // still terminate the slot and clear BTN_TOUCH + tool bits, and a
-        // second rollback must stay silent.
-        let grab = Arc::new(FakeGrab::ok());
+    fn attach_rollback_via_manager_idles_and_destroys() {
+        // Grab-refused attach through the ACTUAL manager dispatch
+        // (`PumpManager::finish_attach`, the same tail production calls
+        // after opening the source). A fresh refused session holds no wire
+        // state, so rollback emits nothing, then idles the source and
+        // destroys both nodes; a repeat refused attach stays silent.
+        let grab = Arc::new(FakeGrab::failing());
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let frames = vec![Ok(Some(frame(vec![finger(1, 10, 100, 60)], 0)))];
-        let mut px = ClickProxy::new(
-            settings(true),
-            SharedGrab(Arc::clone(&grab)),
-            sinks.dual(),
-            SharedHaptic(Arc::clone(&haptic)),
-            ScriptSource::new(frames),
-        );
-        px.set_pump_ready(true);
-        px.attach(&usb_ready("/dev/hidraw1"));
-        let cfg = Config::default();
-        let t0 = std::time::Instant::now();
-        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
-        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
-        let base_len = sinks.pointer.events.lock().unwrap().len();
-        // Exact manager rollback sequence (see PumpManager::attach).
-        px.teardown_session("attach rollback: grab refused");
-        px.replace_source(ScriptSource::new(vec![]));
-        px.uinput.destroy();
-        assert!(!px.is_attached());
-        assert!(px.is_passthrough());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        let live = || ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 10, 100, 60)], 0)))]);
+        manager.finish_attach(&usb_ready("/dev/hidraw1"), live(), |_| {});
+        {
+            let px = manager.proxy().lock().unwrap();
+            assert!(!px.is_attached());
+            assert!(px.is_passthrough());
+            assert!(
+                px.source.frames.borrow().is_empty(),
+                "rollback must idle the source"
+            );
+        }
         assert!(!grab.is_grabbed());
         assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
-        assert_eq!(px.max_slot, 0);
-        assert!(px.last_pos.is_empty());
+        assert!(
+            sinks.pointer.events.lock().unwrap().is_empty(),
+            "fresh rollback must emit no wire traffic"
+        );
+        // A repeat refused attach stays silent.
+        manager.finish_attach(&usb_ready("/dev/hidraw1"), live(), |_| {});
+        assert!(
+            sinks.pointer.events.lock().unwrap().is_empty(),
+            "second rollback emitted duplicate wire traffic"
+        );
+    }
+
+    #[test]
+    fn attach_rollback_terminates_stale_physical_hold() {
+        // Stale wire state through the actual rollback dispatch: seed a
+        // bare-hardware-click hold (`BTN_LEFT` wire-down with no latch, the
+        // physical-only path [`ClickProxy::release_held`] must release),
+        // refuse the grab, and require `BTN_LEFT = 0`, slot termination,
+        // tool clear, exactly one trailing SYN, and silence on repeat.
+        let grab = Arc::new(FakeGrab::failing());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![]),
+            |_| {},
+        );
+        {
+            let mut px = manager.proxy().lock().unwrap();
+            px.btn_left_down = true;
+            px.physical_left_down = true;
+            px.last_pos.insert(1, (100, 60));
+        }
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![]),
+            |_| {},
+        );
+        {
+            let px = manager.proxy().lock().unwrap();
+            assert!(!px.is_attached());
+            assert!(!px.btn_left_down);
+            assert!(!px.physical_left_down);
+            assert!(px.last_pos.is_empty());
+            assert_eq!(px.max_slot, 0);
+        }
+        assert!(!grab.is_grabbed());
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
         let evs = sinks.pointer.events.lock().unwrap().clone();
         let tail = &evs[base_len..];
         assert!(
@@ -5092,6 +5186,11 @@ mod tests {
                 .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 0)
                     && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
             "rollback left slot 0 active: {tail:?}"
+        );
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT).last(),
+            Some(&0),
+            "stale physical hold survived rollback"
         );
         assert_eq!(key_values(&sinks.pointer, BTN_TOUCH).last(), Some(&0));
         for tool in [
@@ -5103,15 +5202,23 @@ mod tests {
         ] {
             assert_eq!(key_values(&sinks.pointer, tool).last(), Some(&0));
         }
-        assert!(tail.contains(&(EV_SYN, SYN_REPORT, 0)));
-        // Idled source drains to no-op; a second rollback stays silent.
-        assert!(px
-            .handle_frame_at(&cfg, spaced_at(t0, 1))
+        assert_single_trailing_syn(tail, "stale rollback");
+        // Idled source drains to no-op; a repeat rollback stays silent.
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        assert!(manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
             .unwrap()
             .is_none());
         let len_after_first = sinks.pointer.events.lock().unwrap().len();
-        px.teardown_session("attach rollback: grab refused");
-        px.uinput.destroy();
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![]),
+            |_| {},
+        );
         assert_eq!(
             sinks.pointer.events.lock().unwrap().len(),
             len_after_first,
@@ -5120,36 +5227,32 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_teardown_is_idempotent() {
-        // Manager shutdown (Drop) runs teardown + source idle + destroy
-        // both. A live press (keys + contact + BTN_LEFT) must fully
-        // terminate, and a repeat shutdown — the Drop-after-detach case —
-        // must emit nothing.
+    fn manager_drop_terminates_live_press() {
+        // Actual `PumpManager` Drop with a live press (keys + contact +
+        // BTN_LEFT): slot terminated, touch/tool/left cleared, exactly one
+        // trailing SYN, grab released, source idled, both nodes destroyed.
         let grab = Arc::new(FakeGrab::ok());
         let sinks = TestSinks::new();
         let haptic = Arc::new(FakeHaptic::new());
-        let frames = vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))];
-        let mut px = ClickProxy::new(
-            settings(true),
-            SharedGrab(Arc::clone(&grab)),
-            sinks.dual(),
-            SharedHaptic(Arc::clone(&haptic)),
-            ScriptSource::new(frames),
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))]),
+            |_| {},
         );
-        px.set_pump_ready(true);
-        px.attach(&usb_ready("/dev/hidraw1"));
+        assert!(manager.proxy().lock().unwrap().is_attached());
         let cfg = Config::default();
         let t0 = std::time::Instant::now();
-        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap();
         assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         let base_len = sinks.pointer.events.lock().unwrap().len();
-        // Exact manager shutdown sequence (see PumpManager::drop).
-        px.teardown_session("shutdown");
-        px.replace_source(ScriptSource::new(vec![]));
-        px.uinput.destroy();
-        assert!(!px.is_attached());
-        assert!(px.is_passthrough());
+        drop(manager);
         assert!(!grab.is_grabbed());
         assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
         let evs = sinks.pointer.events.lock().unwrap().clone();
@@ -5171,15 +5274,93 @@ mod tests {
         ] {
             assert_eq!(key_values(&sinks.pointer, tool).last(), Some(&0));
         }
-        assert!(tail.contains(&(EV_SYN, SYN_REPORT, 0)));
-        // Repeat shutdown (Drop after an explicit detach) stays silent.
-        let len_after_first = sinks.pointer.events.lock().unwrap().len();
-        px.teardown_session("shutdown");
-        px.uinput.destroy();
+        assert_single_trailing_syn(tail, "shutdown drop");
+    }
+
+    #[test]
+    fn manager_drop_recovers_poisoned_proxy() {
+        // A panicked holder poisons the proxy mutex; Drop must recover it
+        // and still terminate the live session (same wire assertions as
+        // the clean Drop above).
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))]),
+            |_| {},
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap();
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        poison_manager_proxy(&manager);
+        drop(manager);
+        assert!(!grab.is_grabbed());
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        let tail = &evs[base_len..];
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 0)
+                    && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
+            "poisoned shutdown left slot 0 active: {tail:?}"
+        );
+        assert_eq!(key_values(&sinks.pointer, BTN_TOUCH).last(), Some(&0));
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT).last(), Some(&0));
+        assert_single_trailing_syn(tail, "poisoned shutdown drop");
+    }
+
+    #[test]
+    fn manager_detach_then_drop_stays_silent() {
+        // Drop-after-detach through the actual dispatch: `detach` owns the
+        // live press (exactly one trailing SYN, source idled, both nodes
+        // destroyed), and the later Drop finds no wire state, so it emits
+        // nothing further.
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))]),
+            |_| {},
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap();
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        manager.detach(&detached("/dev/hidraw1", Transport::Usb));
+        {
+            let px = manager.proxy().lock().unwrap();
+            assert!(!px.is_attached());
+            assert!(px.is_passthrough());
+        }
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        assert_single_trailing_syn(&evs[base_len..], "manager detach");
+        // A sibling Detached must not touch the torn-down session, and
+        // the later Drop must emit nothing further.
+        manager.detach(&detached("/dev/hidraw9", Transport::Usb));
+        let len_after_detach = sinks.pointer.events.lock().unwrap().len();
+        drop(manager);
         assert_eq!(
             sinks.pointer.events.lock().unwrap().len(),
-            len_after_first,
-            "second shutdown emitted duplicate wire traffic"
+            len_after_detach,
+            "Drop after detach emitted duplicate wire traffic"
         );
     }
 
