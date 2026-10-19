@@ -8,10 +8,12 @@
 //! means a live daemon owns it (new instance exits); connection-refused means
 //! a stale socket file (remove + rebind under a sidecar `*.lock` flock mutex,
 //! then re-checking liveness once); any other dial failure (e.g. EACCES)
-//! leaves the file untouched and bails. `Drop` unlinks only while the path
-//! still names the filesystem entry our `bind` created (dev+ino captured at
-//! acquisition, re-checked under a non-blocking try of the same mutex), so a
-//! dying predecessor never removes a successor's rebound file.
+//! leaves the file untouched and bails. `Drop` unlinks only while holding a
+//! non-blocking take of the same mutex and while the path still names the
+//! filesystem entry our `bind` created (dev+ino captured at acquisition), so
+//! a dying predecessor never removes a successor's rebound file. When the
+//! mutex is contended or unusable, `Drop` skips cleanup and leaves reclaimable
+//! residue for the next serialized acquire.
 //! Tests use temp dirs, never `/run`.
 
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -76,13 +78,29 @@ fn replacement_mutex(socket_path: &str) -> ReplacementMutex {
     ReplacementMutex { _file: file }
 }
 
-/// Take `LOCK_EX|LOCK_NB` on `{socket_path}.lock`, returning an unlocked
-/// guard when it is contended or unusable. Used by `Drop`, which must never
-/// block shutdown on a starter mid-acquire (whose own blocking dial can
-/// stall). Callers fall back to the identity check without the mutex.
-fn replacement_mutex_try(socket_path: &str) -> ReplacementMutex {
-    ReplacementMutex {
-        _file: open_lockfile(socket_path).and_then(|f| flock(&f, false).then_some(f)),
+/// Take `LOCK_EX|LOCK_NB` on `{socket_path}.lock`. Returns `Some` only when
+/// the mutex is actually held. Returns `None` when it is contended or
+/// unusable. Used by `Drop`, which must never block shutdown on a starter
+/// mid-acquire (whose own blocking dial can stall). A `None` result means the
+/// caller holds no exclusion and must skip pathname cleanup, leaving any
+/// residue for the next serialized acquire to reclaim. Contention and an
+/// unusable lockfile are logged differently: contention is an expected
+/// shutdown/acquire overlap, while an unusable lockfile is a degraded
+/// best-effort mode where acquisition also proceeds without exclusion.
+fn replacement_mutex_try(socket_path: &str) -> Option<ReplacementMutex> {
+    let file = match open_lockfile(socket_path) {
+        Some(f) => f,
+        None => {
+            // Already logged in `open_lockfile`: degraded mode, no exclusion.
+            log::debug!("skipping socket cleanup for '{socket_path}': mutex unavailable");
+            return None;
+        }
+    };
+    if flock(&file, false) {
+        Some(ReplacementMutex { _file: Some(file) })
+    } else {
+        log::debug!("skipping socket cleanup for '{socket_path}': mutex contended");
+        None
     }
 }
 
@@ -221,26 +239,32 @@ impl Drop for SocketLock {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
         // Serialize the identity check + unlink against a successor's
-        // stale-check/remove/bind whenever the mutex is immediately
-        // available, so a successor cannot rebind the path between our check
-        // and our unlink. Bounded by construction: a single LOCK_NB attempt,
-        // so shutdown never blocks on a starter mid-acquire (whose own
-        // blocking dial can stall on an undrained listener). On contention
-        // or an unusable lockfile, fall back to the identity check alone:
-        // the listener fd stays open until after this runs, so a racing
-        // starter still dials a live socket and backs off rather than
-        // treating our file as stale.
+        // stale-check/remove/bind by holding the replacement mutex across
+        // both steps. Bounded by construction: a single LOCK_NB attempt, so
+        // shutdown never blocks on a starter mid-acquire (whose own blocking
+        // dial can stall on an undrained listener).
+        //
+        // When the mutex cannot be taken immediately (contended or unusable),
+        // skip pathname cleanup entirely: without exclusion a successor could
+        // rebind between our check and our unlink and we would delete its
+        // live pathname. Closing the listener still leaves stale residue that
+        // the next serialized acquire reclaims, so skipping never leaks
+        // permanently. Never stat/unlink as if holding a failed mutex.
         //
         // Unlink only while the path still names the filesystem entry our
         // bind created (dev+ino captured at acquisition). A successor that
         // rebound the path after an external unlink owns a new inode, so a
-        // dying predecessor never removes the live file.
+        // dying predecessor holding the mutex never removes the live file.
         //
         // The entry identity must come from the pathname, not from fstat of
         // the socket fd: on Linux the fd refers to a sockfs inode while the
         // pathname is a filesystem inode, so comparing the two never matches
         // and a normal drop would leak the file.
-        let _mutex = replacement_mutex_try(&self.path);
+        let Some(_mutex) = replacement_mutex_try(&self.path) else {
+            // No exclusion: leave residue for the next acquire. Distinguish
+            // in logs via `replacement_mutex_try` (contended vs unavailable).
+            return;
+        };
         let current = std::fs::metadata(&self.path)
             .ok()
             .map(|m| (m.dev(), m.ino()));
@@ -446,38 +470,62 @@ mod tests {
     }
 
     #[test]
-    fn drop_cleans_up_when_mutex_contended() {
+    fn drop_skips_cleanup_when_mutex_contended() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("drop-busy.sock");
         let sock = sock.to_str().unwrap().to_string();
         let guard = SocketLock::acquire(&sock).unwrap();
-        // Pin the mutex so Drop must use its bounded fallback: it still has
-        // to clean up, and must return without hanging.
-        let _pinned = hold_replacement_lock(&sock);
+        // Pin the mutex so Drop cannot take exclusion: it must return
+        // without hanging and must NOT unlink, leaving reclaimable residue.
+        // Unlinking without the mutex could delete a successor that rebinds
+        // between check and unlink.
+        let pinned = hold_replacement_lock(&sock);
         drop(guard);
         assert!(
-            !std::path::Path::new(&sock).exists(),
-            "drop under a contended mutex must still delete our own pathname"
+            std::path::Path::new(&sock).exists(),
+            "contended drop must leave residue instead of unlinking without exclusion"
         );
+        assert!(
+            !daemon_socket_present(&sock),
+            "dropped listener must not answer even though its pathname remains"
+        );
+        drop(pinned);
+        // The next serialized acquire reclaims the residue.
+        let successor = SocketLock::acquire(&sock).unwrap();
+        assert!(daemon_socket_present(&sock));
+        assert!(std::path::Path::new(&sock).exists());
+        drop(successor);
+        assert!(!std::path::Path::new(&sock).exists());
         assert!(!daemon_socket_present(&sock));
     }
 
     #[test]
     fn drop_vs_blocked_successor_single_owner() {
+        use std::sync::mpsc;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("drop-race.sock");
         let sock = sock.to_str().unwrap().to_string();
         let pred = SocketLock::acquire(&sock).unwrap();
         // Pin the mutex so the successor blocks inside acquire.
         let pinned = hold_replacement_lock(&sock);
+        let (started_tx, started_rx) = mpsc::channel();
         let sock2 = sock.clone();
-        let handle =
-            std::thread::spawn(move || SocketLock::acquire(&sock2).map_err(|e| e.to_string()));
-        // Give the successor time to block on the mutex, then drop the
-        // predecessor: its Drop takes the bounded fallback (no hang) and
-        // must release the pathname without harming the successor's bind.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            SocketLock::acquire(&sock2).map_err(|e| e.to_string())
+        });
+        // Deterministic handshake: the successor thread is alive and has
+        // entered acquire before we drop. It must be blocked on the pinned
+        // mutex regardless of exact scheduling, because the pin is held
+        // across both the drop and the successor's lock attempt. No sleep.
+        started_rx.recv().unwrap();
+        // Predecessor Drop contends on the pinned mutex: it must skip cleanup
+        // (no hang) and leave residue instead of unlinking without exclusion.
         drop(pred);
+        assert!(
+            std::path::Path::new(&sock).exists(),
+            "contended predecessor drop must leave residue for serialized reclaim"
+        );
         drop(pinned);
         let succ = handle
             .join()
@@ -486,6 +534,53 @@ mod tests {
         assert_eq!(succ.path(), sock);
         assert!(daemon_socket_present(&sock));
         assert!(std::path::Path::new(&sock).exists());
+        drop(succ);
+        assert!(!std::path::Path::new(&sock).exists());
+        assert!(!daemon_socket_present(&sock));
+    }
+
+    #[test]
+    fn contended_drop_after_external_unlink_preserves_successor() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("drop-ext-unlink.sock");
+        let sock = sock.to_str().unwrap().to_string();
+        let pred = SocketLock::acquire(&sock).unwrap();
+        // Pin the replacement mutex so predecessor Drop cannot take
+        // exclusion. This is the actual contention boundary (real flock),
+        // not a mocked flag.
+        let pinned = hold_replacement_lock(&sock);
+        let (started_tx, started_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(pred);
+        });
+        // Ensure the Drop thread is alive while we perform the supported
+        // external-unlink handoff step from
+        // `predecessor_drop_keeps_successor_socket`: the old pathname is
+        // unlinked while the predecessor listener is still open. With the
+        // mutex pinned, Drop must skip cleanup, so this unlink is the only
+        // remover and no racing unlink can delete the successor below.
+        started_rx.recv().unwrap();
+        std::fs::remove_file(&sock).unwrap();
+        dropper.join().unwrap();
+        // Contended Drop must not have unlinked anything after the external
+        // unlink (it holds no exclusion). The path is free for replacement.
+        assert!(
+            !std::path::Path::new(&sock).exists(),
+            "path must stay free after contended drop + external unlink"
+        );
+        drop(pinned);
+        // Serialized successor rebinds the free path and owns it.
+        let succ = SocketLock::acquire(&sock).unwrap();
+        assert!(daemon_socket_present(&sock));
+        assert!(
+            std::path::Path::new(&sock).exists(),
+            "successor pathname must exist after serialized rebind"
+        );
+        // No late predecessor unlink can follow: the predecessor already
+        // finished while contended and skipped cleanup.
+        assert!(daemon_socket_present(&sock));
         drop(succ);
         assert!(!std::path::Path::new(&sock).exists());
         assert!(!daemon_socket_present(&sock));
