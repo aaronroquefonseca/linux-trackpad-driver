@@ -309,72 +309,42 @@ impl TouchSource for PumpSource {
 /// (source fd / deadline set changed) and on shutdown; the pump thread
 /// `poll(2)`s the read end alongside the hidraw fd and drains it on wake.
 /// Pipe writes are thread-safe (kernel); drain/poll run on the pump thread.
+/// Atomic `pipe2(O_NONBLOCK | O_CLOEXEC)` sets both flags at creation, so no
+/// post-creation `fcntl` race and no manual close bookkeeping: `OwnedFd`
+/// closes exactly once and is `Send + Sync`, so no explicit unsafe impls.
 pub struct PumpControl {
-    read_fd: RawFd,
-    write_fd: RawFd,
-}
-
-// Raw fds are kernel handles: Send/Sync for the pipe's write-vs-read split
-// (manager notifies, pump drains/polls). The fds close exactly once in Drop.
-unsafe impl Send for PumpControl {}
-unsafe impl Sync for PumpControl {}
-
-impl Drop for PumpControl {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.read_fd);
-            libc::close(self.write_fd);
-        }
-    }
-}
-
-fn set_cloexec_nonblock(fd: RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if fd_flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    read: std::os::unix::io::OwnedFd,
+    write: std::os::unix::io::OwnedFd,
 }
 
 impl PumpControl {
     pub fn new() -> std::io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
         let mut fds = [0 as RawFd; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if let Err(e) = set_cloexec_nonblock(fds[0]).and_then(|()| set_cloexec_nonblock(fds[1])) {
-            unsafe {
-                libc::close(fds[0]);
-                libc::close(fds[1]);
-            }
-            return Err(e);
-        }
+        // SAFETY: `pipe2` succeeded, so both entries are valid owned fds.
+        let [read_fd, write_fd] = fds;
         Ok(Self {
-            read_fd: fds[0],
-            write_fd: fds[1],
+            read: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(read_fd) },
+            write: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(write_fd) },
         })
     }
 
     pub fn read_fd(&self) -> RawFd {
-        self.read_fd
+        use std::os::unix::io::AsRawFd;
+        self.read.as_raw_fd()
     }
 
     /// Wake the pump thread (attach/detach/shutdown). Nonblocking: a full
     /// pipe means the pump is already awake, so `EAGAIN` is success.
     pub fn notify(&self) {
+        use std::os::unix::io::AsRawFd;
         let byte = [1u8];
         loop {
-            let ret = unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), byte.len()) };
+            let ret =
+                unsafe { libc::write(self.write.as_raw_fd(), byte.as_ptr().cast(), byte.len()) };
             if ret == 1 {
                 break;
             }
@@ -391,9 +361,11 @@ impl PumpControl {
 
     /// Drain all pending wakeups (pump thread only).
     pub fn drain(&self) {
+        use std::os::unix::io::AsRawFd;
         let mut buf = [0u8; 64];
         loop {
-            let ret = unsafe { libc::read(self.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let ret =
+                unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if ret <= 0 {
                 if ret < 0 {
                     let e = std::io::Error::last_os_error();
@@ -437,8 +409,28 @@ where
 {
     let mut px = proxy.lock().unwrap_or_else(|e| e.into_inner());
     let (result, activity) = px.pump_step_at(cfg, now);
-    if let Err(e) = result {
-        log::warn!("pump: handle_frame error (dropped): {e:#}");
+    // Output-failure logging has one owner: the proxy logs and retires the
+    // session in `output_failed`; the pump only propagates the activity.
+    let _ = result;
+    activity
+}
+
+/// Run one step and back off once on a transient read failure, so a
+/// persistently failing fd cannot busy-spin. Returns the step activity:
+/// `Frame` still drains immediately (no sleep), `Transient` sleeps once.
+fn pump_once_with_backoff<G, U, H, S>(
+    proxy: &Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
+    cfg: &crate::config::Config,
+) -> PumpActivity
+where
+    G: crate::proxy::GrabDevice,
+    U: crate::proxy::UinputSink,
+    H: crate::proxy::HapticSender,
+    S: TouchSource,
+{
+    let activity = pump_once(proxy, cfg);
+    if activity == PumpActivity::Transient {
+        std::thread::sleep(ERROR_BACKOFF);
     }
     activity
 }
@@ -610,10 +602,10 @@ where
                 (px.poll_fd(), px.has_pending_frame(), px.next_deadline())
             };
             if has_pending {
-                // Queued double-report half: drain without blocking.
-                if pump_once(&proxy, &cfg) == PumpActivity::Transient {
-                    std::thread::sleep(ERROR_BACKOFF);
-                }
+                // Queued double-report half: drain without blocking. The
+                // helper sleeps once on transient reads; frames drain
+                // immediately with no throttle.
+                pump_once_with_backoff(&proxy, &cfg);
                 continue;
             }
             if hidraw_fd.is_none() {
@@ -623,13 +615,10 @@ where
                 // control/deadline. Only traffic (`Frame`) loops
                 // immediately; deadline work re-arms via `poll(2)` so a
                 // not-yet-due stagger never busy-spins. Steady idle does
-                // one trial per wakeup, not a continuous poll.
-                match pump_once(&proxy, &cfg) {
-                    PumpActivity::Frame => continue,
-                    PumpActivity::Transient => {
-                        std::thread::sleep(ERROR_BACKOFF);
-                        continue;
-                    }
+                // one trial per wakeup, not a continuous poll. The helper
+                // already slept on `Transient`, so that arm just continues.
+                match pump_once_with_backoff(&proxy, &cfg) {
+                    PumpActivity::Frame | PumpActivity::Transient => continue,
                     PumpActivity::Idle | PumpActivity::Deadline | PumpActivity::Disconnect => {}
                 }
             }
@@ -643,24 +632,20 @@ where
                     thread_control.drain();
                 }
                 PollWake::Both => {
+                    // Drain control first so a concurrent attach/detach
+                    // snapshot refreshes next loop; then drain input.
                     thread_control.drain();
-                    if pump_once(&proxy, &cfg) == PumpActivity::Transient {
-                        std::thread::sleep(ERROR_BACKOFF);
-                    }
+                    pump_once_with_backoff(&proxy, &cfg);
                 }
                 PollWake::Hidraw => {
-                    if pump_once(&proxy, &cfg) == PumpActivity::Transient {
-                        std::thread::sleep(ERROR_BACKOFF);
-                    }
+                    pump_once_with_backoff(&proxy, &cfg);
                 }
                 PollWake::Timeout => {
                     // Deadline expired: advance deadlines. With no fd and no
                     // deadline this is unreachable (infinite wait); a
                     // spurious/EINTR wake re-evaluates.
-                    if (deadline.is_some() || hidraw_fd.is_some())
-                        && pump_once(&proxy, &cfg) == PumpActivity::Transient
-                    {
-                        std::thread::sleep(ERROR_BACKOFF);
+                    if deadline.is_some() || hidraw_fd.is_some() {
+                        pump_once_with_backoff(&proxy, &cfg);
                     }
                 }
                 PollWake::WaitError => {
@@ -858,6 +843,42 @@ mod tests {
             poll_wait_with(None, control.read_fd(), 0, libc::poll),
             PollWake::Timeout
         );
+    }
+
+    #[test]
+    fn control_pipe_is_nonblocking_cloexec_and_coalesces() {
+        use std::os::unix::io::AsRawFd;
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PumpControl>();
+        let control = PumpControl::new().unwrap();
+        for fd in [control.read.as_raw_fd(), control.write.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0);
+        }
+        // Full-pipe coalescing: repeated notifies must never block, even when
+        // the pipe fills; drain then restores Timeout.
+        let start = Instant::now();
+        for _ in 0..100_000 {
+            control.notify();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "notify must not block on a full pipe"
+        );
+        control.drain();
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, libc::poll),
+            PollWake::Timeout
+        );
+        // A fresh notify still wakes after the drain (lifetime intact).
+        control.notify();
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, libc::poll),
+            PollWake::Control
+        );
+        control.drain();
     }
 
     #[test]

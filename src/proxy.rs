@@ -641,7 +641,9 @@ where
         match result {
             Ok((ev, activity)) => (Ok(ev), activity),
             Err(e) => {
-                log::warn!("pump: handle_frame error (dropped): {e:#}");
+                // Single owner for output-failure diagnostics: `output_failed`
+                // logs and retires the session; the pump layer propagates
+                // silently to avoid duplicate warnings per failure.
                 self.output_failed(&e);
                 (Err(e), PumpActivity::Disconnect)
             }
