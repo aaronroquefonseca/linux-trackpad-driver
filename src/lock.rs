@@ -90,6 +90,16 @@ struct ReplacementMutex {
     _file: Option<std::fs::File>,
 }
 
+impl ReplacementMutex {
+    /// Whether this instance actually holds the sidecar lock. Cleanup of a
+    /// fresh pathname is only safe with exclusion; a degraded (mutex-less)
+    /// acquire must leave residue for the next serialized acquire, since a
+    /// successor may already own the name after an external unlink.
+    fn is_held(&self) -> bool {
+        self._file.is_some()
+    }
+}
+
 /// Take `LOCK_EX` on `{socket_path}.lock`. Best-effort: when the lockfile is
 /// unusable (read-only dir, odd permissions) acquisition proceeds without
 /// mutual exclusion rather than refusing to start.
@@ -181,6 +191,22 @@ fn filesystem_id(path: &str) -> Result<(u64, u64)> {
     Ok((m.dev(), m.ino()))
 }
 
+/// Best-effort cleanup of our fresh pathname after a post-bind init failure.
+/// Only unlinks when we hold the replacement mutex and the path still names
+/// the entry our `bind` created (`sock_id`); otherwise leaves reclaimable
+/// residue for the next serialized acquire. In particular a degraded
+/// mutex-less acquire never unlinks, and a stale identity (successor rebound
+/// after an external unlink) never unlinks the live name. Mirrors the
+/// ownership policy of `Drop`; never stat/unlink as if holding exclusion.
+fn cleanup_failed_acquire(path: &str, sock_id: (u64, u64), mutex_held: bool) {
+    if !mutex_held {
+        return;
+    }
+    if filesystem_id(path).ok() == Some(sock_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 impl SocketLock {
     /// Acquire the lock at `path`. Errors if a live daemon holds it.
     pub fn acquire(path: &str) -> Result<Self> {
@@ -200,30 +226,26 @@ impl SocketLock {
         // exits. Without the mutex the loser could unlink the winner's new
         // pathname using its earlier refusal observation and bind a second
         // listener, leaving two self-declared owners.
-        let _replacement = replacement_mutex(path);
+        let replacement = replacement_mutex(path);
         // Up to two passes: bind, or stale-cleanup then re-bind with a fresh
         // liveness check (a parallel starter may have rebound between).
         for _ in 0..2 {
             match UnixListener::bind(path) {
                 Ok(listener) => {
-                    // Capture the filesystem entry our bind created while the
-                    // mutex still excludes parallel starters, so Drop can
+                    // Capture the filesystem entry our bind created so Drop can
                     // later tell "our file" from a successor's rebound entry.
-                    // Any failure after `bind` cleans up our fresh pathname
-                    // best-effort while still holding the mutex (no successor
-                    // can have rebound yet), leaving at most reclaimable
-                    // residue on unlink failure.
+                    // Without a captured identity later cleanup cannot prove
+                    // ownership, so it leaves residue for the next starter.
                     let sock_id = match filesystem_id(path) {
                         Ok(id) => id,
                         Err(err) => {
                             drop(listener);
-                            let _ = std::fs::remove_file(path);
                             return Err(err);
                         }
                     };
                     if let Err(err) = listener.set_nonblocking(true) {
                         drop(listener);
-                        let _ = std::fs::remove_file(path);
+                        cleanup_failed_acquire(path, sock_id, replacement.is_held());
                         return Err(err)
                             .with_context(|| format!("setting nonblocking on socket '{path}'"));
                     }
@@ -232,7 +254,7 @@ impl SocketLock {
                         Ok(pair) => pair,
                         Err(err) => {
                             drop(listener);
-                            let _ = std::fs::remove_file(path);
+                            cleanup_failed_acquire(path, sock_id, replacement.is_held());
                             return Err(err).with_context(|| {
                                 format!("creating drain shutdown pipe for '{path}'")
                             });
@@ -244,7 +266,7 @@ impl SocketLock {
                             drop(listener);
                             drop(shutdown_tx);
                             drop(shutdown_rx);
-                            let _ = std::fs::remove_file(path);
+                            cleanup_failed_acquire(path, sock_id, replacement.is_held());
                             return Err(err)
                                 .with_context(|| format!("cloning socket '{path}' for drain"));
                         }
@@ -263,7 +285,7 @@ impl SocketLock {
                         Err(err) => {
                             drop(listener);
                             drop(shutdown_tx);
-                            let _ = std::fs::remove_file(path);
+                            cleanup_failed_acquire(path, sock_id, replacement.is_held());
                             return Err(err)
                                 .with_context(|| format!("spawning drain thread for '{path}'"));
                         }
@@ -417,7 +439,8 @@ fn poll_two(
 
 /// Readiness waiter replacing the old 10ms idle sleep: block in `poll` until
 /// the listener is readable or the shutdown pipe fires. Each input wake
-/// drains one bounded `drain_once` pass.
+/// drains one bounded `drain_once` pass; a pass that makes no progress while
+/// the socket stays readable backs off instead of repolling immediately.
 fn drain_loop(listener: UnixListener, stop: Arc<AtomicBool>, shutdown_rx: std::os::fd::OwnedFd) {
     drain_loop_with_wait(listener, stop, shutdown_rx, poll_two)
 }
@@ -461,8 +484,19 @@ fn drain_loop_with_wait(
                 if listener_revents & libc::POLLIN != 0 {
                     // One bounded pass per wake; the next wait returns
                     // immediately while backlog remains, so bursts drain
-                    // promptly without spinning.
-                    drain_once(&listener);
+                    // promptly without spinning. A pass that drains nothing
+                    // while the socket stays readable (e.g. accept keeps
+                    // failing under EMFILE) would otherwise repoll forever:
+                    // back off instead of hot-spinning. Shutdown stays
+                    // prompt: `stop` is checked before sleeping and at the
+                    // top, and a queued shutdown byte makes the next wait
+                    // return with `shutdown_revents` set.
+                    if drain_once(&listener) == 0 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(DRAIN_ERROR_BACKOFF);
+                    }
                 } else if listener_revents & (libc::POLLERR | libc::POLLHUP) != 0 {
                     // Error with no input to drain: `poll` would return
                     // immediately again, so back off instead of hot-spinning.
@@ -1233,12 +1267,13 @@ mod tests {
 
     #[test]
     fn idle_waiter_wakes_on_shutdown_without_connection() {
-        // Explicit shutdown wakeup with no connection ever queued. The notify
-        // fires immediately after spawn — before the waiter necessarily
-        // enters `poll` — so a missed wakeup (lost signal) would hang the
+        // Explicit shutdown wakeup with no connection ever queued. The wait
+        // wrapper signals actual `poll_two` entry before stop is requested,
+        // so this test cannot pass via the loop-top flag check without ever
+        // entering `poll`: a missed pipe wakeup (lost signal) would hang the
         // join. The pipe byte persists, so the waiter must still exit.
-        // Bounded via channel + `recv_timeout` so a regression fails instead
-        // of hanging the suite.
+        // Bounded via channels so a regression fails instead of hanging the
+        // suite, and the worker join propagates panics.
         use std::sync::mpsc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1249,17 +1284,26 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = shutdown_pipe().unwrap();
         let drain_stop = Arc::clone(&stop);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("test-drain-wake".to_string())
-            .spawn(move || drain_loop(listener, drain_stop, rx))
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |listener_fd, shutdown_fd| {
+                    let _ = entered_tx.send(());
+                    poll_two(listener_fd, shutdown_fd)
+                })
+            })
             .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must enter poll before shutdown");
         // Flag then notify, mirroring `Drop`: covers both an idle `poll`
         // waiter (byte) and a failing waiter (flag).
         stop.store(true, Ordering::Relaxed);
         notify_shutdown(&tx);
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = handle.join();
+            handle.join().expect("worker thread must not panic");
             let _ = done_tx.send(());
         });
         done_rx
@@ -1397,6 +1441,138 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("POLLNVAL waiter must exit without requiring shutdown");
+    }
+
+    #[test]
+    fn pollin_without_drain_progress_backs_off_and_stops() {
+        // R1 regression with an injected wait seam: the listener reports
+        // POLLIN but the bounded drain pass makes no progress (models accept
+        // failing behind a readable queue, e.g. EMFILE, where `poll` stays
+        // readable). The waiter must back off instead of repolling
+        // immediately, and `stop` must still end it promptly. The empty real
+        // queue keeps `drain_once` at zero without touching host limits.
+        use std::sync::{atomic::AtomicUsize, mpsc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("no-progress.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("test-drain-no-progress".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
+                    if calls_in.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let _ = entered_tx.send(());
+                    }
+                    Ok((libc::POLLIN, 0))
+                })
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must poll at least once before the window");
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        notify_shutdown(&tx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().expect("worker thread must not panic");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no-progress waiter must still exit on stop");
+        let n = calls.load(Ordering::Relaxed);
+        assert!(
+            (2..=12).contains(&n),
+            "POLLIN with zero drain progress must back off, not spin: {n} waits in ~200ms"
+        );
+    }
+
+    #[test]
+    fn failed_acquire_cleanup_preserves_live_successor() {
+        // R2 regression: post-bind failure cleanup must never unlink a live
+        // successor. A real successor holds the path while each failure
+        // branch's cleanup decision is replayed: degraded (no exclusion, any
+        // identity) and held-mutex-but-stale-identity must both leave the
+        // live name alone. Mirrors the ownership policy of `Drop`.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("succ-live.sock");
+        let sock_str = sock.to_str().unwrap();
+        let successor = SocketLock::acquire(sock_str).unwrap();
+        assert!(daemon_socket_present(sock_str));
+        // Degraded predecessor: no exclusion, even with the live identity.
+        cleanup_failed_acquire(sock_str, successor.sock_id, false);
+        assert!(std::path::Path::new(sock_str).exists());
+        assert!(daemon_socket_present(sock_str));
+        // Held-mutex predecessor with a stale identity (successor rebound
+        // after an external unlink between our bind and our failure).
+        let stale = (successor.sock_id.0, successor.sock_id.1.wrapping_add(1));
+        cleanup_failed_acquire(sock_str, stale, true);
+        assert!(
+            std::path::Path::new(sock_str).exists(),
+            "stale-identity cleanup must not unlink the live successor"
+        );
+        assert!(daemon_socket_present(sock_str));
+        drop(successor);
+        assert!(
+            !std::path::Path::new(sock_str).exists(),
+            "normal drop must still delete the socket pathname"
+        );
+        assert!(!daemon_socket_present(sock_str));
+    }
+
+    #[test]
+    fn failed_acquire_cleanup_removes_own_entry() {
+        // Positive side of the R2 policy: with exclusion held and a matching
+        // identity, our own fresh entry is still removed (no leak).
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("own-entry.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let id = filesystem_id(sock_str).unwrap();
+        drop(listener);
+        // Stale residue of a dead binder, identity still matches: reclaimable.
+        cleanup_failed_acquire(sock_str, id, true);
+        assert!(
+            !std::path::Path::new(sock_str).exists(),
+            "owned matching entry must be removed"
+        );
+    }
+
+    #[test]
+    fn degraded_acquire_drop_leaves_reclaimable_residue() {
+        // End-to-end degraded mode: an unusable sidecar lockfile (here a
+        // directory, so the lock open fails) still allows acquire, and both
+        // failure-path and `Drop` cleanup skip the unlink without exclusion.
+        // The next serialized acquire reclaims the residue.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("degraded.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+        std::fs::create_dir(format!("{sock_str}.lock")).unwrap();
+        let guard = SocketLock::acquire(&sock_str).unwrap();
+        drop(guard);
+        assert!(
+            std::path::Path::new(&sock_str).exists(),
+            "degraded drop must leave residue instead of unlinking without exclusion"
+        );
+        assert!(
+            !daemon_socket_present(&sock_str),
+            "dropped listener must not answer even though its pathname remains"
+        );
+        std::fs::remove_dir(format!("{sock_str}.lock")).unwrap();
+        let successor = SocketLock::acquire(&sock_str).unwrap();
+        assert!(daemon_socket_present(&sock_str));
+        drop(successor);
+        assert!(!std::path::Path::new(&sock_str).exists());
+        assert!(!daemon_socket_present(&sock_str));
     }
 
     #[test]
