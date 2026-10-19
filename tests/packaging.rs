@@ -321,6 +321,24 @@ fn debian_copyright_carries_complete_mit_text() {
 }
 
 #[test]
+fn debian_copyright_has_no_shadow_package_file() {
+    // dh_installdocs prefers debian/<pkg>.copyright over debian/copyright,
+    // so a stale package-specific file would silently replace the validated
+    // payload. Forbid the shadow; if one is ever needed, validate its MIT
+    // payload the same way instead.
+    let shadow: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "debian/linux-trackpad-driver.copyright",
+    ]
+    .iter()
+    .collect();
+    assert!(
+        !shadow.exists(),
+        "debian/linux-trackpad-driver.copyright would shadow debian/copyright via dh_installdocs"
+    );
+}
+
+#[test]
 fn ltd_config_default_path_parity() {
     // Daemon, hook, and tick must verify against the same rate: all four
     // shipped files must agree on the system config path. (A hook at
