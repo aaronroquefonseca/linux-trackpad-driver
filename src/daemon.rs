@@ -3660,6 +3660,7 @@ mod tests {
         // stalled frame holding the same mutex. Restores `stop=false` so the
         // shutdown under test establishes it.
         session.manager.stop.store(true, Ordering::SeqCst);
+        session.manager.notify_pump();
         let old = session
             .manager
             .thread
@@ -3669,6 +3670,49 @@ mod tests {
             .expect("pump thread must be running");
         old.join().expect("healthy pump must join");
         session.manager.stop.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn retire_healthy_pump_wakes_idle_worker() {
+        let cfg = Config::default();
+        // No device is opened: the fixture only waits on its control pipe.
+        let proxy = Arc::new(Mutex::new(DaemonProxy::new(
+            ProxySettings::from(&cfg),
+            RealGrab::new(""),
+            DualSink::new(RealUinput::new(""), RealUinput::new_extras("")),
+            AsyncHaptic::new(RealHaptic::new()),
+            PumpSource::Idle,
+        )));
+        let stop = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(crate::pump::PumpControl::new().unwrap());
+        let worker_control = Arc::clone(&control);
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let mut fd = libc::pollfd {
+                fd: worker_control.read_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Always enter poll, even if retirement starts first. A queued
+            // wakeup is readable too, so no scheduling-dependent sleep is needed.
+            // The finite timeout makes a missing wakeup fail rather than hang.
+            let ready = unsafe { libc::poll(&mut fd, 1, 2_000) };
+            assert_eq!(ready, 1, "retirement must wake the idle worker");
+            assert_ne!(fd.revents & libc::POLLIN, 0);
+            assert!(worker_stop.load(Ordering::SeqCst));
+        });
+        let session = DaemonSession {
+            manager: Arc::new(
+                PumpManager::new(proxy, cfg, stop, || PumpSource::Idle)
+                    .with_thread(worker)
+                    .with_control(control),
+            ),
+        };
+
+        retire_healthy_pump(&session);
+
+        assert!(!session.manager.stop.load(Ordering::SeqCst));
+        assert!(session.manager.thread.lock().unwrap().is_none());
     }
 
     #[test]
