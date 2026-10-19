@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::apple_parse::TouchSource;
 use crate::config::Config;
 use crate::discovery::{self, DiscoveredDevice};
 use crate::init::{
@@ -32,7 +33,8 @@ use crate::init::{
 };
 use crate::lock::{self, SocketLock};
 use crate::proxy::{
-    AsyncHaptic, ClickProxy, DualSink, ProxySettings, RealGrab, RealHaptic, RealUinput, UinputSink,
+    AsyncHaptic, ClickProxy, DualSink, GrabDevice, HapticSender, ProxySettings, RealGrab,
+    RealHaptic, RealUinput, UinputSink,
 };
 use crate::pump::PumpSource;
 use crate::resume::{self, ResumeReport};
@@ -42,55 +44,177 @@ pub fn hub() -> DeviceReadyHub {
     DeviceReadyHub::new()
 }
 
-/// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
-/// Gate-off (`enhanced_clicks=false`) still subscribes — the proxy then
-/// short-circuits to passthrough. The gate is evaluated from the startup
-/// config; there is no live reload, so a config change needs a restart.
-/// Never blocks init: callbacks do bounded attach/detach only, and grab
-/// failure degrades to passthrough with a log.
-///
-/// Production pump: `attach` builds the real path — BOTH uinput nodes
-/// (`UI_DEV_CREATE` pointer FIRST, then extras), hidraw→eventN
-/// auto-resolution (`$LTD_EVDEV_NODE` override wins, else sysfs walk, else
-/// name scan), then hidraw open, then `set_pump_ready(true)` + grab.
-/// `detach` tears down in reverse (release grab, latch reset, trailing
-/// `SYN` on both nodes, source to idle, BOTH nodes destroyed). Single
-/// active node: first `Ready` wins, siblings ignored until `Detached`
-/// clears it — except a `Ready` for the active node whose session died on
-/// its own (disconnect self-release): that tears down the stale wiring
-/// and re-attaches fresh fds instead of early-returning into a dead
-/// session. A single pump thread drains the proxy for the process
-/// lifetime; frame rate is device-bounded.
-///
-/// Two-node failure isolation: pointer-create failure → passthrough (no
-/// touch emit path, so no grab — same as the old single node). Extras-
-/// create failure is NON-fatal: the session continues pointer-only
-/// (motion/buttons live, combos dropped) with a loud log, and teardown
-/// always destroys both nodes so no sibling leaks.
-///
-/// Attach decision for a `Ready` event (see [`attach_decision`]):
-/// - no active session → adopt (full attach);
-/// - same node + live proxy → ignore (duplicate);
-/// - same node + dead proxy → teardown + full re-attach;
-/// - another node active → ignore (sibling).
-type DaemonProxy =
-    ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
-struct PumpManager {
-    proxy: std::sync::Arc<std::sync::Mutex<DaemonProxy>>,
+/// Shared pump lifecycle: attach tail (grab-refused rollback), detach and
+/// shutdown teardown. One generic manager serves production (real
+/// grab/uinput/haptic/source) and unit tests (fakes): the rollback,
+/// detach and `Drop` paths below are the actual dispatch under test, not
+/// copies. The idle source is a plain `fn` pointer (never captures), and
+/// tests inject their live source via [`PumpManager::finish_attach`].
+pub(crate) struct PumpManager<G, U, H, S>
+where
+    G: GrabDevice,
+    U: UinputSink,
+    H: HapticSender,
+    S: TouchSource,
+{
+    proxy: std::sync::Arc<std::sync::Mutex<ClickProxy<G, U, H, S>>>,
     cfg: Config,
     active: std::sync::Mutex<Option<String>>,
     haptic_node: std::sync::Mutex<Option<String>>,
-    control: std::sync::Arc<crate::pump::PumpControl>,
-    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    _thread: std::thread::JoinHandle<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    idle: fn() -> S,
+    control: Option<std::sync::Arc<crate::pump::PumpControl>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
-impl PumpManager {
-    fn notify_pump(&self) {
-        // Wake the event-driven pump so it re-reads its hidraw fd and
-        // deadline set instead of blocking past this attach/detach.
-        self.control.notify();
+
+impl<G, U, H, S> PumpManager<G, U, H, S>
+where
+    G: GrabDevice,
+    U: UinputSink,
+    H: HapticSender,
+    S: TouchSource,
+{
+    pub(crate) fn new(
+        proxy: std::sync::Arc<std::sync::Mutex<ClickProxy<G, U, H, S>>>,
+        cfg: Config,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        idle: fn() -> S,
+    ) -> Self {
+        Self {
+            proxy,
+            cfg,
+            active: std::sync::Mutex::new(None),
+            haptic_node: std::sync::Mutex::new(None),
+            stop,
+            idle,
+            control: None,
+            thread: None,
+        }
     }
 
+    pub(crate) fn with_thread(mut self, handle: std::thread::JoinHandle<()>) -> Self {
+        self.thread = Some(handle);
+        self
+    }
+
+    pub(crate) fn with_control(
+        mut self,
+        control: std::sync::Arc<crate::pump::PumpControl>,
+    ) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Wake the event-driven pump (#86) so it re-reads its hidraw fd and
+    /// deadline set instead of blocking past this attach/detach. No-op
+    /// without a pump (unit tests).
+    fn notify_pump(&self) {
+        if let Some(control) = &self.control {
+            control.notify();
+        }
+    }
+
+    /// Borrow the managed proxy (tests drive frames / assert wire through this).
+    #[cfg(test)]
+    pub(crate) fn proxy(&self) -> &std::sync::Arc<std::sync::Mutex<ClickProxy<G, U, H, S>>> {
+        &self.proxy
+    }
+
+    /// Shared attach tail under one proxy lock: run caller wiring (grab /
+    /// haptic node selection), swap in the live source, flip pump-ready,
+    /// then grab. A refused grab rolls back through the single teardown
+    /// (held keys + virtual contacts terminated when possible) plus idle
+    /// source and node destroy, so no orphan nodes linger.
+    pub(crate) fn finish_attach(
+        &self,
+        event: &DeviceReadyEvent,
+        source: S,
+        wire: impl FnOnce(&mut ClickProxy<G, U, H, S>),
+    ) {
+        let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        wire(&mut px);
+        px.replace_source(source);
+        px.set_pump_ready(true);
+        px.attach(event);
+        if px.is_attached() {
+            *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(event.devnode.clone());
+        } else {
+            Self::teardown_locked(&mut px, self.idle, "attach rollback: grab refused");
+        }
+        self.notify_pump();
+    }
+
+    /// Idempotent manager teardown: single proxy teardown (contacts +
+    /// keys ended on the wire) + source to idle + virtual nodes destroyed.
+    /// Used by shutdown (via `Drop`); detach/rollback share it.
+    fn teardown_locked(proxy: &mut ClickProxy<G, U, H, S>, idle: fn() -> S, reason: &str) {
+        proxy.teardown_session(reason);
+        proxy.replace_source(idle());
+        proxy.uinput().destroy();
+    }
+
+    pub(crate) fn detach(&self, event: &crate::init::DeviceReadyEvent) {
+        use crate::init::ReadyKind;
+        if event.kind != ReadyKind::Detached {
+            return;
+        }
+        let owned = {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            if active.as_deref() == Some(event.devnode.as_str()) {
+                active.take();
+                true
+            } else {
+                false
+            }
+        };
+        if !owned {
+            // Sibling vanishing while another node owns the pump: touch
+            // nothing. The proxy itself also ignores foreign Detached
+            // events (ownership gate in `ClickProxy::detach`), so the
+            // live grab survives even if this gate is ever bypassed.
+            log::debug!(
+                "pump: ignoring Detached for unowned {} (active: {:?})",
+                event.devnode,
+                self.active.lock().unwrap_or_else(|e| e.into_inner())
+            );
+            return;
+        }
+        {
+            let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+            // `detach` runs the single idempotent proxy teardown
+            // (contacts + keys ended on the wire); manager then idles
+            // the source and destroys the virtual nodes.
+            px.detach(event);
+            px.replace_source((self.idle)());
+            px.uinput().destroy();
+            log::info!("pump: {} torn down", event.devnode);
+        }
+        self.notify_pump();
+    }
+}
+
+impl<G, U, H, S> Drop for PumpManager<G, U, H, S>
+where
+    G: GrabDevice,
+    U: UinputSink,
+    H: HapticSender,
+    S: TouchSource,
+{
+    /// Shutdown path: terminate virtual contacts + keys, idle the
+    /// source, destroy virtual nodes. Idempotent: safe after an
+    /// explicit detach already tore the session down. A poisoned proxy
+    /// mutex is recovered, never a reason to skip cleanup. The pump thread
+    /// is signaled to stop; its handle detaches with the manager at
+    /// process teardown (existing lifecycle, see finding #12).
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify_pump();
+        let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        Self::teardown_locked(&mut px, self.idle, "shutdown");
+    }
+}
+
+impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource> {
     fn attach(&self, event: &crate::init::DeviceReadyEvent) {
         use crate::init::ReadyKind;
         if event.kind != ReadyKind::Ready {
@@ -254,17 +378,18 @@ impl PumpManager {
         // Haptics go to the interface-2 sibling when the USB layout
         // exposes one (actuator interface); otherwise the touch node
         // itself, loudly logged as pending HW verify.
-        // Prepare (open) the haptic endpoint BEFORE taking the proxy
-        // mutex: the open can block on kernel activity and the pump
-        // needs that mutex for every frame. The commit below only
-        // swaps Arcs and hands disposal to a background thread.
+        // Prepare (open) the haptic endpoint BEFORE the proxy lock in
+        // `finish_attach`: the open can block on kernel activity and the
+        // pump needs that mutex for every frame. The commit below only
+        // swaps Arcs and hands disposal to a background thread. The tail
+        // (swap in the live source, grab, adopt-or-rollback) is the shared
+        // `finish_attach` dispatch covered by manager unit tests.
         let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
         let haptic_target = crate::proxy::HapticTarget::prepare(
             &hnode,
             event.transport == crate::init::Transport::Bluetooth,
         );
-        {
-            let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        self.finish_attach(event, PumpSource::Live(source), |px| {
             px.grab().set_node(&evdev.to_string_lossy());
             // New session: retire any queued pulses from the previous
             // node and pin the prepared actuator target before the pump
@@ -275,61 +400,45 @@ impl PumpManager {
                 "pump: haptic node {hnode} (interface {hiface:?}) for {}",
                 event.devnode
             );
-            px.replace_source(PumpSource::Live(source));
-            px.set_pump_ready(true);
-            px.attach(event);
-            if px.is_attached() {
-                *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(event.devnode.clone());
-            } else {
-                // Grab refused: unwind to idle + destroy both so no orphan nodes.
-                px.set_pump_ready(false);
-                px.replace_source(PumpSource::Idle);
-                px.uinput().destroy();
-            }
-        }
-        self.notify_pump();
-    }
-
-    fn detach(&self, event: &crate::init::DeviceReadyEvent) {
-        use crate::init::ReadyKind;
-        if event.kind != ReadyKind::Detached {
-            return;
-        }
-        let owned = {
-            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            if active.as_deref() == Some(event.devnode.as_str()) {
-                active.take();
-                true
-            } else {
-                false
-            }
-        };
-        if !owned {
-            // Sibling vanishing while another node owns the pump: touch
-            // nothing. The proxy itself also ignores foreign Detached
-            // events (ownership gate in `ClickProxy::detach`), so the
-            // live grab survives even if this gate is ever bypassed.
-            log::debug!(
-                "pump: ignoring Detached for unowned {} (active: {:?})",
-                event.devnode,
-                self.active.lock().unwrap_or_else(|e| e.into_inner())
-            );
-            return;
-        }
-        {
-            let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
-            px.detach(event);
-            px.set_pump_ready(false);
-            px.replace_source(PumpSource::Idle);
-            px.uinput().destroy();
-            log::info!("pump: {} torn down", event.devnode);
-        }
-        self.notify_pump();
+        });
     }
 }
 
+/// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
+/// Gate-off (`enhanced_clicks=false`) still subscribes — the proxy then
+/// short-circuits to passthrough. The gate is evaluated from the startup
+/// config; there is no live reload, so a config change needs a restart.
+/// Never blocks init: callbacks do bounded attach/detach only, and grab
+/// failure degrades to passthrough with a log.
+///
+/// Production pump: `attach` builds the real path — BOTH uinput nodes
+/// (`UI_DEV_CREATE` pointer FIRST, then extras), hidraw→eventN
+/// auto-resolution (`$LTD_EVDEV_NODE` override wins, else sysfs walk, else
+/// name scan), then hidraw open, then `set_pump_ready(true)` + grab.
+/// `detach` tears down in reverse (release grab, latch reset, trailing
+/// `SYN` on both nodes, source to idle, BOTH nodes destroyed). Single
+/// active node: first `Ready` wins, siblings ignored until `Detached`
+/// clears it — except a `Ready` for the active node whose session died on
+/// its own (disconnect self-release): that tears down the stale wiring
+/// and re-attaches fresh fds instead of early-returning into a dead
+/// session. A single pump thread drains the proxy for the process
+/// lifetime; frame rate is device-bounded.
+///
+/// Two-node failure isolation: pointer-create failure → passthrough (no
+/// touch emit path, so no grab — same as the old single node). Extras-
+/// create failure is NON-fatal: the session continues pointer-only
+/// (motion/buttons live, combos dropped) with a loud log, and teardown
+/// always destroys both nodes so no sibling leaks.
+///
+/// Attach decision for a `Ready` event (see [`attach_decision`]):
+/// - no active session → adopt (full attach);
+/// - same node + live proxy → ignore (duplicate);
+/// - same node + dead proxy → teardown + full re-attach;
+/// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl Fn(&str) -> bool {
+    type DaemonProxy =
+        ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
+
     let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
     let proxy = std::sync::Arc::new(std::sync::Mutex::new(DaemonProxy::new(
         ProxySettings::from(cfg),
@@ -348,16 +457,12 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         cfg.clone(),
         std::sync::Arc::clone(&stop),
     );
-    let manager = std::sync::Arc::new(PumpManager {
-        proxy,
-        cfg: cfg.clone(),
-        active: std::sync::Mutex::new(None),
-        haptic_node: std::sync::Mutex::new(None),
-        control,
-        _stop: stop,
-        _thread: thread,
-    });
-    // NOTE: `PumpManager._thread` is never joined — the pump lives until
+    let manager = std::sync::Arc::new(
+        PumpManager::new(proxy, cfg.clone(), stop, || PumpSource::Idle)
+            .with_thread(thread)
+            .with_control(control),
+    );
+    // NOTE: the pump thread handle is never joined — the pump lives until
     // process exit by design. `JoinHandle` is held (not detached) so a
     // panic inside the pump does not silently vanish; the handle is
     // dropped with the manager at process teardown.
@@ -1388,8 +1493,8 @@ mod tests {
                 s.events.push(event.kind);
                 if event.kind == ReadyKind::Detached {
                     if s.active.as_deref() == Some(&event.devnode) {
+                        // `detach` runs the full teardown; no second pass needed.
                         s.proxy.detach(event);
-                        s.proxy.set_pump_ready(false);
                         s.active = None;
                     }
                     return;
@@ -2639,6 +2744,12 @@ mod tests {
             ..Config::default()
         };
         let control = Arc::new(crate::pump::PumpControl::new().unwrap());
+        type DaemonProxy = ClickProxy<
+            RealGrab,
+            DualSink<RealUinput, RealUinput>,
+            AsyncHaptic<RealHaptic>,
+            PumpSource,
+        >;
         let proxy = Arc::new(Mutex::new(DaemonProxy::new(
             crate::proxy::ProxySettings::from(&cfg),
             crate::proxy::RealGrab::new(""),
@@ -2649,15 +2760,12 @@ mod tests {
             crate::proxy::AsyncHaptic::new(crate::proxy::RealHaptic::new()),
             crate::pump::PumpSource::Idle,
         )));
-        let manager = PumpManager {
-            proxy,
-            cfg: cfg.clone(),
-            active: Mutex::new(None),
-            haptic_node: Mutex::new(None),
-            control: Arc::clone(&control),
-            _stop: Arc::new(AtomicBool::new(false)),
-            _thread: std::thread::spawn(|| {}),
-        };
+        let manager =
+            PumpManager::new(proxy, cfg.clone(), Arc::new(AtomicBool::new(false)), || {
+                PumpSource::Idle
+            })
+            .with_thread(std::thread::spawn(|| {}))
+            .with_control(Arc::clone(&control));
         manager.attach(&crate::init::usb_ready("/dev/hidraw1"));
         assert!(
             control_wakes_within(&control, std::time::Duration::from_secs(2)),
