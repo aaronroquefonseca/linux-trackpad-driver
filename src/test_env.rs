@@ -2,7 +2,7 @@
 //!
 //! `std::env::set_var` racing with any concurrent env read is unsound, and
 //! the Unix test harness runs tests threaded. Every test that mutates or
-//! reads process env (`LTD_CONFIG`, `LTD_SOCKET`) must hold
+//! reads process env (`LTD_CONFIG`, `LTD_SOCKET`, `LTD_HIDRAW_SYSFS`) must hold
 //! [`lock_env`] for the whole critical section so the previously-flaky
 //! config/lock pair cannot interleave.
 

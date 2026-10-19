@@ -88,8 +88,28 @@ pub fn hid_id_from_uevent(text: &str) -> Option<String> {
 
 /// Scan `/sys/class/hidraw` for supported trackpad nodes.
 /// Returns an empty vec (not an error) when no hardware is present.
+///
+/// Hermetic override: `$LTD_HIDRAW_SYSFS` replaces the class dir (tests /
+/// isolated runs). Child processes inherit it via env, so CLI subprocess
+/// tests never discover host hardware even on a developer machine.
 pub fn scan_trackpads() -> Result<Vec<DiscoveredDevice>> {
-    scan_sysfs("/sys/class/hidraw")
+    scan_sysfs(&sysfs_class_dir())
+}
+
+/// Env var overriding the hidraw sysfs class dir (hermetic tests / isolated
+/// runs). Production default is [`SYSFS_CLASS_DEFAULT`].
+pub const SYSFS_CLASS_ENV: &str = "LTD_HIDRAW_SYSFS";
+/// Production hidraw sysfs class dir.
+pub const SYSFS_CLASS_DEFAULT: &str = "/sys/class/hidraw";
+
+/// Effective sysfs class dir: `$LTD_HIDRAW_SYSFS` when set and non-empty,
+/// else [`SYSFS_CLASS_DEFAULT`]. Pure over env so unit tests can set env and
+/// subprocess tests inherit it.
+pub fn sysfs_class_dir() -> String {
+    std::env::var(SYSFS_CLASS_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| SYSFS_CLASS_DEFAULT.to_string())
 }
 
 fn scan_sysfs(class_dir: &str) -> Result<Vec<DiscoveredDevice>> {
@@ -157,7 +177,7 @@ pub enum InterfaceRank {
 
 /// Rank a node with the production sysfs root.
 pub fn rank_for_node(devnode: &str) -> InterfaceRank {
-    rank_with_root(devnode, "/sys/class/hidraw")
+    rank_with_root(devnode, &sysfs_class_dir())
 }
 
 fn rank_with_root(devnode: &str, class_root: &str) -> InterfaceRank {
@@ -183,9 +203,9 @@ fn iface_preference_with_root(devnode: &str, class_root: &str) -> u8 {
 }
 
 /// Human-readable selection reason for the attach INFO log.
-/// Production root; see [`selection_reason_with_root`] for tests.
+/// Effective sysfs root (respects `$LTD_HIDRAW_SYSFS`); see [`selection_reason_with_root`] for tests.
 pub fn selection_reason_for_node(devnode: &str) -> String {
-    selection_reason_with_root(devnode, "/sys/class/hidraw")
+    selection_reason_with_root(devnode, &sysfs_class_dir())
 }
 
 pub(crate) fn selection_reason_with_root(devnode: &str, class_root: &str) -> String {
@@ -412,7 +432,7 @@ pub fn parse_interface_number(text: &str) -> Option<u8> {
 /// interface parent does). Returns `None` for BT nodes / unknown layouts —
 /// callers treat that as "route the full idempotent sequence anyway".
 pub fn interface_number_for_node(devnode: &str) -> Option<u8> {
-    interface_number_with_root(devnode, "/sys/class/hidraw")
+    interface_number_with_root(devnode, &sysfs_class_dir())
 }
 
 fn interface_number_with_root(devnode: &str, class_root: &str) -> Option<u8> {
@@ -438,7 +458,7 @@ fn interface_number_with_root(devnode: &str, class_root: &str) -> Option<u8> {
 /// True when the hidraw node's HID device is bound to a driver
 /// (`.../device/driver` symlink exists). Best-effort: `false` on any error.
 pub fn driver_bound_for_node(devnode: &str) -> bool {
-    driver_bound_with_root(devnode, "/sys/class/hidraw")
+    driver_bound_with_root(devnode, &sysfs_class_dir())
 }
 
 fn driver_bound_with_root(devnode: &str, class_root: &str) -> bool {
@@ -454,7 +474,7 @@ fn driver_bound_with_root(devnode: &str, class_root: &str) -> bool {
 /// writes when the node exists even if the bind is not yet visible (the
 /// bind symlink layout varies across kernels).
 pub fn wait_for_ready(devnode: &str, timeout_ms: u64) -> (bool, bool) {
-    wait_for_ready_with_root(devnode, timeout_ms, "/sys/class/hidraw")
+    wait_for_ready_with_root(devnode, timeout_ms, &sysfs_class_dir())
 }
 
 fn wait_for_ready_with_root(devnode: &str, timeout_ms: u64, class_root: &str) -> (bool, bool) {
@@ -526,6 +546,31 @@ mod tests {
     fn missing_sysfs_is_empty_not_error() {
         let devs = scan_sysfs("/nonexistent-class-dir-xyz").unwrap();
         assert!(devs.is_empty());
+    }
+
+    #[test]
+    fn sysfs_class_dir_override_is_hermetic() {
+        // The CLI subprocess tests isolate discovery via `$LTD_HIDRAW_SYSFS`;
+        // pin the override here so a host with a real trackpad cannot leak
+        // into those tests. Empty string falls back to the default.
+        let _guard = crate::test_env::lock_env();
+        let old = std::env::var(SYSFS_CLASS_ENV).ok();
+        unsafe { std::env::remove_var(SYSFS_CLASS_ENV) };
+        assert_eq!(sysfs_class_dir(), SYSFS_CLASS_DEFAULT);
+        unsafe { std::env::set_var(SYSFS_CLASS_ENV, "") };
+        assert_eq!(sysfs_class_dir(), SYSFS_CLASS_DEFAULT);
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("hidraw");
+        std::fs::create_dir_all(&empty).unwrap();
+        unsafe { std::env::set_var(SYSFS_CLASS_ENV, empty.to_str().unwrap()) };
+        assert_eq!(sysfs_class_dir(), empty.to_str().unwrap());
+        // Empty isolated root scans empty without touching host sysfs.
+        let devs = scan_trackpads().unwrap();
+        assert!(devs.is_empty());
+        match old {
+            Some(v) => unsafe { std::env::set_var(SYSFS_CLASS_ENV, v) },
+            None => unsafe { std::env::remove_var(SYSFS_CLASS_ENV) },
+        }
     }
 
     #[test]
