@@ -107,8 +107,8 @@
 //!   single up on final release — no phantom release+press mid-hold.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -217,6 +217,154 @@ pub trait UinputSink: Send {
     fn destroy(&self) {}
 }
 
+/// Bound on simultaneously outstanding haptic endpoint files.
+///
+/// Production needs at most a couple (current session plus an in-flight
+/// pulse on the retired fd); the margin covers parallel test churn. One
+/// background closer and one bounded channel serve the whole process, so
+/// this is also the bound on queued disposal work and on fds retained if
+/// the closer ever stalls.
+const HAPTIC_ENDPOINT_CAP: usize = 32;
+
+/// Bounded background disposal pool (F3).
+///
+/// One worker thread drops items; handoff is `try_send` and never blocks.
+/// Admission reserves a slot *before* acquisition, so live plus queued
+/// items never exceed `cap` and the handoff can never find a full
+/// channel. Setup failure yields `Err` and callers must degrade
+/// explicitly (no acquisition, no synchronous close on the caller).
+struct DisposalPool<T: Send + 'static> {
+    tx: std::sync::mpsc::SyncSender<T>,
+    live: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+impl<T: Send + 'static> std::fmt::Debug for DisposalPool<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DisposalPool")
+            .field("cap", &self.cap)
+            .field("live", &self.live.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static> DisposalPool<T> {
+    /// Start one daemon-lifetime worker. `spawner` runs the close loop;
+    /// tests inject a failing spawner for a deterministic setup-failure
+    /// path without touching host resource limits.
+    fn start<S>(cap: usize, spawner: S) -> std::io::Result<Arc<Self>>
+    where
+        S: FnOnce(
+            Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(cap);
+        let live = Arc::new(AtomicUsize::new(0));
+        let live_worker = Arc::clone(&live);
+        let handle = spawner(Box::new(move || {
+            while let Ok(item) = rx.recv() {
+                drop(item);
+                live_worker.fetch_sub(1, Ordering::SeqCst);
+            }
+            // Senders gone: queue already drained by `recv`, so nothing
+            // is stranded. Forgotten items (handoff bug path) stay
+            // retained until exit by design, bounded by `cap`.
+        }))?;
+        // Detached daemon lifetime: teardown never joins the closer, so
+        // a stalled HID release cannot escape into the shutdown budget.
+        std::mem::forget(handle);
+        Ok(Arc::new(Self { tx, live, cap }))
+    }
+
+    /// Reserve a slot before acquisition. `None` means at capacity: the
+    /// caller must degrade explicitly instead of opening.
+    fn reserve(&self) -> Option<Reservation<'_, T>> {
+        let mut current = self.live.load(Ordering::SeqCst);
+        loop {
+            if current >= self.cap {
+                return None;
+            }
+            match self.live.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Reservation {
+                        pool: self,
+                        armed: true,
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Nonblocking handoff of a reserved item. Unreachable-by-construction
+    /// when every acquisition reserved first (queued never exceeds live,
+    /// live never exceeds `cap`, channel bound equals `cap`). The bug-path
+    /// fallback retains until exit instead of closing on the caller, still
+    /// bounded by `cap` because the slot stays consumed.
+    fn handoff(&self, item: T) {
+        if let Err(e) = self.tx.try_send(item) {
+            log::error!("haptic disposal queue full; retaining endpoint until exit (bounded)");
+            match e {
+                std::sync::mpsc::TrySendError::Full(item)
+                | std::sync::mpsc::TrySendError::Disconnected(item) => {
+                    std::mem::forget(item);
+                }
+            }
+        }
+    }
+}
+
+/// Outstanding-slot guard: releases back to the pool unless disarmed.
+/// Prepare disarms once the opened file is owned by an endpoint (the
+/// slot is then released by the closer worker after the close).
+struct Reservation<'a, T: Send + 'static> {
+    pool: &'a DisposalPool<T>,
+    armed: bool,
+}
+
+impl<T: Send + 'static> Reservation<'_, T> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<T: Send + 'static> Drop for Reservation<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Process-wide endpoint closer, established before any endpoint is
+/// admitted. `None` (worker setup failed) means haptics degrade to
+/// log-only explicitly: prepare acquires nothing.
+static ENDPOINT_POOL: OnceLock<Option<Arc<DisposalPool<std::fs::File>>>> = OnceLock::new();
+
+/// Borrow the process closer, starting it once. Never blocks on HID.
+fn endpoint_pool() -> Option<Arc<DisposalPool<std::fs::File>>> {
+    ENDPOINT_POOL
+        .get_or_init(|| {
+            match DisposalPool::start(HAPTIC_ENDPOINT_CAP, |job| {
+                std::thread::Builder::new()
+                    .name("ltd-haptic-close".into())
+                    .spawn(job)
+            }) {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    log::error!("haptic disposal worker failed to start ({e:#}); haptics log-only");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
 /// Pinned kernel endpoint for one haptic session target.
 ///
 /// A frozen pathname is NOT a device identity: the kernel may reuse a
@@ -227,54 +375,46 @@ pub trait UinputSink: Send {
 /// reopen. Clones share the same underlying file description, so queued
 /// pulses from one session share one identity and an in-flight pulse
 /// keeps the old fd even after retirement installs a replacement.
+///
+/// The final close never runs on the caller: the last drop hands the
+/// file to the bounded process closer, so retirement/teardown never
+/// block under the queue mutex, on the input pump thread, or inside the
+/// bounded worker join.
 #[derive(Debug)]
 struct HapticEndpoint {
     file: Mutex<Option<std::fs::File>>,
+    pool: Option<Arc<DisposalPool<std::fs::File>>>,
 }
 
 impl HapticEndpoint {
-    fn open(node: &str) -> Arc<Self> {
-        let file = if node.is_empty() {
-            None
-        } else {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(node)
-            {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    log::warn!("haptic endpoint unavailable for '{node}': {e:#}");
-                    None
-                }
-            }
-        };
-        Arc::new(Self {
-            file: Mutex::new(file),
-        })
-    }
-
     fn empty() -> Arc<Self> {
         Arc::new(Self {
             file: Mutex::new(None),
+            pool: None,
+        })
+    }
+
+    fn with_file(file: std::fs::File, pool: Arc<DisposalPool<std::fs::File>>) -> Arc<Self> {
+        Arc::new(Self {
+            file: Mutex::new(Some(file)),
+            pool: Some(pool),
         })
     }
 }
 
 impl Drop for HapticEndpoint {
     fn drop(&mut self) {
-        // Final close deferred off the current thread: hidraw release can
-        // block on kernel activity, so retirement/teardown must never close
-        // synchronously under the queue mutex or on the input pump thread,
-        // nor before Drop's bounded worker join. The spawn itself is fast;
-        // the blocking close runs on the background thread. On spawn
-        // failure (shutdown/OOM) the file drops here synchronously.
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(f) = file {
-            let _ = std::thread::Builder::new()
-                .name("ltd-haptic-close".into())
-                .spawn(move || drop(f));
-        }
+        let Some(f) = file else { return };
+        let Some(pool) = self.pool.as_ref() else {
+            // Unreachable: a live file always carries its pool (prepare
+            // only opens after admission). Retain boundedly rather than
+            // closing on the caller if this ever breaks.
+            log::error!("haptic endpoint without pool; retaining until exit (bounded)");
+            std::mem::forget(f);
+            return;
+        };
+        pool.handoff(f);
     }
 }
 
@@ -298,20 +438,58 @@ pub struct HapticTarget {
 }
 
 impl HapticTarget {
-    fn new(node: &str, bluetooth: bool) -> Self {
-        Self {
-            node: node.to_string(),
-            bluetooth,
-            endpoint: HapticEndpoint::open(node),
-        }
-    }
-
     /// Prepare (open) a session endpoint. Performs filesystem I/O and must
     /// be called outside the proxy mutex (live input path) and outside the
     /// queue mutex; commit with [`AsyncHaptic::retarget_prepared`] or
     /// [`AsyncHaptic::update_route_prepared`].
+    ///
+    /// Admission is reserved *before* opening against the bounded process
+    /// closer: at capacity, or when the closer failed to start, this
+    /// degrades to a file-less target explicitly (log-only sends, never a
+    /// later pathname reopen) instead of acquiring unbounded work or
+    /// closing synchronously on the caller.
     pub fn prepare(node: &str, bluetooth: bool) -> Self {
-        Self::new(node, bluetooth)
+        if node.is_empty() {
+            return Self::empty();
+        }
+        let Some(pool) = endpoint_pool() else {
+            log::warn!("haptic disposal unavailable; degrading '{node}' to log-only");
+            return Self::degraded(node, bluetooth);
+        };
+        let Some(reservation) = pool.reserve() else {
+            log::warn!("haptic endpoint capacity reached; degrading '{node}' to log-only");
+            return Self::degraded(node, bluetooth);
+        };
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(node)
+        {
+            Ok(file) => {
+                reservation.disarm();
+                Self {
+                    node: node.to_string(),
+                    bluetooth,
+                    endpoint: HapticEndpoint::with_file(file, pool),
+                }
+            }
+            Err(e) => {
+                log::warn!("haptic endpoint unavailable for '{node}': {e:#}");
+                Self::degraded(node, bluetooth)
+            }
+        }
+    }
+
+    /// File-less target that keeps its routing identity but never touches
+    /// hardware: sends degrade to log-only and must not reopen the
+    /// pathname later. Used for empty routing, failed opens, full
+    /// disposal capacity, or a failed closer setup.
+    fn degraded(node: &str, bluetooth: bool) -> Self {
+        Self {
+            node: node.to_string(),
+            bluetooth,
+            endpoint: HapticEndpoint::empty(),
+        }
     }
 
     fn empty() -> Self {
@@ -2680,12 +2858,15 @@ impl RealHaptic {
     }
 
     pub fn set_node(&self, node: &str) {
+        // Read routing first, then prepare (open) with no lock held, so a
+        // blocked open never stalls a concurrent sender on this mutex.
         let bluetooth = self
             .target
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .bluetooth;
-        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = HapticTarget::new(node, bluetooth);
+        let target = HapticTarget::prepare(node, bluetooth);
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = target;
     }
 
     pub fn set_bluetooth(&self, bt: bool) {
@@ -2874,9 +3055,10 @@ impl HapticShared {
     /// stray enqueue degrades to log-only). Returns pulses purged.
     /// Enqueue/retarget serialize here. Replaced endpoints and cleared
     /// pulses drop their last references here, but the blocking device
-    /// close itself runs on a background thread (see [`HapticEndpoint`]),
-    /// so this never stalls the queue lock owner or the input pump, and
-    /// teardown's bounded join does not include endpoint close.
+    /// close itself runs on the bounded process closer (see
+    /// [`DisposalPool`]), so this never stalls the queue lock owner or
+    /// the input pump, and teardown's bounded join does not include
+    /// endpoint close.
     fn retire(&self, target: Option<HapticTarget>) -> u64 {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let stale = state.pulses.len() as u64;
@@ -3001,16 +3183,17 @@ where
     /// [`AsyncHaptic::retarget_prepared`] with a target prepared before
     /// locking instead, so the open never stalls input processing.
     /// The retire then commits the new endpoint together with the
-    /// generation bump. Final disposal of the replaced endpoint runs on a
-    /// background thread, never under the queue lock or on the caller.
+    /// generation bump. Final disposal of the replaced endpoint runs on
+    /// the bounded process closer, never under the queue lock or on the
+    /// caller.
     pub fn retarget(&self, node: &str, bluetooth: bool) {
-        let target = HapticTarget::new(node, bluetooth);
+        let target = HapticTarget::prepare(node, bluetooth);
         self.shared.retire(Some(target));
     }
 
     /// New session commit for a target prepared outside all live locks.
-    /// No filesystem I/O under any mutex; replaced endpoints close on a
-    /// background thread.
+    /// No filesystem I/O under any mutex; replaced endpoints close on the
+    /// bounded process closer.
     pub fn retarget_prepared(&self, target: HapticTarget) {
         self.shared.retire(Some(target));
     }
@@ -3036,7 +3219,7 @@ where
         // Open outside the queue lock; commit below only if the session
         // has not retired meanwhile (otherwise the correction would clobber
         // the new session's endpoint).
-        let corrected = HapticTarget::new(node, bluetooth);
+        let corrected = HapticTarget::prepare(node, bluetooth);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.shared.generation.load(Ordering::SeqCst) != generation {
             return;
@@ -7621,6 +7804,111 @@ mod tests {
             std::fs::metadata(&fresh).unwrap().ino()
         );
         drop(ah);
+    }
+
+    #[test]
+    fn disposal_pool_startup_failure_degrades_explicitly() {
+        // F3 failure path: a cleanup worker that cannot start must deny
+        // admission deterministically (mock spawner, no host limit
+        // changes). Queue/pump/Drop work stays bounded on the degraded
+        // file-less target; nothing closes synchronously on the caller.
+        let failing =
+            |_job: Box<dyn FnOnce() + Send + 'static>| -> std::io::Result<std::thread::JoinHandle<()>> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "mock closer spawn failure",
+                ))
+            };
+        assert!(
+            DisposalPool::<std::fs::File>::start(2, failing).is_err(),
+            "worker setup failure must be an explicit error, never silent"
+        );
+        // Degraded target keeps routing identity but acquires nothing.
+        let target = HapticTarget::degraded("/dev/hidraw9", false);
+        assert_eq!(target.node, "/dev/hidraw9");
+        assert!(target.try_clone_file().is_none());
+        // Queue lifecycle on file-less targets stays prompt and bounded.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget_prepared(target);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        let t0 = std::time::Instant::now();
+        ah.retire_session();
+        assert_eq!(ah.pending(), 0);
+        gate.open();
+        gate.wait_executed(1);
+        drop(ah);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "degraded retire/Drop must stay bounded"
+        );
+    }
+
+    #[test]
+    fn disposal_pool_capacity_bounds_outstanding() {
+        // F3 capacity: reserve-before-open bounds simultaneous items;
+        // handoff never blocks even while the closer is stuck in a slow
+        // close (mock slow Drop, no shim); slots recycle after the close.
+        struct SlowClose {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Drop for SlowClose {
+            fn drop(&mut self) {
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            }
+        }
+        let pool = DisposalPool::start(2, |job| {
+            std::thread::Builder::new()
+                .name("ltd-test-closer".into())
+                .spawn(job)
+        })
+        .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let r1 = pool.reserve();
+        let r2 = pool.reserve();
+        assert!(r1.is_some() && r2.is_some());
+        assert!(
+            pool.reserve().is_none(),
+            "third reservation past cap must deny, never block"
+        );
+        r1.unwrap().disarm();
+        r2.unwrap().disarm();
+        // Nonblocking handoff of both reserved items while closes stall.
+        let t0 = std::time::Instant::now();
+        pool.handoff(SlowClose {
+            gate: Arc::clone(&gate),
+        });
+        pool.handoff(SlowClose {
+            gate: Arc::clone(&gate),
+        });
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(250),
+            "handoff must not wait for the stuck closer"
+        );
+        assert_eq!(pool.live.load(Ordering::SeqCst), 2);
+        // Stuck closer holds both; capacity stays denied (bounded).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(pool.reserve().is_none());
+        assert_eq!(pool.live.load(Ordering::SeqCst), 2);
+        // Release: the single worker closes both, slots recycle.
+        {
+            let mut open = gate.0.lock().unwrap();
+            *open = true;
+            gate.1.notify_all();
+        }
+        let t0 = std::time::Instant::now();
+        while pool.live.load(Ordering::SeqCst) != 0 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "slots must recycle after the close"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(pool.reserve().is_some());
     }
 
     #[test]
