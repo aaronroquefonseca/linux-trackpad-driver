@@ -13,7 +13,7 @@
 # The CI Fedora job additionally builds and installs a binary RPM.
 
 Name:           linux-trackpad-driver
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Userspace driver enhancing Apple Magic Trackpad 2 functionality
 License:        MIT OR Apache-2.0
@@ -85,6 +85,10 @@ fi
 %{_prefix}/lib/systemd/system-sleep/ltd-resume
 
 %changelog
+* Mon Oct 19 2026 Aarón Roque Fonseca <aaronroquefonseca@gmail.com> - 0.1.1-1
+- Prompt hotplug attachment, session recovery, and input failure safeguards.
+- Idle release completion, build identity, and packaging fixes.
+
 * Wed Oct 14 2026 Aarón Roque Fonseca <aaronroquefonseca@gmail.com> - 0.1.0-1
 - Initial Fedora packaging: ltd binary, udev rules, systemd units
   (main, reconnect@, resume, system-sleep hook), default system config.
