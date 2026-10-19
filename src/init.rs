@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 
 use crate::apple_parse::PRESSURE_VALID_MAX;
-use crate::config::Config;
+use crate::config::{force_threshold_value, Config};
 
 /// USB multitouch-enable feature report.
 pub const MULTITOUCH_USB: &[u8] = &[0x02, 0x01];
@@ -115,7 +115,8 @@ pub fn check_usb_polling_usable(polling_hz: u32) -> Result<()> {
 /// unobserved/reserved `254..=255` band (nominal device range `0..=253`,
 /// see [`PRESSURE_VALID_MAX`]), and an armed force level whose
 /// `sensitivity + force_offset` threshold sits above that nominal maximum
-/// (mirroring [`crate::clicks::ClickMachine::force_threshold`]; thresholds
+/// (shared [`crate::config::force_threshold_value`] with
+/// [`crate::clicks::ClickMachine::force_threshold`]; thresholds
 /// above 255 can never fire against a `u8` pressure byte at all).
 /// Warnings only — intentional setups still validate and run.
 pub fn usb_applicability_warnings(cfg: &Config) -> Vec<String> {
@@ -127,12 +128,7 @@ pub fn usb_applicability_warnings(cfg: &Config) -> Vec<String> {
             cfg.click.sensitivity
         ));
     }
-    if cfg.force.force_offset > 0 {
-        let threshold = cfg
-            .click
-            .sensitivity
-            .clamp(1, 255)
-            .saturating_add(cfg.force.force_offset.min(255));
+    if let Some(threshold) = force_threshold_value(cfg.click.sensitivity, cfg.force.force_offset) {
         if threshold > u16::from(PRESSURE_VALID_MAX) {
             warnings.push(format!(
                 "[force] threshold {threshold} (sensitivity {} + offset {}) \
@@ -1286,5 +1282,39 @@ mod tests {
         let mut tune = crate::config::Config::default();
         tune.force.force_offset = 130;
         assert!(validate_config_for_usb(&tune).unwrap().is_empty());
+    }
+
+    #[test]
+    fn force_warnings_agree_with_shared_threshold() {
+        // Doctor warnings must fire exactly when the single shared threshold
+        // exceeds the nominal max; disabled force never warns.
+        for (sensitivity, offset) in [
+            (30u16, 0u16),
+            (30, 130),
+            (30, 223),
+            (30, 230),
+            (0, 255),
+            (255, 255),
+            (254, 10),
+        ] {
+            let mut cfg = crate::config::Config::default();
+            cfg.click.sensitivity = sensitivity;
+            cfg.force.force_offset = offset;
+            let shared = crate::config::force_threshold_value(sensitivity, offset);
+            assert_eq!(
+                shared,
+                crate::clicks::ClickMachine::force_threshold(&cfg),
+                "shared helper must match runtime for {sensitivity}+{offset}"
+            );
+            let warns = usb_applicability_warnings(&cfg)
+                .iter()
+                .any(|w| w.contains("[force]"));
+            let expect =
+                shared.is_some_and(|t| t > u16::from(crate::apple_parse::PRESSURE_VALID_MAX));
+            assert_eq!(
+                warns, expect,
+                "force warn mismatch for {sensitivity}+{offset}"
+            );
+        }
     }
 }

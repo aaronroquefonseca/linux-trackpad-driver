@@ -14,7 +14,10 @@ const UNIX_TABLE: &str = "/proc/net/unix";
 ///
 /// Beyond syntax/range validity ([`Config::validate`]), this applies the
 /// shared USB hardware-applicability gate
-/// ([`init::validate_config_for_usb`], the same check USB startup uses):
+/// ([`init::check_usb_polling_usable`], via the doctor-facing
+/// [`init::validate_config_for_usb`] wrapper; USB startup shares the same
+/// predicate via [`crate::daemon::validate_polling_rate`] /
+/// [`init::resolve_polling`]):
 /// polling below the device floor fails here exactly as it fails init, so
 /// doctor can no longer bless a config USB init would reject. `Ok` carries
 /// semantic warnings (effectively unreachable thresholds) that do not fail

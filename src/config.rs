@@ -41,6 +41,25 @@ pub const MAX_BYTE_VALUE: u16 = 255;
 pub const MIN_SPEED: u32 = 1;
 pub const MAX_SPEED: u32 = 1000;
 
+/// Shared force arming threshold (`sensitivity + force_offset`, `u16` so
+/// `255 + offset` never overflows; thresholds above 255 simply never fire
+/// against a `u8` pressure byte). Clamps mirror the press path (`1..=255`,
+/// offset capped at 255). `None` when `force_offset == 0` (force disabled).
+/// Single source for runtime ([`crate::clicks::ClickMachine::force_threshold`])
+/// and diagnostics ([`crate::init::usb_applicability_warnings`]) so the two
+/// cannot drift.
+pub fn force_threshold_value(sensitivity: u16, force_offset: u16) -> Option<u16> {
+    if force_offset > 0 {
+        Some(
+            sensitivity
+                .clamp(1, 255)
+                .saturating_add(force_offset.min(255)),
+        )
+    } else {
+        None
+    }
+}
+
 /// Parsed daemon configuration (sectioned v1 schema).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -597,8 +616,11 @@ impl Config {
     /// Syntax/range layer only: polling `1..=110` passes here while USB init
     /// needs `>= 16`, and extreme-but-in-range thresholds pass while being
     /// effectively unreachable. That hardware applicability is
-    /// [`crate::init::validate_config_for_usb`], shared by USB startup and
-    /// doctor so the two can never diverge again.
+    /// [`crate::init::check_usb_polling_usable`], shared by USB startup
+    /// (via [`crate::daemon::validate_polling_rate`] /
+    /// [`crate::init::resolve_polling`]) and doctor (via the doctor-facing
+    /// [`crate::init::validate_config_for_usb`] wrapper) so the two can
+    /// never diverge again.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             anyhow::bail!(
@@ -1420,6 +1442,18 @@ mod tests {
         let mut armed = Config::default();
         armed.force.force_offset = 20;
         assert!(armed.force_enabled());
+    }
+
+    #[test]
+    fn force_threshold_value_single_source() {
+        // Disabled stays silent.
+        assert_eq!(force_threshold_value(30, 0), None);
+        // Owner tune: 30 + 130 = 160.
+        assert_eq!(force_threshold_value(30, 130), Some(160));
+        // Clamps mirror the press path: sensitivity 0 -> 1, offset capped at 255.
+        assert_eq!(force_threshold_value(0, 300), Some(1 + 255));
+        // Unvalidated max never overflows: 255 + 255 = 510.
+        assert_eq!(force_threshold_value(255, 255), Some(510));
     }
 
     #[test]

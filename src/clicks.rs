@@ -363,18 +363,11 @@ impl ClickMachine {
     /// `255 + offset` never overflows; thresholds above 255 simply never
     /// fire). Clamps mirror [`press_threshold`] (`1..=255`) and
     /// [`release_threshold`] (`margin` capped at 255). `None` when
-    /// `force_offset == 0` (force disabled entirely).
+    /// `force_offset == 0` (force disabled entirely). Single source is
+    /// [`crate::config::force_threshold_value`], shared with
+    /// [`crate::init::usb_applicability_warnings`].
     pub fn force_threshold(cfg: &Config) -> Option<u16> {
-        if cfg.force.force_offset > 0 {
-            Some(
-                cfg.click
-                    .sensitivity
-                    .clamp(1, 255)
-                    .saturating_add(cfg.force.force_offset.min(255)),
-            )
-        } else {
-            None
-        }
+        crate::config::force_threshold_value(cfg.click.sensitivity, cfg.force.force_offset)
     }
 
     /// Force release point: `sensitivity + force_offset - margin`, saturating
