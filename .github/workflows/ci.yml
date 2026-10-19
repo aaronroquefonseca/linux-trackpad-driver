@@ -108,6 +108,27 @@ jobs:
           test -f "$PKG/lib/systemd/system-sleep/ltd-resume"
           test -f "$PKG/lib/udev/rules.d/99-linux-trackpad-driver.rules"
           test -f "$PKG/usr/bin/ltd"
+      - name: license payload (installed copyright content)
+        run: |
+          set -euo pipefail
+          # MIT has no /usr/share/common-licenses entry (Debian Policy 12.5):
+          # the binary package must carry the text itself. Check the
+          # INSTALLED artifact debhelper ships (verbatim copy of
+          # debian/copyright), not just that the source file exists.
+          if grep -q 'common-licenses/MIT' debian/copyright; then
+            echo 'debian/copyright must not reference /usr/share/common-licenses/MIT' >&2
+            exit 1
+          fi
+          STAGE=$(mktemp -d)
+          trap 'rm -rf "$STAGE"' EXIT
+          DOC="$STAGE/pkg/usr/share/doc/linux-trackpad-driver"
+          mkdir -p "$DOC"
+          cp debian/copyright "$DOC/copyright"
+          for marker in 'Copyright (c) 2026' 'Permission is hereby granted' \
+              'WITHOUT WARRANTY OF ANY KIND' '/usr/share/common-licenses/Apache-2.0'; do
+            grep -q "$marker" "$DOC/copyright" \
+              || { echo "installed copyright missing: $marker" >&2; exit 1; }
+          done
       - name: changelog + control syntax
         run: |
           dpkg-parsechangelog -l debian/changelog
