@@ -13,12 +13,30 @@ Install tools once:
 sudo pacman -S --needed usbutils bluez bluez-utils libinput evtest hid-tools
 ```
 
-Run the daemon with debug logs when testing init paths:
+Debug logs come from `log_level = "debug"` in the *selected* config —
+`RUST_LOG` is ignored (`config::init_logging` in `src/config.rs`).
+Selection is `-c <file>` first, then nonempty `LTD_CONFIG`, then built-in
+defaults; the shipped service sets `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml`,
+so a bare `sudo ltd run` without `-c`/`LTD_CONFIG` runs at defaults.
+
+Service path (uses the installed file):
 
 ```sh
-sudo RUST_LOG=debug ltd run 2>&1 | tee /tmp/ltd-run.log
-# or per-config: set log_level = "debug" in /etc/linux-trackpad-driver/config.toml
+sudo sed -i 's/^log_level *=.*/log_level = "debug"/' /etc/linux-trackpad-driver/config.toml
+grep -E '^log_level' /etc/linux-trackpad-driver/config.toml  # expect debug
+sudo systemctl restart linux-trackpad-driver.service
+journalctl -u linux-trackpad-driver.service 2>&1 | tee /tmp/ltd-run.log
 ```
+
+Manual-run path (same file, explicit selection):
+
+```sh
+grep -E '^log_level' /etc/linux-trackpad-driver/config.toml  # expect debug
+sudo ltd run -c /etc/linux-trackpad-driver/config.toml 2>&1 | tee /tmp/ltd-run.log
+```
+
+A listed socket (`ls /run/linux-trackpad-driver/driver.sock`, `ltd doctor`
+socket line) only observes a listener — it does not prove the proxy attached.
 
 Replace `/dev/hidrawN` / `/dev/input/eventX` with your nodes throughout.
 
@@ -126,10 +144,11 @@ grep -E '^enhanced_clicks' /etc/linux-trackpad-driver/config.toml  # expect fals
 
 ### 2a. `run` from cold plug
 
-- [ ] Unplug USB. Start daemon, then plug:
+- [ ] Unplug USB. Start daemon (debug config selected explicitly), then plug:
 
 ```sh
-sudo RUST_LOG=debug ltd run 2>&1 | tee /tmp/ltd-usb-run.log
+sudo ltd run -c /etc/linux-trackpad-driver/config.toml 2>&1 | tee /tmp/ltd-usb-run.log
+# needs log_level = "debug" in that file (see top of this checklist)
 ```
 
 - [ ] Expect in log (good-lines, see §7):
@@ -185,7 +204,8 @@ sudo ltd reconnect /dev/hidrawN -f -p 500 2>&1 | grep -iE 'clamp|polling|accepte
 # wire byte stays 0x23, never below 0x23
 ```
 
-- [ ] Read-back verify path exercised: with `RUST_LOG=debug`, look for
+- [ ] Read-back verify path exercised: with `log_level = "debug"` in the
+      selected config, look for
       absence of `polling verify mismatch` / `verify unreadable` warnings
       on a healthy device. Either warning once is fine; repeating every
       30 s tick is a finding (paste back, §8).
@@ -379,13 +399,19 @@ any panic backtrace (must never happen — file as P0).
 
 ## 8. What to paste back as findings
 
-One block per failing/odd row in §9. Include:
+One block per failing/odd row in §9. `RUST_LOG` is ignored — the log
+excerpt below only exists when the run used `log_level = "debug"` in the
+selected config (see top of this checklist). Name the selected file and how
+it was selected (`-c <file>` vs service `LTD_CONFIG` vs defaults); a socket
+line alone does not prove the proxy attached.
 
 ```sh
-# 1. versions + config
+# 1. build identity + config source (selected file, not just its contents)
 ltd --version; uname -r; libinput --version
+ltd doctor  # or: ltd doctor -c <same file used for the run>
+echo "LTD_CONFIG=$LTD_CONFIG"
 cat /etc/linux-trackpad-driver/config.toml
-# 2. device identity
+# 2. device identity + transport
 lsusb -d 05ac:0265; lsusb -d 05ac:0324
 bluetoothctl info <MAC> 2>/dev/null | head -20
 cat /sys/class/hidraw/hidrawN/device/uevent
@@ -394,8 +420,10 @@ dmesg | tail -40
 sudo udevadm info -a /dev/hidrawN | head -60
 # 4. rates
 wc -l /tmp/evtest-baseline.log /tmp/evtest-110hz.log
-# 5. logs (trim to the interesting 50 lines)
-grep -E 'USB init|BT |resume|proxy|polling|verify|failed|error' /tmp/ltd-run.log | tail -50
+# 5. debug logs: startup identity + selected source/evdev/actuator + session state
+#    (trim to the interesting 50 lines; keep the `starting`, `config:`, `found`,
+#    `evdev:`/`haptic: ... actuator`, `USB init`/`BT`, `proxy:` lines intact)
+grep -E 'starting|config:|found .* trackpad|evdev:|actuator|USB init|BT |resume|proxy|polling|verify|failed|error' /tmp/ltd-run.log | tail -50
 ```
 
 Unknown behaviors (new PID, new report bytes, new dropout shape) additionally
