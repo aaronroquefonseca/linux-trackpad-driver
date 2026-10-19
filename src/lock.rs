@@ -1272,11 +1272,12 @@ mod tests {
         // F1 regression with an injected wait seam (no host rlimit/fd games):
         // the readiness wait always fails (e.g. ENOMEM), so the shutdown pipe
         // byte can never surface through `poll`. The `stop` flag must still
-        // end the worker. Stop fires immediately after spawn — before the
-        // waiter necessarily runs — so a flag check tied to `poll` success
-        // would hang the join. Bounded via channel so failure reports
+        // end the worker. The entered-gate below proves the failing wait
+        // actually ran before stop is requested: without it the worker could
+        // exit at the loop-top flag check having never exercised the
+        // persistent-error path. Bounded via channels so failure reports
         // instead of hanging the suite.
-        use std::sync::mpsc;
+        use std::sync::{atomic::AtomicUsize, mpsc};
 
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("wait-err.sock");
@@ -1285,32 +1286,47 @@ mod tests {
         let (_tx, rx) = shutdown_pipe().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let drain_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("test-drain-wait-err".to_string())
             .spawn(move || {
-                drain_loop_with_wait(listener, drain_stop, rx, |_, _| {
-                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
+                    if calls_in.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let _ = entered_tx.send(());
+                    }
+                    Err::<(i16, i16), _>(io::Error::from_raw_os_error(libc::ENOMEM))
                 })
             })
             .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failing wait must run at least once before stop");
         stop.store(true, Ordering::Relaxed);
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = handle.join();
+            handle.join().expect("worker thread must not panic");
             let _ = done_tx.send(());
         });
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("waiter must exit on stop even when poll keeps failing");
+        assert!(
+            calls.load(Ordering::Relaxed) >= 1,
+            "failing wait must have run"
+        );
     }
 
     #[test]
     fn listener_error_revents_back_off_without_spin() {
         // F2 regression with an injected wait seam: the listener reports
         // POLLERR with no POLLIN, which `poll` would return immediately and
-        // forever. The waiter must back off instead of hot-spinning. Run in
-        // a bounded window and assert the wait-call count stays tiny (a
-        // spinning waiter would call thousands of times here).
+        // forever. The waiter must back off instead of hot-spinning. The
+        // entered-gate synchronizes on the first injected wait so a delayed
+        // scheduler cannot observe zero runs; the bounded window then asserts
+        // the wait-call count stays tiny (a spinning waiter would call
+        // thousands of times here).
         use std::sync::{atomic::AtomicUsize, mpsc};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1322,21 +1338,27 @@ mod tests {
         let drain_stop = Arc::clone(&stop);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("test-drain-listen-err".to_string())
             .spawn(move || {
                 drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
-                    calls_in.fetch_add(1, Ordering::Relaxed);
+                    if calls_in.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let _ = entered_tx.send(());
+                    }
                     Ok((libc::POLLERR, 0))
                 })
             })
             .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must run at least once before the window");
         std::thread::sleep(Duration::from_millis(150));
         stop.store(true, Ordering::Relaxed);
         notify_shutdown(&tx);
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = handle.join();
+            handle.join().expect("worker thread must not panic");
             let _ = done_tx.send(());
         });
         done_rx
@@ -1369,7 +1391,7 @@ mod tests {
             .unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = handle.join();
+            handle.join().expect("worker thread must not panic");
             let _ = done_tx.send(());
         });
         done_rx
