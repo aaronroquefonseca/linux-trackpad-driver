@@ -456,9 +456,22 @@ enum PollWake {
     Hidraw,
     Both,
     Timeout,
+    /// `poll(2)` itself failed with a persistent non-EINTR error (EINVAL,
+    /// ENOMEM, ...). Distinct from `Timeout` so the caller can bound retries
+    /// even when idle: a `Timeout` with no fd/deadline does no work and must
+    /// not sleep, while a `WaitError` must back off unconditionally or the
+    /// loop would spin on the immediately-failing wait.
+    WaitError,
 }
 
-fn poll_wait(hidraw_fd: Option<RawFd>, control_fd: RawFd, timeout_ms: i32) -> PollWake {
+type RawPollFn = unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, i32) -> i32;
+
+fn poll_wait_with(
+    hidraw_fd: Option<RawFd>,
+    control_fd: RawFd,
+    timeout_ms: i32,
+    poll_fn: RawPollFn,
+) -> PollWake {
     use std::mem::zeroed;
     let mut fds = unsafe { [zeroed::<libc::pollfd>(), zeroed::<libc::pollfd>()] };
     let mut nfds = 0usize;
@@ -471,7 +484,7 @@ fn poll_wait(hidraw_fd: Option<RawFd>, control_fd: RawFd, timeout_ms: i32) -> Po
     fds[control_idx].fd = control_fd;
     fds[control_idx].events = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
     nfds += 1;
-    let ret = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
+    let ret = unsafe { poll_fn(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
     if ret < 0 {
         let e = std::io::Error::last_os_error();
         if e.kind() == std::io::ErrorKind::Interrupted {
@@ -479,10 +492,10 @@ fn poll_wait(hidraw_fd: Option<RawFd>, control_fd: RawFd, timeout_ms: i32) -> Po
             // promptly instead of restarting the full timeout.
             return PollWake::Timeout;
         }
-        // A failed poll must not spin: back off briefly in the caller.
-        // Report a timeout so the caller takes one (deadline-checked) step
-        // and then re-polls; transient poll errors stay bounded.
-        return PollWake::Timeout;
+        // Persistent wait failure: report distinctly so the caller backs off
+        // even when idle/control-only. EINTR stays a responsive Timeout.
+        log::warn!("pump: poll(2) failed, backing off: {e:#}");
+        return PollWake::WaitError;
     }
     if ret == 0 {
         return PollWake::Timeout;
@@ -505,9 +518,38 @@ fn deadline_timeout_ms(deadline: Option<Instant>) -> i32 {
             if d <= now {
                 0
             } else {
-                (d - now).as_millis().min(i64::from(i32::MAX) as u128) as i32
+                let remaining = d - now;
+                // Ceiling to whole milliseconds: `as_millis` truncates, so a
+                // positive sub-millisecond remainder would become a 0 timeout
+                // and busy-spin until the deadline. Overdue stays 0, absent
+                // stays -1; future deadlines wait at least 1 ms and never fire
+                // early, preserving the 5/30 ms floors and release ordering.
+                let floor_ms = remaining.as_millis();
+                let ceil_ms = if remaining.subsec_nanos().is_multiple_of(1_000_000) {
+                    floor_ms
+                } else {
+                    floor_ms.saturating_add(1)
+                };
+                ceil_ms.min(i64::from(i32::MAX) as u128) as i32
             }
         }
+    }
+}
+
+/// Bounded sleep for a failed `poll(2)` wait. Independent of source activity
+/// (idle/control-only failures must not hot-loop) but deadline-aware so an
+/// imminent deadline is not overshot by a full [`ERROR_BACKOFF`].
+fn wait_error_backoff(deadline: Option<Instant>) -> Duration {
+    match deadline {
+        Some(d) => {
+            let now = Instant::now();
+            if d <= now {
+                ERROR_BACKOFF
+            } else {
+                (d - now).min(ERROR_BACKOFF)
+            }
+        }
+        None => ERROR_BACKOFF,
     }
 }
 
@@ -530,6 +572,25 @@ pub fn spawn_pump<G, U, H, S>(
     proxy: Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
     cfg: crate::config::Config,
     stop: Arc<AtomicBool>,
+) -> (std::thread::JoinHandle<()>, Arc<PumpControl>)
+where
+    G: crate::proxy::GrabDevice + Send + 'static,
+    U: crate::proxy::UinputSink + Send + 'static,
+    H: crate::proxy::HapticSender + Send + 'static,
+    S: TouchSource + Send + 'static,
+{
+    spawn_pump_with_poll(name, proxy, cfg, stop, libc::poll)
+}
+
+/// Test-injectable pump loop: `poll_fn` replaces `libc::poll` so persistent
+/// wait failures can be simulated without touching process/host rlimits.
+/// Production always uses [`libc::poll`] via [`spawn_pump`].
+pub(crate) fn spawn_pump_with_poll<G, U, H, S>(
+    name: String,
+    proxy: Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
+    cfg: crate::config::Config,
+    stop: Arc<AtomicBool>,
+    poll_fn: RawPollFn,
 ) -> (std::thread::JoinHandle<()>, Arc<PumpControl>)
 where
     G: crate::proxy::GrabDevice + Send + 'static,
@@ -572,10 +633,11 @@ where
                     PumpActivity::Idle | PumpActivity::Deadline | PumpActivity::Disconnect => {}
                 }
             }
-            match poll_wait(
+            match poll_wait_with(
                 hidraw_fd,
                 thread_control.read_fd(),
                 deadline_timeout_ms(deadline),
+                poll_fn,
             ) {
                 PollWake::Control => {
                     thread_control.drain();
@@ -592,13 +654,37 @@ where
                     }
                 }
                 PollWake::Timeout => {
-                    // Deadline expired (or poll failed): advance deadlines.
-                    // With no fd and no deadline this is unreachable
-                    // (infinite wait); a spurious wake re-evaluates.
+                    // Deadline expired: advance deadlines. With no fd and no
+                    // deadline this is unreachable (infinite wait); a
+                    // spurious/EINTR wake re-evaluates.
                     if (deadline.is_some() || hidraw_fd.is_some())
                         && pump_once(&proxy, &cfg) == PumpActivity::Transient
                     {
                         std::thread::sleep(ERROR_BACKOFF);
+                    }
+                }
+                PollWake::WaitError => {
+                    // Persistent wait failure (EINVAL/ENOMEM/...): bound the
+                    // retry even when idle/control-only. Drain any control
+                    // notify that arrived before the failure, make best-effort
+                    // deadline progress, then sleep deadline-aware so an
+                    // imminent deadline is not overshot by a full backoff.
+                    thread_control.drain();
+                    if stop.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let overdue = deadline.is_some_and(|d| d <= Instant::now());
+                    if overdue || hidraw_fd.is_some() {
+                        let _ = pump_once(&proxy, &cfg);
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let backoff = wait_error_backoff(deadline);
+                    if backoff.is_zero() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    } else {
+                        std::thread::sleep(backoff);
                     }
                 }
             }
@@ -762,13 +848,16 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(50));
                 control.notify();
             });
-            let wake = poll_wait(None, control.read_fd(), -1);
+            let wake = poll_wait_with(None, control.read_fd(), -1, libc::poll);
             assert_eq!(wake, PollWake::Control);
         });
         assert!(start.elapsed() >= Duration::from_millis(40));
         control.drain();
         // After drain, a 0-timeout poll with nothing ready times out.
-        assert_eq!(poll_wait(None, control.read_fd(), 0), PollWake::Timeout);
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, libc::poll),
+            PollWake::Timeout
+        );
     }
 
     #[test]
@@ -779,6 +868,178 @@ mod tests {
         let future = Instant::now() + Duration::from_millis(30);
         let ms = deadline_timeout_ms(Some(future));
         assert!((1..=30).contains(&ms), "deadline ms: {ms}");
+    }
+
+    #[test]
+    fn deadline_timeout_ceils_submillisecond_without_early_fire() {
+        // Root cause of the pre-deadline spin: `as_millis` truncates a
+        // positive sub-ms remainder to a 0 timeout, so `poll` returns
+        // immediately until the clock reaches the deadline. Ceiling keeps a
+        // strictly-future deadline at >=1 ms and never fires early.
+        let deadline = Instant::now() + Duration::from_micros(800);
+        let timeout = deadline_timeout_ms(Some(deadline));
+        if deadline > Instant::now() {
+            assert_eq!(
+                timeout, 1,
+                "sub-ms future must ceil to 1 ms, not truncate to 0"
+            );
+        } else {
+            // Slept past an 800 us deadline between the two `now()`s
+            // (pathological deschedule); overdue correctly reports 0.
+            assert_eq!(timeout, 0);
+        }
+        // Exact-ms deadlines stay exact; overdue stays 0; absent stays -1.
+        let exact = Instant::now() + Duration::from_millis(50);
+        let exact_ms = deadline_timeout_ms(Some(exact));
+        assert!(
+            (49..=50).contains(&exact_ms),
+            "50 ms deadline must not fire early or spin: {exact_ms}"
+        );
+        assert_eq!(deadline_timeout_ms(Some(Instant::now())), 0);
+        assert_eq!(deadline_timeout_ms(None), -1);
+    }
+
+    #[test]
+    fn poll_wait_maps_errors_distinctly_with_mocked_poll() {
+        // Safe mocked poll: no rlimit/host changes. EINTR stays a responsive
+        // Timeout; persistent failures become WaitError (never Timeout, or
+        // the idle loop would hot-spin).
+        unsafe extern "C" fn mock_eintr(
+            _fds: *mut libc::pollfd,
+            _nfds: libc::nfds_t,
+            _timeout: i32,
+        ) -> i32 {
+            *libc::__errno_location() = libc::EINTR;
+            -1
+        }
+        unsafe extern "C" fn mock_einval(
+            _fds: *mut libc::pollfd,
+            _nfds: libc::nfds_t,
+            _timeout: i32,
+        ) -> i32 {
+            *libc::__errno_location() = libc::EINVAL;
+            -1
+        }
+        unsafe extern "C" fn mock_enomem(
+            _fds: *mut libc::pollfd,
+            _nfds: libc::nfds_t,
+            _timeout: i32,
+        ) -> i32 {
+            *libc::__errno_location() = libc::ENOMEM;
+            -1
+        }
+        let control = PumpControl::new().unwrap();
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), -1, mock_eintr),
+            PollWake::Timeout
+        );
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), -1, mock_einval),
+            PollWake::WaitError
+        );
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), -1, mock_enomem),
+            PollWake::WaitError
+        );
+        // Control-only failure is also distinct (idle must back off, not spin).
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, mock_einval),
+            PollWake::WaitError
+        );
+    }
+
+    #[test]
+    fn wait_error_backoff_is_bounded_and_deadline_aware() {
+        assert_eq!(wait_error_backoff(None), ERROR_BACKOFF);
+        assert_eq!(
+            wait_error_backoff(Some(Instant::now() - Duration::from_millis(1))),
+            ERROR_BACKOFF
+        );
+        // Far deadline caps at the 10 ms backoff, never overshoots.
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(wait_error_backoff(Some(far)), ERROR_BACKOFF);
+        // Imminent deadline sleeps only until the deadline.
+        let near = Instant::now() + Duration::from_millis(3);
+        let backoff = wait_error_backoff(Some(near));
+        assert!(
+            backoff <= Duration::from_millis(3) && !backoff.is_zero(),
+            "imminent deadline must bound sleep, got {backoff:?}"
+        );
+    }
+
+    static FAILING_POLL_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn mock_poll_always_fail(
+        _fds: *mut libc::pollfd,
+        _nfds: libc::nfds_t,
+        _timeout: i32,
+    ) -> i32 {
+        FAILING_POLL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *libc::__errno_location() = libc::EINVAL;
+        -1
+    }
+
+    #[test]
+    fn failing_poll_backs_off_when_idle_and_stops_promptly() {
+        // Idle/control-only session (no fd, no deadline) with a persistently
+        // failing wait: must back off at ~10 ms intervals, not hot-spin, and
+        // `stop_pump` during the backoff must exit promptly. Uses injected
+        // mock poll, never touching process/host rlimits.
+        use crate::proxy::{ClickProxy, ProxySettings};
+        FAILING_POLL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = Arc::new(Mutex::new(ClickProxy::new(
+            ProxySettings { enhanced: true },
+            PumpTestGrab,
+            PumpTestSink,
+            PumpTestHaptic,
+            CountingSource {
+                polls: Arc::new(AtomicBool::new(false)),
+                count: Arc::clone(&count),
+            },
+        )));
+        {
+            let mut px = proxy.lock().unwrap();
+            px.set_pump_ready(true);
+            px.attach(&crate::init::usb_ready("/dev/hidraw1"));
+            assert!(px.is_attached());
+            assert!(px.poll_fd().is_none());
+            assert!(px.next_deadline().is_none());
+        }
+        let cfg = crate::config::Config {
+            enhanced_clicks: true,
+            ..crate::config::Config::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let (handle, control) = spawn_pump_with_poll(
+            "failing-idle-test".to_string(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+            mock_poll_always_fail,
+        );
+        // Control notify during backoff must not deadlock or get lost.
+        control.notify();
+        std::thread::sleep(Duration::from_millis(120));
+        let calls = FAILING_POLL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        // 120 ms at 10 ms backoff ≈ 12 waits; spinning would be thousands.
+        assert!(
+            calls <= 30,
+            "persistently failing idle wait spun: {calls} polls in 120 ms"
+        );
+        assert!(
+            calls >= 2,
+            "failing wait should still retry with backoff, got {calls}"
+        );
+        stop_pump(&stop, &control);
+        handle.join().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop during backoff took too long: {elapsed:?}"
+        );
     }
 
     // Minimal proxy doubles for pump-thread tests (no hardware).
@@ -866,19 +1127,25 @@ mod tests {
         let rfd = rfile.as_raw_fd();
         let control = PumpControl::new().unwrap();
         assert_eq!(
-            poll_wait(Some(rfd), control.read_fd(), 0),
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
             PollWake::Timeout,
             "idle fds must time out"
         );
         write_all(wfd, &[0xAA]);
-        assert_eq!(poll_wait(Some(rfd), control.read_fd(), 0), PollWake::Hidraw);
+        assert_eq!(
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
+            PollWake::Hidraw
+        );
         control.notify();
-        assert_eq!(poll_wait(Some(rfd), control.read_fd(), 0), PollWake::Both);
+        assert_eq!(
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
+            PollWake::Both
+        );
         drain_fd(rfd);
         control.drain();
         control.notify();
         assert_eq!(
-            poll_wait(Some(rfd), control.read_fd(), 0),
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
             PollWake::Control
         );
         control.drain();

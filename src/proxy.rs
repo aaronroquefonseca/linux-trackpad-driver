@@ -10186,6 +10186,68 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
     }
 
     #[test]
+    fn stagger_deadline_waits_without_spinning() {
+        // Regression for the sub-millisecond truncation spin: a 50 ms stagger
+        // deadline must be reached with a bounded number of source reads, not
+        // hundreds of 0-timeout polls in the final millisecond. Counts every
+        // `poll_frame` while `spawn_pump` waits 90 ms around the deadline.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountIdle(Arc<AtomicUsize>, Option<TouchFrame>);
+        impl TouchSource for CountIdle {
+            fn tier(&self) -> CapabilityTier {
+                CapabilityTier::L2p
+            }
+            fn pressure_units(&self) -> PressureUnits {
+                PressureUnits::Arbitrary
+            }
+            fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(self.1.take())
+            }
+        }
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            sinks.dual(),
+            FakeHaptic::new(),
+            CountIdle(
+                Arc::clone(&count),
+                Some(frame(vec![finger(1, 200, 0, 0)], 0)),
+            ),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw-review"));
+        assert!(px.is_attached());
+        px.handle_frame_at(&cfg, std::time::Instant::now()).unwrap();
+        assert!(px.pending_buttons.is_some());
+        let proxy = Arc::new(Mutex::new(px));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, control) = crate::pump::spawn_pump(
+            "review-repro".into(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        crate::pump::stop_pump(&stop, &control);
+        handle.join().unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        let reads = count.load(Ordering::SeqCst);
+        assert!(
+            reads <= 10,
+            "50 ms deadline spun: {reads} source reads in 90 ms (buggy ceiling-truncated loop did ~680)"
+        );
+    }
+
+    #[test]
     fn pump_step_disconnect_reports_disconnect_and_self_releases() {
         // Same dead-fd path as `disconnect_self_releases_once_with_bounded_polls`,
         // but through the event-loop entry (`pump_step_at`): the step must
