@@ -56,7 +56,7 @@ def require_final(*names, label, still_msg):
     if not present:
         fail(f"{label} metadata absent (want explicit {'/'.join(names)}: false); "
              f"refusing to assume {want} is public and final)")
-    if len(present) == 2 and present[0] in release and present[1] in release:
+    if len(present) == 2:
         first, second = release[present[0]], release[present[1]]
         if first != second:
             fail(f"conflicting {label} metadata: {present[0]}={first!r} "
