@@ -74,6 +74,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         proxy: std::sync::Arc<std::sync::Mutex<DaemonProxy>>,
         cfg: Config,
         active: std::sync::Mutex<Option<String>>,
+        haptic_node: std::sync::Mutex<Option<String>>,
         _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _thread: std::thread::JoinHandle<()>,
     }
@@ -89,6 +90,18 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .attach(event);
+                return;
+            }
+            // Enumeration can expose a silent feature interface before
+            // the If1 touch source. Do not let that early sibling own the
+            // single pump; its later If1 event will wake reconciliation.
+            if event.transport == Transport::Usb
+                && !touch_interface_eligible(discovery::interface_number_for_node(&event.devnode))
+            {
+                log::debug!(
+                    "pump: {} is not the USB touch interface; waiting for If1",
+                    event.devnode
+                );
                 return;
             }
             {
@@ -230,6 +243,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
                 px.grab().set_node(&evdev.to_string_lossy());
                 let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
                 px.haptic_mut().inner().set_node(&hnode);
+                *self.haptic_node.lock().unwrap_or_else(|e| e.into_inner()) = Some(hnode.clone());
                 log::info!(
                     "pump: haptic node {hnode} (interface {hiface:?}) for {}",
                     event.devnode
@@ -311,6 +325,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         proxy,
         cfg: cfg.clone(),
         active: std::sync::Mutex::new(None),
+        haptic_node: std::sync::Mutex::new(None),
         _stop: stop,
         _thread: thread,
     });
@@ -334,12 +349,28 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
     // Siblings wait while an owner exists; a dead owner retries its own
     // node first, using the existing teardown/re-attach path.
     move |devnode| {
+        if !manager.cfg.enhanced_clicks
+            || !touch_interface_eligible(discovery::interface_number_for_node(devnode))
+        {
+            return false;
+        }
         let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
-        let live = manager
-            .proxy
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_attached();
+        let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        let live = proxy.is_attached();
+        if live && active.as_deref() == Some(devnode) {
+            // A later actuator sibling must not require a re-grab of the
+            // healthy touch session. Resolve quietly; log only a route change.
+            let (node, _) = crate::evdev::haptic_node_for_quiet(devnode);
+            let mut target = manager
+                .haptic_node
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if target.as_deref() != Some(node.as_str()) {
+                proxy.haptic_mut().inner().set_node(&node);
+                log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
+                *target = Some(node);
+            }
+        }
         session_needs_attach(
             manager.cfg.enhanced_clicks,
             active.as_deref(),
@@ -347,6 +378,11 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
             live,
         )
     }
+}
+
+// Unknown layouts (including Bluetooth) keep their existing source path.
+fn touch_interface_eligible(iface: Option<u8>) -> bool {
+    iface.is_none_or(|number| number == 1)
 }
 
 fn session_needs_attach(enhanced: bool, active: Option<&str>, devnode: &str, live: bool) -> bool {
@@ -514,6 +550,16 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     })
     .map_err(|e| anyhow::anyhow!("installing signal handler: {e}"))?;
 
+    let mut monitor = match crate::hotplug::Monitor::open() {
+        Ok(monitor) => {
+            log::info!("hotplug: kernel device monitor active (30 s verification fallback)");
+            Some(monitor)
+        }
+        Err(error) => {
+            log::warn!("hotplug: monitor unavailable: {error}; using 30 s discovery fallback");
+            None
+        }
+    };
     let ready_hub = hub();
     let needs_attach = subscribe_click_proxy(cfg, &ready_hub);
     let initial: Vec<DiscoveredDevice> = match discovery::scan_trackpads() {
@@ -540,13 +586,49 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
     // Start empty so failed hardware init remains pending on later passes.
     let mut watch = ResumeWatch::new(&[]);
     watch.tick_with_scan(cfg, &ready_hub, initial, &needs_attach);
-    let mut last_tick = std::time::Instant::now();
+    let mut schedule = crate::hotplug::Schedule::new(std::time::Instant::now());
+    if watch.has_pending(cfg, &needs_attach) {
+        schedule.wake(std::time::Instant::now());
+    }
+    let mut overflow_reported = false;
     while running.load(Ordering::SeqCst) {
-        // 100 ms poll: prompt shutdown without burning CPU in the idle loop.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if last_tick.elapsed().as_secs() >= resume::RESUME_REVERIFY_INTERVAL_SECS {
-            last_tick = std::time::Instant::now();
-            watch.tick(cfg, &ready_hub, &needs_attach);
+        std::thread::sleep(crate::hotplug::LOOP_INTERVAL);
+        let now = std::time::Instant::now();
+        if let Some(source) = &monitor {
+            match source.drain() {
+                Ok(true) => schedule.wake(now),
+                Ok(false) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
+                    if !overflow_reported {
+                        log::warn!("hotplug: kernel event overflow; rescanning, monitor and 30 s fallback retained");
+                        overflow_reported = true;
+                    }
+                    schedule.wake(now);
+                }
+                Err(error) => {
+                    // A lost/overflowed stream is only a wake hint. The
+                    // authoritative scan and periodic fallback remain safe.
+                    log::warn!("hotplug: monitor failed: {error}; rescan now, then 30 s fallback");
+                    schedule.wake(now);
+                    monitor = None;
+                }
+            }
+        }
+        if let Some(work) = schedule.take_due(now, running.load(Ordering::SeqCst)) {
+            match work {
+                crate::hotplug::Work::Hotplug => {
+                    watch.scan(cfg, &ready_hub, &needs_attach, false);
+                }
+                crate::hotplug::Work::Verify => {
+                    watch.tick(cfg, &ready_hub, &needs_attach);
+                }
+            }
+            if schedule.completed(
+                std::time::Instant::now(),
+                watch.has_pending(cfg, &needs_attach),
+            ) {
+                log::warn!("hotplug: fast readiness retries exhausted; pending setup/session will retry on the 30 s pass");
+            }
         }
     }
     log::info!("shutdown complete");
@@ -886,6 +968,22 @@ impl ResumeWatch {
         ready_hub: &DeviceReadyHub,
         needs_attach: &dyn Fn(&str) -> bool,
     ) -> Vec<TickAction> {
+        self.scan(cfg, ready_hub, needs_attach, true)
+    }
+
+    fn has_pending(&self, cfg: &Config, needs_attach: &dyn Fn(&str) -> bool) -> bool {
+        self.known.iter().any(|state| {
+            !state.initialized || (cfg.enhanced_clicks && needs_attach(&state.dev.devnode))
+        })
+    }
+
+    fn scan(
+        &mut self,
+        cfg: &Config,
+        ready_hub: &DeviceReadyHub,
+        needs_attach: &dyn Fn(&str) -> bool,
+        verify_hardware: bool,
+    ) -> Vec<TickAction> {
         let current = match discovery::scan_trackpads() {
             Ok(devs) => devs,
             Err(e) => {
@@ -893,7 +991,17 @@ impl ResumeWatch {
                 return Vec::new();
             }
         };
-        self.tick_with_scan(cfg, ready_hub, current, needs_attach)
+        self.reconcile_with_hardware(
+            cfg,
+            ready_hub,
+            current,
+            needs_attach,
+            &LiveWatchHardware {
+                cfg,
+                hub: ready_hub,
+            },
+            verify_hardware,
+        )
     }
 
     /// One pass over an injected scan (production passes the live scan
@@ -924,6 +1032,18 @@ impl ResumeWatch {
         current: Vec<DiscoveredDevice>,
         needs_attach: &dyn Fn(&str) -> bool,
         hardware: &dyn WatchHardware,
+    ) -> Vec<TickAction> {
+        self.reconcile_with_hardware(cfg, ready_hub, current, needs_attach, hardware, true)
+    }
+
+    fn reconcile_with_hardware(
+        &mut self,
+        cfg: &Config,
+        ready_hub: &DeviceReadyHub,
+        current: Vec<DiscoveredDevice>,
+        needs_attach: &dyn Fn(&str) -> bool,
+        hardware: &dyn WatchHardware,
+        verify_hardware: bool,
     ) -> Vec<TickAction> {
         let mut actions = Vec::new();
         // Nodes recorded Detached mid-pass (present in the scan but gone by
@@ -980,9 +1100,12 @@ impl ResumeWatch {
                 }
                 continue;
             }
-            if dev.transport != Transport::Usb {
-                // BT needs no hardware re-init. The live proxy owns its
-                // grab; a background scan must not alter driver bindings.
+            if dev.transport != Transport::Usb
+                || (!verify_hardware && (!cfg.enhanced_clicks || !needs_attach(&dev.devnode)))
+            {
+                // Healthy known hardware readback stays on the 30 s pass.
+                // A dead USB session still verifies before reacquiring a
+                // grab: polling drift may require a full rearm first.
                 continue;
             }
             let verify = hardware.verify(&dev.devnode);
@@ -1050,7 +1173,7 @@ impl ResumeWatch {
         }
         // Reconcile sessions separately: hardware success does not imply
         // an attached proxy session. At most one Ready per node
-        // per 30 s pass, including init/re-init emits. Healthy owners and
+        // per scheduled pass, including init/re-init emits. Healthy owners and
         // siblings produce no additional hub traffic; gate-off never retries.
         next.retain(|s| !detached.contains(&s.dev.devnode));
         for state in &next {
@@ -1129,6 +1252,14 @@ mod tests {
     }
     impl TestSession {
         fn subscribe(hub: &DeviceReadyHub, fail: bool) -> Arc<Mutex<Self>> {
+            Self::subscribe_filtered(hub, fail, |_| true)
+        }
+
+        fn subscribe_filtered(
+            hub: &DeviceReadyHub,
+            fail: bool,
+            eligible: impl Fn(&DeviceReadyEvent) -> bool + Send + Sync + 'static,
+        ) -> Arc<Mutex<Self>> {
             let session = Arc::new(Mutex::new(Self {
                 proxy: TestProxy::new(
                     ProxySettings { enhanced: true },
@@ -1158,6 +1289,9 @@ mod tests {
                         s.proxy.set_pump_ready(false);
                         s.active = None;
                     }
+                    return;
+                }
+                if !eligible(event) {
                     return;
                 }
                 if !session_needs_attach(
@@ -1247,6 +1381,238 @@ mod tests {
             enhanced_clicks: true,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn hotplug_after_periodic_scan_observes_short_connection_and_coalesces_duplicates() {
+        use crate::hotplug::{Schedule, Work};
+        use std::time::{Duration, Instant};
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, false);
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        let dev = fixture_devs().remove(0);
+        let mut passes = 0;
+        let mut first_attach = None;
+        let mut removal_seen = false;
+        // Empty periodic scan just ran at 30 s; a connection at 30.1 s
+        // must not wait for the next periodic pass at 60 s.
+        for ms in (30_000..=32_000).step_by(100) {
+            let now = start + Duration::from_millis(ms);
+            if ms == 30_100 || ms == 30_800 || ms == 31_300 {
+                for _ in 0..20 {
+                    schedule.wake(now);
+                } // interface burst
+            }
+            if let Some(work) = schedule.take_due(now, true) {
+                passes += 1;
+                let present = (30_100..30_800).contains(&ms) || ms >= 31_300;
+                let scan = if present { vec![dev.clone()] } else { vec![] };
+                let actions = watch.reconcile_with_hardware(
+                    &cfg,
+                    &hub,
+                    scan,
+                    &health,
+                    &hardware,
+                    work == Work::Verify,
+                );
+                if first_attach.is_none() && session.lock().unwrap().proxy.is_attached() {
+                    first_attach = Some(ms);
+                }
+                removal_seen |= actions.contains(&TickAction::Detached(dev.devnode.clone()));
+                schedule.completed(now, watch.has_pending(&cfg, &health));
+            }
+        }
+        assert!(first_attach.unwrap() - 30_100 <= 1_000);
+        assert!(
+            removal_seen,
+            "subsecond connection must be adopted and removed"
+        );
+        assert!(passes < 10, "duplicate notifications coalesce");
+        let s = session.lock().unwrap();
+        assert!(s.proxy.is_attached());
+        assert_eq!(s.attempts, 2, "one grab per connection");
+        assert_eq!(
+            s.events,
+            vec![ReadyKind::Ready, ReadyKind::Detached, ReadyKind::Ready]
+        );
+        assert_eq!(hardware.inits.get(), 2);
+        assert_eq!(
+            hardware.verifies.get(),
+            0,
+            "healthy duplicates need no readback"
+        );
+    }
+
+    #[test]
+    fn hotplug_retries_late_touch_init_and_evdev_without_adopting_early_silent_interface() {
+        use crate::hotplug::{Schedule, Work};
+        use std::time::{Duration, Instant};
+        let hub = hub();
+        let session = TestSession::subscribe_filtered(&hub, true, |ev| {
+            touch_interface_eligible(Some(if ev.devnode.ends_with('0') { 0 } else { 1 }))
+        });
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let start = Instant::now();
+        let mut schedule = Schedule::new(start);
+        let touch = fixture_devs().remove(0);
+        let early = DiscoveredDevice {
+            devnode: "/dev/hidraw0".into(),
+            ..touch.clone()
+        };
+        let health = |node: &str| {
+            touch_interface_eligible(Some(if node.ends_with('0') { 0 } else { 1 }))
+                && session.lock().unwrap().needs_attach(node)
+        };
+        let mut attached_at = None;
+        for ms in (0..=3_000).step_by(100) {
+            let now = start + Duration::from_millis(ms);
+            if ms == 0 || ms == 400 {
+                schedule.wake(now);
+            }
+            hardware.init_fails.set((400..600).contains(&ms));
+            session
+                .lock()
+                .unwrap()
+                .proxy
+                .grab()
+                .fail
+                .store(ms < 1_000, Ordering::SeqCst);
+            if let Some(work) = schedule.take_due(now, true) {
+                let scan = if ms < 400 {
+                    vec![early.clone()]
+                } else {
+                    vec![touch.clone(), early.clone()]
+                };
+                watch.reconcile_with_hardware(
+                    &cfg,
+                    &hub,
+                    scan,
+                    &health,
+                    &hardware,
+                    work == Work::Verify,
+                );
+                if session.lock().unwrap().proxy.is_attached() && attached_at.is_none() {
+                    attached_at = Some(ms);
+                }
+                schedule.completed(now, watch.has_pending(&cfg, &health));
+            }
+            if ms < 400 {
+                assert_eq!(session.lock().unwrap().attempts, 0);
+            }
+        }
+        assert!(
+            attached_at.unwrap() - 1_000 <= 1_000,
+            "retry within 1 s once evdev is ready"
+        );
+        let s = session.lock().unwrap();
+        assert_eq!(s.active.as_deref(), Some(touch.devnode.as_str()));
+        assert_eq!(s.attempts, 2, "failed grab then successful attach");
+        assert_eq!(
+            hardware.inits.get(),
+            3,
+            "early node once, touch init fails then succeeds"
+        );
+        assert_eq!(hardware.reinits.get(), 0);
+        assert_eq!(
+            hardware.verifies.get(),
+            1,
+            "only the unhealthy touch session is verified"
+        );
+    }
+
+    #[test]
+    fn hotplug_dead_usb_verifies_before_attach_and_pending_rearm_cannot_be_bypassed() {
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, false);
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let dev = fixture_devs().remove(0);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        session.lock().unwrap().proxy.set_pump_ready(false);
+        hardware.verify.set(Some(false));
+        hardware.resume_fails.set(true);
+        hardware.init_fails.set(true);
+        watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        assert!(!watch.known[0].initialized);
+        assert!(!session.lock().unwrap().proxy.grab().is_grabbed());
+        hardware.verify.set(Some(true));
+        watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        assert_eq!(session.lock().unwrap().attempts, 1);
+        hardware.init_fails.set(false);
+        watch.reconcile_with_hardware(&cfg, &hub, vec![dev], &health, &hardware, false);
+        assert!(session.lock().unwrap().proxy.is_attached());
+        assert_eq!(session.lock().unwrap().attempts, 2);
+        assert_eq!(hardware.verifies.get(), 1);
+        assert_eq!(hardware.reinits.get(), 1);
+    }
+
+    #[test]
+    fn hotplug_same_name_replacement_retires_owner_before_fresh_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hidraw");
+        std::fs::write(&path, []).unwrap();
+        let mut dev = fixture_devs().remove(0);
+        dev.devnode = path.to_string_lossy().into_owned();
+        let hub = hub();
+        let session = TestSession::subscribe(&hub, false);
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(&[]);
+        let health = |node: &str| session.lock().unwrap().needs_attach(node);
+        watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        // Preserve the old inode so the fixture cannot reuse its identity.
+        std::fs::rename(&path, dir.path().join("retired")).unwrap();
+        std::fs::write(&path, []).unwrap();
+        let actions =
+            watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Detached(dev.devnode.clone()),
+                TickAction::Initialized(dev.devnode)
+            ]
+        );
+        let s = session.lock().unwrap();
+        assert!(s.proxy.is_attached());
+        assert_eq!(s.attempts, 2);
+        assert_eq!(
+            s.events,
+            vec![ReadyKind::Ready, ReadyKind::Detached, ReadyKind::Ready]
+        );
+        assert_eq!(hardware.inits.get(), 2);
+        assert_eq!(hardware.verifies.get(), 0);
+    }
+
+    #[test]
+    fn hotplug_gate_off_skips_session_work_and_known_hardware_reads() {
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let devs = fixture_devs();
+        let mut watch = ResumeWatch::new(&devs);
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs,
+            &|_| panic!("gate off"),
+            &hardware,
+            false,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(hardware.inits.get(), 0);
+        assert_eq!(hardware.verifies.get(), 0);
     }
 
     #[test]

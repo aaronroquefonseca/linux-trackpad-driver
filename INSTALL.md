@@ -120,19 +120,29 @@ systemctl status linux-trackpad-driver-resume.service
   USB node every 30 s (`GET_FEATURE` read-back of the polling report) and
   re-inits on mismatch; newly appeared nodes get full init, vanished nodes
   emit `Detached`.
-- Re-attach path: the `ltd resume` one-shot re-arms hardware only (its hub
-  would reach zero listeners, so it emits nothing). Clicks re-attaches on
-  the daemon hub: each 30 s pass also checks enhanced-session health.
-  Failed attachments and sessions released after source or output loss retry even
-  when USB polling still matches or a Bluetooth node keeps its name.
-  These attachment-only retries send no hardware init reports. Failed
-  hardware init or required USB re-init remains pending and blocks
-  attachment until full setup succeeds, even if polling later matches.
-  A replaced devnode instance is detached before fresh init, including
-  when its name is reused between scans.
-  Healthy sessions and siblings receive no attachment retries; gate-off
-  keeps native passthrough. Recovery starts on a later pass, with init and
-  attachment work adding to the scan interval.
+- Hotplug: the resident subscribes to kernel HID/hidraw/input events before
+  its boot scan. Supported trackpad events coalesce for 100 ms; the daemon
+  checks the queue every 100 ms, so ready nodes normally start reconciliation
+  within 200 ms, plus bounded hardware init/attachment time. The reconnect
+  helper still prepares hardware only; its success does not mean the
+  resident has attached. No notification connection to the lock socket is
+  required.
+- Late readiness: event bursts settle for one second. Pending init/grab/source
+  setup retries after 250 ms, then 500 ms, then at most 800 ms between
+  attempts, for up to ten seconds after an event. A late touch or input node
+  wakes discovery again. Known USB feature interfaces cannot take ownership
+  ahead of If1; unknown layouts keep their existing fallback. A late actuator
+  sibling updates the haptic target without re-grabbing a healthy touch
+  session. Healthy sessions/siblings produce no extra attachment events or
+  periodic hardware readbacks on these fast passes.
+- Recovery/fallback: failed full USB setup blocks attachment until the full
+  sequence succeeds, even if polling later matches. Dead USB sessions verify
+  before reattaching; Bluetooth keeps native bindings intact. Gate-off never
+  requests a proxy grab. Instance replacement tears down old ownership before
+  initialization, including a name reused between scans. Monitor startup or
+  receive failure and exhausted readiness retries are logged; the 30-second
+  full scan/readback remains the fallback for missed events and later
+  recovery. Idle/full verification cadence is unchanged.
 
 No udev `change` rule is needed: resume re-enumeration already emits `add`,
 which the rules above hand to the reconnect template; the hook + daemon

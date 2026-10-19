@@ -142,11 +142,22 @@ pub fn resolve_haptic_node(
     hidraw_root: &str,
     dev_prefix: &str,
 ) -> (String, Option<u8>) {
+    resolve_haptic_node_inner(hidraw, hidraw_root, dev_prefix, true)
+}
+
+fn resolve_haptic_node_inner(
+    hidraw: &str,
+    hidraw_root: &str,
+    dev_prefix: &str,
+    diagnose: bool,
+) -> (String, Option<u8>) {
     let own = hidraw.to_string();
     let Some(usb_dev) = usb_device_dir(hidraw, hidraw_root) else {
-        log::warn!(
-            "haptic: no USB interface layout for {hidraw}; using touch node (If2 routing pending HW verify)"
-        );
+        if diagnose {
+            log::warn!(
+                "haptic: no USB interface layout for {hidraw}; using touch node (If2 routing pending HW verify)"
+            );
+        }
         return (own, None);
     };
     let entries = match std::fs::read_dir(hidraw_root) {
@@ -175,13 +186,17 @@ pub fn resolve_haptic_node(
     match if2.into_iter().next() {
         Some(base) => {
             let node = format!("{dev_prefix}/{base}");
-            log::info!("haptic: {hidraw} actuator → {node} (interface 2)");
+            if diagnose {
+                log::info!("haptic: {hidraw} actuator → {node} (interface 2)");
+            }
             (node, Some(2))
         }
         None => {
-            log::warn!(
-                "haptic: no interface-2 sibling for {hidraw}; using touch node (If2 routing pending HW verify)"
-            );
+            if diagnose {
+                log::warn!(
+                    "haptic: no interface-2 sibling for {hidraw}; using touch node (If2 routing pending HW verify)"
+                );
+            }
             let own_iface = hid_device_dir(hidraw, hidraw_root).and_then(iface_number_from_tree);
             (own, own_iface)
         }
@@ -191,6 +206,11 @@ pub fn resolve_haptic_node(
 /// Production haptic-node entry (`/sys/class/hidraw`, `/dev`).
 pub fn haptic_node_for(hidraw: &str) -> (String, Option<u8>) {
     resolve_haptic_node(hidraw, "/sys/class/hidraw", "/dev")
+}
+
+/// Reconcile late sibling routing without logging unchanged healthy state.
+pub fn haptic_node_for_quiet(hidraw: &str) -> (String, Option<u8>) {
+    resolve_haptic_node_inner(hidraw, "/sys/class/hidraw", "/dev", false)
 }
 
 fn sysfs_walk(
@@ -470,6 +490,33 @@ mod tests {
             resolve_haptic_node("/dev/hidraw9", &hroot, "/dev"),
             ("/dev/hidraw10".to_string(), Some(2))
         );
+    }
+
+    #[test]
+    fn quiet_haptic_resolution_observes_late_actuator_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let hroot = dir.path().join("hidraw");
+        let usb = dir.path().join("devices/usb");
+        for (base, iface) in [("hidraw8", 1), ("hidraw9", 2)] {
+            std::fs::create_dir_all(hroot.join(base)).unwrap();
+            std::fs::create_dir_all(usb.join(format!("if{iface}/hid"))).unwrap();
+            std::fs::write(
+                usb.join(format!("if{iface}/bInterfaceNumber")),
+                format!("{iface:02x}"),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(usb.join("if1/hid"), hroot.join("hidraw8/device")).unwrap();
+        let resolve =
+            || resolve_haptic_node_inner("/dev/hidraw8", hroot.to_str().unwrap(), "/dev", false);
+        assert_eq!(resolve(), ("/dev/hidraw8".into(), Some(1)));
+        std::os::unix::fs::symlink(usb.join("if2/hid"), hroot.join("hidraw9/device")).unwrap();
+        assert_eq!(resolve(), ("/dev/hidraw9".into(), Some(2)));
+        // Repeated health checks retain the target; disappearance restores
+        // the existing fallback without tearing down the touch session.
+        assert_eq!(resolve(), ("/dev/hidraw9".into(), Some(2)));
+        std::fs::remove_file(hroot.join("hidraw9/device")).unwrap();
+        assert_eq!(resolve(), ("/dev/hidraw8".into(), Some(1)));
     }
 
     #[test]
