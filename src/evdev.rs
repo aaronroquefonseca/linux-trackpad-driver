@@ -46,12 +46,15 @@ pub fn grab_allowed(source: &EvdevSource) -> bool {
 }
 
 /// Production entry: env → sysfs walk → name scan.
+/// The hidraw sysfs root respects `$LTD_HIDRAW_SYSFS` (hermetic tests inherit
+/// it); input/dev roots stay production-fixed (daemon input path, not the
+/// CLI activation tests).
 pub fn resolve_evdev_node(hidraw: &str) -> Option<(PathBuf, EvdevSource)> {
     let env = std::env::var(EVDEV_ENV).ok().filter(|v| !v.is_empty());
     resolve_with_roots(
         hidraw,
         env.as_deref(),
-        "/sys/class/hidraw",
+        &crate::discovery::sysfs_class_dir(),
         "/sys/class/input",
         "/dev/input",
     )
@@ -203,14 +206,14 @@ fn resolve_haptic_node_inner(
     }
 }
 
-/// Production haptic-node entry (`/sys/class/hidraw`, `/dev`).
+/// Production haptic-node entry (`$LTD_HIDRAW_SYSFS` or `/sys/class/hidraw`, `/dev`).
 pub fn haptic_node_for(hidraw: &str) -> (String, Option<u8>) {
-    resolve_haptic_node(hidraw, "/sys/class/hidraw", "/dev")
+    resolve_haptic_node(hidraw, &crate::discovery::sysfs_class_dir(), "/dev")
 }
 
 /// Reconcile late sibling routing without logging unchanged healthy state.
 pub fn haptic_node_for_quiet(hidraw: &str) -> (String, Option<u8>) {
-    resolve_haptic_node_inner(hidraw, "/sys/class/hidraw", "/dev", false)
+    resolve_haptic_node_inner(hidraw, &crate::discovery::sysfs_class_dir(), "/dev", false)
 }
 
 fn sysfs_walk(

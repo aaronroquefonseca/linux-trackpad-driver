@@ -5,11 +5,20 @@
 //! shared [`DeviceReadyHub`], then idles until signal (SIGINT/SIGTERM/SIGHUP).
 //! No devices = log + idle (graceful, exit 0 on signal), never panic.
 //!
-//! `reconnect <dev>`: idempotent per-node re-init for udev `add`. Daemon
-//! socket absent without `-f` → disengage path (host-click off, no init).
-//! `-p` overrides the polling request (same ~110 Hz cap). Always re-sends
-//! multitouch enable first: the resume regression (report 0x02 21→8 bytes
-//! across power transition) is only fixed by re-init.
+//! `reconnect <dev>`: idempotent per-node re-init for udev `add`.
+//! Activation contract (finding #14): the main service is the only automatic
+//! activator. Daemon socket absent without `-f`/`-d` → inactive: leave the
+//! hardware alone and exit 0 (no init, no disengage write). `-f` forces init
+//! anyway (explicit manual bring-up); `-d` always disengages (explicit manual
+//! disengage). `-p` overrides the polling request (same ~110 Hz cap). Init
+//! always re-sends multitouch enable first: the resume regression (report
+//! 0x02 21→8 bytes across power transition) is only fixed by re-init.
+//!
+//! `resume`: post-sleep re-init over every discovered node. Same contract:
+//! daemon socket absent without `-f` → inactive no-op (exit 0, hardware left
+//! alone). Plain `resume` is the automatic background form used by the
+//! system-sleep hook and the resume unit; `-f` is explicit manual forcing
+//! while the daemon is stopped.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,8 +33,8 @@ use crate::init::{
 };
 use crate::lock::{self, SocketLock};
 use crate::proxy::{
-    AsyncHaptic, ClickProxy, DualSink, GrabDevice, HapticSender, RealGrab, RealHaptic, RealUinput,
-    UinputSink,
+    AsyncHaptic, ClickProxy, DualSink, GrabDevice, HapticSender, ProxySettings, RealGrab,
+    RealHaptic, RealUinput, UinputSink,
 };
 use crate::pump::PumpSource;
 use crate::resume::{self, ResumeReport};
@@ -54,6 +63,7 @@ where
     haptic_node: std::sync::Mutex<Option<String>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     idle: fn() -> S,
+    control: Option<std::sync::Arc<crate::pump::PumpControl>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -77,6 +87,7 @@ where
             haptic_node: std::sync::Mutex::new(None),
             stop,
             idle,
+            control: None,
             thread: None,
         }
     }
@@ -84,6 +95,23 @@ where
     pub(crate) fn with_thread(mut self, handle: std::thread::JoinHandle<()>) -> Self {
         self.thread = Some(handle);
         self
+    }
+
+    pub(crate) fn with_control(
+        mut self,
+        control: std::sync::Arc<crate::pump::PumpControl>,
+    ) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Wake the event-driven pump (#86) so it re-reads its hidraw fd and
+    /// deadline set instead of blocking past this attach/detach. No-op
+    /// without a pump (unit tests).
+    fn notify_pump(&self) {
+        if let Some(control) = &self.control {
+            control.notify();
+        }
     }
 
     /// Borrow the managed proxy (tests drive frames / assert wire through this).
@@ -113,6 +141,7 @@ where
         } else {
             Self::teardown_locked(&mut px, self.idle, "attach rollback: grab refused");
         }
+        self.notify_pump();
     }
 
     /// Idempotent manager teardown: single proxy teardown (contacts +
@@ -160,6 +189,7 @@ where
             px.uinput().destroy();
             log::info!("pump: {} torn down", event.devnode);
         }
+        self.notify_pump();
     }
 }
 
@@ -178,6 +208,7 @@ where
     /// process teardown (existing lifecycle, see finding #12).
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify_pump();
         let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
         Self::teardown_locked(&mut px, self.idle, "shutdown");
     }
@@ -194,6 +225,7 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .attach(event);
+            self.notify_pump();
             return;
         }
         // Enumeration can expose a silent feature interface before
@@ -273,6 +305,7 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .attach(event);
+            self.notify_pump();
             return;
         }
         {
@@ -295,6 +328,7 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                 .unwrap_or_else(|e| e.into_inner())
                 .uinput()
                 .destroy();
+            self.notify_pump();
             return;
         };
         if !crate::evdev::grab_allowed(&src) {
@@ -314,6 +348,7 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                 .unwrap_or_else(|e| e.into_inner())
                 .uinput()
                 .destroy();
+            self.notify_pump();
             return;
         }
         // 3. Open the hidraw source nonblocking.
@@ -329,6 +364,7 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                     .unwrap_or_else(|e| e.into_inner())
                     .uinput()
                     .destroy();
+                self.notify_pump();
                 return;
             }
         };
@@ -341,21 +377,29 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
         // 4. Wire nodes, flip ready, then grab (attach checks both gates).
         // Haptics go to the interface-2 sibling when the USB layout
         // exposes one (actuator interface); otherwise the touch node
-        // itself, loudly logged as pending HW verify. The tail (swap in
-        // the live source, grab, adopt-or-rollback) is the shared
+        // itself, loudly logged as pending HW verify.
+        // Prepare (open) the haptic endpoint BEFORE the proxy lock in
+        // `finish_attach`: the open can block on kernel activity and the
+        // pump needs that mutex for every frame. The commit below only
+        // swaps Arcs and hands disposal to a background thread. The tail
+        // (swap in the live source, grab, adopt-or-rollback) is the shared
         // `finish_attach` dispatch covered by manager unit tests.
+        let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
+        let haptic_target = crate::proxy::HapticTarget::prepare(
+            &hnode,
+            event.transport == crate::init::Transport::Bluetooth,
+        );
         self.finish_attach(event, PumpSource::Live(source), |px| {
             px.grab().set_node(&evdev.to_string_lossy());
-            let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
-            px.haptic_mut().inner().set_node(&hnode);
+            // New session: retire any queued pulses from the previous
+            // node and pin the prepared actuator target before the pump
+            // enqueues.
+            px.haptic_mut().retarget_prepared(haptic_target);
             *self.haptic_node.lock().unwrap_or_else(|e| e.into_inner()) = Some(hnode.clone());
             log::info!(
                 "pump: haptic node {hnode} (interface {hiface:?}) for {}",
                 event.devnode
             );
-            px.haptic_mut()
-                .inner()
-                .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
         });
     }
 }
@@ -392,8 +436,6 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
 /// - same node + dead proxy → teardown + full re-attach;
 /// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl Fn(&str) -> bool {
-    use crate::proxy::ProxySettings;
-
     type DaemonProxy =
         ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
 
@@ -409,14 +451,16 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         PumpSource::Idle,
     )));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let thread = crate::pump::spawn_pump(
+    let (thread, control) = crate::pump::spawn_pump(
         "daemon".to_string(),
         std::sync::Arc::clone(&proxy),
         cfg.clone(),
         std::sync::Arc::clone(&stop),
     );
     let manager = std::sync::Arc::new(
-        PumpManager::new(proxy, cfg.clone(), stop, || PumpSource::Idle).with_thread(thread),
+        PumpManager::new(proxy, cfg.clone(), stop, || PumpSource::Idle)
+            .with_thread(thread)
+            .with_control(control),
     );
     // NOTE: the pump thread handle is never joined — the pump lives until
     // process exit by design. `JoinHandle` is held (not detached) so a
@@ -443,23 +487,53 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         {
             return false;
         }
-        let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
-        let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
-        let live = proxy.is_attached();
-        if live && active.as_deref() == Some(devnode) {
+        // Snapshot live/owner/routing/generation under brief locks; no I/O.
+        // Route resolution and endpoint open happen below outside the proxy
+        // mutex so a blocked open never stalls the pump's frames.
+        let (live, owned, cur_bt, baseline_gen) = {
+            let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+            let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+            let live = proxy.is_attached();
+            let owned = active.as_deref() == Some(devnode);
+            let (_, bt) = proxy.haptic_mut().current_routing();
+            let gen = proxy.haptic_mut().generation();
+            (live, owned, bt, gen)
+        };
+        if live && owned {
             // A later actuator sibling must not require a re-grab of the
             // healthy touch session. Resolve quietly; log only a route change.
+            // Resolution may touch sysfs; keep it outside all live locks.
             let (node, _) = crate::evdev::haptic_node_for_quiet(devnode);
-            let mut target = manager
-                .haptic_node
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if target.as_deref() != Some(node.as_str()) {
-                proxy.haptic_mut().inner().set_node(&node);
-                log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
-                *target = Some(node);
+            let needs = {
+                let tracked = manager
+                    .haptic_node
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tracked.as_deref() != Some(node.as_str())
+            };
+            if needs {
+                // Open outside the proxy mutex; commit generation-fenced
+                // below. A blocked open leaves the pump responsive.
+                let prepared = crate::proxy::HapticTarget::prepare(&node, cur_bt);
+                let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+                let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                let still_owned = proxy.is_attached() && active.as_deref() == Some(devnode);
+                if still_owned
+                    && proxy
+                        .haptic_mut()
+                        .update_route_prepared(prepared, baseline_gen)
+                {
+                    *manager
+                        .haptic_node
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(node.clone());
+                    log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
+                }
             }
         }
+        let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
+        let proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        let live = proxy.is_attached();
         session_needs_attach(
             manager.cfg.enhanced_clicks,
             active.as_deref(),
@@ -737,16 +811,22 @@ pub fn classify_node(devnode: &str, devs: &[DiscoveredDevice]) -> Result<Transpo
 
 /// `reconnect` mode decision: pure, unit-tested.
 ///
-/// Semantics (udev entry):
-/// - `-d`/`--disengage` always wins → host-click off, no init.
-/// - Daemon socket absent without `-f` → disengage mode (safe default: never
-///   init behind a dead daemon; udev rule relies on this).
-/// - Daemon socket absent with `-f` → init anyway (forced bring-up).
+/// Activation contract (single, for daemon/hotplug/sleep paths):
+/// - `-d`/`--disengage` always wins → host-click off, no init (explicit
+///   manual disengage, touches hardware as requested).
+/// - Daemon socket absent without `-f` → inactive: leave the hardware alone
+///   (no init, no disengage write). This is the automatic background form
+///   the udev reconnect template relies on: installing (never started) or
+///   stopping the main service (socket absent) is a comprehensible off
+///   switch (`disable` alone does not stop a running service).
+/// - Daemon socket absent with `-f` → init anyway (explicit manual forcing).
 /// - Daemon live (with or without `-f`) → init, unless `-d` was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectMode {
     Init,
     Disengage,
+    /// Automatic background call with no live daemon: touch nothing, exit 0.
+    Inactive,
 }
 
 pub fn resolve_reconnect_mode(daemon_live: bool, force: bool, disengage: bool) -> ReconnectMode {
@@ -754,26 +834,37 @@ pub fn resolve_reconnect_mode(daemon_live: bool, force: bool, disengage: bool) -
         return ReconnectMode::Disengage;
     }
     if !daemon_live && !force {
-        return ReconnectMode::Disengage;
+        return ReconnectMode::Inactive;
     }
     ReconnectMode::Init
 }
 
-/// Validate a polling request for the USB arm: range, device floor
-/// (`MIN_EXPRESSIBLE_HZ`), cap warning. Kept out of the disengage/BT arms
-/// on purpose — both discard the rate, so rejecting there would break
-/// valid hotplug events. Pure so the USB-only gating is unit-tested
-/// without hardware.
+/// `resume` mode decision: pure, unit-tested. Same contract as reconnect:
+/// the system-sleep hook and the resume unit run plain `resume` (automatic
+/// background → inactive no-op unless the daemon is live); `-f`/`--force`
+/// is explicit manual forcing while the daemon is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    Proceed,
+    /// No live daemon and no `--force`: touch nothing, exit 0.
+    Inactive,
+}
+
+pub fn resolve_resume_mode(daemon_live: bool, force: bool) -> ResumeMode {
+    if !daemon_live && !force {
+        return ResumeMode::Inactive;
+    }
+    ResumeMode::Proceed
+}
+
+/// Validate a polling request for the USB arm: range plus the shared device
+/// floor ([`crate::init::check_usb_polling_usable`], the same gate doctor
+/// applies to configs), with a cap warning on top. Kept out of the
+/// disengage/BT arms on purpose — both discard the rate, so rejecting there
+/// would break valid hotplug events. Pure so the USB-only gating is
+/// unit-tested without hardware.
 pub fn validate_polling_rate(polling_hz: u32) -> Result<()> {
-    if polling_hz == 0 || polling_hz > u16::MAX as u32 {
-        anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
-    }
-    if polling_hz < crate::init::MIN_EXPRESSIBLE_HZ {
-        anyhow::bail!(
-            "polling rate {polling_hz} Hz below device floor (~{} Hz)",
-            crate::init::MIN_EXPRESSIBLE_HZ
-        );
-    }
+    crate::init::check_usb_polling_usable(polling_hz)?;
     if polling_hz > EFFECTIVE_CAP_HZ as u32 {
         log::warn!("requested {polling_hz} Hz above device cap; clamped to ~110 Hz (X=0x23)");
     }
@@ -801,12 +892,18 @@ pub fn run_reconnect(
     let sock = lock::socket_path();
     let daemon_live = lock::daemon_socket_present(&sock);
     let mode = resolve_reconnect_mode(daemon_live, force, disengage);
-    if disengage && daemon_live {
-        log::info!("disengage requested while daemon live; applying host-click off");
-    } else if !daemon_live && !force {
+    if mode == ReconnectMode::Inactive {
+        // Automatic background call (udev one-shot) with no live daemon:
+        // installed-but-stopped (socket absent) is off. Touch nothing,
+        // exit 0 — before any node wait/scan so the no-op is fast and
+        // cannot fail on hardware.
         log::info!(
-            "daemon socket absent ({sock}); proceeding in disengage mode (use -f to init anyway)"
+            "daemon socket absent ({sock}); inactive: leaving hardware alone (use -f to init, -d to disengage)"
         );
+        return Ok(());
+    }
+    if disengage {
+        log::info!("disengage requested; applying host-click off");
     } else if !daemon_live {
         log::info!("daemon socket absent but -f given; proceeding with init");
     }
@@ -830,6 +927,11 @@ fn reconnect_classified_node(
     polling_override: Option<u32>,
     cfg: &Config,
 ) -> Result<()> {
+    if mode == ReconnectMode::Inactive {
+        // Defensive: `run_reconnect` returns before classify in this mode.
+        log::info!("{devnode}: inactive (no live daemon); leaving hardware alone");
+        return Ok(());
+    }
     if mode == ReconnectMode::Disengage {
         match transport {
             Transport::Bluetooth => {
@@ -892,19 +994,36 @@ fn reconnect_classified_node(
 
 /// `resume` entry (system-sleep hook + resume unit + manual re-init).
 /// System-side only: re-verifies every discovered node and re-runs the USB
-/// sequence from multitouch enable on mismatch. Unlike `reconnect`, this
-/// always inits — it is the post-sleep authority and must work whether or
-/// not the daemon socket is present (the daemon may not have survived
-/// suspend). Per-node failures are collected in the report, never fatal to
-/// siblings; only a failed scan is an `Err`.
-pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeReport> {
+/// sequence from multitouch enable on mismatch. Unlike `reconnect`, the
+/// plain form has no per-node target: it covers every discovered node.
+///
+/// Activation contract: plain `resume` is automatic background (hook/unit)
+/// → inactive no-op without a live daemon (hardware left alone, exit 0).
+/// `-f`/`--force` is explicit manual forcing while the daemon is stopped.
+/// Per-node failures are collected in the report, never fatal to
+/// siblings; only a failed scan is an `Err`. Polling validation runs before
+/// the gate so bad rates always error, even when inactive.
+pub fn run_resume(
+    cfg: &Config,
+    polling_override: Option<u32>,
+    force: bool,
+) -> Result<ResumeReport> {
     let polling_hz = polling_override.unwrap_or(cfg.device.polling_rate);
     validate_polling_rate(polling_hz)?;
     let sock = lock::socket_path();
-    if lock::daemon_socket_present(&sock) {
+    let daemon_live = lock::daemon_socket_present(&sock);
+    if resolve_resume_mode(daemon_live, force) == ResumeMode::Inactive {
+        log::info!(
+            "resume: daemon socket absent ({sock}); inactive: leaving hardware alone (use -f to force re-init)"
+        );
+        return Ok(ResumeReport::default());
+    }
+    if daemon_live {
         log::debug!("resume: daemon socket present ({sock}); re-init covers live daemon too");
     } else {
-        log::info!("resume: daemon socket absent ({sock}); re-initing hardware directly");
+        log::info!(
+            "resume: daemon socket absent ({sock}) but -f given; re-initing hardware directly"
+        );
     }
     // Journal trace proving the hook/one-shot ran (hook failures are
     // swallowed to exit 0, so this line is the post-sleep evidence).
@@ -1682,6 +1801,93 @@ mod tests {
     }
 
     #[test]
+    fn hotplug_wake_attaches_session_without_waiting_for_verify() {
+        // Finding #9: a plug event must reconcile to an attached session
+        // on the fast hotplug pass, not at the next 30 s verification.
+        // Both transports: USB (feature-report init) and BT (direct Ready).
+        use crate::hotplug::{Schedule, Work};
+        use std::time::{Duration, Instant};
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, false);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let start = Instant::now();
+            let mut schedule = Schedule::new(start);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            // No event: nothing due well before the 30 s verification.
+            assert_eq!(
+                schedule.take_due(start + Duration::from_secs(5), true),
+                None
+            );
+            // Plug event at 5 s; the coalesced fast pass fires, never a Verify.
+            schedule.wake(start + Duration::from_secs(5));
+            let due = start + Duration::from_secs(5) + Duration::from_millis(100);
+            assert_eq!(schedule.take_due(due, true), Some(Work::Hotplug));
+            let actions = watch.reconcile_with_hardware(
+                &cfg,
+                &hub,
+                vec![dev.clone()],
+                &health,
+                &hardware,
+                false,
+            );
+            assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+            schedule.completed(due, watch.has_pending(&cfg, &health));
+            assert!(session.lock().unwrap().proxy.is_attached());
+            assert_eq!(session.lock().unwrap().attempts, 1);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.verifies.get(), 0);
+        }
+    }
+
+    #[test]
+    fn hotplug_gate_off_discovers_new_hardware_promptly_without_session_work() {
+        // Finding #9: gate-off must still init new hardware on the fast
+        // hotplug pass (no 30 s wait); it just never builds a proxy session.
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let mut watch = ResumeWatch::new(&[]);
+        let devs = fixture_devs();
+        // Hotplug fast pass: no hardware verification, like production
+        // `watch.scan(..., verify_hardware=false)`.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs.clone(),
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Initialized(devs[0].devnode.clone()),
+                TickAction::Initialized(devs[1].devnode.clone()),
+            ]
+        );
+        assert_eq!(hardware.inits.get(), 2);
+        assert_eq!(hardware.verifies.get(), 0);
+        assert_eq!(hardware.reinits.get(), 0);
+        // Steady state on the fast pass: no readbacks, no attachment traffic.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs,
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(hardware.verifies.get(), 0);
+    }
+
+    #[test]
     fn hotplug_gate_off_skips_session_work_and_known_hardware_reads() {
         let hub = hub();
         let hardware = TestHardware::new(&hub);
@@ -2072,8 +2278,10 @@ mod tests {
     #[test]
     fn resume_rejects_bad_polling_without_touching_hardware() {
         let cfg = Config::default();
-        assert!(run_resume(&cfg, Some(0)).is_err());
-        assert!(run_resume(&cfg, Some(70_000)).is_err());
+        // Validation runs before the activation gate, so bad rates error
+        // even when the call would otherwise be an inactive no-op.
+        assert!(run_resume(&cfg, Some(0), false).is_err());
+        assert!(run_resume(&cfg, Some(70_000), true).is_err());
     }
 
     #[test]
@@ -2220,6 +2428,22 @@ mod tests {
         assert!(validate_polling_rate(16).is_ok());
     }
 
+    #[test]
+    fn polling_validation_agrees_with_init_gate() {
+        // Startup and init share one floor check (finding #16): every
+        // boundary must agree, including the doctor-visible config gate.
+        for hz in [0u32, 1, 15] {
+            assert!(validate_polling_rate(hz).is_err());
+            assert!(crate::init::check_usb_polling_usable(hz).is_err());
+            assert!(crate::init::resolve_polling(hz).is_err());
+        }
+        for hz in [16u32, 60, 110, 500] {
+            assert!(validate_polling_rate(hz).is_ok());
+            assert!(crate::init::check_usb_polling_usable(hz).is_ok());
+        }
+        assert!(validate_polling_rate(70_000).is_err());
+    }
+
     fn fixture_devs() -> Vec<DiscoveredDevice> {
         vec![
             DiscoveredDevice {
@@ -2290,10 +2514,11 @@ mod tests {
                 "disengage must win for live={live} force={force}"
             );
         }
-        // Socket absent without -f → disengage (safe default for udev entry).
+        // Socket absent without -f → inactive (hardware left alone; the
+        // automatic background form the udev template relies on).
         assert_eq!(
             resolve_reconnect_mode(false, false, false),
-            ReconnectMode::Disengage
+            ReconnectMode::Inactive
         );
         // Socket absent with -f → init anyway.
         assert_eq!(
@@ -2312,15 +2537,97 @@ mod tests {
     }
 
     #[test]
-    fn socket_absent_without_force_disengages_not_inits() {
+    fn resume_mode_matrix() {
+        // Automatic background (hook/unit plain resume) without a live
+        // daemon stays inactive; explicit -f forces; live daemon proceeds.
+        assert_eq!(resolve_resume_mode(false, false), ResumeMode::Inactive);
+        assert_eq!(resolve_resume_mode(false, true), ResumeMode::Proceed);
+        assert_eq!(resolve_resume_mode(true, false), ResumeMode::Proceed);
+        assert_eq!(resolve_resume_mode(true, true), ResumeMode::Proceed);
+    }
+
+    #[test]
+    fn socket_absent_without_force_leaves_hardware_alone() {
         // Decision-level coverage for the udev socket-absent path: without
-        // -f the mode must be Disengage (host-click off only, no init).
+        // -f the mode must be Inactive (no init, no disengage write).
         assert_eq!(
             resolve_reconnect_mode(
                 /* daemon_live */ false, /* force */ false, /* disengage */ false
             ),
-            ReconnectMode::Disengage
+            ReconnectMode::Inactive
         );
+        assert_eq!(
+            resolve_resume_mode(/* daemon_live */ false, /* force */ false),
+            ResumeMode::Inactive
+        );
+    }
+
+    #[test]
+    fn inactive_reconnect_skips_node_wait_scan_and_classify() {
+        // Lifecycle: installed-but-stopped (socket absent) is off. With no
+        // live daemon and no -f, even a bogus node returns Ok immediately —
+        // no 2 s node wait, no sysfs scan, no fail-closed classify error,
+        // no writes.
+        let _env_guard = crate::test_env::lock_env();
+        let old = std::env::var(crate::lock::SOCKET_ENV).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("no-daemon.sock");
+        unsafe { std::env::set_var(crate::lock::SOCKET_ENV, &absent) };
+        let cfg = Config::default();
+        let result = run_reconnect("/nonexistent-hidraw-xyz", false, None, false, &cfg);
+        match old {
+            Some(v) => unsafe { std::env::set_var(crate::lock::SOCKET_ENV, v) },
+            None => unsafe { std::env::remove_var(crate::lock::SOCKET_ENV) },
+        }
+        assert!(
+            result.is_ok(),
+            "inactive reconnect must exit 0, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_resume_returns_empty_report_without_scan() {
+        // Lifecycle: sleep hook / resume unit with no live daemon must not
+        // rescan or re-init. Empty report, no errors, exit-0 shape.
+        let _env_guard = crate::test_env::lock_env();
+        let old = std::env::var(crate::lock::SOCKET_ENV).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("no-daemon.sock");
+        unsafe { std::env::set_var(crate::lock::SOCKET_ENV, &absent) };
+        let cfg = Config::default();
+        let report = run_resume(&cfg, None, false).unwrap();
+        match old {
+            Some(v) => unsafe { std::env::set_var(crate::lock::SOCKET_ENV, v) },
+            None => unsafe { std::env::remove_var(crate::lock::SOCKET_ENV) },
+        }
+        assert!(report.nodes.is_empty());
+        assert!(!report.failed());
+    }
+
+    #[test]
+    fn inactive_classified_node_touches_nothing() {
+        // Defensive arm: even if reached, Inactive performs no writes.
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let cfg = Config::default();
+        for transport in [Transport::Usb, Transport::Bluetooth] {
+            reconnect_classified_node(
+                node.path().to_str().unwrap(),
+                transport,
+                ReconnectMode::Inactive,
+                None,
+                &cfg,
+            )
+            .unwrap();
+        }
+        // A bogus node is equally fine — nothing is opened or classified.
+        reconnect_classified_node(
+            "/nonexistent-hidraw-xyz",
+            Transport::Usb,
+            ReconnectMode::Inactive,
+            None,
+            &cfg,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2406,5 +2713,76 @@ mod tests {
             }
         }
         assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
+
+    /// True when `control` becomes readable within `timeout` (drains the
+    /// byte so phases stay independent).
+    fn control_wakes_within(
+        control: &Arc<crate::pump::PumpControl>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: control.read_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let woke = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) } > 0;
+        if woke {
+            control.drain();
+        }
+        woke
+    }
+
+    #[test]
+    fn pump_manager_attach_and_detach_wake_blocked_pump() {
+        // Gate-off config: attach/detach touch no hardware (no uinput
+        // create, no evdev/hidraw) but each owned transition must still
+        // wake a poll-blocked pump via control. An unowned detach changes
+        // nothing and must stay silent.
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let control = Arc::new(crate::pump::PumpControl::new().unwrap());
+        type DaemonProxy = ClickProxy<
+            RealGrab,
+            DualSink<RealUinput, RealUinput>,
+            AsyncHaptic<RealHaptic>,
+            PumpSource,
+        >;
+        let proxy = Arc::new(Mutex::new(DaemonProxy::new(
+            crate::proxy::ProxySettings::from(&cfg),
+            crate::proxy::RealGrab::new(""),
+            crate::proxy::DualSink::new(
+                crate::proxy::RealUinput::new("/dev/uinput"),
+                crate::proxy::RealUinput::new_extras("/dev/uinput"),
+            ),
+            crate::proxy::AsyncHaptic::new(crate::proxy::RealHaptic::new()),
+            crate::pump::PumpSource::Idle,
+        )));
+        let manager =
+            PumpManager::new(proxy, cfg.clone(), Arc::new(AtomicBool::new(false)), || {
+                PumpSource::Idle
+            })
+            .with_thread(std::thread::spawn(|| {}))
+            .with_control(Arc::clone(&control));
+        manager.attach(&crate::init::usb_ready("/dev/hidraw1"));
+        assert!(
+            control_wakes_within(&control, std::time::Duration::from_secs(2)),
+            "attach did not notify a poll-blocked pump"
+        );
+        // Owned detach (seeded active owner) must wake too.
+        *manager.active.lock().unwrap() = Some("/dev/hidraw1".to_string());
+        manager.detach(&crate::init::detached("/dev/hidraw1", Transport::Usb));
+        assert!(
+            control_wakes_within(&control, std::time::Duration::from_secs(2)),
+            "owned detach did not notify a poll-blocked pump"
+        );
+        // Unowned sibling detach changes nothing: no wake.
+        manager.detach(&crate::init::detached("/dev/hidraw9", Transport::Usb));
+        assert!(
+            !control_wakes_within(&control, std::time::Duration::from_millis(100)),
+            "unowned detach must not wake the pump"
+        );
     }
 }
