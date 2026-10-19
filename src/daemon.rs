@@ -258,12 +258,25 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
                     *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(event.devnode.clone());
                 } else {
-                    // Grab refused: unwind to idle + destroy both so no orphan nodes.
-                    px.set_pump_ready(false);
+                    // Grab refused: single teardown unwinds to idle (held
+                    // keys + virtual contacts terminated on the wire when
+                    // possible) + destroy both so no orphan nodes.
+                    px.teardown_session("attach rollback: grab refused");
                     px.replace_source(PumpSource::Idle);
                     px.uinput().destroy();
                 }
             }
+        }
+
+        /// Idempotent manager teardown: single proxy teardown (contacts +
+        /// keys ended on the wire) + source to idle + both virtual nodes
+        /// destroyed. Used by shutdown (via `Drop`); detach/rollback run
+        /// the same proxy teardown through `detach`/`teardown_session`
+        /// plus idle+destroy.
+        fn teardown_locked(proxy: &mut DaemonProxy, reason: &str) {
+            proxy.teardown_session(reason);
+            proxy.replace_source(PumpSource::Idle);
+            proxy.uinput().destroy();
         }
 
         fn detach(&self, event: &crate::init::DeviceReadyEvent) {
@@ -294,12 +307,27 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
             }
             {
                 let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+                // `detach` runs the single idempotent proxy teardown
+                // (contacts + keys ended on the wire); manager then idles
+                // the source and destroys both virtual nodes.
                 px.detach(event);
-                px.set_pump_ready(false);
                 px.replace_source(PumpSource::Idle);
                 px.uinput().destroy();
                 log::info!("pump: {} torn down", event.devnode);
             }
+        }
+    }
+
+    impl Drop for PumpManager {
+        /// Shutdown path: terminate virtual contacts + keys, idle the
+        /// source, destroy both virtual nodes. Idempotent: safe after an
+        /// explicit detach already tore the session down. The pump thread
+        /// is signaled to stop; its handle detaches with the manager at
+        /// process teardown (existing lifecycle, see finding #12).
+        fn drop(&mut self) {
+            self._stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+            Self::teardown_locked(&mut px, "shutdown");
         }
     }
 
@@ -1285,8 +1313,8 @@ mod tests {
                 s.events.push(event.kind);
                 if event.kind == ReadyKind::Detached {
                     if s.active.as_deref() == Some(&event.devnode) {
+                        // `detach` runs the full teardown; no second pass needed.
                         s.proxy.detach(event);
-                        s.proxy.set_pump_ready(false);
                         s.active = None;
                     }
                     return;
