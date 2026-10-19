@@ -261,6 +261,23 @@ impl HapticEndpoint {
     }
 }
 
+impl Drop for HapticEndpoint {
+    fn drop(&mut self) {
+        // Final close deferred off the current thread: hidraw release can
+        // block on kernel activity, so retirement/teardown must never close
+        // synchronously under the queue mutex or on the input pump thread,
+        // nor before Drop's bounded worker join. The spawn itself is fast;
+        // the blocking close runs on the background thread. On spawn
+        // failure (shutdown/OOM) the file drops here synchronously.
+        let file = self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = file {
+            let _ = std::thread::Builder::new()
+                .name("ltd-haptic-close".into())
+                .spawn(move || drop(f));
+        }
+    }
+}
+
 /// Session snapshot for one queued actuator pulse.
 ///
 /// The pump thread snapshots the current session target at enqueue time;
@@ -287,6 +304,14 @@ impl HapticTarget {
             bluetooth,
             endpoint: HapticEndpoint::open(node),
         }
+    }
+
+    /// Prepare (open) a session endpoint. Performs filesystem I/O and must
+    /// be called outside the proxy mutex (live input path) and outside the
+    /// queue mutex; commit with [`AsyncHaptic::retarget_prepared`] or
+    /// [`AsyncHaptic::update_route_prepared`].
+    pub fn prepare(node: &str, bluetooth: bool) -> Self {
+        Self::new(node, bluetooth)
     }
 
     fn empty() -> Self {
@@ -2847,7 +2872,11 @@ impl HapticShared {
     /// execution instead of running. Optionally installs the next
     /// session's target (new attach) or clears routing (detach, so a
     /// stray enqueue degrades to log-only). Returns pulses purged.
-    /// The caller holds no other lock; enqueue/retarget serialize here.
+    /// Enqueue/retarget serialize here. Replaced endpoints and cleared
+    /// pulses drop their last references here, but the blocking device
+    /// close itself runs on a background thread (see [`HapticEndpoint`]),
+    /// so this never stalls the queue lock owner or the input pump, and
+    /// teardown's bounded join does not include endpoint close.
     fn retire(&self, target: Option<HapticTarget>) -> u64 {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let stale = state.pulses.len() as u64;
@@ -2967,12 +2996,22 @@ where
     }
 
     /// New session: retire queued work and pin the actuator target.
-    /// The daemon calls this on attach before the pump can enqueue.
-    /// The endpoint fd is opened BEFORE the queue lock is taken, so the
-    /// lock is never held across filesystem I/O; the retire then commits
-    /// the new endpoint together with the generation bump.
+    /// Convenience wrapper that prepares (opens) outside the queue lock;
+    /// callers holding the live proxy mutex must use
+    /// [`AsyncHaptic::retarget_prepared`] with a target prepared before
+    /// locking instead, so the open never stalls input processing.
+    /// The retire then commits the new endpoint together with the
+    /// generation bump. Final disposal of the replaced endpoint runs on a
+    /// background thread, never under the queue lock or on the caller.
     pub fn retarget(&self, node: &str, bluetooth: bool) {
         let target = HapticTarget::new(node, bluetooth);
+        self.shared.retire(Some(target));
+    }
+
+    /// New session commit for a target prepared outside all live locks.
+    /// No filesystem I/O under any mutex; replaced endpoints close on a
+    /// background thread.
+    pub fn retarget_prepared(&self, target: HapticTarget) {
         self.shared.retire(Some(target));
     }
 
@@ -2980,6 +3019,8 @@ where
     /// pending pulses at the corrected node without retiring them. Pins
     /// a new endpoint fd for the corrected node; pulses already popped
     /// by the worker keep the old endpoint. The generation is unchanged.
+    /// Convenience wrapper; proxy-mutex holders must prepare outside and
+    /// use [`AsyncHaptic::update_route_prepared`] instead.
     pub fn update_route(&self, node: &str) {
         let (generation, bluetooth, current) = {
             let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3011,6 +3052,42 @@ where
         }
     }
 
+    /// Same-session route commit for a target prepared outside all live
+    /// locks. Generation-fenced: returns false (discarding the prepared
+    /// endpoint, which then closes on a background thread) when the
+    /// session retired between prepare and commit, or when the route is
+    /// already correct. No filesystem I/O under any mutex.
+    pub fn update_route_prepared(&self, prepared: HapticTarget, baseline_generation: u64) -> bool {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.generation.load(Ordering::SeqCst) != baseline_generation {
+            return false;
+        }
+        if state.target.node == prepared.node {
+            return false;
+        }
+        state.target = prepared.clone();
+        for pulse in state.pulses.iter_mut() {
+            if pulse.generation == baseline_generation {
+                pulse.target = prepared.clone();
+            }
+        }
+        true
+    }
+
+    /// Current session generation (atomic load, no locks, no I/O).
+    /// Daemon captures this before preparing a route correction outside
+    /// the proxy mutex, then fences the commit with it.
+    pub fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
+    }
+
+    /// Current routing (node + bluetooth) under a brief queue lock; no I/O.
+    /// Daemon reads this before preparing outside the proxy mutex.
+    pub fn current_routing(&self) -> (String, bool) {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.target.node.clone(), state.target.bluetooth)
+    }
+
     #[cfg(test)]
     pub fn pending(&self) -> usize {
         self.shared
@@ -3019,11 +3096,6 @@ where
             .unwrap_or_else(|e| e.into_inner())
             .pulses
             .len()
-    }
-
-    #[cfg(test)]
-    pub fn generation(&self) -> u64 {
-        self.shared.generation.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -7459,6 +7531,96 @@ mod tests {
         gate.open();
         gate.wait_executed(3);
         drop(px);
+    }
+
+    #[test]
+    fn haptic_route_prepared_commits_same_session() {
+        // F3 prepared route path: prepare (open) outside all live locks,
+        // then commit generation-fenced without I/O. Pending pulses move
+        // to the corrected endpoint; generation unchanged; in-flight keeps
+        // the old endpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let corrected = dir.path().join("corrected");
+        std::fs::write(&old, []).unwrap();
+        std::fs::write(&corrected, []).unwrap();
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget(old.to_str().unwrap(), false);
+        let gen = ah.generation();
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 7, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        assert_eq!(ah.pending(), 2);
+        // Prepare outside any proxy/queue lock (fast here; gated slow-open
+        // placement is covered by the io evidence run).
+        let (_, bt) = ah.current_routing();
+        let prepared = HapticTarget::prepare(corrected.to_str().unwrap(), bt);
+        assert!(ah.update_route_prepared(prepared, gen));
+        assert_eq!(ah.generation(), gen, "route commit must not retire");
+        assert_eq!(ah.pending(), 2, "route commit must not drop");
+        gate.open();
+        gate.wait_executed(3);
+        drop(ah);
+        let got = gate.executed();
+        assert_eq!(
+            got,
+            vec![
+                (old.to_str().unwrap().to_string(), false, true, 64, 5, false),
+                (
+                    corrected.to_str().unwrap().to_string(),
+                    false,
+                    true,
+                    64,
+                    7,
+                    false
+                ),
+                (
+                    corrected.to_str().unwrap().to_string(),
+                    false,
+                    false,
+                    64,
+                    0,
+                    false
+                ),
+            ],
+            "prepared route missed: {got:?}"
+        );
+    }
+
+    #[test]
+    fn haptic_route_prepared_fence_discards_stale() {
+        // F3 generation fence: a correction prepared before a retire must
+        // not clobber the new session's endpoint, generation, or mode.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let late = dir.path().join("late");
+        let fresh = dir.path().join("fresh");
+        for node in [&old, &late, &fresh] {
+            std::fs::write(node, []).unwrap();
+        }
+        let ah = AsyncHaptic::new(RealHaptic::new());
+        ah.retarget(old.to_str().unwrap(), false);
+        let baseline = ah.generation();
+        let (_, bt) = ah.current_routing();
+        assert!(!bt);
+        let prepared = HapticTarget::prepare(late.to_str().unwrap(), bt);
+        ah.retire_session();
+        ah.retarget(fresh.to_str().unwrap(), true);
+        let generation = ah.generation();
+        assert!(!ah.update_route_prepared(prepared, baseline));
+        assert_eq!(ah.generation(), generation);
+        // Prepared endpoint discarded; new session intact with its own fd.
+        let target = ah.shared.state.lock().unwrap().target.clone();
+        assert_eq!(target.node, fresh.to_str().unwrap());
+        assert!(target.bluetooth);
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            target.try_clone_file().unwrap().metadata().unwrap().ino(),
+            std::fs::metadata(&fresh).unwrap().ino()
+        );
+        drop(ah);
     }
 
     #[test]
