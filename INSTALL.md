@@ -122,10 +122,18 @@ systemctl status linux-trackpad-driver-resume.service
   `hybrid-sleep`, `suspend-then-hibernate`); `pre` is a no-op. The hook is
   system-side only — `user.slice` is frozen while sleep hooks run, so it
   never touches user sessions (no `--user` units, no session D-Bus).
-  Sleep hooks inherit PID1's environment, so the hook sets and exports
+  Sleep hooks inherit PID1's environment, not any unit's `Environment=`,
+  so the hook sets and exports
   `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml` (same path as the
-  units) before exec — otherwise resume would re-init at defaults while
-  the daemon verifies against the system rate. Hook runtime is bounded
+  units) before exec to keep its `ltd resume` on the same file. Without
+  this export the hook would still read the installed file via the shared
+  fallback (not built-in defaults when the installed file exists). A custom
+  `LTD_CONFIG` set only on the main unit does not reach the hook or the
+  other units — each separately launched unit/hook needs the same override;
+  there is no automatic cross-process propagation. (All commands share one
+  selection: `-c`, then `$LTD_CONFIG`, then the installed file, then
+  built-in defaults.) Hook
+  runtime is bounded
   (~1 s node wait + backoff retries per node); failures are logged and
   swallowed, the hook always exits 0 so a driver hiccup never perturbs
   the sleep cycle.
