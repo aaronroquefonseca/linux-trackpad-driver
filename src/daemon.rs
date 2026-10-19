@@ -662,8 +662,9 @@ pub fn classify_node(devnode: &str, devs: &[DiscoveredDevice]) -> Result<Transpo
 ///   manual disengage, touches hardware as requested).
 /// - Daemon socket absent without `-f` → inactive: leave the hardware alone
 ///   (no init, no disengage write). This is the automatic background form
-///   the udev reconnect template relies on: installing, disabling, or
-///   stopping the main service is a comprehensible off switch.
+///   the udev reconnect template relies on: installing (never started) or
+///   stopping the main service (socket absent) is a comprehensible off
+///   switch (`disable` alone does not stop a running service).
 /// - Daemon socket absent with `-f` → init anyway (explicit manual forcing).
 /// - Daemon live (with or without `-f`) → init, unless `-d` was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -746,8 +747,9 @@ pub fn run_reconnect(
     let mode = resolve_reconnect_mode(daemon_live, force, disengage);
     if mode == ReconnectMode::Inactive {
         // Automatic background call (udev one-shot) with no live daemon:
-        // installed-but-disabled is off. Touch nothing, exit 0 — before any
-        // node wait/scan so the no-op is fast and cannot fail on hardware.
+        // installed-but-stopped (socket absent) is off. Touch nothing,
+        // exit 0 — before any node wait/scan so the no-op is fast and
+        // cannot fail on hardware.
         log::info!(
             "daemon socket absent ({sock}); inactive: leaving hardware alone (use -f to init, -d to disengage)"
         );
@@ -2312,9 +2314,10 @@ mod tests {
 
     #[test]
     fn inactive_reconnect_skips_node_wait_scan_and_classify() {
-        // Lifecycle: installed-but-disabled is off. With no live daemon and
-        // no -f, even a bogus node returns Ok immediately — no 2 s node
-        // wait, no sysfs scan, no fail-closed classify error, no writes.
+        // Lifecycle: installed-but-stopped (socket absent) is off. With no
+        // live daemon and no -f, even a bogus node returns Ok immediately —
+        // no 2 s node wait, no sysfs scan, no fail-closed classify error,
+        // no writes.
         let _env_guard = crate::test_env::lock_env();
         let old = std::env::var(crate::lock::SOCKET_ENV).ok();
         let dir = tempfile::tempdir().unwrap();

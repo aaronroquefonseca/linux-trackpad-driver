@@ -1,8 +1,9 @@
-//! Finding #14 lifecycle: installed-but-disabled is off.
+//! Finding #14 lifecycle: installed-but-stopped (socket absent) is off.
 //!
 //! End-to-end through the real binary with hermetic child-process env (per
 //! child, so no process-env races):
-//! - `LTD_SOCKET` isolates the live-daemon probe (absent = stopped).
+//! - `LTD_SOCKET` isolates the live-daemon probe (absent = stopped;
+//!   `disable` alone does not stop a running service).
 //! - `LTD_HIDRAW_SYSFS` isolates device discovery to an empty temp dir, so
 //!   forced paths can never discover or open host hardware even on a
 //!   developer machine with a real trackpad attached.
@@ -43,7 +44,8 @@ struct Iso {
 }
 
 fn absent_iso() -> Iso {
-    // No listener bound: the disabled/stopped-daemon state. Empty sysfs:
+    // No listener bound: the stopped-daemon (socket absent) state
+    // (`disable` alone does not stop a running service). Empty sysfs:
     // no hidraw entries, so discovery is deterministically empty and no
     // host node can be opened even past the gate.
     let dir = tempfile::tempdir().unwrap();
@@ -171,8 +173,9 @@ fn live_daemon_background_reconnect_proceeds_past_gate() {
     let (iso, _listener) = live_iso();
     // Daemon live: the automatic form proceeds past the gate, then fails
     // closed on the non-trackpad node — proving the gate (not the
-    // classify) is what kept the disabled case quiet. Empty isolated
-    // sysfs keeps this hermetic: no host node can satisfy classify.
+    // classify) is what kept the stopped (socket-absent) case quiet.
+    // Empty isolated sysfs keeps this hermetic: no host node can satisfy
+    // classify.
     let out = run(
         &["reconnect", "/dev/null"],
         &iso.sock,

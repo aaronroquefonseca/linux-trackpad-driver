@@ -1,12 +1,12 @@
 # ltd.install — shared install scriptlets for linux-trackpad-driver{,-bin,-git}.
 # Policy: never enable or start the daemon on install (admin opts in with
 # `systemctl enable --now linux-trackpad-driver.service`, same as debian/).
-# Activation contract (finding #14): installed-but-disabled is off, so this
-# scriptlet must never touch trackpad hardware. Only reloads udev/systemd;
-# it deliberately does NOT `udevadm trigger --action=add` (that would queue
-# reconnect one-shots at install time). Background one-shots without a live
-# daemon are inactive no-ops anyway; the admin replugs or enables the
-# service to bring the device up.
+# Activation contract (finding #14): installed-but-stopped (socket absent)
+# is off, so this scriptlet must never touch trackpad hardware. Only
+# reloads udev/systemd; it deliberately does NOT `udevadm trigger
+# --action=add` (that would queue reconnect one-shots at install time).
+# Background one-shots without a live daemon are inactive no-ops anyway;
+# the admin replugs or enables the service to bring the device up.
 # Kept POSIX sh, quoted, `|| true` guarded so failures never break transactions.
 
 post_install() {

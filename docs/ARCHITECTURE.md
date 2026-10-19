@@ -109,7 +109,8 @@ incl. nested, unknown version errors.
 - `ltd run [-c config]` — init loop + optional clicks pipeline.
 - `ltd reconnect <hidraw-dev> [-f] [-p Hz] [-d]` — udev entry; idempotent.
   Activation contract: without a live daemon socket and without `-f`/`-d`
-  it leaves the hardware alone (exit 0), so installed-but-disabled is off;
+  it leaves the hardware alone (exit 0), so installed-but-stopped (socket
+  absent) is off (`disable` alone does not stop a running service);
   `-f` forces init, `-d` disengages (explicit manual forms).
 - `ltd resume [-f] [-p Hz] [-c config]` — re-run init after suspend (also via
   sleep hook). Plain `resume` without a live daemon is an inactive no-op;

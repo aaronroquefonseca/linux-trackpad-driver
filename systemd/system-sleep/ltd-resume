@@ -18,8 +18,9 @@
 #
 # Activation contract (finding #14): plain `ltd resume` below is the
 # AUTOMATIC background form — without a live main-service daemon it leaves
-# the hardware alone and exits 0, so installed-but-disabled stays off across
-# sleep. Explicit manual forcing while stopped is `ltd resume -f`.
+# the hardware alone and exits 0, so installed-but-stopped (socket absent)
+# stays off across sleep. Explicit manual forcing while stopped is
+# `ltd resume -f`.
 set -eu
 
 LTD_BIN="${LTD_BIN:-/usr/bin/ltd}"

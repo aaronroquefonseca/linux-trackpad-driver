@@ -6,7 +6,8 @@
 #
 # Activation contract (finding #14): this unit is the AUTOMATIC background
 # form (no -f). Without a live main-service daemon it is an inactive no-op:
-# hardware left alone, exit 0. Installed-but-disabled is therefore off, even
+# hardware left alone, exit 0. Installed-but-stopped (socket absent) is
+# therefore off (`disable` alone does not stop a running service), even
 # though udev still queues this unit on hotplug. Explicit manual forcing
 # while the daemon is stopped is `ltd reconnect /dev/HIDRAW -f` (or -d to
 # disengage) run directly — never via this template.

@@ -80,18 +80,22 @@ systemctl status linux-trackpad-driver.service
 
 ## Activation contract (off means off)
 
-The main service is the only automatic activator. Installing, disabling,
-or stopping it leaves the trackpad hardware alone:
+The main service is the only automatic activator. Installing (never
+started), or stopping it (socket absent) leaves the trackpad hardware
+alone. Note: `disable` alone does not stop an already-running service; use
+`stop` or `disable --now` to make the entry gate inactive:
 
-| Path | Daemon stopped | Daemon running |
+| Path | Daemon stopped (socket absent at entry) | Daemon running (socket live at entry) |
 |---|---|---|
 | udev hotplug → `reconnect@` one-shot (no `-f`) | no-op, exit 0 | re-inits node |
 | sleep hook / resume unit → plain `ltd resume` | no-op, exit 0 | re-verifies + re-inits on mismatch |
 | `ltd reconnect /dev/hidrawN -f`, `ltd reconnect /dev/hidrawN -d`, `ltd resume -f` | runs as requested (explicit manual forcing) | runs as requested |
 
-Background one-shots check the live daemon socket and return before any
+Background one-shots probe the live daemon socket at entry and return before any
 node wait, scan, or feature-report write, so a queued unit can neither
-fail on missing hardware nor touch it. Packaging never triggers hardware
+fail on missing hardware nor touch it. The probe is entry-time only: it does
+not cancel work already admitted (a daemon stop racing a waiting/rescanning
+one-shot is not revoked). Packaging never triggers hardware
 either: install/upgrade scriptlets only reload udev/systemd (no
 `udevadm trigger`, no enable/start — same policy on Arch, Debian, and
 Fedora).
