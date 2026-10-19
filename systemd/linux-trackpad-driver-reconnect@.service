@@ -8,7 +8,7 @@
 # form (no -f). Without a live main-service daemon it is an inactive no-op:
 # hardware left alone, exit 0. Installed-but-disabled is therefore off, even
 # though udev still queues this unit on hotplug. Explicit manual forcing
-# while the daemon is stopped is `ltd reconnect -f /dev/HIDRAW` (or -d to
+# while the daemon is stopped is `ltd reconnect /dev/HIDRAW -f` (or -d to
 # disengage) run directly — never via this template.
 #
 # Why a unit and not RUN+=: reconnect waits for the node + driver bind and

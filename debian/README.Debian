@@ -34,7 +34,7 @@ system-sleep hook, which runs whenever installed and executable.
 Activation contract: background one-shots (udev reconnect, sleep hook,
 plain resume unit) without the main service running leave the hardware
 alone and exit 0 — disabled stays off. Explicit forcing while stopped
-is `ltd resume -f` / `ltd reconnect -f` run directly.
+is `ltd resume -f` / `ltd reconnect /dev/hidrawN -f` run directly.
 
 Removal (debian/prerm) disables the main and resume units so no enabled
 state is left behind.

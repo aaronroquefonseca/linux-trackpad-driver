@@ -178,7 +178,7 @@ default — values carry over one-to-one.
 sudo ltd run                                   # daemon: setup + click engine
 sudo ltd run -c /etc/linux-trackpad-driver/config.toml
 sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init (daemon running)
-sudo ltd reconnect -f /dev/hidrawN -p 90       # explicit forcing while the daemon is stopped
+sudo ltd reconnect /dev/hidrawN -f -p 90      # explicit forcing while the daemon is stopped
 sudo ltd reconnect /dev/hidrawN -d             # explicit manual disengage (host-click off)
 sudo ltd resume -f                             # explicit resume forcing while stopped
 ltd doctor                                     # read-only checklist

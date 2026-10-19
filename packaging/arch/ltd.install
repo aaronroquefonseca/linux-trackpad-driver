@@ -16,7 +16,7 @@ post_install() {
 linux-trackpad-driver installed.
 Enable the daemon: sudo systemctl enable --now linux-trackpad-driver.service
 Config: /etc/linux-trackpad-driver/config.toml (preserved on upgrade/reinstall)
-Manual re-init while stopped: sudo ltd resume -f (or: sudo ltd reconnect -f /dev/hidrawN)
+Manual re-init while stopped: sudo ltd resume -f (or: sudo ltd reconnect /dev/hidrawN -f)
 Hotplug reconnect is automatic via udev + linux-trackpad-driver-reconnect@.service once the main service runs.
 EOF
   if [ -f /etc/linux-trackpad-driver/config.toml.pacsave ]; then

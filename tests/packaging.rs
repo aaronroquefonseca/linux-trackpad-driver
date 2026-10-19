@@ -331,7 +331,7 @@ fn activation_background_paths_carry_no_force_flag() {
     // Finding #14 contract: the shipped background invocations are the
     // AUTOMATIC form (no -f/--force/-d), so without a live daemon they
     // leave hardware alone. Explicit forcing lives on the direct CLI
-    // (`ltd reconnect -f`, `ltd resume -f`), never in these files.
+    // (`ltd reconnect /dev/hidrawN -f`, `ltd resume -f`), never in these files.
     let reconnect_exec = RECONNECT
         .lines()
         .find(|l| l.trim_start().starts_with("ExecStart="))

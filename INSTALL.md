@@ -58,7 +58,7 @@ sudo systemctl start 'linux-trackpad-driver-reconnect@hidraw2.service'
 # or directly:
 sudo ltd reconnect /dev/hidraw2
 # explicit forcing while the daemon is stopped:
-sudo ltd reconnect -f /dev/hidraw2
+sudo ltd reconnect /dev/hidraw2 -f
 ```
 
 ## systemd units
@@ -87,7 +87,7 @@ or stopping it leaves the trackpad hardware alone:
 |---|---|---|
 | udev hotplug → `reconnect@` one-shot (no `-f`) | no-op, exit 0 | re-inits node |
 | sleep hook / resume unit → plain `ltd resume` | no-op, exit 0 | re-verifies + re-inits on mismatch |
-| `ltd reconnect -f …`, `ltd reconnect -d …`, `ltd resume -f` | runs as requested (explicit manual forcing) | runs as requested |
+| `ltd reconnect /dev/hidrawN -f`, `ltd reconnect /dev/hidrawN -d`, `ltd resume -f` | runs as requested (explicit manual forcing) | runs as requested |
 
 Background one-shots check the live daemon socket and return before any
 node wait, scan, or feature-report write, so a queued unit can neither
@@ -212,3 +212,7 @@ Normally unset — the daemon resolves everything itself:
   interfaces stay passthrough until the touch interface attaches.
 - `LTD_UINPUT_NODE=/dev/uinput`: uinput control node for the virtual
   device (default `/dev/uinput`).
+- `LTD_HIDRAW_SYSFS=/path/to/class/hidraw`: override the hidraw sysfs class
+  dir (default `/sys/class/hidraw`) for hermetic runs. Tests set this to an
+  empty temp dir so `ltd reconnect` / `ltd resume` subprocesses never
+  discover host hardware; child processes inherit it via env.
