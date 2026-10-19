@@ -35,45 +35,12 @@ pub fn hub() -> DeviceReadyHub {
     DeviceReadyHub::new()
 }
 
-/// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
-/// Gate-off (`enhanced_clicks=false`) still subscribes — the proxy then
-/// short-circuits to passthrough. The gate is evaluated from the startup
-/// config; there is no live reload, so a config change needs a restart.
-/// Never blocks init: callbacks do bounded attach/detach only, and grab
-/// failure degrades to passthrough with a log.
-///
-/// Production pump: `attach` builds the real path — BOTH uinput nodes
-/// (`UI_DEV_CREATE` pointer FIRST, then extras), hidraw→eventN
-/// auto-resolution (`$LTD_EVDEV_NODE` override wins, else sysfs walk, else
-/// name scan), then hidraw open, then `set_pump_ready(true)` + grab.
-/// `detach` tears down in reverse (release grab, latch reset, trailing
-/// `SYN` on both nodes, source to idle, BOTH nodes destroyed). Single
-/// active node: first `Ready` wins, siblings ignored until `Detached`
-/// clears it — except a `Ready` for the active node whose session died on
-/// its own (disconnect self-release): that tears down the stale wiring
-/// and re-attaches fresh fds instead of early-returning into a dead
-/// session. A single pump thread drains the proxy for the process
-/// lifetime; frame rate is device-bounded.
-///
-/// Two-node failure isolation: pointer-create failure → passthrough (no
-/// touch emit path, so no grab — same as the old single node). Extras-
-/// create failure is NON-fatal: the session continues pointer-only
-/// (motion/buttons live, combos dropped) with a loud log, and teardown
-/// always destroys both nodes so no sibling leaks.
-///
-/// Attach decision for a `Ready` event (see [`attach_decision`]):
-/// - no active session → adopt (full attach);
-/// - same node + live proxy → ignore (duplicate);
-/// - same node + dead proxy → teardown + full re-attach;
-/// - another node active → ignore (sibling).
-///
 /// Shared pump lifecycle: attach tail (grab-refused rollback), detach and
 /// shutdown teardown. One generic manager serves production (real
 /// grab/uinput/haptic/source) and unit tests (fakes): the rollback,
 /// detach and `Drop` paths below are the actual dispatch under test, not
-/// copies. Hardware preparation (node creation, evdev resolution, hidraw
-/// open, stream verify) stays in the production `attach` below; tests
-/// inject their source via [`PumpManager::finish_attach`].
+/// copies. The idle source is a plain `fn` pointer (never captures), and
+/// tests inject their live source via [`PumpManager::finish_attach`].
 pub(crate) struct PumpManager<G, U, H, S>
 where
     G: GrabDevice,
@@ -86,7 +53,7 @@ where
     active: std::sync::Mutex<Option<String>>,
     haptic_node: std::sync::Mutex<Option<String>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    idle: Box<dyn Fn() -> S + Send + Sync>,
+    idle: fn() -> S,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -101,7 +68,7 @@ where
         proxy: std::sync::Arc<std::sync::Mutex<ClickProxy<G, U, H, S>>>,
         cfg: Config,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        idle: impl Fn() -> S + Send + Sync + 'static,
+        idle: fn() -> S,
     ) -> Self {
         Self {
             proxy,
@@ -109,7 +76,7 @@ where
             active: std::sync::Mutex::new(None),
             haptic_node: std::sync::Mutex::new(None),
             stop,
-            idle: Box::new(idle),
+            idle,
             thread: None,
         }
     }
@@ -144,14 +111,14 @@ where
         if px.is_attached() {
             *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(event.devnode.clone());
         } else {
-            Self::teardown_locked(&mut px, &self.idle, "attach rollback: grab refused");
+            Self::teardown_locked(&mut px, self.idle, "attach rollback: grab refused");
         }
     }
 
     /// Idempotent manager teardown: single proxy teardown (contacts +
     /// keys ended on the wire) + source to idle + virtual nodes destroyed.
     /// Used by shutdown (via `Drop`); detach/rollback share it.
-    fn teardown_locked(proxy: &mut ClickProxy<G, U, H, S>, idle: &dyn Fn() -> S, reason: &str) {
+    fn teardown_locked(proxy: &mut ClickProxy<G, U, H, S>, idle: fn() -> S, reason: &str) {
         proxy.teardown_session(reason);
         proxy.replace_source(idle());
         proxy.uinput().destroy();
@@ -212,7 +179,7 @@ where
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
-        Self::teardown_locked(&mut px, &self.idle, "shutdown");
+        Self::teardown_locked(&mut px, self.idle, "shutdown");
     }
 }
 
@@ -393,6 +360,37 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
     }
 }
 
+/// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
+/// Gate-off (`enhanced_clicks=false`) still subscribes — the proxy then
+/// short-circuits to passthrough. The gate is evaluated from the startup
+/// config; there is no live reload, so a config change needs a restart.
+/// Never blocks init: callbacks do bounded attach/detach only, and grab
+/// failure degrades to passthrough with a log.
+///
+/// Production pump: `attach` builds the real path — BOTH uinput nodes
+/// (`UI_DEV_CREATE` pointer FIRST, then extras), hidraw→eventN
+/// auto-resolution (`$LTD_EVDEV_NODE` override wins, else sysfs walk, else
+/// name scan), then hidraw open, then `set_pump_ready(true)` + grab.
+/// `detach` tears down in reverse (release grab, latch reset, trailing
+/// `SYN` on both nodes, source to idle, BOTH nodes destroyed). Single
+/// active node: first `Ready` wins, siblings ignored until `Detached`
+/// clears it — except a `Ready` for the active node whose session died on
+/// its own (disconnect self-release): that tears down the stale wiring
+/// and re-attaches fresh fds instead of early-returning into a dead
+/// session. A single pump thread drains the proxy for the process
+/// lifetime; frame rate is device-bounded.
+///
+/// Two-node failure isolation: pointer-create failure → passthrough (no
+/// touch emit path, so no grab — same as the old single node). Extras-
+/// create failure is NON-fatal: the session continues pointer-only
+/// (motion/buttons live, combos dropped) with a loud log, and teardown
+/// always destroys both nodes so no sibling leaks.
+///
+/// Attach decision for a `Ready` event (see [`attach_decision`]):
+/// - no active session → adopt (full attach);
+/// - same node + live proxy → ignore (duplicate);
+/// - same node + dead proxy → teardown + full re-attach;
+/// - another node active → ignore (sibling).
 pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl Fn(&str) -> bool {
     use crate::proxy::ProxySettings;
 
