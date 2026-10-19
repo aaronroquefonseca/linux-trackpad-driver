@@ -1,3 +1,46 @@
+## [0.1.1] - 2026-10-19
+
+### Highlights
+
+- Connect USB trackpads without waiting for the next 30-second discovery scan; device events wake attachment with bounded readiness retries ([#68](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/68)).
+- Recover missing or dead enhanced sessions without restarting the daemon, while keeping failed USB setup ungrabbed ([#67](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/67)).
+- Preserve native Bluetooth input until the proxy successfully grabs it; automatic driver unbinding is removed ([#66](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/66)).
+- Return to native input when pointer output fails, and complete debounced mouse/key releases even when device reports stop ([#65](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/65), [#64](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/64)).
+- Identify the running build through `ltd --version`, doctor output, and startup logs, including source commit and build channel.
+- Diagnose installed configuration and listener state with `ltd doctor` without requiring sudo.
+- Add Fedora RPM release packages and repair RPM builds; install Debian configuration as a regular file.
+
+### Details
+
+#### Features
+
+- Embed source identity (build) ([c725071](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/c72507107318112b54c67ac80742fc0bac802b9e))
+- Add version flags (cli) ([299fd35](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/299fd351e70c632304792398e4b7d6848a785686))
+- Build release RPM, document install ([#58](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/58)) (fedora) ([e5053cb](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/e5053cba322ac6a798914962ddbbe77fe93a3618))
+
+#### Bug Fixes
+
+- Wake on trackpad hotplug events ([#68](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/68)) (daemon) ([3857049](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/3857049f4d5468cf7ac65bfc409c004e9910f17b))
+- Retry missing and dead enhanced sessions ([#67](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/67)) (daemon) ([4006858](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/4006858986f1170d98224ddc8f1e721bf9f96b01))
+- Preserve native input until proxy grabs ([#66](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/66)) (bluetooth) ([0e824aa](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/0e824aa8ced989c9035b59ea65f01aaae28feeba))
+- Release grabs when output fails ([#65](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/65)) (uinput) ([506b4c4](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/506b4c44cbbac062377428a869f4d4bfe470c29c))
+- Complete debounced releases during idle ([#64](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/64)) (clicks) ([a0b1b92](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/a0b1b923ed034eee8d578239141a815524d0068f))
+- Diagnose installed config and listeners without sudo (doctor) ([13ab1c9](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/13ab1c907196a6541cf512c96663244234639e56))
+- Repair RPM packaging and validate builds in CI (fedora) ([18d6666](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/18d66664196334e80cb318b23098b412c8c29d8f))
+- Install configuration as a regular file (debian) ([f30c3b5](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/f30c3b5048b780e69b5689f6c2ba09e50bde5ecc))
+
+#### Documentation
+
+- Hint at .pacsave on variant switch ([#56](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/56)) (packaging) ([1c5f284](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/1c5f284ed6ecf1f2f66c3d5809f75f39d0d22d3a))
+- Document AUR and Debian installation (readme) ([7a9f26a](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/7a9f26a37353fd0635949b66a3e12463b0ecd92a))
+
+#### Miscellaneous
+
+- Enforce release note hygiene (changelog) ([2ef0451](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/2ef0451b93e569ac7b0d3a3630990d3cb46ed922))
+- Refresh description, pkgrel 2 ([#55](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/55)) (aur) ([204111d](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/204111d63e7eb21f2022fddaa2ec70d23e988fda))
+
+Full diff: https://github.com/aaronroquefonseca/linux-trackpad-driver/compare/v0.1.0...v0.1.1
+
 ## [0.1.0] - 2026-10-17
 
 ### Bug Fixes

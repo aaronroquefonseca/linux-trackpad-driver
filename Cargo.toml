@@ -1,6 +1,6 @@
 [package]
 name = "linux-trackpad-driver"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Linux driver core-init for Apple Magic Trackpad 2 (USB/BT)"
 authors = ["Aarón Roque Fonseca <aaronroquefonseca@gmail.com>"]
