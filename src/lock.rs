@@ -45,8 +45,6 @@ pub const SOCKET_ENV: &str = "LTD_SOCKET";
 /// Bound for connect-based liveness probes. A full listen queue must degrade
 /// to a fast verdict, never block reconnect/resume/acquire indefinitely.
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(500);
-/// How often the drain thread sleeps when the queue is empty.
-const DRAIN_IDLE_SLEEP: Duration = Duration::from_millis(10);
 /// Per-call accept cap so a burst cannot spin the drainer forever.
 const DRAIN_BATCH_LIMIT: usize = 4096;
 
@@ -75,7 +73,13 @@ pub struct SocketLock {
     /// this entry.
     sock_id: (u64, u64),
     _listener: UnixListener,
+    /// Shutdown flag observed independently of `poll` success, plus the write
+    /// end of the shutdown pipe. `Drop` sets the flag then writes one byte
+    /// before joining: the flag keeps shutdown observable even if `poll`
+    /// keeps failing, and the byte wakes an idle `poll` promptly. A full
+    /// pipe still leaves the waiter readable, so no wakeup is lost.
     stop: Arc<AtomicBool>,
+    shutdown_tx: std::os::fd::OwnedFd,
     drainer: Option<JoinHandle<()>>,
 }
 
@@ -84,6 +88,16 @@ pub struct SocketLock {
 /// once acquisition succeeds or fails; it is not the daemon lock itself.
 struct ReplacementMutex {
     _file: Option<std::fs::File>,
+}
+
+impl ReplacementMutex {
+    /// Whether this instance actually holds the sidecar lock. Cleanup of a
+    /// fresh pathname is only safe with exclusion; a degraded (mutex-less)
+    /// acquire must leave residue for the next serialized acquire, since a
+    /// successor may already own the name after an external unlink.
+    fn is_held(&self) -> bool {
+        self._file.is_some()
+    }
 }
 
 /// Take `LOCK_EX` on `{socket_path}.lock`. Best-effort: when the lockfile is
@@ -177,6 +191,22 @@ fn filesystem_id(path: &str) -> Result<(u64, u64)> {
     Ok((m.dev(), m.ino()))
 }
 
+/// Best-effort cleanup of our fresh pathname after a post-bind init failure.
+/// Only unlinks when we hold the replacement mutex and the path still names
+/// the entry our `bind` created (`sock_id`); otherwise leaves reclaimable
+/// residue for the next serialized acquire. In particular a degraded
+/// mutex-less acquire never unlinks, and a stale identity (successor rebound
+/// after an external unlink) never unlinks the live name. Mirrors the
+/// ownership policy of `Drop`; never stat/unlink as if holding exclusion.
+fn cleanup_failed_acquire(path: &str, sock_id: (u64, u64), mutex_held: bool) {
+    if !mutex_held {
+        return;
+    }
+    if filesystem_id(path).ok() == Some(sock_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 impl SocketLock {
     /// Acquire the lock at `path`. Errors if a live daemon holds it.
     pub fn acquire(path: &str) -> Result<Self> {
@@ -196,33 +226,76 @@ impl SocketLock {
         // exits. Without the mutex the loser could unlink the winner's new
         // pathname using its earlier refusal observation and bind a second
         // listener, leaving two self-declared owners.
-        let _replacement = replacement_mutex(path);
+        let replacement = replacement_mutex(path);
         // Up to two passes: bind, or stale-cleanup then re-bind with a fresh
         // liveness check (a parallel starter may have rebound between).
         for _ in 0..2 {
             match UnixListener::bind(path) {
                 Ok(listener) => {
-                    // Capture the filesystem entry our bind created while the
-                    // mutex still excludes parallel starters, so Drop can
+                    // Capture the filesystem entry our bind created so Drop can
                     // later tell "our file" from a successor's rebound entry.
-                    let sock_id = filesystem_id(path)?;
-                    listener
-                        .set_nonblocking(true)
-                        .with_context(|| format!("setting nonblocking on socket '{path}'"))?;
+                    // Without a captured identity later cleanup cannot prove
+                    // ownership, so it leaves residue for the next starter.
+                    let sock_id = match filesystem_id(path) {
+                        Ok(id) => id,
+                        Err(err) => {
+                            drop(listener);
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = listener.set_nonblocking(true) {
+                        drop(listener);
+                        cleanup_failed_acquire(path, sock_id, replacement.is_held());
+                        return Err(err)
+                            .with_context(|| format!("setting nonblocking on socket '{path}'"));
+                    }
                     let stop = Arc::new(AtomicBool::new(false));
-                    let drain_listener = listener
-                        .try_clone()
-                        .with_context(|| format!("cloning socket '{path}' for drain"))?;
+                    let (shutdown_tx, shutdown_rx) = match shutdown_pipe() {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            drop(listener);
+                            cleanup_failed_acquire(path, sock_id, replacement.is_held());
+                            return Err(err).with_context(|| {
+                                format!("creating drain shutdown pipe for '{path}'")
+                            });
+                        }
+                    };
+                    let drain_listener = match listener.try_clone() {
+                        Ok(clone) => clone,
+                        Err(err) => {
+                            drop(listener);
+                            drop(shutdown_tx);
+                            drop(shutdown_rx);
+                            cleanup_failed_acquire(path, sock_id, replacement.is_held());
+                            return Err(err)
+                                .with_context(|| format!("cloning socket '{path}' for drain"));
+                        }
+                    };
+                    // `drain_listener`/`shutdown_rx` move into the spawn closure;
+                    // on failure the closure (and both fds) drops with it, so
+                    // only the bound listener and `shutdown_tx` need explicit
+                    // drops here before unlinking our fresh pathname.
+                    // `stop` is only moved on success; on failure it drops.
                     let drain_stop = Arc::clone(&stop);
-                    let drainer = thread::Builder::new()
+                    let drainer = match thread::Builder::new()
                         .name("ltd-sock-drain".to_string())
-                        .spawn(move || drain_loop(drain_listener, drain_stop))
-                        .with_context(|| format!("spawning drain thread for '{path}'"))?;
+                        .spawn(move || drain_loop(drain_listener, drain_stop, shutdown_rx))
+                    {
+                        Ok(handle) => handle,
+                        Err(err) => {
+                            drop(listener);
+                            drop(shutdown_tx);
+                            cleanup_failed_acquire(path, sock_id, replacement.is_held());
+                            return Err(err)
+                                .with_context(|| format!("spawning drain thread for '{path}'"));
+                        }
+                    };
                     return Ok(Self {
                         path: path.to_string(),
                         sock_id,
                         _listener: listener,
                         stop,
+                        shutdown_tx,
                         drainer: Some(drainer),
                     });
                 }
@@ -288,13 +361,169 @@ impl SocketLock {
     }
 }
 
-/// Accept loop for the holder: dequeue probe connects and close them at
-/// once so the kernel queue cannot fill and stall later probes.
-fn drain_loop(listener: UnixListener, stop: Arc<AtomicBool>) {
-    while !stop.load(Ordering::Relaxed) {
-        let drained = drain_once(&listener);
-        if drained == 0 {
-            thread::sleep(DRAIN_IDLE_SLEEP);
+/// Owned self-pipe for drainer shutdown: `(write, read)`, both
+/// `CLOEXEC` + nonblocking. The holder keeps the write end; the drain thread
+/// blocks in `poll` on the read end alongside the listening socket. Bytes
+/// persist in the pipe, so a shutdown queued before the waiter enters `poll`
+/// still wakes it — no lost wakeup.
+fn shutdown_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` points to two writable descriptor slots.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two newly owned descriptors; fds[0] reads,
+    // fds[1] writes.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[1]), OwnedFd::from_raw_fd(fds[0])) })
+}
+
+/// Wake an idle drain waiter: write one byte to the shutdown pipe.
+/// Retries `EINTR`; ignores `EAGAIN` (already readable) and any other error
+/// because the waiter treats any readability as shutdown and `Drop` joins
+/// regardless.
+fn notify_shutdown(tx: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let byte = [1_u8];
+    loop {
+        // SAFETY: `tx` is the live write end and `byte` is readable for 1 byte.
+        let rc = unsafe { libc::write(tx.as_raw_fd(), byte.as_ptr().cast(), 1) };
+        if rc == 1 {
+            return;
+        }
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        return;
+    }
+}
+
+/// Backoff applied when the readiness wait itself fails or the listener
+/// reports an error without input. Prevents hot-spinning; shutdown stays
+/// observable via `stop` (checked each pass) and typically resolves within
+/// about one backoff. Not a hard realtime bound: scheduling can delay it.
+const DRAIN_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Single readiness wait: one blocking `poll(-1)` over the listener and the
+/// shutdown pipe. Returns `(listener_revents, shutdown_revents)`. No retry or
+/// sleep here; the caller applies the stop/error policy so `EINTR` and
+/// persistent failures never bypass shutdown.
+fn poll_two(
+    listener_fd: std::os::fd::RawFd,
+    shutdown_fd: std::os::fd::RawFd,
+) -> io::Result<(i16, i16)> {
+    let mut fds = [
+        libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: shutdown_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `fds` is a valid two-element array for the duration of the call.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+    if rc >= 0 {
+        Ok((fds[0].revents, fds[1].revents))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Readiness waiter replacing the old 10ms idle sleep: block in `poll` until
+/// the listener is readable or the shutdown pipe fires. Each input wake
+/// drains one bounded `drain_once` pass; a pass that makes no progress while
+/// the socket stays readable backs off instead of repolling immediately.
+fn drain_loop(listener: UnixListener, stop: Arc<AtomicBool>, shutdown_rx: std::os::fd::OwnedFd) {
+    drain_loop_with_wait(listener, stop, shutdown_rx, poll_two)
+}
+
+/// Wait-injected waiter core. `wait` performs one readiness wait over the
+/// two fds; production passes [`poll_two`], tests inject failures or error
+/// revents without touching host limits. Shutdown (`stop` + any shutdown
+/// revents) always wins over listener handling.
+fn drain_loop_with_wait(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    shutdown_rx: std::os::fd::OwnedFd,
+    mut wait: impl FnMut(std::os::fd::RawFd, std::os::fd::RawFd) -> io::Result<(i16, i16)>,
+) {
+    use std::os::fd::AsRawFd;
+    let listener_fd = listener.as_raw_fd();
+    let shutdown_fd = shutdown_rx.as_raw_fd();
+    loop {
+        // Independent of `poll` success so a persistent wait failure cannot
+        // hide shutdown (F1): `Drop` sets `stop` before notifying.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match wait(listener_fd, shutdown_fd) {
+            Ok((listener_revents, shutdown_revents)) => {
+                // Any shutdown readability (including pipe errors) exits;
+                // the pipe is only ever used for this signal.
+                if shutdown_revents != 0 {
+                    return;
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if listener_revents & libc::POLLNVAL != 0 {
+                    // Invalid listener fd: unrecoverable without fd surgery.
+                    // Exit so `Drop` can still join; the holder keeps its
+                    // pathname semantics and the next acquire reclaims.
+                    log::debug!("drain waiter exiting: listener fd invalid");
+                    return;
+                }
+                if listener_revents & libc::POLLIN != 0 {
+                    // One bounded pass per wake; the next wait returns
+                    // immediately while backlog remains, so bursts drain
+                    // promptly without spinning. A pass that drains nothing
+                    // while the socket stays readable (e.g. accept keeps
+                    // failing under EMFILE) would otherwise repoll forever:
+                    // back off instead of hot-spinning. Shutdown stays
+                    // prompt: `stop` is checked before sleeping and at the
+                    // top, and a queued shutdown byte makes the next wait
+                    // return with `shutdown_revents` set.
+                    if drain_once(&listener) == 0 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(DRAIN_ERROR_BACKOFF);
+                    }
+                } else if listener_revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                    // Error with no input to drain: `poll` would return
+                    // immediately again, so back off instead of hot-spinning.
+                    // Shutdown stays prompt: `stop` is checked at the top
+                    // and a queued shutdown byte makes the next wait return
+                    // with `shutdown_revents` set.
+                    thread::sleep(DRAIN_ERROR_BACKOFF);
+                }
+                // Otherwise spurious (e.g. zero revents): re-wait.
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // `EINTR`: re-wait; `stop` is rechecked at the top, so a
+                // signal storm cannot delay shutdown beyond one wait.
+                continue;
+            }
+            Err(e) => {
+                // Persistent wait failure (e.g. ENOMEM): the queued shutdown
+                // byte may never surface through `poll`, so `stop` (not the
+                // pipe) is the shutdown signal here. Back off to avoid
+                // hot-spinning; the top-of-loop check exits typically within
+                // about one backoff after `Drop` sets `stop`.
+                log::debug!("drain wait failed ({e}); backing off");
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(DRAIN_ERROR_BACKOFF);
+            }
         }
     }
 }
@@ -446,7 +675,14 @@ impl Drop for SocketLock {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
         // Stop the drainer first so no cloned fd outlives our unlink check.
+        // Flag THEN notify BEFORE joining: the flag keeps shutdown observable
+        // even if `poll` keeps failing, and one byte wakes an idle `poll`
+        // waiter promptly. The byte persists if the waiter has not entered
+        // `poll` yet, so the wakeup cannot be lost. A full pipe already
+        // leaves the waiter readable, and `EINTR` retries; all other write
+        // outcomes are ignored because the thread exits on flag or pipe.
         self.stop.store(true, Ordering::Relaxed);
+        notify_shutdown(&self.shutdown_tx);
         if let Some(handle) = self.drainer.take() {
             let _ = handle.join();
         }
@@ -1005,6 +1241,395 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn drainer_accepts_after_idle() {
+        // Idle-window regression for the readiness waiter: after a quiet
+        // period with an empty queue (longer than the old 10ms idle sleep),
+        // a new probe must still be accepted and closed in the background.
+        // The assertion is synchronized (EOF with a generous read timeout),
+        // not a timing measurement; no power/CPU claim is made.
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("idle.sock");
+        let sock_str = sock.to_str().unwrap();
+        let guard = SocketLock::acquire(sock_str).unwrap();
+        assert_eq!(guard.drain_pending(), 0);
+        std::thread::sleep(Duration::from_millis(100));
+        let mut client = UnixStream::connect(sock_str).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn idle_waiter_wakes_on_shutdown_without_connection() {
+        // Explicit shutdown wakeup with no connection ever queued. The wait
+        // wrapper signals actual `poll_two` entry before stop is requested,
+        // so this test cannot pass via the loop-top flag check without ever
+        // entering `poll`: a missed pipe wakeup (lost signal) would hang the
+        // join. The pipe byte persists, so the waiter must still exit.
+        // Bounded via channels so a regression fails instead of hanging the
+        // suite, and the worker join propagates panics.
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("wake.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = shutdown_pipe().unwrap();
+        let drain_stop = Arc::clone(&stop);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("test-drain-wake".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |listener_fd, shutdown_fd| {
+                    let _ = entered_tx.send(());
+                    poll_two(listener_fd, shutdown_fd)
+                })
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must enter poll before shutdown");
+        // Flag then notify, mirroring `Drop`: covers both an idle `poll`
+        // waiter (byte) and a failing waiter (flag).
+        stop.store(true, Ordering::Relaxed);
+        notify_shutdown(&tx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().expect("worker thread must not panic");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle poll waiter must wake on shutdown");
+    }
+
+    #[test]
+    fn persistent_wait_error_plus_shutdown_returns_promptly() {
+        // F1 regression with an injected wait seam (no host rlimit/fd games):
+        // the readiness wait always fails (e.g. ENOMEM), so the shutdown pipe
+        // byte can never surface through `poll`. The `stop` flag must still
+        // end the worker. The entered-gate below proves the failing wait
+        // actually ran before stop is requested: without it the worker could
+        // exit at the loop-top flag check having never exercised the
+        // persistent-error path. Bounded via channels so failure reports
+        // instead of hanging the suite.
+        use std::sync::{atomic::AtomicUsize, mpsc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("wait-err.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let (_tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("test-drain-wait-err".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
+                    if calls_in.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let _ = entered_tx.send(());
+                    }
+                    Err::<(i16, i16), _>(io::Error::from_raw_os_error(libc::ENOMEM))
+                })
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failing wait must run at least once before stop");
+        stop.store(true, Ordering::Relaxed);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().expect("worker thread must not panic");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must exit on stop even when poll keeps failing");
+        assert!(
+            calls.load(Ordering::Relaxed) >= 1,
+            "failing wait must have run"
+        );
+    }
+
+    #[test]
+    fn listener_error_revents_back_off_without_spin() {
+        // F2 regression with an injected wait seam: the listener reports
+        // POLLERR with no POLLIN, which `poll` would return immediately and
+        // forever. The waiter must back off instead of hot-spinning. The
+        // entered-gate synchronizes on the first injected wait so a delayed
+        // scheduler cannot observe zero runs; the bounded window then asserts
+        // the wait-call count stays tiny (a spinning waiter would call
+        // thousands of times here).
+        use std::sync::{atomic::AtomicUsize, mpsc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("listen-err.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let (tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("test-drain-listen-err".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
+                    if calls_in.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let _ = entered_tx.send(());
+                    }
+                    Ok((libc::POLLERR, 0))
+                })
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must run at least once before the window");
+        std::thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::Relaxed);
+        notify_shutdown(&tx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().expect("worker thread must not panic");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("error-revent waiter must still exit on stop");
+        let n = calls.load(Ordering::Relaxed);
+        assert!(
+            n <= 10,
+            "POLLERR without input must back off, not spin: {n} waits in ~150ms"
+        );
+        assert!(n >= 1, "waiter must have waited at least once");
+    }
+
+    #[test]
+    fn listener_nval_exits_worker_without_shutdown() {
+        // Terminal policy: POLLNVAL means the listener fd is unrecoverable.
+        // The worker exits on its own (no stop needed) so `Drop` can still
+        // join instead of spinning or blocking forever.
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("listen-nval.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let (_tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::Builder::new()
+            .name("test-drain-listen-nval".to_string())
+            .spawn(move || drain_loop_with_wait(listener, stop, rx, |_, _| Ok((libc::POLLNVAL, 0))))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().expect("worker thread must not panic");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("POLLNVAL waiter must exit without requiring shutdown");
+    }
+
+    #[test]
+    fn pollin_without_drain_progress_backs_off_and_stops() {
+        // R1 regression with an injected wait seam: the listener reports
+        // POLLIN but the bounded drain pass makes no progress (models accept
+        // failing behind a readable queue, e.g. EMFILE, where `poll` stays
+        // readable). The waiter must back off instead of repolling
+        // immediately, and `stop` must still end it promptly. The empty real
+        // queue keeps `drain_once` at zero without touching host limits.
+        use std::sync::{atomic::AtomicUsize, mpsc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("no-progress.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("test-drain-no-progress".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
+                    if calls_in.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let _ = entered_tx.send(());
+                    }
+                    Ok((libc::POLLIN, 0))
+                })
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must poll at least once before the window");
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        notify_shutdown(&tx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            handle.join().expect("worker thread must not panic");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no-progress waiter must still exit on stop");
+        let n = calls.load(Ordering::Relaxed);
+        assert!(
+            (2..=12).contains(&n),
+            "POLLIN with zero drain progress must back off, not spin: {n} waits in ~200ms"
+        );
+    }
+
+    #[test]
+    fn failed_acquire_cleanup_preserves_live_successor() {
+        // R2 regression: post-bind failure cleanup must never unlink a live
+        // successor. A real successor holds the path while each failure
+        // branch's cleanup decision is replayed: degraded (no exclusion, any
+        // identity) and held-mutex-but-stale-identity must both leave the
+        // live name alone. Mirrors the ownership policy of `Drop`.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("succ-live.sock");
+        let sock_str = sock.to_str().unwrap();
+        let successor = SocketLock::acquire(sock_str).unwrap();
+        assert!(daemon_socket_present(sock_str));
+        // Degraded predecessor: no exclusion, even with the live identity.
+        cleanup_failed_acquire(sock_str, successor.sock_id, false);
+        assert!(std::path::Path::new(sock_str).exists());
+        assert!(daemon_socket_present(sock_str));
+        // Held-mutex predecessor with a stale identity (successor rebound
+        // after an external unlink between our bind and our failure).
+        let stale = (successor.sock_id.0, successor.sock_id.1.wrapping_add(1));
+        cleanup_failed_acquire(sock_str, stale, true);
+        assert!(
+            std::path::Path::new(sock_str).exists(),
+            "stale-identity cleanup must not unlink the live successor"
+        );
+        assert!(daemon_socket_present(sock_str));
+        drop(successor);
+        assert!(
+            !std::path::Path::new(sock_str).exists(),
+            "normal drop must still delete the socket pathname"
+        );
+        assert!(!daemon_socket_present(sock_str));
+    }
+
+    #[test]
+    fn failed_acquire_cleanup_removes_own_entry() {
+        // Positive side of the R2 policy: with exclusion held and a matching
+        // identity, our own fresh entry is still removed (no leak).
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("own-entry.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let id = filesystem_id(sock_str).unwrap();
+        drop(listener);
+        // Stale residue of a dead binder, identity still matches: reclaimable.
+        cleanup_failed_acquire(sock_str, id, true);
+        assert!(
+            !std::path::Path::new(sock_str).exists(),
+            "owned matching entry must be removed"
+        );
+    }
+
+    #[test]
+    fn degraded_acquire_drop_leaves_reclaimable_residue() {
+        // End-to-end degraded mode: an unusable sidecar lockfile (here a
+        // directory, so the lock open fails) still allows acquire, and both
+        // failure-path and `Drop` cleanup skip the unlink without exclusion.
+        // The next serialized acquire reclaims the residue.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("degraded.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+        std::fs::create_dir(format!("{sock_str}.lock")).unwrap();
+        let guard = SocketLock::acquire(&sock_str).unwrap();
+        drop(guard);
+        assert!(
+            std::path::Path::new(&sock_str).exists(),
+            "degraded drop must leave residue instead of unlinking without exclusion"
+        );
+        assert!(
+            !daemon_socket_present(&sock_str),
+            "dropped listener must not answer even though its pathname remains"
+        );
+        std::fs::remove_dir(format!("{sock_str}.lock")).unwrap();
+        let successor = SocketLock::acquire(&sock_str).unwrap();
+        assert!(daemon_socket_present(&sock_str));
+        drop(successor);
+        assert!(!std::path::Path::new(&sock_str).exists());
+        assert!(!daemon_socket_present(&sock_str));
+    }
+
+    #[test]
+    fn bounded_stop_under_queued_load() {
+        // `Drop` must join promptly even with backlog queued: notify fires
+        // before join, and the waiter exits instead of draining forever.
+        // Generous 5s bound; failure reports via timeout, not a hung suite.
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("loaded-stop.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+        let guard = SocketLock::acquire(&sock_str).unwrap();
+        // Queue pressure without stalling: nonblocking dials held open.
+        let mut pending = Vec::new();
+        for _ in 0..200 {
+            match nonblocking_dial(&sock_str) {
+                Ok(s) => pending.push(s),
+                Err(_) => break,
+            }
+        }
+        assert!(!pending.is_empty(), "must queue load for stop test");
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(guard);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drop must join promptly under queued load");
+        drop(pending);
+    }
+
+    #[test]
+    fn shutdown_pipe_is_nonblocking_cloexec() {
+        // Descriptor contract without touching rlimits: both ends must be
+        // nonblocking (drainer `poll` + `Drop` write never block) and
+        // close-on-exec (no leak into `reconnect`/helper children).
+        use std::os::fd::AsRawFd;
+        let (tx, rx) = shutdown_pipe().unwrap();
+        for fd in [tx.as_raw_fd(), rx.as_raw_fd()] {
+            // SAFETY: `fd` is a live owned pipe end for the duration.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0, "fcntl F_GETFL must succeed");
+            assert_eq!(
+                flags & libc::O_NONBLOCK,
+                libc::O_NONBLOCK,
+                "shutdown pipe ends must be nonblocking"
+            );
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(fd_flags >= 0, "fcntl F_GETFD must succeed");
+            assert_eq!(
+                fd_flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "shutdown pipe ends must be CLOEXEC"
+            );
+        }
     }
 
     #[test]
