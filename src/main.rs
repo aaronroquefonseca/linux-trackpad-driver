@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod evdev;
 pub mod evdev_generic;
+pub mod hotplug;
 #[cfg(test)]
 pub mod hw_mock;
 pub mod init;

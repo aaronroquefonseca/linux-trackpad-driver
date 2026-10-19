@@ -22,8 +22,10 @@
 //! without repeating hardware init, even when polling matches or BT keeps
 //! its name. Those emits only happen on a live daemon hub: the one-shot
 //! owns no listeners. Cross-process re-attach starts on a later daemon
-//! pass ([`RESUME_REVERIFY_INTERVAL_SECS`], plus init/attach work). A node
-//! that vanished emits `Detached` instead, never `Ready`.
+//! pass: kernel hotplug events wake discovery promptly with bounded readiness
+//! retries; [`RESUME_REVERIFY_INTERVAL_SECS`] remains the full verification
+//! and missed-event fallback. Init/attachment work adds to scheduling time.
+//! A node that vanished emits `Detached` instead, never `Ready`.
 
 use anyhow::Result;
 
