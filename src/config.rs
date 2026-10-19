@@ -495,33 +495,13 @@ pub enum ActionKind {
 /// Canonical representative for a key token: aliases resolving to the same
 /// kernel code share one representative so [`ActionKind::is_same_action`]
 /// compares wire identity, not spelling (`super+left` == `meta+left`,
-/// `ctrl+c` == `control+c`). Mirrors [`crate::proxy::key_token_to_code`];
-/// every multi-token arm there has its members listed here. Tokens with
-/// distinct codes (`rctrl` vs `ctrl`, `left` vs `left_arrow`,
-/// `pause` vs `pausecd`) intentionally keep distinct representatives.
+/// `ctrl+c` == `control+c`). Single source is
+/// [`crate::action_tokens::canonical_token`]; this wrapper preserves the
+/// existing path. Tokens with distinct codes (`rctrl` vs `ctrl`,
+/// `left` vs `left_arrow`, `pause` vs `pausecd`) intentionally keep
+/// distinct representatives.
 pub fn canonical_key_token(token: &str) -> &str {
-    match token {
-        "control" | "lctrl" => "ctrl",
-        "lshift" => "shift",
-        "lalt" => "alt",
-        "super" | "cmd" | "command" | "win" | "lmeta" => "meta",
-        "escape" => "esc",
-        "return" => "enter",
-        "pgup" => "pageup",
-        "pgdn" => "pagedown",
-        "arrow_up" => "up",
-        "arrow_down" => "down",
-        "volumeup" => "volup",
-        "volumedown" => "voldown",
-        "playpause" => "play",
-        "stopcd" => "stop",
-        "nextsong" => "next",
-        "previous" | "previoussong" => "prev",
-        "browser_back" => "browserback",
-        "browser_forward" => "browserforward",
-        "lock" => "screenlock",
-        _ => token,
-    }
+    crate::action_tokens::canonical_token(token)
 }
 
 impl ActionKind {
@@ -560,7 +540,7 @@ impl ActionKind {
 /// `browserforward` — `back`/`forward` stay mouse buttons — plus `refresh`,
 /// `homepage`, `search`, `favorites`, `bookmarks`, `www`), app keys
 /// (`calc`, `mail`, `computer`, `player`, `screenlock`/`lock`), `a`-`z`,
-/// `0`-`9`, and `f1`-`f24` (see [`crate::proxy::key_token_to_code`] for
+/// `0`-`9`, and `f1`-`f24` (see [`crate::action_tokens::token_code`] for
 /// codes and the deliberately-excluded list). Combos accept every known
 /// key (e.g. `ctrl+refresh`). Returns a descriptive error naming
 /// the offending key segment on failure.
@@ -605,46 +585,11 @@ pub fn parse_click_action(s: &str) -> std::result::Result<ClickAction, String> {
 }
 
 /// Whether `name` (already lowercased + trimmed) is a valid key/button token
-/// for a click action combo.
+/// for a click action combo. Single source is
+/// [`crate::action_tokens::is_known_token`]: accepts exactly what the
+/// shared table maps (including dynamic `a`-`z`, `0`-`9`, `f1`-`f24`).
 fn is_known_key(name: &str) -> bool {
-    matches!(
-        name,
-        // Mouse buttons.
-        "left" | "right" | "middle" | "back" | "forward"
-        // Modifiers.
-        | "ctrl" | "control" | "lctrl" | "rctrl"
-        | "shift" | "lshift" | "rshift"
-        | "alt" | "lalt" | "ralt"
-        | "meta" | "super" | "cmd" | "command" | "win" | "lmeta" | "rmeta"
-        // Navigation / editing.
-        | "esc" | "escape" | "enter" | "return" | "space" | "tab"
-        | "backspace" | "delete" | "insert" | "print" | "home" | "end"
-        | "pageup" | "pgup" | "pagedown" | "pgdn"
-        | "up" | "arrow_up" | "down" | "arrow_down"
-        | "left_arrow" | "right_arrow"
-        // Media (codes in crate::proxy; each header-verified).
-        | "volup" | "volumeup" | "voldown" | "volumedown" | "mute" | "micmute"
-        | "play" | "playpause" | "playcd" | "pausecd" | "pause"
-        | "stop" | "stopcd" | "next" | "nextsong"
-        | "prev" | "previous" | "previoussong"
-        // Browser (`back`/`forward` stay mouse buttons; browser variants
-        // carry the AC Back/Forward codes 158/159).
-        | "browserback" | "browser_back" | "browserforward" | "browser_forward"
-        | "refresh" | "homepage" | "search" | "favorites" | "bookmarks" | "www"
-        // App launchers / system.
-        | "calc" | "mail" | "computer" | "player" | "screenlock" | "lock"
-        // Letters.
-        | "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k"
-        | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v"
-        | "w" | "x" | "y" | "z"
-        // Digits.
-        | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-        // Function row (codes in crate::proxy; F13..F24 = 183..=194).
-        | "f1" | "f2" | "f3" | "f4" | "f5" | "f6"
-        | "f7" | "f8" | "f9" | "f10" | "f11" | "f12"
-        | "f13" | "f14" | "f15" | "f16" | "f17" | "f18"
-        | "f19" | "f20" | "f21" | "f22" | "f23" | "f24"
-    )
+    crate::action_tokens::is_known_token(name)
 }
 
 impl Config {
@@ -1346,70 +1291,38 @@ mod tests {
     }
 
     #[test]
-    fn same_action_treats_aliases_as_identical() {
+    fn same_action_agrees_with_shared_token_table() {
+        // Shared-driven drift guarantee: group the shared token universe
+        // by wire code. Same-code tokens merge (aliases, both directions);
+        // different-code tokens never do. Adding a token to the shared
+        // table extends this coverage automatically; no manual pair list.
+        use crate::action_tokens::{all_known_tokens, token_code};
+        let tokens = all_known_tokens();
+        let kinds: Vec<ActionKind> = tokens
+            .iter()
+            .map(|t| parse_click_action(t).unwrap().kind)
+            .collect();
+        for (i, a) in tokens.iter().enumerate() {
+            for (j, b) in tokens.iter().enumerate() {
+                let same_wire = token_code(a) == token_code(b);
+                assert_eq!(
+                    kinds[i].is_same_action(&kinds[j]),
+                    same_wire,
+                    "comparison must agree with wire codes: '{a}' vs '{b}'"
+                );
+            }
+        }
+        // Combo-level semantics survive canonicalization: order- and
+        // duplicate-insensitive, alias-aware.
         let keys = |s: &str| parse_click_action(s).unwrap().kind;
-        // Every multi-token arm of proxy `key_token_to_code` merges here.
-        // Combos exercise the handoff path (`super+left` vs `meta+left`);
-        // bare pairs pin the canonical grouping itself.
-        for (a, b) in [
-            ("super+left", "meta+left"),
-            ("cmd+left", "win+left"),
-            ("command+c", "meta+c"),
-            ("lmeta+c", "super+c"),
-            ("ctrl+c", "control+c"),
-            ("ctrl+c", "lctrl+c"),
-            ("shift+x", "lshift+x"),
-            ("alt+f4", "lalt+f4"),
-            ("esc", "escape"),
-            ("enter", "return"),
-            ("pageup", "pgup"),
-            ("pagedown", "pgdn"),
-            ("up", "arrow_up"),
-            ("down", "arrow_down"),
-            ("volup", "volumeup"),
-            ("voldown", "volumedown"),
-            ("play", "playpause"),
-            ("stop", "stopcd"),
-            ("next", "nextsong"),
-            ("prev", "previous"),
-            ("prev", "previoussong"),
-            ("browserback", "browser_back"),
-            ("browserforward", "browser_forward"),
-            ("screenlock", "lock"),
-            // Order/dup-insensitivity survives canonicalization.
-            ("left+super", "meta+left"),
-            ("ctrl+ctrl+c", "control+c"),
-        ] {
-            assert!(
-                keys(a).is_same_action(&keys(b)),
-                "aliases must merge: '{a}' vs '{b}'"
-            );
-            assert!(
-                keys(b).is_same_action(&keys(a)),
-                "aliases must merge (symmetric): '{b}' vs '{a}'"
-            );
-        }
-        // Distinct codes must NOT merge: right-hand modifiers, button-vs-key,
-        // and near-miss media tokens.
-        for (a, b) in [
-            ("ctrl", "rctrl"),
-            ("shift", "rshift"),
-            ("alt", "ralt"),
-            ("meta", "rmeta"),
-            ("super", "rmeta"),
-            ("left", "left_arrow"),
-            ("pause", "pausecd"),
-            ("play", "playcd"),
-            ("play", "pausecd"),
-            ("mute", "micmute"),
-            ("super+left", "meta+right"),
-            ("ctrl+c", "ctrl+v"),
-        ] {
-            assert!(
-                !keys(a).is_same_action(&keys(b)),
-                "distinct codes must not merge: '{a}' vs '{b}'"
-            );
-        }
+        assert!(keys("left+super").is_same_action(&keys("meta+left")));
+        assert!(keys("ctrl+ctrl+c").is_same_action(&keys("control+c")));
+        assert!(!keys("super+left").is_same_action(&keys("meta+right")));
+        assert!(!keys("ctrl+c").is_same_action(&keys("ctrl+v")));
+        // `None`/`Empty` keep their distinct identity.
+        assert!(keys("empty").is_same_action(&keys("EMPTY")));
+        assert!(!keys("empty").is_same_action(&keys("left")));
+        assert!(!keys("none").is_same_action(&keys("empty")));
     }
 
     #[test]

@@ -2,13 +2,12 @@
 """Generate docs/KEYS.md from code truth (no hand-typed name->code tables).
 
 Sources (all parsed, never hand-copied):
-  - src/proxy.rs  : key_token_to_code match arms (+ BTN_* consts,
-                    keycode_letter_digit arms, keycode_fn rules)
-  - src/config.rs : is_known_key matches! token set (must equal the map keys)
+  - src/action_tokens.rs : KEY_TOKEN_CODES table, letter_digit_code arms,
+    fn_code rules (the single token->code source of truth)
   - /usr/include/linux/input-event-codes.h : code -> kernel macro name(s)
 
 Grouping by token name is presentation-only (codes always come from the
-sources above). Unknown tokens fall into "misc" so a map addition can never
+source above). Unknown tokens fall into "misc" so a map addition can never
 silently drop a row -- the drift pin (keys_md_pins_generated_table) only
 checks names/codes.
 
@@ -24,8 +23,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PROXY_RS = ROOT / "src" / "proxy.rs"
-CONFIG_RS = ROOT / "src" / "config.rs"
+TOKENS_RS = ROOT / "src" / "action_tokens.rs"
 OUT = ROOT / "docs" / "KEYS.md"
 DEFAULT_HEADER = "/usr/include/linux/input-event-codes.h"
 
@@ -140,82 +138,48 @@ def region(text: str, start_marker: str, end_marker: str) -> str:
     return text[start:end]
 
 
-def parse_proxy_map(proxy_src: str) -> dict:
-    """token -> code, extracted from the three keycode fns (no hand tables)."""
+def parse_token_map(tokens_src: str) -> dict:
+    """token -> code, extracted from the shared table + helpers (no hand tables)."""
     mapping: dict[str, int] = {}
 
-    # BTN_* const values (e.g. BTN_LEFT = 272).
-    consts = dict(
-        (name, int(val))
-        for name, val in re.findall(r"pub const (BTN_\w+): u16 = (\d+);", proxy_src)
-    )
-    if not {"BTN_LEFT", "BTN_RIGHT", "BTN_MIDDLE", "BTN_SIDE", "BTN_EXTRA"} <= set(
-        consts
-    ):
-        fail("BTN_* consts missing from src/proxy.rs")
+    # Static table: ("name", code) rows (canonical first; codes literal).
+    body = region(tokens_src, "pub const KEY_TOKEN_CODES", "];")
+    for tok, code in re.findall(r'\(\s*"([^"]+)"\s*,\s*(\d+)\s*\)', body):
+        if tok in mapping:
+            fail(f"duplicate token {tok!r} in KEY_TOKEN_CODES")
+        mapping[tok] = int(code)
 
-    # Direct match arms: "a" | "b" => Some((EV_KEY, 29)) or (EV_KEY, BTN_X).
-    body = region(proxy_src, "pub fn key_token_to_code", "fn keycode_letter_digit")
-    arm_re = re.compile(
-        r"((?:\"[^\"]+\"\s*\|\s*)*\"[^\"]+\")\s*=>\s*Some\(\(EV_KEY,\s*(BTN_[A-Z_]+|\d+)\)\)"
-    )
-    for lhs, code in arm_re.findall(body):
-        tokens = re.findall(r"\"([^\"]+)\"", lhs)
-        value = consts[code] if code.startswith("BTN_") else int(code)
-        if code.startswith("BTN_") and code not in consts:
-            fail(f"unknown const {code}")
-        for tok in tokens:
-            if tok in mapping:
-                fail(f"duplicate token {tok!r} in key_token_to_code")
-            mapping[tok] = value
-
-    # Single-char letters/digits: arms like 'a' => 30 inside keycode_letter_digit.
-    ld_body = region(proxy_src, "fn keycode_letter_digit", "fn keycode_fn")
+    # Single-char letters/digits: arms like 'a' => 30 inside letter_digit_code.
+    ld_body = region(tokens_src, "fn letter_digit_code", "fn fn_code")
     for char, code in re.findall(r"'([^']+)'\s*=>\s*(\d+),", ld_body):
         if len(char) != 1:
-            fail(f"unexpected multi-char arm {char!r} in keycode_letter_digit")
+            fail(f"unexpected multi-char arm {char!r} in letter_digit_code")
         if char in mapping:
-            fail(f"duplicate token {char!r} from keycode_letter_digit")
+            fail(f"duplicate token {char!r} from letter_digit_code")
         mapping[char] = int(code)
 
     # Fn keys: range rule (N..=M => base + n) + single rules (N => code).
-    fn_body = region(proxy_src, "fn keycode_fn", "// ---- proxy ----")
+    fn_body = region(tokens_src, "fn fn_code", "pub fn is_known_token")
     covered: dict[int, int] = {}
     for lo, hi, base in re.findall(
-        r"(\d+)\.\.=(\d+)\s*=>\s*Some\(\(EV_KEY,\s*(\d+)\s*\+\s*u16::from\(n\)\)\)",
+        r"(\d+)\.\.=(\d+)\s*=>\s*Some\(\s*(\d+)\s*\+\s*u16::from\(n\)\s*\)",
         fn_body,
     ):
         for n in range(int(lo), int(hi) + 1):
             covered[n] = int(base) + n
     for n, code in re.findall(
-        r"(?<!\.\.)(?<!\d)(\d+)\s*=>\s*Some\(\(EV_KEY,\s*(\d+)\)\),", fn_body
+        r"(?<!\.\.)(?<!\d)(\d+)\s*=>\s*Some\(\s*(\d+)\s*\)\s*,", fn_body
     ):
         # Skip the range-rule line's numbers (it has no trailing comma form).
         covered[int(n)] = int(code)
     if not covered:
-        fail("no F-key rules parsed from keycode_fn")
+        fail("no F-key rules parsed from fn_code")
     for n in sorted(covered):
         tok = f"f{n}"
         if tok in mapping:
-            fail(f"duplicate token {tok!r} from keycode_fn")
+            fail(f"duplicate token {tok!r} from fn_code")
         mapping[tok] = covered[n]
     return mapping
-
-
-def parse_config_tokens(config_src: str) -> set:
-    """Token set from is_known_key's matches! (must equal the proxy map keys)."""
-    start = config_src.find("fn is_known_key")
-    if start < 0:
-        fail("fn is_known_key not found in src/config.rs")
-    end = config_src.find("\n}\n", start)
-    body = config_src[start:end]
-    tokens = set(re.findall(r"\"([^\"]+)\"", body))
-    for tok in tokens:
-        if not re.fullmatch(r"[a-z0-9_]+", tok):
-            fail(f"unexpected string {tok!r} inside is_known_key")
-    if not tokens:
-        fail("no tokens parsed from is_known_key")
-    return tokens
 
 
 def parse_header_macros(header_path: str) -> dict:
@@ -249,14 +213,14 @@ def parse_header_macros(header_path: str) -> dict:
     return by_code
 
 
-def parse_excluded_doc(proxy_src: str) -> list:
-    """Deliberately-excluded bullets, verbatim from the key_token_to_code docs."""
-    start = proxy_src.find("Deliberately excluded")
+def parse_excluded_doc(tokens_src: str) -> list:
+    """Deliberately-excluded bullets, verbatim from the token_code docs."""
+    start = tokens_src.find("Deliberately excluded")
     if start < 0:
-        fail("Deliberately excluded docs missing from src/proxy.rs")
-    end = proxy_src.find("pub fn key_token_to_code", start)
+        fail("Deliberately excluded docs missing from src/action_tokens.rs")
+    end = tokens_src.find("pub fn token_code", start)
     lines = []
-    for line in proxy_src[start:end].splitlines():
+    for line in tokens_src[start:end].splitlines():
         line = line.strip()
         if line.startswith("///"):
             lines.append(line[3:].lstrip())
@@ -269,7 +233,7 @@ def parse_excluded_doc(proxy_src: str) -> list:
         elif bullets and ln and not ln.startswith("- "):
             bullets[-1] += " " + ln
     if not bullets:
-        fail("no exclusion bullets parsed from src/proxy.rs docs")
+        fail("no exclusion bullets parsed from src/action_tokens.rs docs")
     return bullets
 
 
@@ -305,8 +269,8 @@ def render(mapping: dict, macros: dict, excluded: list) -> str:
     out = []
     out.append("# Clickable keys\n")
     out.append(
-        "> Generated by `tools/gen_keys_md.py` from `src/proxy.rs`"
-        " (`key_token_to_code`), `src/config.rs` (`is_known_key`), and"
+        "> Generated by `tools/gen_keys_md.py` from `src/action_tokens.rs`"
+        " (the shared token table) and"
         " `/usr/include/linux/input-event-codes.h`. Do not edit by hand;"
         " regeneration or `--check` fails CI on drift."
     )
@@ -347,7 +311,7 @@ def render(mapping: dict, macros: dict, excluded: list) -> str:
     out.append("")
     out.append("## Deliberately excluded")
     out.append("")
-    out.append("Mirrored verbatim from the `key_token_to_code` docs -- these")
+    out.append("Mirrored verbatim from the `token_code` docs -- these")
     out.append("tokens stay unmapped on purpose:")
     out.append("")
     for bullet in excluded:
@@ -376,19 +340,12 @@ def main() -> int:
     ap.add_argument("--header", default=DEFAULT_HEADER)
     args = ap.parse_args()
 
-    proxy_src = PROXY_RS.read_text()
-    config_src = CONFIG_RS.read_text()
-    mapping = parse_proxy_map(proxy_src)
-    known = parse_config_tokens(config_src)
-    if set(mapping) != known:
-        only_map = sorted(set(mapping) - known)
-        only_cfg = sorted(set(known) - set(mapping))
-        fail(
-            "proxy map vs is_known_key drift:"
-            f" only-in-map={only_map} only-in-config={only_cfg}"
-        )
+    tokens_src = TOKENS_RS.read_text()
+    mapping = parse_token_map(tokens_src)
+    if not mapping:
+        fail("no tokens parsed from src/action_tokens.rs")
     macros = parse_header_macros(args.header)
-    excluded = parse_excluded_doc(proxy_src)
+    excluded = parse_excluded_doc(tokens_src)
     text = render(mapping, macros, excluded)
 
     out_path = Path(args.out)
