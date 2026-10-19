@@ -155,8 +155,8 @@ XHIDE="$TMP_BASE/xhide"; mkdir -p "$XHIDE"
 for tool in mktemp grep chmod rm cat; do
   ln -sf "$(command -v "$tool")" "$XHIDE/$tool"
 done
-printf '#!/usr/bin/env bash\nexit 0\n' > "$XHIDE/ssh"
-printf '#!/usr/bin/env bash\necho "stub git: fake clone failure" >&2\nexit 1\n' > "$XHIDE/git"
+printf '#!/bin/sh\nexit 0\n' > "$XHIDE/ssh"
+printf '#!/bin/sh\necho "stub git: fake clone failure" >&2\nexit 1\n' > "$XHIDE/git"
 chmod +x "$XHIDE/ssh" "$XHIDE/git"
 if PATH="$XHIDE" AUR_SSH_PRIVATE_KEY="$XSENT" "$BIN_BASH" -x "$REL/publish-aur.sh" \
   --pkg linux-trackpad-driver --dir "$TMP_BASE/r1" \
@@ -165,6 +165,9 @@ if PATH="$XHIDE" AUR_SSH_PRIVATE_KEY="$XSENT" "$BIN_BASH" -x "$REL/publish-aur.s
   >"$TMP_BASE/xtrace-out.txt" 2>"$TMP_BASE/xtrace-err.txt"; then
   echo "FAIL: xtrace probe expects clone failure" >&2; exit 1
 fi
+grep -q "stub git: fake clone failure" "$TMP_BASE/xtrace-err.txt" \
+  || { echo "FAIL: xtrace probe exercised the fake clone failure" >&2; exit 1; }
+ok "xtrace probe exercised the fake clone failure"
 cat "$TMP_BASE/xtrace-out.txt" "$TMP_BASE/xtrace-err.txt" > "$TMP_BASE/xtrace-all.txt"
 if grep -qF "$XSENT" "$TMP_BASE/xtrace-all.txt"; then
   echo "FAIL: sentinel leaked under xtrace" >&2; exit 1
