@@ -59,10 +59,64 @@ remains experimental and is not yet hardware-verified with this rewrite
 
 ## Privileges and attack surface
 
-The shipped systemd unit has no `User=` directive. The shipped service
-currently runs as root to access HID and input devices. There is no
-privilege dropping today. Sandboxing or privilege reduction are future
-ideas only, not current protections.
+The shipped systemd units run as root (no `User=` directive) to access HID
+and input devices. There is no privilege dropping via users today. What
+*is* in place since finding #19 is an incremental systemd sandbox subset,
+chosen restriction-by-restriction against the daemon's audited access and
+pinned by `tests/packaging.rs`:
+
+- Filesystem: `ProtectSystem=strict` (API FS `/dev`, `/proc`, `/sys`
+  stay usable, so hidraw/evdev/uinput reads+writes, sysfs discovery
+  reads, and the `/etc` config read are unchanged; the writable `/run`
+  socket dir comes from `RuntimeDirectory=linux-trackpad-driver`, not
+  from a general `/run` exemption), `ProtectHome=yes`, `PrivateTmp=yes`,
+  `ProtectKernelTunables=yes`, `ProtectKernelModules=yes`,
+  `ProtectControlGroups=yes`, `ProtectHostname=yes`, `ProtectKernelLogs=yes`.
+  `ProtectClock` is deliberately deferred (all three units): on pre-v252
+  systemd (e.g. Ubuntu Jammy) `ProtectClock=yes` adds an RTC-only device
+  allowlist that denies `/dev/hidraw*`, `/dev/input/event*`, and
+  `/dev/uinput` (upstream systemd#25075, fixed in v252). Time access stays
+  read-only without it; re-add only with a systemd version floor plus
+  hardware validation.
+- Privilege: `NoNewPrivileges=yes` (the daemon spawns no child processes),
+  `RestrictSUIDSGID=yes`, `RestrictRealtime=yes`, `LockPersonality=yes`,
+  `RestrictNamespaces=yes` (no namespace creation; the hotplug monitor only
+  binds netlink).
+- Sockets: `RestrictAddressFamilies=AF_UNIX AF_NETLINK` on the daemon (the
+  only families used in `src`: `AF_UNIX` lock socket, `AF_NETLINK` hotplug
+  monitor — no `AF_INET`/`AF_PACKET` anywhere); `AF_UNIX` only on the
+  reconnect/resume one-shots, which never open the netlink monitor.
+- No new config surface was added: the privileged path still reads only the
+  single system config (`LTD_CONFIG`, default
+  `/etc/linux-trackpad-driver/config.toml`). Arbitrary per-user
+  configuration and live reload stay out of the privileged path.
+
+Verification so far: `systemd-analyze verify` on all three units, the full
+cargo gates (`fmt --check`, `clippy -D warnings`, `cargo test`), and a
+source audit that every restricted facility is unused (no child processes,
+no setuid/setgid, no realtime scheduling, no namespace creation, no
+non-Unix/netlink sockets, no sysfs writes — discovery and evdev resolution
+are read-only). Hardware re-validation on a real pad (hidraw init +
+evdev grab + uinput creation under the sandboxed unit) has NOT been done
+here and is required before claiming containment: install the unit, run
+`ltd doctor`, exercise touch/clicks, suspend/resume, and hotplug, then
+confirm no `AVC`/denial lines in `journalctl -u linux-trackpad-driver`.
+
+Deliberately NOT done (follow-ups, each needs a device-access refactor plus
+that hardware validation — do not paste blindly):
+
+- `User=`/`DynamicUser=`: `/dev/hidraw*`, `/dev/input/event*`, and
+  `/dev/uinput` are root-gated; dropping root needs a udev `uaccess`/group
+  + supplementary-groups design.
+- `DevicePolicy=`/`DeviceAllow=`/`PrivateDevices`: dynamic hidraw/event
+  numbering plus uinput node creation need cgroup device rules proven on
+  hardware.
+- `CapabilityBoundingSet=`: root currently relies on DAC override for
+  `/dev`; shrinking caps is part of the same device-access refactor.
+- `SystemCallFilter=`: the daemon is ioctl-heavy (`HIDIOCSFEATURE`,
+  `EVIOCGRAB`, `UI_DEV_CREATE`); the allowlist must be validated on hardware.
+- `ProtectProc=`/`PrivateUsers=`: `ltd doctor` reads `/proc/net/unix`, and
+  ID-mapping changes device visibility.
 
 What is in place today:
 

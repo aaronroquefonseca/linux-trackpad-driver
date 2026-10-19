@@ -31,6 +31,35 @@ fn code_lines(text: &str) -> String {
         .join("\n")
 }
 
+/// Active (non-comment, non-empty) directive lines, trimmed.
+fn active_lines(text: &str) -> Vec<String> {
+    code_lines(text)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Assert an active directive line equals `directive` exactly. Comments do
+/// not count, and a later override of the same key fails.
+fn assert_active_directive(text: &str, context: &str, directive: &str) {
+    let key = directive.split('=').next().unwrap_or(directive);
+    let lines = active_lines(text);
+    let keyed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.split('=').next().unwrap_or("") == key)
+        .collect();
+    assert!(
+        !keyed.is_empty(),
+        "{context} must carry active {directive} (commented-out does not count)"
+    );
+    assert!(
+        keyed.last().map(|s| s.as_str()) == Some(directive),
+        "{context} must leave {directive} effective (later override: {:?})",
+        keyed.last()
+    );
+}
+
 const RULES: &str = include_str!("../udev/99-linux-trackpad-driver.rules");
 const SERVICE: &str = include_str!("../systemd/linux-trackpad-driver.service");
 const RECONNECT: &str = include_str!("../systemd/linux-trackpad-driver-reconnect@.service");
@@ -128,6 +157,123 @@ fn service_unit_shape() {
         SERVICE.contains("ExecStart=/usr/bin/ltd run"),
         "service must exec the daemon entry"
     );
+}
+
+#[test]
+fn service_sandbox_subset_finding_19() {
+    // Incremental containment: every added restriction must preserve the
+    // daemon's audited access (/dev R/W for hidraw/evdev/uinput, /sys +
+    // /proc reads, /etc RO config read, /run socket, AF_UNIX + AF_NETLINK).
+    // See the unit comments and SECURITY.md for the per-restriction rationale.
+    // ProtectClock is deliberately deferred (pre-v252 RTC-only device
+    // allowlist denies hidraw/evdev/uinput; systemd#25075, fixed in v252).
+    for directive in [
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectControlGroups=yes",
+        "ProtectHostname=yes",
+        "ProtectKernelLogs=yes",
+        "NoNewPrivileges=yes",
+        "RestrictSUIDSGID=yes",
+        "RestrictRealtime=yes",
+        "LockPersonality=yes",
+        "RestrictNamespaces=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+    ] {
+        assert_active_directive(SERVICE, "main unit", directive);
+    }
+    // Deferred for compat: must stay absent in code (comments may name it
+    // only to explain the deferral, so check code lines).
+    let service_code = code_lines(SERVICE);
+    assert!(
+        !service_code.contains("ProtectClock"),
+        "main unit must NOT set ProtectClock without a systemd version floor + hw validation (pre-v252 denies devices)"
+    );
+    // Deliberately left out: these need a device-access refactor (non-root
+    // device ACLs / cgroup device rules / ioctl allowlist) plus hardware
+    // validation. They are named in unit *comments* only to prohibit them, so
+    // check code lines. If you add one, update SECURITY.md's follow-up list
+    // and record hardware re-validation evidence in the PR.
+    for banned in [
+        "User=",
+        "DynamicUser=",
+        "PrivateDevices",
+        "DevicePolicy",
+        "DeviceAllow",
+        "CapabilityBoundingSet",
+        "SystemCallFilter",
+        "SystemCallArchitectures",
+        "ProtectProc",
+        "PrivateUsers",
+    ] {
+        assert!(
+            !service_code.contains(banned),
+            "main unit must NOT carry {banned:?} without the SECURITY.md follow-up work"
+        );
+    }
+}
+
+#[test]
+fn oneshot_units_carry_narrower_sandbox_subset() {
+    // One-shots (reconnect/resume) share the filesystem + privilege subset
+    // but need AF_UNIX only: they probe the daemon socket and re-send
+    // hidraw reports, never opening the AF_NETLINK hotplug monitor.
+    // ProtectClock deferred like the main unit (pre-v252 denies devices).
+    for (name, text) in [
+        ("reconnect template", RECONNECT),
+        ("resume unit", RESUME_UNIT),
+    ] {
+        for directive in [
+            "ProtectSystem=strict",
+            "ProtectHome=yes",
+            "PrivateTmp=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
+            "ProtectHostname=yes",
+            "ProtectKernelLogs=yes",
+            "NoNewPrivileges=yes",
+            "RestrictSUIDSGID=yes",
+            "RestrictRealtime=yes",
+            "LockPersonality=yes",
+            "RestrictNamespaces=yes",
+            "RestrictAddressFamilies=AF_UNIX",
+        ] {
+            assert_active_directive(text, name, directive);
+        }
+        assert!(
+            !code_lines(text).contains("AF_NETLINK"),
+            "{name} must not allow AF_NETLINK in code (no hotplug monitor in one-shots)"
+        );
+        // Same deliberate omissions as the main unit: device-access refactor
+        // + hardware validation required (see SECURITY.md). Comments may name
+        // them only to prohibit them, so check code lines.
+        let unit_code = code_lines(text);
+        assert!(
+            !unit_code.contains("ProtectClock"),
+            "{name} must NOT set ProtectClock without a systemd version floor + hw validation (pre-v252 denies devices)"
+        );
+        for banned in [
+            "User=",
+            "DynamicUser=",
+            "PrivateDevices",
+            "DevicePolicy",
+            "DeviceAllow",
+            "CapabilityBoundingSet",
+            "SystemCallFilter",
+            "SystemCallArchitectures",
+            "ProtectProc",
+            "PrivateUsers",
+        ] {
+            assert!(
+                !unit_code.contains(banned),
+                "{name} must NOT carry {banned:?} without the SECURITY.md follow-up work"
+            );
+        }
+    }
 }
 
 #[test]
