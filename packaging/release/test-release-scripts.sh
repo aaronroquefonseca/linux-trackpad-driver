@@ -50,12 +50,48 @@ expect_fail "version sync rejects Cargo.toml drift" "$REL/check-version-sync.sh"
 # 2. release publicity gate --------------------------------------------------
 printf '{"tagName":"v9.9.9","isDraft":false,"isPrerelease":false}' > "$TMP_BASE/public.json"
 must "public final release passes" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/public.json"
+printf '{"tag_name":"v9.9.9","draft":false,"prerelease":false}' > "$TMP_BASE/public-snake.json"
+must "REST snake_case public final passes" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/public-snake.json"
+printf '{"tagName":"v9.9.9","tag_name":"v9.9.9","isDraft":false,"draft":false,"isPrerelease":false,"prerelease":false}' > "$TMP_BASE/public-dual.json"
+must "consistent dual aliases pass" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/public-dual.json"
+printf '{"tag_name":"v9.9.9","isDraft":false,"prerelease":false}' > "$TMP_BASE/public-mixed.json"
+must "mixed aliases pass" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/public-mixed.json"
 printf '{"tagName":"v9.9.9","isDraft":true,"isPrerelease":false}' > "$TMP_BASE/draft.json"
 expect_fail "draft release rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/draft.json"
 printf '{"tagName":"v9.9.9","isDraft":false,"isPrerelease":true}' > "$TMP_BASE/pre.json"
 expect_fail "prerelease rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/pre.json"
 printf '{"tagName":"v9.9.8","isDraft":false,"isPrerelease":false}' > "$TMP_BASE/other.json"
 expect_fail "tag mismatch rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/other.json"
+printf '{"tagName":"v9.9.9"}' > "$TMP_BASE/bare.json"
+expect_fail "bare tag without publicity fields rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/bare.json"
+printf '{"tagName":"v9.9.9","isDraft":false}' > "$TMP_BASE/nopre.json"
+expect_fail "missing prerelease field rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/nopre.json"
+printf '{"tagName":"v9.9.9","isPrerelease":false}' > "$TMP_BASE/nodraft.json"
+expect_fail "missing draft field rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/nodraft.json"
+printf '{"tagName":"v9.9.9","isDraft":null,"isPrerelease":false}' > "$TMP_BASE/nulldraft.json"
+expect_fail "null draft rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/nulldraft.json"
+printf '{"tagName":"v9.9.9","isDraft":false,"isPrerelease":null}' > "$TMP_BASE/nullpre.json"
+expect_fail "null prerelease rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/nullpre.json"
+printf '{"tagName":"v9.9.9","isDraft":"false","isPrerelease":false}' > "$TMP_BASE/strdraft.json"
+expect_fail "string draft rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/strdraft.json"
+printf '{"tagName":"v9.9.9","isDraft":false,"isPrerelease":"false"}' > "$TMP_BASE/strpre.json"
+expect_fail "string prerelease rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/strpre.json"
+printf '{"tagName":"v9.9.9","isDraft":0,"isPrerelease":false}' > "$TMP_BASE/numdraft.json"
+expect_fail "numeric draft rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/numdraft.json"
+printf '{"tagName":"v9.9.9","isDraft":false,"isPrerelease":0}' > "$TMP_BASE/numpre.json"
+expect_fail "numeric prerelease rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/numpre.json"
+printf '{"tagName":"v9.9.9","isDraft":false,"draft":true,"isPrerelease":false}' > "$TMP_BASE/conflictdraft.json"
+expect_fail "conflicting draft aliases rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/conflictdraft.json"
+printf '{"tagName":"v9.9.9","isDraft":false,"isPrerelease":false,"prerelease":true}' > "$TMP_BASE/conflictpre.json"
+expect_fail "conflicting prerelease aliases rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/conflictpre.json"
+printf '[]' > "$TMP_BASE/array.json"
+expect_fail "non-object JSON rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/array.json"
+printf 'null' > "$TMP_BASE/null.json"
+expect_fail "null JSON rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/null.json"
+printf '{"tagName":null,"isDraft":false,"isPrerelease":false}' > "$TMP_BASE/nulltag.json"
+expect_fail "null tag rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/nulltag.json"
+printf '{"tagName":"v9.9.9","tag_name":"v9.9.8","isDraft":false,"isPrerelease":false}' > "$TMP_BASE/conflicttag.json"
+expect_fail "conflicting tag aliases rejected" "$REL/check-release-json.sh" v9.9.9 "$TMP_BASE/conflicttag.json"
 
 # 3. asset manifest gate ------------------------------------------------------
 ASSETS="$TMP_BASE/assets"; mkdir -p "$ASSETS"
@@ -147,6 +183,35 @@ fi
 grep -q "ssh client not found" "$TMP_BASE/ssh-err.txt" \
   || { echo "FAIL: ssh guard names the missing client" >&2; exit 1; }
 ok "ssh client guard fails closed without openssh"
+# ssh:// key handling never leaks the secret under xtrace: a dummy sentinel
+# must not appear in captured -x output. No real credentials are used;
+# stubbed ssh/git keep the probe offline (clone fails closed).
+XSENT="XTRACE_SENTINEL_9x9x_FAKE_SECRET"
+XHIDE="$TMP_BASE/xhide"; mkdir -p "$XHIDE"
+for tool in mktemp grep chmod rm cat; do
+  ln -sf "$(command -v "$tool")" "$XHIDE/$tool"
+done
+printf '#!/bin/sh\nexit 0\n' > "$XHIDE/ssh"
+printf '#!/bin/sh\necho "stub git: fake clone failure" >&2\nexit 1\n' > "$XHIDE/git"
+chmod +x "$XHIDE/ssh" "$XHIDE/git"
+if PATH="$XHIDE" AUR_SSH_PRIVATE_KEY="$XSENT" "$BIN_BASH" -x "$REL/publish-aur.sh" \
+  --pkg linux-trackpad-driver --dir "$TMP_BASE/r1" \
+  --message "test xtrace" --expect-pkgver 9.9.9 \
+  --remote ssh://aur@aur.archlinux.org/linux-trackpad-driver.git \
+  >"$TMP_BASE/xtrace-out.txt" 2>"$TMP_BASE/xtrace-err.txt"; then
+  echo "FAIL: xtrace probe expects clone failure" >&2; exit 1
+fi
+grep -q "stub git: fake clone failure" "$TMP_BASE/xtrace-err.txt" \
+  || { echo "FAIL: xtrace probe exercised the fake clone failure" >&2; exit 1; }
+ok "xtrace probe exercised the fake clone failure"
+cat "$TMP_BASE/xtrace-out.txt" "$TMP_BASE/xtrace-err.txt" > "$TMP_BASE/xtrace-all.txt"
+if grep -qF "$XSENT" "$TMP_BASE/xtrace-all.txt"; then
+  echo "FAIL: sentinel leaked under xtrace" >&2; exit 1
+fi
+ok "xtrace never logs the SSH sentinel"
+grep -q "disabled shell tracing" "$TMP_BASE/xtrace-err.txt" \
+  || { echo "FAIL: tracing guard announces itself" >&2; exit 1; }
+ok "tracing guard announces itself"
 
 # 5. draft manager against a stubbed gh (empty cwd, no git inference) ---------
 DRAFT_TAG="v9.9.9"

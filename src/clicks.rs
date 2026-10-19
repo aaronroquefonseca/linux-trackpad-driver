@@ -114,11 +114,6 @@ pub fn touch_present(f: &FingerContact) -> bool {
     f.contact || f.pressure > TOUCH_PRESSURE_FLOOR
 }
 
-/// Scale a pointer delta by `speed` percent (`100` = 1:1). Proxy path only.
-pub fn scale_delta(delta: i32, speed: u32) -> i32 {
-    ((i64::from(delta) * i64::from(speed)) / 100) as i32
-}
-
 /// Negate raw orientation for `ABS_MT_ORIENTATION` (kernel parity).
 pub fn negate_orientation(raw: i8) -> i8 {
     raw.wrapping_neg()
@@ -363,18 +358,11 @@ impl ClickMachine {
     /// `255 + offset` never overflows; thresholds above 255 simply never
     /// fire). Clamps mirror [`press_threshold`] (`1..=255`) and
     /// [`release_threshold`] (`margin` capped at 255). `None` when
-    /// `force_offset == 0` (force disabled entirely).
+    /// `force_offset == 0` (force disabled entirely). Single source is
+    /// [`crate::config::force_threshold_value`], shared with
+    /// [`crate::init::usb_applicability_warnings`].
     pub fn force_threshold(cfg: &Config) -> Option<u16> {
-        if cfg.force.force_offset > 0 {
-            Some(
-                cfg.click
-                    .sensitivity
-                    .clamp(1, 255)
-                    .saturating_add(cfg.force.force_offset.min(255)),
-            )
-        } else {
-            None
-        }
+        crate::config::force_threshold_value(cfg.click.sensitivity, cfg.force.force_offset)
     }
 
     /// Force release point: `sensitivity + force_offset - margin`, saturating
@@ -942,14 +930,6 @@ mod tests {
         assert!(ClickMachine::physical_button(0xC1));
         assert!(!ClickMachine::physical_button(0xC0));
         assert!(!ClickMachine::physical_button(0x00));
-    }
-
-    #[test]
-    fn scale_delta_speed() {
-        assert_eq!(scale_delta(100, 100), 100);
-        assert_eq!(scale_delta(100, 200), 200);
-        assert_eq!(scale_delta(-40, 50), -20);
-        assert_eq!(scale_delta(0, 1000), 0);
     }
 
     #[test]

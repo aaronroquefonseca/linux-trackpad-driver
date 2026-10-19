@@ -31,6 +31,12 @@ The reconnect template needs no enabling (udev instantiates it per
 device). The resume service can additionally be enabled for an
 idempotent re-init pass at boot; the post-resume trigger itself is the
 system-sleep hook, which runs whenever installed and executable.
+Activation contract: background one-shots (udev reconnect, sleep hook,
+plain resume unit) without the main service running leave the hardware
+alone and exit 0 — stopped (socket absent) stays off (`disable` alone
+does not stop a running service; use `stop` or `disable --now`).
+Explicit forcing while stopped
+is `ltd resume -f` / `ltd reconnect /dev/hidrawN -f` run directly.
 
 Removal (debian/prerm) disables the main and resume units so no enabled
 state is left behind.

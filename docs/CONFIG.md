@@ -14,8 +14,11 @@ Trackpad 2 implemented; others planned.
 
 ## Loading
 
-- Explicit `-c <path>` wins, else `$LTD_CONFIG`, else built-in defaults
-  (`load_or_default_with_env`; a missing env-pointed file falls back to
+- Explicit `-c <path>` wins, else `$LTD_CONFIG`, else the installed
+  `/etc/linux-trackpad-driver/config.toml`, else built-in defaults
+  (shared `select_config_source_with_installed`; every command reports the selected
+  source — startup entries log it as the live settings, doctor prints the
+  on-disk file it validated; a missing env/installed file falls back to
   defaults, a missing explicit `-c` file errors).
 - `schema_version = 1` is required; unknown `schema_version` fails.
 - Omitted keys take their defaults; omitted tables fall back wholesale.
@@ -42,7 +45,7 @@ restart (live reload planned).
 | `log_level` | string enum | `debug\|info\|warn\|error` | `"info"` | always | Logging filter. |
 | `enhanced_clicks` | bool | `true\|false` | `true` | always | Opt-in gate for the entire clicks pipeline (see Gate semantics). |
 | `device` | table | — | — | always | USB device tuning (independent of `enhanced_clicks`). |
-| `device.polling_rate` | integer (Hz) | `16..=110` request | `110` | always | Requested Apple USB polling rate. Capped posture: values `> 110` rejected; init clamps runtime overrides; `< 16` rejected at init. No BT rate equivalent. |
+| `device.polling_rate` | integer (Hz) | `1..=110` syntax, `16..=110` usable for USB | `110` | always | Requested Apple USB polling rate. Syntax accepts `1..=110`; values `> 110` rejected. `< 16` passes syntax but fails USB init and doctor via one shared gate (`init::check_usb_polling_usable` — doctor via `init::validate_config_for_usb`, startup via `daemon::validate_polling_rate` / `init::resolve_polling`); runtime `-p` overrides above 110 are clamped. No BT rate equivalent (BT ignores the rate). |
 | `pointer` | table | — | — | `enhanced_clicks` | Pointer tuning. |
 | `pointer.speed` | integer (percent) | `1..=1000` | `100` | `enhanced_clicks` | Pointer speed percent (`100` = 1:1). Software delta scaling in the proxy path only, applied exactly once. |
 | `click` | table | — | — | `enhanced_clicks` | Press thresholds + standard maps. |
@@ -330,7 +333,8 @@ actions_follow_spoof = false
 - **`unknown field` on load** → typo (`deny_unknown_fields` at every level);
   compare spelling against the table above.
 - **Edited config, nothing changed** → restart required for every key
-  (no live reload). Check precedence: `-c` beats `$LTD_CONFIG` beats
-  defaults.
+  (no live reload). Check precedence: `-c` beats `$LTD_CONFIG` beats the
+  installed file beats defaults; compare the `config source` line in the
+  logs against the source `ltd doctor` validated.
 - **`unsupported schema_version`** → file is pre-v1 or future; set
   `schema_version = 1`.

@@ -183,8 +183,10 @@ pub fn resume_bt_node(devnode: &str) -> ResumeAction {
 
 /// Exact recovery command named by every resume dead-end log: no path may
 /// require a manual `systemctl restart` without saying so up front.
+/// `-f` forces re-init even while the daemon is stopped (plain `resume`
+/// without a live daemon is an inactive no-op by the activation contract).
 pub fn empty_scan_recovery_hint() -> &'static str {
-    "retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume)"
+    "retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume -f)"
 }
 
 /// Pure scan diff by devnode: renumbers (hidraw2→hidraw3) read as one

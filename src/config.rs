@@ -21,7 +21,6 @@
 //! input with a clear error instead of failing opaquely at TOML parse.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -40,6 +39,25 @@ pub const MAX_BYTE_VALUE: u16 = 255;
 /// Bounds for pointer speed percent (`100` = 1:1).
 pub const MIN_SPEED: u32 = 1;
 pub const MAX_SPEED: u32 = 1000;
+
+/// Shared force arming threshold (`sensitivity + force_offset`, `u16` so
+/// `255 + offset` never overflows; thresholds above 255 simply never fire
+/// against a `u8` pressure byte). Clamps mirror the press path (`1..=255`,
+/// offset capped at 255). `None` when `force_offset == 0` (force disabled).
+/// Single source for runtime ([`crate::clicks::ClickMachine::force_threshold`])
+/// and diagnostics ([`crate::init::usb_applicability_warnings`]) so the two
+/// cannot drift.
+pub fn force_threshold_value(sensitivity: u16, force_offset: u16) -> Option<u16> {
+    if force_offset > 0 {
+        Some(
+            sensitivity
+                .clamp(1, 255)
+                .saturating_add(force_offset.min(255)),
+        )
+    } else {
+        None
+    }
+}
 
 /// Parsed daemon configuration (sectioned v1 schema).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -474,20 +492,59 @@ pub enum ActionKind {
     Keys(Vec<String>),
 }
 
+/// Canonical representative for a key token: aliases resolving to the same
+/// kernel code share one representative so [`ActionKind::is_same_action`]
+/// compares wire identity, not spelling (`super+left` == `meta+left`,
+/// `ctrl+c` == `control+c`). Mirrors [`crate::proxy::key_token_to_code`];
+/// every multi-token arm there has its members listed here. Tokens with
+/// distinct codes (`rctrl` vs `ctrl`, `left` vs `left_arrow`,
+/// `pause` vs `pausecd`) intentionally keep distinct representatives.
+pub fn canonical_key_token(token: &str) -> &str {
+    match token {
+        "control" | "lctrl" => "ctrl",
+        "lshift" => "shift",
+        "lalt" => "alt",
+        "super" | "cmd" | "command" | "win" | "lmeta" => "meta",
+        "escape" => "esc",
+        "return" => "enter",
+        "pgup" => "pageup",
+        "pgdn" => "pagedown",
+        "arrow_up" => "up",
+        "arrow_down" => "down",
+        "volumeup" => "volup",
+        "volumedown" => "voldown",
+        "playpause" => "play",
+        "stopcd" => "stop",
+        "nextsong" => "next",
+        "previous" | "previoussong" => "prev",
+        "browser_back" => "browserback",
+        "browser_forward" => "browserforward",
+        "lock" => "screenlock",
+        _ => token,
+    }
+}
+
 impl ActionKind {
-    /// Wire-identity compare: key sets match as sets (order- and
-    /// duplicate-insensitive, mirroring proxy same-level dedup:
-    /// `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one `left`
-    /// and one `ctrl`). `Empty == Empty`; `None` only equals `None`
-    /// (a latched slide is never `None`, so handoffs only merge real
-    /// holds).
+    /// Wire-identity compare: key sets match as sets of canonical wire
+    /// codes (order- and duplicate-insensitive, mirroring proxy same-level
+    /// dedup: `left+ctrl`, `ctrl+left`, and `left+left+ctrl` all hold one
+    /// `left` and one `ctrl`). Alias spellings resolving to the same code
+    /// also merge (`super+left` == `meta+left`, `ctrl+c` == `control+c`),
+    /// so alias-equivalent handoffs hold continuously instead of taking
+    /// the release/repress path. `Empty == Empty`; `None` only equals
+    /// `None` (a latched slide is never `None`, so handoffs only merge
+    /// real holds).
     pub fn is_same_action(&self, other: &Self) -> bool {
         match (self, other) {
             (ActionKind::None, ActionKind::None) => true,
             (ActionKind::Empty, ActionKind::Empty) => true,
             (ActionKind::Keys(a), ActionKind::Keys(b)) => {
-                a.iter().collect::<std::collections::HashSet<_>>()
-                    == b.iter().collect::<std::collections::HashSet<_>>()
+                a.iter()
+                    .map(|k| canonical_key_token(k))
+                    .collect::<std::collections::HashSet<_>>()
+                    == b.iter()
+                        .map(|k| canonical_key_token(k))
+                        .collect::<std::collections::HashSet<_>>()
             }
             _ => false,
         }
@@ -593,6 +650,15 @@ fn is_known_key(name: &str) -> bool {
 impl Config {
     /// Validate every user-facing value; each failure names the key and the
     /// accepted range/set.
+    ///
+    /// Syntax/range layer only: polling `1..=110` passes here while USB init
+    /// needs `>= 16`, and extreme-but-in-range thresholds pass while being
+    /// effectively unreachable. That hardware applicability is
+    /// [`crate::init::check_usb_polling_usable`], shared by USB startup
+    /// (via [`crate::daemon::validate_polling_rate`] /
+    /// [`crate::init::resolve_polling`]) and doctor (via the doctor-facing
+    /// [`crate::init::validate_config_for_usb`] wrapper) so the two can
+    /// never diverge again.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             anyhow::bail!(
@@ -822,21 +888,6 @@ impl Config {
     }
 }
 
-/// Load config from `path`, or defaults when `None`. Missing file with an
-/// explicit path is an error; `None` never fails. Unknown keys are rejected
-/// at every level (likely typos); omitted keys/tables take documented
-/// defaults. `schema_version = 1` is required in files.
-pub fn load_or_default(path: Option<&str>) -> Result<Config> {
-    let Some(path) = path else {
-        return Ok(Config::default());
-    };
-    let text = std::fs::read_to_string(Path::new(path))
-        .with_context(|| format!("reading config '{path}'"))?;
-    let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing config '{path}'"))?;
-    cfg.validate()?;
-    Ok(cfg)
-}
-
 /// Env var naming the config file for contexts that cannot take `-c`
 /// (udev/systemd one-shots run `ltd reconnect /dev/%I` with no room for
 /// per-call flags). An explicit `-c` path always wins over this.
@@ -847,25 +898,133 @@ pub fn config_path_from_env() -> Option<String> {
     std::env::var(CONFIG_ENV).ok().filter(|v| !v.is_empty())
 }
 
-/// Load config for entry points: explicit `-c` path wins, else
-/// `$LTD_CONFIG`, else defaults.
-///
-/// A *missing* env-pointed file falls back to defaults with a log line
-/// (hotplug must keep working on machines with no system config installed);
-/// a present-but-unparsable file is still an error, as is a missing
-/// explicit `-c` file.
-pub fn load_or_default_with_env(explicit: Option<&str>) -> Result<Config> {
+/// Installed system config: final fallback before built-in defaults.
+/// Shared by every entry point (`run`, `reconnect`, `resume`, `doctor`).
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/linux-trackpad-driver/config.toml";
+
+/// Which selector chose the config path (shared selection matrix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSourceKind {
+    /// Explicit `-c`/`--config` flag.
+    Explicit,
+    /// Nonempty `$LTD_CONFIG`.
+    Env,
+    /// Installed system file ([`SYSTEM_CONFIG_PATH`]).
+    Installed,
+}
+
+/// Selected config path plus which selector chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedConfigSource {
+    pub path: String,
+    pub kind: ConfigSourceKind,
+}
+
+/// Shared selection: explicit `-c` wins, else nonempty `$LTD_CONFIG`,
+/// else the installed system file. Pure over its inputs so every entry
+/// point resolves identically; [`load_selected_config`] reads the process
+/// environment. An empty env value counts as unset.
+pub fn select_config_source_with_installed(
+    explicit: Option<&str>,
+    env: Option<&str>,
+    installed: &str,
+) -> SelectedConfigSource {
     if let Some(path) = explicit {
-        return load_or_default(Some(path));
-    }
-    match config_path_from_env() {
-        None => Ok(Config::default()),
-        Some(path) if !Path::new(&path).exists() => {
-            log::info!("config env {CONFIG_ENV}='{path}' missing; using defaults");
-            Ok(Config::default())
+        SelectedConfigSource {
+            path: path.to_string(),
+            kind: ConfigSourceKind::Explicit,
         }
-        Some(path) => load_or_default(Some(&path)),
+    } else if let Some(path) = env.filter(|p| !p.is_empty()) {
+        SelectedConfigSource {
+            path: path.to_string(),
+            kind: ConfigSourceKind::Env,
+        }
+    } else {
+        SelectedConfigSource {
+            path: installed.to_string(),
+            kind: ConfigSourceKind::Installed,
+        }
     }
+}
+
+/// Source label for a successfully selected file (shared with doctor).
+pub fn loaded_config_source(path: &str) -> String {
+    format!("{path}; on disk")
+}
+
+/// Source label when the env/installed file is missing and built-in
+/// defaults apply (shared with doctor). Explicit files never fall back;
+/// the `Explicit` arm is defensive only.
+pub fn fallback_config_source(path: &str, kind: ConfigSourceKind) -> String {
+    let selection = match kind {
+        ConfigSourceKind::Env => "LTD_CONFIG",
+        ConfigSourceKind::Installed => "installed",
+        ConfigSourceKind::Explicit => "explicit",
+    };
+    format!("<built-in defaults>; {selection} config missing: {path}")
+}
+
+/// Read a config file: `Ok(None)` means truly absent (no directory entry,
+/// not even a dangling symlink); `Err` means selected-but-broken (dangling
+/// symlink, directory, permissions, other I/O). Shared by startup loading
+/// and doctor so a dangling symlink errors everywhere instead of silently
+/// falling back to defaults in one command and failing in another.
+pub fn read_config_text(path: &str) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symlink is a selected but broken config, not absence.
+            match std::fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(e),
+                Err(other) => Err(other),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Load config for entry points and report the selected source, using the
+/// shared selection matrix. A *missing* env/installed file falls back to
+/// defaults (hotplug must keep working on machines with no system config
+/// installed); a present-but-unparsable file is an error, as is a missing
+/// explicit `-c` file. Returns `(config, source)` where `source` uses the
+/// same labels doctor reports (`"<path>; on disk"` or
+/// `"<built-in defaults>; <LTD_CONFIG|installed> config missing: <path>"`).
+pub fn load_selected_config_with_installed(
+    explicit: Option<&str>,
+    env: Option<&str>,
+    installed: &str,
+) -> Result<(Config, String)> {
+    let selected = select_config_source_with_installed(explicit, env, installed);
+    match read_config_text(&selected.path) {
+        Ok(None) if selected.kind != ConfigSourceKind::Explicit => Ok((
+            Config::default(),
+            fallback_config_source(&selected.path, selected.kind),
+        )),
+        Ok(text) => {
+            let source = loaded_config_source(&selected.path);
+            let text =
+                text.with_context(|| format!("config '{}' does not exist", selected.path))?;
+            let cfg: Config = toml::from_str(&text)
+                .with_context(|| format!("parsing config '{}'", selected.path))?;
+            cfg.validate()?;
+            Ok((cfg, source))
+        }
+        Err(e) => Err(anyhow::anyhow!(e).context(format!("reading config '{}'", selected.path))),
+    }
+}
+
+/// Load config plus selected source for real entry points (process env +
+/// installed system path). Every command logs/prints the returned source:
+/// startup entries log it as the live settings for the process, doctor
+/// prints it as the on-disk file it validated.
+pub fn load_selected_config(explicit: Option<&str>) -> Result<(Config, String)> {
+    load_selected_config_with_installed(
+        explicit,
+        config_path_from_env().as_deref(),
+        SYSTEM_CONFIG_PATH,
+    )
 }
 
 /// Best-effort logging init; safe to call twice (tests, reconnect entry).
@@ -1187,6 +1346,73 @@ mod tests {
     }
 
     #[test]
+    fn same_action_treats_aliases_as_identical() {
+        let keys = |s: &str| parse_click_action(s).unwrap().kind;
+        // Every multi-token arm of proxy `key_token_to_code` merges here.
+        // Combos exercise the handoff path (`super+left` vs `meta+left`);
+        // bare pairs pin the canonical grouping itself.
+        for (a, b) in [
+            ("super+left", "meta+left"),
+            ("cmd+left", "win+left"),
+            ("command+c", "meta+c"),
+            ("lmeta+c", "super+c"),
+            ("ctrl+c", "control+c"),
+            ("ctrl+c", "lctrl+c"),
+            ("shift+x", "lshift+x"),
+            ("alt+f4", "lalt+f4"),
+            ("esc", "escape"),
+            ("enter", "return"),
+            ("pageup", "pgup"),
+            ("pagedown", "pgdn"),
+            ("up", "arrow_up"),
+            ("down", "arrow_down"),
+            ("volup", "volumeup"),
+            ("voldown", "volumedown"),
+            ("play", "playpause"),
+            ("stop", "stopcd"),
+            ("next", "nextsong"),
+            ("prev", "previous"),
+            ("prev", "previoussong"),
+            ("browserback", "browser_back"),
+            ("browserforward", "browser_forward"),
+            ("screenlock", "lock"),
+            // Order/dup-insensitivity survives canonicalization.
+            ("left+super", "meta+left"),
+            ("ctrl+ctrl+c", "control+c"),
+        ] {
+            assert!(
+                keys(a).is_same_action(&keys(b)),
+                "aliases must merge: '{a}' vs '{b}'"
+            );
+            assert!(
+                keys(b).is_same_action(&keys(a)),
+                "aliases must merge (symmetric): '{b}' vs '{a}'"
+            );
+        }
+        // Distinct codes must NOT merge: right-hand modifiers, button-vs-key,
+        // and near-miss media tokens.
+        for (a, b) in [
+            ("ctrl", "rctrl"),
+            ("shift", "rshift"),
+            ("alt", "ralt"),
+            ("meta", "rmeta"),
+            ("super", "rmeta"),
+            ("left", "left_arrow"),
+            ("pause", "pausecd"),
+            ("play", "playcd"),
+            ("play", "pausecd"),
+            ("mute", "micmute"),
+            ("super+left", "meta+right"),
+            ("ctrl+c", "ctrl+v"),
+        ] {
+            assert!(
+                !keys(a).is_same_action(&keys(b)),
+                "distinct codes must not merge: '{a}' vs '{b}'"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_f13_through_f24_and_rejects_f25() {
         for n in 13..=24 {
             let name = format!("f{n}");
@@ -1417,6 +1643,18 @@ mod tests {
     }
 
     #[test]
+    fn force_threshold_value_single_source() {
+        // Disabled stays silent.
+        assert_eq!(force_threshold_value(30, 0), None);
+        // Owner tune: 30 + 130 = 160.
+        assert_eq!(force_threshold_value(30, 130), Some(160));
+        // Clamps mirror the press path: sensitivity 0 -> 1, offset capped at 255.
+        assert_eq!(force_threshold_value(0, 300), Some(1 + 255));
+        // Unvalidated max never overflows: 255 + 255 = 510.
+        assert_eq!(force_threshold_value(255, 255), Some(510));
+    }
+
+    #[test]
     fn click_and_force_accessors() {
         let c = Config::default();
         assert_eq!(
@@ -1614,14 +1852,24 @@ actions_follow_spoof = true
 
     #[test]
     fn shipped_default_toml_validates() {
+        let _env_guard = crate::test_env::lock_env();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/default.toml");
-        let cfg = load_or_default(Some(path)).unwrap();
+        let (cfg, source) = load_selected_config(Some(path)).unwrap();
         assert_eq!(cfg, Config::default());
+        assert_eq!(source, format!("{path}; on disk"));
     }
 
     #[test]
-    fn none_path_gives_defaults() {
-        assert_eq!(load_or_default(None).unwrap(), Config::default());
+    fn missing_installed_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent-installed.toml");
+        let absent = absent.to_str().unwrap();
+        let (cfg, source) = load_selected_config_with_installed(None, None, absent).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; installed config missing: {absent}")
+        );
     }
 
     #[test]
@@ -1636,13 +1884,14 @@ actions_follow_spoof = true
         .unwrap();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, &path) };
-        let cfg = load_or_default_with_env(None).unwrap();
+        let (cfg, source) = load_selected_config(None).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert!(cfg.enhanced_clicks);
         assert_eq!(cfg.device.polling_rate, 90);
+        assert_eq!(source, format!("{}; on disk", path.display()));
     }
 
     #[test]
@@ -1655,44 +1904,167 @@ actions_follow_spoof = true
         std::fs::write(&cli_path, "schema_version = 1\nenhanced_clicks = false\n").unwrap();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, &env_path) };
-        let cfg = load_or_default_with_env(Some(cli_path.to_str().unwrap())).unwrap();
+        let (cfg, source) = load_selected_config(Some(cli_path.to_str().unwrap())).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert!(!cfg.enhanced_clicks);
+        assert_eq!(source, format!("{}; on disk", cli_path.display()));
     }
 
     #[test]
     fn missing_env_file_falls_back_to_defaults() {
         let _env_guard = crate::test_env::lock_env();
         let old = std::env::var(CONFIG_ENV).ok();
-        unsafe { std::env::set_var(CONFIG_ENV, "/nonexistent-ltd-config-xyz.toml") };
-        let cfg = load_or_default_with_env(None).unwrap();
+        let missing = "/nonexistent-ltd-config-xyz.toml";
+        unsafe { std::env::set_var(CONFIG_ENV, missing) };
+        let (cfg, source) = load_selected_config(None).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; LTD_CONFIG config missing: {missing}")
+        );
     }
 
     #[test]
     fn missing_explicit_file_errors() {
-        assert!(load_or_default(Some("/nonexistent-ltd-config-xyz.toml")).is_err());
+        let _env_guard = crate::test_env::lock_env();
+        assert!(load_selected_config(Some("/nonexistent-ltd-config-xyz.toml")).is_err());
     }
 
     #[test]
     fn invalid_file_values_fail_load() {
+        let _env_guard = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
         std::fs::write(&path, "schema_version = 1\n[device]\npolling_rate = 500\n").unwrap();
-        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+        assert!(load_selected_config(Some(path.to_str().unwrap())).is_err());
         let path = dir.path().join("badkey.toml");
         std::fs::write(
             &path,
             "schema_version = 1\n[click]\nclick_1 = \"frobnicate\"\n",
         )
         .unwrap();
-        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+        assert!(load_selected_config(Some(path.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn shared_selection_matrix_explicit_env_installed() {
+        // Flag > env > installed file. Empty env counts as unset.
+        let selected =
+            select_config_source_with_installed(Some("explicit"), Some("env"), "installed");
+        assert_eq!(
+            selected,
+            SelectedConfigSource {
+                path: "explicit".into(),
+                kind: ConfigSourceKind::Explicit,
+            }
+        );
+        let selected = select_config_source_with_installed(None, Some("env"), "installed");
+        assert_eq!(
+            selected,
+            SelectedConfigSource {
+                path: "env".into(),
+                kind: ConfigSourceKind::Env,
+            }
+        );
+        for env in [None, Some("")] {
+            let selected = select_config_source_with_installed(None, env, "installed");
+            assert_eq!(
+                selected,
+                SelectedConfigSource {
+                    path: "installed".into(),
+                    kind: ConfigSourceKind::Installed,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn startup_loading_follows_shared_selection_with_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed.toml");
+        let installed = installed.to_str().unwrap();
+        std::fs::write(
+            installed,
+            "schema_version = 1\n[device]\npolling_rate = 90\n",
+        )
+        .unwrap();
+        let env_path = dir.path().join("env.toml");
+        let env_path = env_path.to_str().unwrap();
+        std::fs::write(
+            env_path,
+            "schema_version = 1\n[device]\npolling_rate = 60\n",
+        )
+        .unwrap();
+        let explicit = dir.path().join("explicit.toml");
+        let explicit = explicit.to_str().unwrap();
+        std::fs::write(
+            explicit,
+            "schema_version = 1\n[device]\npolling_rate = 16\n",
+        )
+        .unwrap();
+        // Explicit wins over env and installed; env wins over installed;
+        // installed applies with no flag/env.
+        for (exp, env, rate, path) in [
+            (Some(explicit), Some(env_path), 16, explicit),
+            (None, Some(env_path), 60, env_path),
+            (None, None, 90, installed),
+        ] {
+            let (cfg, source) = load_selected_config_with_installed(exp, env, installed).unwrap();
+            assert_eq!(cfg.device.polling_rate, rate);
+            assert_eq!(source, format!("{path}; on disk"));
+        }
+        // Missing env/installed files fall back to defaults and name the
+        // missing selector; an empty env falls through to installed.
+        let missing = dir.path().join("missing.toml");
+        let missing = missing.to_str().unwrap();
+        let (cfg, source) =
+            load_selected_config_with_installed(None, Some(missing), installed).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; LTD_CONFIG config missing: {missing}")
+        );
+        let absent = dir.path().join("absent-installed.toml");
+        let absent = absent.to_str().unwrap();
+        let (cfg, source) = load_selected_config_with_installed(None, None, absent).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; installed config missing: {absent}")
+        );
+        let (cfg, source) = load_selected_config_with_installed(None, Some(""), installed).unwrap();
+        assert_eq!(cfg.device.polling_rate, 90);
+        assert_eq!(source, format!("{installed}; on disk"));
+        // Missing explicit files, dangling symlinks, and invalid content
+        // are errors everywhere, never silent defaults.
+        assert!(load_selected_config_with_installed(Some(missing), None, installed).is_err());
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), missing).unwrap();
+        assert!(load_selected_config_with_installed(None, Some(missing), installed).is_err());
+        assert!(load_selected_config_with_installed(Some(missing), None, installed).is_err());
+        std::fs::remove_file(missing).unwrap();
+        std::fs::write(
+            missing,
+            "schema_version = 1\n[device]\npolling_rate = 500\n",
+        )
+        .unwrap();
+        assert!(load_selected_config_with_installed(None, Some(missing), installed).is_err());
+        // A directory as the selected file errors (shared read semantic),
+        // and an empty explicit path never falls back to defaults.
+        let subdir = dir.path().join("adir");
+        std::fs::create_dir(&subdir).unwrap();
+        assert!(load_selected_config_with_installed(
+            None,
+            Some(subdir.to_str().unwrap()),
+            installed
+        )
+        .is_err());
+        assert!(load_selected_config_with_installed(Some(""), None, installed).is_err());
     }
 }

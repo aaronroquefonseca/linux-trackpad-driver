@@ -10,6 +10,12 @@
 # src/resume.rs). Enabling this unit adds a harmless idempotent re-init
 # pass at boot.
 #
+# Activation contract (finding #14): plain `ltd resume` is the AUTOMATIC
+# background form — without a live main-service daemon it is an inactive
+# no-op (hardware left alone, exit 0). Installed-but-stopped (socket
+# absent) is therefore off. Explicit manual forcing while the daemon is
+# stopped is `ltd resume -f` run directly.
+#
 # SYSTEM-SIDE ONLY: no user-session IPC (user.slice is frozen while sleep
 # hooks run; see docs/RESEARCH.md §6). No --user units, no session D-Bus.
 [Unit]
@@ -24,6 +30,30 @@ Type=oneshot
 Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
 ExecStart=/usr/bin/ltd resume
 Nice=10
+
+# Finding #19 containment, one-shot subset (same rationale as the reconnect
+# template: filesystem + privilege restrictions, AF_UNIX only — resume probes
+# the daemon socket and re-sends hidraw feature reports, never monitors
+# netlink or grabs evdev / creates uinput itself).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# ProtectClock deferred (see main unit + SECURITY.md): pre-v252 RTC-only
+# device allowlist denies hidraw/evdev/uinput.
+ProtectHostname=yes
+ProtectKernelLogs=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+# Deliberately OMITTED (see main unit + SECURITY.md): User=, device rules,
+# CapabilityBoundingSet, SystemCallFilter, ProtectProc, PrivateUsers.
+# Deferred for compat: ProtectClock (pre-v252 RTC allowlist denies devices).
 
 [Install]
 WantedBy=multi-user.target
