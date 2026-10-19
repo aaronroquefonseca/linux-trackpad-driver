@@ -157,7 +157,7 @@ Every clickable key name: **138 names, 113 distinct codes**. Each row's code is 
 
 ## Deliberately excluded
 
-Mirrored verbatim from the `key_token_to_code` docs -- these
+Mirrored verbatim from the `token_code` docs -- these
 tokens stay unmapped on purpose:
 
 - `KEY_FN` (464): the Fn modifier itself — no standalone meaning.

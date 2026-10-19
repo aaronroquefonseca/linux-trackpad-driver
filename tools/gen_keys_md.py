@@ -311,7 +311,7 @@ def render(mapping: dict, macros: dict, excluded: list) -> str:
     out.append("")
     out.append("## Deliberately excluded")
     out.append("")
-    out.append("Mirrored verbatim from the `key_token_to_code` docs -- these")
+    out.append("Mirrored verbatim from the `token_code` docs -- these")
     out.append("tokens stay unmapped on purpose:")
     out.append("")
     for bullet in excluded:
