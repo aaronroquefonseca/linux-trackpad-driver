@@ -19,13 +19,16 @@ Selection is `-c <file>` first, then nonempty `LTD_CONFIG`, then built-in
 defaults; the shipped service sets `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml`,
 so a bare `sudo ltd run` without `-c`/`LTD_CONFIG` runs at defaults.
 
-Service path (uses the installed file):
+Service path (uses the installed file; export after reproducing so the
+log covers startup through the failure):
 
 ```sh
+START=$(date '+%Y-%m-%d %H:%M:%S')
 sudo sed -i 's/^log_level *=.*/log_level = "debug"/' /etc/linux-trackpad-driver/config.toml
 grep -E '^log_level' /etc/linux-trackpad-driver/config.toml  # expect debug
 sudo systemctl restart linux-trackpad-driver.service
-journalctl -u linux-trackpad-driver.service 2>&1 | tee /tmp/ltd-run.log
+# ... reproduce the issue now, then export the bounded session:
+journalctl -u linux-trackpad-driver.service --since "$START" 2>&1 | tee /tmp/ltd-run.log
 ```
 
 Manual-run path (same file, explicit selection):
@@ -420,9 +423,11 @@ dmesg | tail -40
 sudo udevadm info -a /dev/hidrawN | head -60
 # 4. rates
 wc -l /tmp/evtest-baseline.log /tmp/evtest-110hz.log
-# 5. debug logs: startup identity + selected source/evdev/actuator + session state
-#    (trim to the interesting 50 lines; keep the `starting`, `config:`, `found`,
-#    `evdev:`/`haptic: ... actuator`, `USB init`/`BT`, `proxy:` lines intact)
+# 5. debug logs from the bounded-session export above (startup identity
+#    plus the failure excerpt — a single tail drops startup after long sessions)
+# 5a. startup identity (first matches: starting/config/found/evdev/actuator/init)
+grep -E 'starting|config:|found .* trackpad|evdev:|actuator|USB init|BT ' /tmp/ltd-run.log | head -30
+# 5b. failure excerpt (last matches through the reproduction)
 grep -E 'starting|config:|found .* trackpad|evdev:|actuator|USB init|BT |resume|proxy|polling|verify|failed|error' /tmp/ltd-run.log | tail -50
 ```
 

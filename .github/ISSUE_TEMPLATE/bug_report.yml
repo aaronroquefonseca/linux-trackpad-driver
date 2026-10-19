@@ -67,8 +67,12 @@ body:
       render: shell
       placeholder: |
         log_level = "debug" in <selected file>; then:
+        START=$(date '+%Y-%m-%d %H:%M:%S')
         sudo systemctl restart linux-trackpad-driver.service
-        journalctl -u linux-trackpad-driver.service | tail -100
+        # ... reproduce the issue, then export the bounded session:
+        journalctl -u linux-trackpad-driver.service --since "$START" > /tmp/ltd-run.log
+        grep -E 'starting|config:|found|evdev:|actuator|USB init|BT ' /tmp/ltd-run.log | head -30
+        grep -E 'resume|proxy|polling|verify|failed|error' /tmp/ltd-run.log | tail -50
         # or: sudo ltd run -c /etc/linux-trackpad-driver/config.toml 2>&1 | tee /tmp/ltd-run.log
         ltd --version
         ltd doctor  # or: ltd doctor -c <same file>
