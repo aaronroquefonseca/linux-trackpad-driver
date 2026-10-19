@@ -1720,15 +1720,20 @@ where
     fn scaled_pos(&mut self, id: u8, x: i32, y: i32, speed: u32) -> (i32, i32) {
         match self.last_pos.get(&id).copied() {
             None => {
+                // Clamp the first EMITTED report to the advertised bounds so
+                // a stationary out-of-range contact cannot step on its second
+                // frame; raw stays unclamped as the delta origin.
+                let ex = x.clamp(POSITION_MIN_X, POSITION_MAX_X);
+                let ey = y.clamp(POSITION_MIN_Y, POSITION_MAX_Y);
                 self.last_pos.insert(
                     id,
                     PointerAnchor {
                         raw: (x, y),
-                        emitted: (x, y),
+                        emitted: (ex, ey),
                         rem: (0, 0),
                     },
                 );
-                (x, y)
+                (ex, ey)
             }
             Some(mut anchor) => {
                 let speed = i64::from(speed);
@@ -1768,7 +1773,8 @@ where
 /// Bounds: emitted positions clamp to the virtual `ABS_X`/`ABS_Y`
 /// (`-3678..=3934`, `-2478..=2587`, see [`uinput_abs_setup`]). Overshoot is
 /// dropped (raw still advances, so reversal responds immediately).
-/// Reanchoring: a fresh id anchors `emitted = raw, rem = 0`; lift
+/// Reanchoring: a fresh id anchors `raw` unclamped (delta origin) and
+/// `emitted = clamp(raw), rem = 0`; lift
 /// (non-touching or absent id), detach, pump loss, or output failure evicts
 /// the anchor so reuse never inherits a stale base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3339,6 +3345,41 @@ mod tests {
         out
     }
 
+    /// Emitted MT Y values for one handled frame, in slot order.
+    fn frame_mt_y(sinks: &TestSinks, before: usize) -> Vec<i32> {
+        sinks.pointer.events.lock().unwrap()[before..]
+            .iter()
+            .filter(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_Y)
+            .map(|&(_, _, v)| v)
+            .collect()
+    }
+
+    fn drive_speed_points(raw: &[(i32, i32)], speed: u32) -> Vec<(i32, i32)> {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = raw
+            .iter()
+            .map(|&(x, y)| Ok(Some(frame(vec![finger(1, 200, x, y)], 0))))
+            .collect();
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(raw.len());
+        for (i, _) in raw.iter().enumerate() {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i as u64)).unwrap();
+            let xs = frame_mt_x(&sinks, before);
+            let ys = frame_mt_y(&sinks, before);
+            assert_eq!(xs.len(), 1, "one touching contact per frame");
+            assert_eq!(ys.len(), 1, "one touching contact per frame");
+            out.push((xs[0], ys[0]));
+        }
+        out
+    }
+
     #[test]
     fn speed_accumulates_emitted_position_across_frames() {
         // Finding #6 repro: raw [0,10,20,30,30] @200% must emit
@@ -3455,6 +3496,75 @@ mod tests {
         // Lower bound pins symmetrically.
         let emitted = drive_speed_frames(&[-3600, -3650, -3650, -3600], 200);
         assert_eq!(emitted, vec![-3600, POSITION_MIN_X, POSITION_MIN_X, -3578]);
+    }
+
+    #[test]
+    fn speed_fresh_out_of_range_anchor_clamps_and_holds() {
+        // Fresh out-of-range contacts must emit the clamped bound on first
+        // contact and stay put while raw is stationary (zero delta = no move).
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 4000], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X]
+        );
+        assert_eq!(
+            drive_speed_frames(&[-4000, -4000, -4000], 100),
+            vec![POSITION_MIN_X, POSITION_MIN_X, POSITION_MIN_X]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, 3000), (0, 3000), (0, 3000)], 100),
+            vec![
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y)
+            ]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, -3000), (0, -3000), (0, -3000)], 100),
+            vec![
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y)
+            ]
+        );
+    }
+
+    #[test]
+    fn speed_fresh_out_of_range_first_move_uses_raw_delta() {
+        // Raw stays the delta origin: inward motion from a clamped anchor
+        // steps off the bound; outward overshoot stays pinned.
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 3990], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X - 10]
+        );
+        assert_eq!(
+            drive_speed_frames(&[-4000, -4000, -3990], 100),
+            vec![POSITION_MIN_X, POSITION_MIN_X, POSITION_MIN_X + 10]
+        );
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 4010], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X]
+        );
+        // Y mirrors X, and scaling still applies to the raw delta.
+        assert_eq!(
+            drive_speed_points(&[(0, 3000), (0, 3000), (0, 2990)], 100),
+            vec![
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y - 10)
+            ]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, -3000), (0, -3000), (0, -2990)], 100),
+            vec![
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y + 10)
+            ]
+        );
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 3990], 200),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X - 20]
+        );
     }
 
     #[test]
