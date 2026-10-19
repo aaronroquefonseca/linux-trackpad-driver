@@ -242,15 +242,15 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
                 let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
                 px.grab().set_node(&evdev.to_string_lossy());
                 let (hnode, hiface) = crate::evdev::haptic_node_for(&event.devnode);
-                px.haptic_mut().inner().set_node(&hnode);
+                // New session: retire any queued pulses from the previous
+                // node and pin the actuator target before the pump enqueues.
+                px.haptic_mut()
+                    .retarget(&hnode, event.transport == crate::init::Transport::Bluetooth);
                 *self.haptic_node.lock().unwrap_or_else(|e| e.into_inner()) = Some(hnode.clone());
                 log::info!(
                     "pump: haptic node {hnode} (interface {hiface:?}) for {}",
                     event.devnode
                 );
-                px.haptic_mut()
-                    .inner()
-                    .set_bluetooth(event.transport == crate::init::Transport::Bluetooth);
                 px.replace_source(PumpSource::Live(source));
                 px.set_pump_ready(true);
                 px.attach(event);
@@ -366,7 +366,9 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if target.as_deref() != Some(node.as_str()) {
-                proxy.haptic_mut().inner().set_node(&node);
+                // Same session, corrected route: re-point pending pulses,
+                // no retire (queued work still belongs to this session).
+                proxy.haptic_mut().update_route(&node);
                 log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
                 *target = Some(node);
             }
