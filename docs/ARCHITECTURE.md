@@ -35,6 +35,11 @@ hidraw/evdev ──> init (always on) ──> kernel/libinput passthrough (fallb
 ## Click state machine (spec)
 
 - Per-finger pressure vs `sensitivity` (press) / `sensitivity - margin` (release hysteresis).
+- Timed debounce holds a first-level-only release until 30 ms after its press;
+  a force pressure dip holds until 30 ms after the last force-held report.
+  Idle polls finish these observed releases before pending combo presses,
+  even when no further HID report arrives. Idle time preserves contacts still
+  held in the last report and never retries or creates press/force/slide edges.
 - Finger-count at press edge selects action `click_1..=click_5`
   (`left/right/middle/none/empty`/key-combo).
 - `force_offset > 0` arms second level at `sensitivity + force_offset`

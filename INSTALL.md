@@ -123,7 +123,7 @@ systemctl status linux-trackpad-driver-resume.service
 - Re-attach path: the `ltd resume` one-shot re-arms hardware only (its hub
   would reach zero listeners, so it emits nothing). Clicks re-attaches on
   the daemon hub: each 30 s pass also checks enhanced-session health.
-  Failed attachments and sessions released after source loss retry even
+  Failed attachments and sessions released after source or output loss retry even
   when USB polling still matches or a Bluetooth node keeps its name.
   These attachment-only retries send no hardware init reports. Failed
   hardware init remains pending; a replaced devnode instance is detached

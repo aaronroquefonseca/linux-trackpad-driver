@@ -51,9 +51,9 @@ pub const RESUME_RESCAN_INTERVAL_MS: u64 = 100;
 /// Outcome of one resume pass for one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeAction {
-    /// Polling read-back matched; no reports sent, no hub traffic.
+    /// USB polling matched or BT needs no setup; no reports or hub traffic.
     UpToDate,
-    /// Mismatch (or unreadable verify) → multitouch-first re-init sent.
+    /// USB mismatch (or unreadable verify) → multitouch-first re-init sent.
     /// Hub `Ready` is emitted only when a live hub is passed (daemon tick);
     /// the one-shot passes none (its hub would reach zero listeners).
     Reinitialized,
@@ -164,22 +164,19 @@ pub fn resume_usb_node(
     Ok(ResumeAction::Reinitialized)
 }
 
-/// Resume one BT node (one-shot hardware arm): no `GET_FEATURE` verify exists
-/// on this path, so re-apply the coexistence policy (re-suppresses when the
-/// opt-in is set — the unbind did not survive sleep). Emits nothing by
-/// design: clicks re-attach is tick/udev-mediated (daemon re-emits `Ready`
-/// when the node re-appears or the tick re-inits it). A node that vanished
-/// between scan and arm is recorded `Detached`, mirroring the USB arm.
-pub fn resume_bt_node(devnode: &str, enhanced_clicks: bool) -> ResumeAction {
+/// Observe one BT node after resume without changing driver bindings.
+/// There is no BT hardware init or polling verify on this path. A one-shot
+/// owns no proxy, so only the daemon may suppress events with its evdev grab.
+/// A vanished node is recorded `Detached`, mirroring the USB arm.
+pub fn resume_bt_node(devnode: &str) -> ResumeAction {
     if !std::path::Path::new(devnode).exists() {
         log::warn!(
             "resume: BT node {devnode} gone after suspend; recording Detached (tick adopts it within one pass if it re-enumerates under a new name)"
         );
         return ResumeAction::Detached;
     }
-    let _ = init::apply_bt_coexistence(devnode, enhanced_clicks);
-    log::info!("resume: BT {devnode} policy re-applied (hub re-attach is tick-mediated)");
-    ResumeAction::Reinitialized
+    log::debug!("resume: BT {devnode} present (native input retained)");
+    ResumeAction::UpToDate
 }
 
 /// Exact recovery command named by every resume dead-end log: no path may
@@ -271,11 +268,7 @@ impl ResumeReport {
 /// fix, and re-enumeration is destructive (fail-closed posture). A node that
 /// stays mismatched after the retry budget lands in `errors` with the exact
 /// recovery command; the tick keeps re-trying so a late recovery self-heals.
-pub fn run_resume_scan(
-    devs: &[DiscoveredDevice],
-    polling_hz: u32,
-    enhanced_clicks: bool,
-) -> ResumeReport {
+pub fn run_resume_scan(devs: &[DiscoveredDevice], polling_hz: u32) -> ResumeReport {
     log::info!("resume: starting pass over {} node(s)", devs.len());
     let mut report = ResumeReport::default();
     for dev in devs {
@@ -284,7 +277,7 @@ pub fn run_resume_scan(
                 let first_verify = verify_node_polling(&dev.devnode, polling_hz);
                 resume_usb_node(&dev.devnode, polling_hz, None, &first_verify)
             }
-            Transport::Bluetooth => Ok(resume_bt_node(&dev.devnode, enhanced_clicks)),
+            Transport::Bluetooth => Ok(resume_bt_node(&dev.devnode)),
         };
         match outcome {
             Ok(action) => report.nodes.push(NodeResume {
@@ -345,18 +338,30 @@ mod tests {
     }
 
     #[test]
-    fn bt_oneshot_reapplies_policy_without_hub_traffic() {
-        // One-shot BT re-arms hardware only (coexistence policy); it owns no
-        // listeners, so it takes no hub and emits nothing. Ready re-emit is
-        // tick/udev-mediated. (/dev/null stands in for a present node: the
-        // passthrough policy touches no hardware.)
-        let action = resume_bt_node("/dev/null", false);
-        assert_eq!(action, ResumeAction::Reinitialized);
-        // Vanished between scan and arm → Detached, mirroring the USB arm.
-        assert_eq!(
-            resume_bt_node("/nonexistent-hidraw-xyz", false),
-            ResumeAction::Detached
-        );
+    fn bt_oneshot_only_checks_presence_without_reinitializing() {
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let path = node.path().to_str().unwrap().to_string();
+        assert_eq!(resume_bt_node(&path), ResumeAction::UpToDate);
+        drop(node);
+        assert_eq!(resume_bt_node(&path), ResumeAction::Detached);
+    }
+
+    #[test]
+    fn bt_resume_scan_without_daemon_needs_no_reinit() {
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let dev = DiscoveredDevice {
+            devnode: node.path().to_str().unwrap().into(),
+            vendor_id: 0x004c,
+            product_id: 0x0324,
+            transport: Transport::Bluetooth,
+        };
+        // This is the core used by the no-daemon resume entry. Invalid USB
+        // polling cannot affect BT; the helper owns no enhanced session.
+        let report = run_resume_scan(&[dev], 0);
+        assert_eq!(report.nodes.len(), 1);
+        assert_eq!(report.nodes[0].action, ResumeAction::UpToDate);
+        assert_eq!(report.reinitialized(), 0);
+        assert!(!report.failed());
     }
 
     #[test]
@@ -491,7 +496,7 @@ mod tests {
     #[test]
     fn scan_core_collects_per_node_errors() {
         // /dev/null exists but is not a trackpad: USB resume fails on
-        // ioctl, BT re-arms fine — one node's failure never takes the
+        // ioctl, BT needs no setup — one node's failure never takes the
         // pass (or the sibling) down.
         let devs = vec![
             DiscoveredDevice {
@@ -507,9 +512,9 @@ mod tests {
                 transport: Transport::Bluetooth,
             },
         ];
-        let report = run_resume_scan(&devs, 110, false);
+        let report = run_resume_scan(&devs, 110);
         assert_eq!(report.nodes.len(), 1);
-        assert_eq!(report.nodes[0].action, ResumeAction::Reinitialized);
+        assert_eq!(report.nodes[0].action, ResumeAction::UpToDate);
         assert_eq!(report.errors.len(), 1);
         assert!(report.failed());
     }

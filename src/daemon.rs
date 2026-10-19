@@ -24,7 +24,7 @@ use crate::init::{
 use crate::lock::{self, SocketLock};
 use crate::resume::{self, ResumeReport};
 
-/// Shared device-ready hub for this process. Clicks subscribes in Phase 1.
+/// Shared device-ready hub for this process. The daemon proxy subscribes.
 pub fn hub() -> DeviceReadyHub {
     DeviceReadyHub::new()
 }
@@ -436,33 +436,18 @@ fn verify_attach_stream(chosen: &str) {
 
 /// Initialize one discovered node and return its ready event.
 /// USB: defer (node+bind) → retrying feature reports → verify → ready.
-/// BT: single-node, no reports, straight to ready + coexistence policy.
-///
-/// FOOTGUN: this convenience leaves `enhanced_clicks=false` (BT passthrough
-/// untouched). Production paths (`run`/`reconnect`) must use
-/// [`init_node_with_config`] so the opt-in is honored.
+/// BT: no reports, straight to ready. Native input is suppressed only by a
+/// live proxy's reversible evdev grab, never by hardware initialization.
+/// Device setup runs independently of the enhanced-clicks gate.
 pub fn init_node(
     dev: &DiscoveredDevice,
     polling_hz: u32,
-    ready_hub: &DeviceReadyHub,
-) -> Result<DeviceReadyEvent> {
-    init_node_with_config(dev, polling_hz, false, ready_hub)
-}
-
-/// [`init_node`] with the clicks opt-in plumbed through (BT double-input
-/// handling only; USB path is identical either way).
-pub fn init_node_with_config(
-    dev: &DiscoveredDevice,
-    polling_hz: u32,
-    enhanced_clicks: bool,
     ready_hub: &DeviceReadyHub,
 ) -> Result<DeviceReadyEvent> {
     match dev.transport {
         Transport::Bluetooth => {
             let ev = init::init_bluetooth(&dev.devnode);
             ready_hub.emit(&ev);
-            // Best-effort, never fails init; default leaves passthrough intact.
-            let _ = init::apply_bt_coexistence(&dev.devnode, enhanced_clicks);
             Ok(ev)
         }
         Transport::Usb => {
@@ -661,27 +646,24 @@ pub fn run_reconnect(
     }
     let devs = discovery::scan_trackpads().context("scanning hidraw for reconnect")?;
     let transport = classify_node(devnode, &devs)?;
-    // No proxy subscription here: reconnect is a short-lived udev process
-    // and must never grab. Its hub is a per-process orphan reaching zero
-    // listeners; the daemon owns the proxy and re-attaches tick-mediated
-    // (rescan → init on its own hub, ≤30 s latency).
-    let ready_hub = hub();
+    reconnect_classified_node(devnode, transport, mode, polling_override, cfg)
+}
 
+/// Hardware setup after discovery has validated the reconnect target.
+/// A one-shot owns no proxy or live hub; it must leave native BT input alone
+/// in every mode. Only the daemon can acquire a reversible evdev grab.
+fn reconnect_classified_node(
+    devnode: &str,
+    transport: Transport,
+    mode: ReconnectMode,
+    polling_override: Option<u32>,
+    cfg: &Config,
+) -> Result<()> {
     if mode == ReconnectMode::Disengage {
         match transport {
             Transport::Bluetooth => {
-                // No host-click report defined for the BT bring-up path.
-                // Unbind is sticky: restore passthrough for a previously
-                // suppressed node (best-effort no-op when already bound).
-                // Resume re-suppresses via the init arm when the opt-in is
-                // set; the Detached event below lets clicks release the
-                // node (re-attach is tick-mediated: rescan → init → Ready
-                // on the daemon hub).
-                log::info!("BT {devnode}: disengage (no reports sent)");
-                if let Err(e) = init::restore_bt_passthrough(devnode) {
-                    log::warn!("BT {devnode}: re-bind best-effort failed ({e:#})");
-                }
-                ready_hub.emit(&init::detached(devnode, Transport::Bluetooth));
+                // No BT host-click report or driver binding changes.
+                log::info!("BT {devnode}: disengage (native input retained)");
                 return Ok(());
             }
             Transport::Usb => {
@@ -689,12 +671,6 @@ pub fn run_reconnect(
                     devnode: devnode.to_string(),
                 };
                 init::disengage_usb_with_retry(&sender)?;
-                // Stateless restore: no-op when already bound (EBUSY skip),
-                // re-binds when a previous suppress left the node unbound.
-                if let Err(e) = init::restore_bt_passthrough(devnode) {
-                    log::warn!("USB {devnode}: re-bind best-effort failed ({e:#})");
-                }
-                ready_hub.emit(&init::detached(devnode, Transport::Usb));
                 return Ok(());
             }
         }
@@ -709,11 +685,7 @@ pub fn run_reconnect(
                     "BT {devnode}: skipping polling rate (unsupported on Bluetooth; USB-first)"
                 );
             }
-            let ev = init::init_bluetooth(devnode);
-            ready_hub.emit(&ev);
-            // Default leaves kernel passthrough intact; only
-            // enhanced_clicks=true suppresses the physical node.
-            let _ = init::apply_bt_coexistence(devnode, cfg.enhanced_clicks);
+            init::init_bluetooth(devnode);
             Ok(())
         }
         Transport::Usb => {
@@ -742,7 +714,6 @@ pub fn run_reconnect(
                 outcome.iface,
                 outcome.plan.x,
             );
-            ready_hub.emit(&init::usb_ready(devnode));
             Ok(())
         }
     }
@@ -781,21 +752,7 @@ pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeR
             resume::empty_scan_recovery_hint()
         );
     }
-    Ok(resume::run_resume_scan(
-        &devs,
-        polling_hz,
-        cfg.enhanced_clicks,
-    ))
-}
-/// Ticks between BT coexistence re-applies for known nodes (10 × 30 s =
-/// 5 min). The hook's one-shot is the primary re-suppressor; this is the
-/// backstop for hook-missed sleeps. Never emits hub traffic.
-pub const BT_REAPPLY_EVERY_TICKS: u64 = 10;
-
-/// Pure cadence: re-apply on every Nth tick (unit-tested; the tick itself
-/// needs hardware).
-pub fn bt_reapply_due(ticks: u64) -> bool {
-    ticks > 0 && ticks.is_multiple_of(BT_REAPPLY_EVERY_TICKS)
+    Ok(resume::run_resume_scan(&devs, polling_hz))
 }
 
 /// One daemon tick action, for logs/tests.
@@ -821,7 +778,7 @@ pub enum TickAction {
 /// fresh scan against it:
 ///
 /// - added/replaced node or previously failed init → full
-///   [`init_node_with_config`] (same ordering as boot init);
+///   [`init_node`] (same ordering as boot init);
 /// - still-present known USB node → one `GET_FEATURE` re-verify, threaded
 ///   into [`resume::resume_usb_node`] (no double read); multitouch-first
 ///   re-init on mismatch, [`resume::needs_reinit`] as the decision;
@@ -829,12 +786,11 @@ pub enum TickAction {
 ///   re-init once (assume transient), then assume armed until the periodic
 ///   reprobe ([`resume::unreadable_disposition`]) — firmware that NAKs reads
 ///   must not cause a re-init + `Ready` storm every pass;
-/// - still-present known BT node → slow-cadence coexistence re-apply only
-///   (every [`BT_REAPPLY_EVERY_TICKS`]; the hook is primary, this backstops
-///   hook-missed sleeps; no hardware-driven `Ready`);
+/// - still-present known BT node → no hardware init or binding changes;
 /// - vanished/replaced instance → `Detached` emit so clicks releases it;
 /// - initialized hardware with a missing/dead enhanced session → bounded
-///   attachment-only `Ready`, independent of USB verify / BT policy work.
+///   attachment-only `Ready`, independent of USB verify or unchanged BT
+///   hardware.
 ///
 /// Healthy sessions and siblings do not receive retry events.
 ///
@@ -844,8 +800,6 @@ pub enum TickAction {
 /// clicks re-attaches without reordering init.
 pub struct ResumeWatch {
     known: Vec<NodeState>,
-    /// Pass counter for slow-cadence work (BT re-apply).
-    ticks: u64,
 }
 
 struct NodeState {
@@ -882,7 +836,6 @@ trait WatchHardware {
     fn initialize(&self, dev: &DiscoveredDevice) -> Result<()>;
     fn verify(&self, devnode: &str) -> Result<bool>;
     fn resume(&self, devnode: &str, verify: &Result<bool>) -> Result<resume::ResumeAction>;
-    fn reapply_bt(&self, devnode: &str);
 }
 
 struct LiveWatchHardware<'a> {
@@ -892,12 +845,7 @@ struct LiveWatchHardware<'a> {
 
 impl WatchHardware for LiveWatchHardware<'_> {
     fn initialize(&self, dev: &DiscoveredDevice) -> Result<()> {
-        init_node_with_config(
-            dev,
-            self.cfg.device.polling_rate,
-            self.cfg.enhanced_clicks,
-            self.hub,
-        )?;
+        init_node(dev, self.cfg.device.polling_rate, self.hub)?;
         Ok(())
     }
     fn verify(&self, devnode: &str) -> Result<bool> {
@@ -910,9 +858,6 @@ impl WatchHardware for LiveWatchHardware<'_> {
             Some(self.hub),
             verify,
         )
-    }
-    fn reapply_bt(&self, devnode: &str) {
-        let _ = init::apply_bt_coexistence(devnode, self.cfg.enhanced_clicks);
     }
 }
 
@@ -930,7 +875,6 @@ impl ResumeWatch {
                     identity: node_identity(&dev.devnode),
                 })
                 .collect(),
-            ticks: 0,
         }
     }
 
@@ -940,7 +884,6 @@ impl ResumeWatch {
         ready_hub: &DeviceReadyHub,
         needs_attach: &dyn Fn(&str) -> bool,
     ) -> Vec<TickAction> {
-        self.ticks += 1;
         let current = match discovery::scan_trackpads() {
             Ok(devs) => devs,
             Err(e) => {
@@ -1035,16 +978,8 @@ impl ResumeWatch {
                 continue;
             }
             if dev.transport != Transport::Usb {
-                // Known BT: steady state, no hub traffic — except a
-                // slow-cadence coexistence re-apply (the hook's one-shot is
-                // primary; this backstops hook-missed sleeps). Never emits.
-                if bt_reapply_due(self.ticks) {
-                    log::debug!(
-                        "resume tick: re-applying BT coexistence for {}",
-                        dev.devnode
-                    );
-                    hardware.reapply_bt(&dev.devnode);
-                }
+                // BT needs no hardware re-init. The live proxy owns its
+                // grab; a background scan must not alter driver bindings.
                 continue;
             }
             let verify = hardware.verify(&dev.devnode);
@@ -1161,9 +1096,22 @@ mod tests {
             self.grabbed.load(Ordering::SeqCst)
         }
     }
-    struct TestSink;
+    #[derive(Default)]
+    struct TestSink {
+        fail: AtomicBool,
+        destroyed: AtomicBool,
+    }
     impl UinputSink for TestSink {
-        fn emit(&self, _: u16, _: u16, _: i32) {}
+        fn emit(&self, _: u16, _: u16, _: i32) -> Result<()> {
+            anyhow::ensure!(!self.fail.load(Ordering::SeqCst), "fatal output failure");
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            !self.destroyed.load(Ordering::SeqCst)
+        }
+        fn destroy(&self) {
+            self.destroyed.store(true, Ordering::SeqCst);
+        }
     }
     type TestProxy = ClickProxy<TestGrab, TestSink, LogHaptic, HidrawSource<ScriptReader>>;
     struct TestSession {
@@ -1178,7 +1126,7 @@ mod tests {
                 proxy: TestProxy::new(
                     ProxySettings { enhanced: true },
                     TestGrab::default(),
-                    TestSink,
+                    TestSink::default(),
                     LogHaptic,
                     HidrawSource::new("fixture", ScriptReader::default()),
                 ),
@@ -1218,6 +1166,9 @@ mod tests {
                 // fresh-FD wiring after a failed grab or dead source.
                 s.proxy
                     .replace_source(HidrawSource::new(&event.devnode, ScriptReader::default()));
+                // The real manager recreates retired output nodes before
+                // setting pump readiness and acquiring a fresh grab.
+                s.proxy.uinput().destroyed.store(false, Ordering::SeqCst);
                 s.proxy.set_pump_ready(true);
                 s.proxy.attach(event);
                 if s.proxy.is_attached() {
@@ -1274,7 +1225,6 @@ mod tests {
             self.hub.emit(&init::usb_ready(devnode));
             Ok(resume::ResumeAction::Reinitialized)
         }
-        fn reapply_bt(&self, _: &str) {}
     }
 
     fn enhanced_config() -> Config {
@@ -1368,6 +1318,63 @@ mod tests {
             assert_eq!(session.lock().unwrap().attempts, 2);
             assert_eq!(hardware.inits.get(), 1);
             assert_eq!(hardware.reinits.get(), 0);
+        }
+    }
+
+    #[test]
+    fn unchanged_hardware_recovers_after_fatal_output_cleanup() {
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, false);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            let (report_id, prefix_len) = match dev.transport {
+                Transport::Usb => (0x02, 12),
+                Transport::Bluetooth => (0x31, 4),
+            };
+            let mut report = vec![0; prefix_len];
+            report[0] = report_id;
+            {
+                let mut s = session.lock().unwrap();
+                s.proxy.uinput().fail.store(true, Ordering::SeqCst);
+                // An empty decoded report still emits the touch/tool/SYN
+                // frame, exercising the fallible sink and fatal cleanup.
+                s.proxy.replace_source(HidrawSource::new(
+                    &dev.devnode,
+                    ScriptReader::new(vec![ScriptStep::Bytes(report.clone())]),
+                ));
+                assert!(s.proxy.handle_frame(&cfg).is_err());
+                assert!(!s.proxy.is_attached());
+                assert!(!s.proxy.grab().is_grabbed());
+                assert!(s.proxy.uinput().destroyed.load(Ordering::SeqCst));
+                assert_eq!(s.active.as_deref(), Some(dev.devnode.as_str()));
+                s.proxy.uinput().fail.store(false, Ordering::SeqCst);
+            }
+            let actions =
+                watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+            assert!(actions.contains(&TickAction::AttachmentRetried(dev.devnode.clone())));
+            {
+                let mut s = session.lock().unwrap();
+                assert!(s.proxy.is_attached());
+                assert!(s.proxy.grab().is_grabbed());
+                assert!(!s.proxy.uinput().destroyed.load(Ordering::SeqCst));
+                assert_eq!(s.attempts, 2);
+                s.proxy.replace_source(HidrawSource::new(
+                    &dev.devnode,
+                    ScriptReader::new(vec![ScriptStep::Bytes(report)]),
+                ));
+                s.proxy.handle_frame(&cfg).unwrap();
+                assert!(s.proxy.is_attached());
+            }
+            // Recovery does not re-init hardware or repeat attachment
+            // once the recreated output session is healthy.
+            watch.tick_with_hardware(&cfg, &hub, vec![dev], &health, &hardware);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.reinits.get(), 0);
+            assert_eq!(session.lock().unwrap().attempts, 2);
         }
     }
 
@@ -1476,16 +1483,6 @@ mod tests {
             &hardware,
         );
         assert!(events.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn bt_reapply_fires_every_nth_tick_only() {
-        assert!(!bt_reapply_due(0));
-        assert!(!bt_reapply_due(1));
-        assert!(!bt_reapply_due(BT_REAPPLY_EVERY_TICKS - 1));
-        assert!(bt_reapply_due(BT_REAPPLY_EVERY_TICKS));
-        assert!(!bt_reapply_due(BT_REAPPLY_EVERY_TICKS + 1));
-        assert!(bt_reapply_due(2 * BT_REAPPLY_EVERY_TICKS));
     }
 
     #[test]
@@ -1749,24 +1746,87 @@ mod tests {
     }
 
     #[test]
-    fn bt_node_with_config_plumbs_coexistence_without_reports() {
-        // BT bring-up emits Ready (never Detached) and applies the (default
-        // passthrough) policy — and takes no FeatureSender at all, so no
-        // feature report can be emitted on this path by construction.
+    fn bt_reconnect_needs_no_enhanced_session_in_every_mode() {
+        // Exercise the classified one-shot path without host discovery or
+        // socket access. No daemon/force/disengage combination owns a proxy.
+        let node = tempfile::NamedTempFile::new().unwrap();
+        for enhanced_clicks in [false, true] {
+            let cfg = Config {
+                enhanced_clicks,
+                ..Config::default()
+            };
+            for daemon_live in [false, true] {
+                for force in [false, true] {
+                    for disengage in [false, true] {
+                        let mode = resolve_reconnect_mode(daemon_live, force, disengage);
+                        // BT ignores USB polling options even when invalid.
+                        reconnect_classified_node(
+                            node.path().to_str().unwrap(),
+                            Transport::Bluetooth,
+                            mode,
+                            Some(0),
+                            &cfg,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bt_init_without_proxy_and_failed_listener_keep_siblings_independent() {
         let hub = DeviceReadyHub::new();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = std::sync::Arc::clone(&seen);
-        hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
-        let dev = DiscoveredDevice {
-            devnode: "/dev/hidraw9".into(),
-            vendor_id: 0x004c,
-            product_id: 0x0324,
-            transport: Transport::Bluetooth,
+        let mut devs = fixture_devs();
+        // No daemon/proxy listener: init remains hardware-only, even at an
+        // invalid USB rate. No enhanced path exists to replace native input.
+        let first = devs.pop().unwrap();
+        let ev = init_node(&first, 0, &hub).unwrap();
+        assert_eq!(ev, init::init_bluetooth(&first.devnode));
+        hub.subscribe(|_| panic!("simulated attachment failure"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        hub.subscribe(move |ev| capture.lock().unwrap().push(ev.clone()));
+        let second = DiscoveredDevice {
+            devnode: "/dev/hidraw-other-bt".into(),
+            ..first.clone()
         };
-        let ev = init_node_with_config(&dev, 500, false, &hub).unwrap();
-        assert_eq!(ev.transport, Transport::Bluetooth);
-        assert_eq!(ev.kind, crate::init::ReadyKind::Ready);
-        let seen = seen.lock().expect("seen lock");
-        assert_eq!(*seen, vec![ev]);
+        for dev in [&first, &second] {
+            init_node(dev, 0, &hub).unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].devnode, first.devnode);
+        assert_eq!(seen[1].devnode, second.devnode);
+        assert!(seen.iter().all(|ev| ev.kind == init::ReadyKind::Ready));
+    }
+
+    #[test]
+    fn known_bt_ticks_leave_live_session_ownership_alone() {
+        let dev = fixture_devs().pop().unwrap();
+        let hub = DeviceReadyHub::new();
+        let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = Arc::clone(&events);
+        hub.subscribe(move |_| {
+            capture.fetch_add(1, Ordering::SeqCst);
+        });
+        for enhanced_clicks in [false, true] {
+            let cfg = Config {
+                enhanced_clicks,
+                ..Config::default()
+            };
+            let mut watch = ResumeWatch::new(std::slice::from_ref(&dev));
+            for _ in 0..20 {
+                assert!(watch
+                    .tick_with_scan(&cfg, &hub, vec![dev.clone()], &|node| session_needs_attach(
+                        enhanced_clicks,
+                        Some(&dev.devnode),
+                        node,
+                        true
+                    ))
+                    .is_empty());
+            }
+        }
+        assert_eq!(events.load(Ordering::SeqCst), 0);
     }
 }
