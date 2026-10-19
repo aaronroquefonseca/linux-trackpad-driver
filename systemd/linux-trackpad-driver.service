@@ -18,5 +18,47 @@ RestartSec=2
 RuntimeDirectory=linux-trackpad-driver
 RuntimeDirectoryMode=0755
 
+# Finding #19 containment (incremental, verified subset — NOT a generic
+# hardening paste). Each restriction below preserves the daemon's audited
+# access: /dev R/W (hidraw, evdev, uinput), /sys + /proc reads (discovery,
+# evdev resolution, bind checks), /etc RO read (system config), /run socket
+# create, AF_UNIX (single-instance lock) + AF_NETLINK (hotplug monitor) only.
+# Verified with: systemd-analyze verify, packaging tests, full cargo gates;
+# hardware re-validation (hidraw/evdev/uinput on a real pad) is a follow-up
+# with the exact procedure in SECURITY.md.
+#
+# Filesystem: strict RO OS tree; API FS (/dev, /proc, /sys, /run) stays
+# usable, so hidraw/evdev/uinput/sysfs/config/socket access is unchanged.
+ProtectSystem=strict
+# No home-directory use (config lives in /etc, socket in /run).
+ProtectHome=yes
+# No /tmp or /var/tmp use in production (only tests use tempfiles).
+PrivateTmp=yes
+# No sysfs/procfs/sysctl writes: discovery and evdev resolution are
+# read-only; one-shots and the daemon never write driver bind/unbind.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# No clock/hostname/kmsg writes: time is read-only, logs go to stderr.
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+# Privilege reduction: no child processes (no Command::exec in src),
+# no setuid/setgid files, no realtime scheduling, no personality(2).
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# No namespace creation: the netlink monitor binds AF_NETLINK, never unshares.
+RestrictNamespaces=yes
+# Only socket families used in src (lock.rs AF_UNIX, hotplug.rs AF_NETLINK);
+# no AF_INET/AF_PACKET anywhere (grep-verified).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+#
+# Deliberately OMITTED (need device-access refactor + hardware validation,
+# see SECURITY.md): User=/DynamicUser=, DevicePolicy=/DeviceAllow=/
+# PrivateDevices, CapabilityBoundingSet, SystemCallFilter, ProtectProc,
+# PrivateUsers. Adding any of those blindly breaks hidraw/evdev/uinput.
+
 [Install]
 WantedBy=multi-user.target

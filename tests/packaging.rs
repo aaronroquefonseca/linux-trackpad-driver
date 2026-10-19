@@ -129,6 +129,116 @@ fn service_unit_shape() {
 }
 
 #[test]
+fn service_sandbox_subset_finding_19() {
+    // Incremental containment: every added restriction must preserve the
+    // daemon's audited access (/dev R/W for hidraw/evdev/uinput, /sys +
+    // /proc reads, /etc RO config read, /run socket, AF_UNIX + AF_NETLINK).
+    // See the unit comments and SECURITY.md for the per-restriction rationale.
+    for directive in [
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectControlGroups=yes",
+        "ProtectClock=yes",
+        "ProtectHostname=yes",
+        "ProtectKernelLogs=yes",
+        "NoNewPrivileges=yes",
+        "RestrictSUIDSGID=yes",
+        "RestrictRealtime=yes",
+        "LockPersonality=yes",
+        "RestrictNamespaces=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+    ] {
+        assert!(
+            SERVICE.contains(directive),
+            "main unit must carry {directive}"
+        );
+    }
+    // Deliberately left out: these need a device-access refactor (non-root
+    // device ACLs / cgroup device rules / ioctl allowlist) plus hardware
+    // validation. They are named in unit *comments* only to prohibit them, so
+    // check code lines — like sleep_hook_never_touches_user_sessions does.
+    // If you add one, update SECURITY.md's follow-up list and record
+    // hardware re-validation evidence in the PR.
+    let service_code = code_lines(SERVICE);
+    for banned in [
+        "User=",
+        "DynamicUser=",
+        "PrivateDevices",
+        "DevicePolicy",
+        "DeviceAllow",
+        "CapabilityBoundingSet",
+        "SystemCallFilter",
+        "SystemCallArchitectures",
+        "ProtectProc",
+        "PrivateUsers",
+    ] {
+        assert!(
+            !service_code.contains(banned),
+            "main unit must NOT carry {banned:?} without the SECURITY.md follow-up work"
+        );
+    }
+}
+
+#[test]
+fn oneshot_units_carry_narrower_sandbox_subset() {
+    // One-shots (reconnect/resume) share the filesystem + privilege subset
+    // but need AF_UNIX only: they probe the daemon socket and re-send
+    // hidraw reports, never opening the AF_NETLINK hotplug monitor.
+    for (name, text) in [
+        ("reconnect template", RECONNECT),
+        ("resume unit", RESUME_UNIT),
+    ] {
+        for directive in [
+            "ProtectSystem=strict",
+            "ProtectHome=yes",
+            "PrivateTmp=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
+            "ProtectClock=yes",
+            "ProtectHostname=yes",
+            "ProtectKernelLogs=yes",
+            "NoNewPrivileges=yes",
+            "RestrictSUIDSGID=yes",
+            "RestrictRealtime=yes",
+            "LockPersonality=yes",
+            "RestrictNamespaces=yes",
+            "RestrictAddressFamilies=AF_UNIX",
+        ] {
+            assert!(text.contains(directive), "{name} must carry {directive}");
+        }
+        assert!(
+            !code_lines(text).contains("AF_NETLINK"),
+            "{name} must not allow AF_NETLINK in code (no hotplug monitor in one-shots)"
+        );
+        // Same deliberate omissions as the main unit: device-access refactor
+        // + hardware validation required (see SECURITY.md). Comments may name
+        // them only to prohibit them, so check code lines.
+        let unit_code = code_lines(text);
+        for banned in [
+            "User=",
+            "DynamicUser=",
+            "PrivateDevices",
+            "DevicePolicy",
+            "DeviceAllow",
+            "CapabilityBoundingSet",
+            "SystemCallFilter",
+            "SystemCallArchitectures",
+            "ProtectProc",
+            "PrivateUsers",
+        ] {
+            assert!(
+                !unit_code.contains(banned),
+                "{name} must NOT carry {banned:?} without the SECURITY.md follow-up work"
+            );
+        }
+    }
+}
+
+#[test]
 fn reconnect_template_runs_reconnect_for_instance() {
     assert!(
         RECONNECT.contains("Type=oneshot"),
