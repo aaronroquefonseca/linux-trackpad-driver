@@ -272,7 +272,8 @@ impl<T: Send + 'static> DisposalPool<T> {
         }))?;
         // Detached daemon lifetime: teardown never joins the closer, so
         // a stalled HID release cannot escape into the shutdown budget.
-        std::mem::forget(handle);
+        // `drop` on the handle detaches; no extra thread is created here.
+        drop(handle);
         Ok(Arc::new(Self { tx, live, cap }))
     }
 
@@ -7358,39 +7359,224 @@ mod tests {
     }
 
     #[test]
-    fn haptic_shutdown_bounded_on_hung_actuator() {
-        // A wedged firmware send (never returns) must not hang teardown:
-        // `Drop` closes, joins bounded, then detaches the worker.
-        struct HungHaptic;
-        impl HapticSender for HungHaptic {
-            fn click_feedback(&self, _pressure: u8, _intensity: u8, _quiet: bool) -> Result<()> {
-                std::thread::park();
+    fn haptic_overflow_press_release_owes_no_up() {
+        // Full proxy path across a full queue: the press edge's down-pulse
+        // is rejected, so the proxy owes nothing and the later release
+        // enqueues no up-pulse (no phantom release snap, no extra drop).
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.click_feedback(1, 1, false).unwrap();
+        gate.wait_entered(1);
+        for _ in 0..HAPTIC_QUEUE_CAP {
+            ah.click_feedback(1, 1, false).unwrap();
+        }
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            TestSinks::new().dual(),
+            ah,
+            ScriptSource::new(vec![
+                Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+                Ok(Some(frame(vec![], 0))),
+            ]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("fixture"));
+        let now = std::time::Instant::now();
+        let cfg = Config::default();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(!px.pressed_haptic);
+        assert_eq!(px.haptic.dropped_overflow(), 1);
+        px.handle_frame_at(&cfg, spaced_at(now, 2)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(now, 3)).unwrap();
+        assert!(!px.pressed_haptic);
+        assert_eq!(
+            px.haptic.dropped_overflow(),
+            1,
+            "release must not attempt up for rejected down"
+        );
+        gate.open();
+        gate.wait_executed(HAPTIC_QUEUE_CAP + 1);
+        assert!(gate.executed().iter().all(|pulse| pulse.2));
+    }
+
+    #[test]
+    fn haptic_panic_then_next_pulse_progresses() {
+        // Panic containment through the real queue: a panicking pulse is
+        // caught per pulse and the worker still runs later work in order.
+        struct PanicOnce {
+            panicked: std::sync::atomic::AtomicBool,
+            calls: Mutex<Vec<(u8, u8, bool)>>,
+            releases: Mutex<Vec<(u8, bool)>>,
+        }
+        impl HapticSender for PanicOnce {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
                 Ok(())
             }
-            fn release_feedback(&self, _down_pressure: u8, _quiet: bool) -> Result<()> {
-                std::thread::park();
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(
+                &self,
+                _target: &HapticTarget,
+                pressure: u8,
+                intensity: u8,
+                quiet: bool,
+            ) -> Result<()> {
+                if !self
+                    .panicked
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    panic!("test panic in haptic pulse");
+                }
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((pressure, intensity, quiet));
+                Ok(())
+            }
+            fn execute_up(
+                &self,
+                _target: &HapticTarget,
+                down_pressure: u8,
+                quiet: bool,
+            ) -> Result<()> {
+                self.releases.lock().unwrap().push((down_pressure, quiet));
                 Ok(())
             }
         }
-        let ah = AsyncHaptic::new(HungHaptic);
-        ah.click_feedback(64, 5, false).unwrap();
-        // Wait until the worker picked the pulse up (queue drained into
-        // the hang) so `Drop` exercises the join timeout, not the drain.
+        let rec = Arc::new(PanicOnce {
+            panicked: std::sync::atomic::AtomicBool::new(false),
+            calls: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
+        });
+        struct PanicOnceSender(Arc<PanicOnce>);
+        impl HapticSender for PanicOnceSender {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(&self, target: &HapticTarget, p: u8, i: u8, q: bool) -> Result<()> {
+                self.0.execute_down(target, p, i, q)
+            }
+            fn execute_up(&self, target: &HapticTarget, d: u8, q: bool) -> Result<()> {
+                self.0.execute_up(target, d, q)
+            }
+        }
+        let ah = AsyncHaptic::new(PanicOnceSender(Arc::clone(&rec)));
+        ah.click_feedback(64, 5, false).unwrap(); // panics inside worker
+        ah.click_feedback(70, 6, true).unwrap();
+        ah.release_feedback(70, true).unwrap();
         let t0 = std::time::Instant::now();
-        while ah.pending() != 0 {
+        loop {
+            {
+                let calls = rec.calls.lock().unwrap();
+                let releases = rec.releases.lock().unwrap();
+                if !calls.is_empty() && !releases.is_empty() {
+                    break;
+                }
+            }
             assert!(
                 t0.elapsed() < std::time::Duration::from_secs(5),
-                "haptic worker never picked up pulse"
+                "worker died after panicking pulse"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(rec.panicked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            rec.calls.lock().unwrap().as_slice(),
+            &[(70, 6, true)],
+            "only post-panic pulses run, in order"
+        );
+        assert_eq!(
+            rec.releases.lock().unwrap().as_slice(),
+            &[(70, true)],
+            "up-pulse after panic still fires"
+        );
+        drop(ah);
+    }
+
+    #[test]
+    fn haptic_shutdown_bounded_on_hung_actuator() {
+        // A wedged firmware send (never returns until released) must not
+        // hang teardown: `Drop` joins up to 500 ms, then detaches. The
+        // entered gate proves the worker is inside the send (not draining),
+        // so the measured Drop time exercises the join budget itself.
+        struct HungHaptic {
+            state: Mutex<bool>,
+            cvar: Condvar,
+        }
+        impl HungHaptic {
+            fn enter(&self) {
+                let mut entered = self.state.lock().unwrap();
+                *entered = true;
+                self.cvar.notify_all();
+                while *entered {
+                    entered = self.cvar.wait(entered).unwrap();
+                }
+            }
+        }
+        impl HapticSender for HungHaptic {
+            fn click_feedback(&self, _pressure: u8, _intensity: u8, _quiet: bool) -> Result<()> {
+                self.enter();
+                Ok(())
+            }
+            fn release_feedback(&self, _down_pressure: u8, _quiet: bool) -> Result<()> {
+                self.enter();
+                Ok(())
+            }
+        }
+        let hung = Arc::new(HungHaptic {
+            state: Mutex::new(false),
+            cvar: Condvar::new(),
+        });
+        struct HungSender(Arc<HungHaptic>);
+        impl HapticSender for HungSender {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(&self, _t: &HapticTarget, p: u8, i: u8, q: bool) -> Result<()> {
+                self.0.click_feedback(p, i, q)
+            }
+            fn execute_up(&self, _t: &HapticTarget, d: u8, q: bool) -> Result<()> {
+                self.0.release_feedback(d, q)
+            }
+        }
+        let ah = AsyncHaptic::new(HungSender(Arc::clone(&hung)));
+        ah.click_feedback(64, 5, false).unwrap();
+        // Explicit entered signal: the worker is inside the hung send.
+        let t0 = std::time::Instant::now();
+        while !*hung.state.lock().unwrap() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "haptic worker never entered hung send"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let t0 = std::time::Instant::now();
         drop(ah);
+        let elapsed = t0.elapsed();
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "shutdown hung on wedged actuator: {:?}",
-            t0.elapsed()
+            elapsed >= std::time::Duration::from_millis(450),
+            "Drop returned before the join budget engaged: {elapsed:?}"
         );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2000),
+            "shutdown hung on wedged actuator: {elapsed:?}"
+        );
+        // Release the fixture gate so the detached worker exits cleanly
+        // instead of lingering parked until process exit.
+        {
+            let mut entered = hung.state.lock().unwrap();
+            *entered = false;
+            hung.cvar.notify_all();
+        }
     }
 
     #[test]
