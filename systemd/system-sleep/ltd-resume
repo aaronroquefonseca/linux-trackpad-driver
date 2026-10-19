@@ -15,14 +15,23 @@
 # dropout fix: motion lost until re-init, clicks survive).
 #
 # `pre` is intentionally a no-op: suspend needs no disengage.
+#
+# Activation contract (finding #14): plain `ltd resume` below is the
+# AUTOMATIC background form — without a live main-service daemon it leaves
+# the hardware alone and exits 0, so installed-but-stopped (socket absent)
+# stays off across sleep. Explicit manual forcing while stopped is
+# `ltd resume -f`.
 set -eu
 
 LTD_BIN="${LTD_BIN:-/usr/bin/ltd}"
-# Sleep hooks inherit PID1's environment, not the daemon's: without this,
-# `ltd resume` would re-init at defaults (110 Hz) while the daemon and its
-# tick verify against the system config — a perpetual mismatch re-init loop
-# — and BT re-suppression would never fire on the primary path. A missing
-# file falls back to defaults (same as the units below).
+# Sleep hooks inherit PID1's environment, not any unit's Environment=: a
+# custom LTD_CONFIG set only on the main unit does not reach this hook.
+# This default keeps the hook explicit and matching the units; without it
+# `ltd resume` would still read the installed file via the shared fallback
+# (not built-in defaults when the installed file exists). A missing file
+# falls back to defaults (same as the units). To use a custom path, set the
+# same LTD_CONFIG on every unit/hook that launches ltd; there is no
+# automatic cross-process propagation.
 LTD_CONFIG="${LTD_CONFIG:-/etc/linux-trackpad-driver/config.toml}"
 export LTD_CONFIG
 
@@ -39,7 +48,7 @@ case "${1:-} ${2:-}" in
                 echo "ltd-resume: post ${2:-unknown}: resume pass done" >&2
             else
                 rc=$?
-                echo "ltd-resume: post ${2:-unknown}: ltd resume failed (rc=$rc); retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume); see journal" >&2
+                echo "ltd-resume: post ${2:-unknown}: ltd resume failed (rc=$rc); retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume -f); see journal" >&2
             fi
         else
             echo "ltd-resume: $LTD_BIN missing or not executable; nothing re-inited" >&2

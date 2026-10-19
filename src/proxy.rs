@@ -106,8 +106,9 @@
 //!   are reference-held: down once, retained while either level holds, a
 //!   single up on final release — no phantom release+press mid-hold.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -158,8 +159,9 @@ pub const INPUT_PROP_POINTER: u16 = 0;
 /// Physical position density, units/mm at 1:1 (old-service
 /// `(48 * 100) / speed` at the default `speed = 100`; Y scaled by
 /// 44/48). Fixed here: pointer `speed` is applied in software
-/// ([`crate::clicks::scale_delta`]), so the advertised density stays
-/// truthful while speed still scales motion exactly once.
+/// (per-contact raw/emitted/remainder anchor in `scaled_pos`), so the
+/// advertised density stays truthful while speed still scales motion
+/// exactly once.
 pub const POSITION_RES_X: i32 = 48;
 pub const POSITION_RES_Y: i32 = 44;
 /// Normalized per-contact values (old-service parity, hardware-proven):
@@ -216,6 +218,313 @@ pub trait UinputSink: Send {
     fn destroy(&self) {}
 }
 
+/// Bound on simultaneously outstanding haptic endpoint files.
+///
+/// Production needs at most a couple (current session plus an in-flight
+/// pulse on the retired fd); the margin covers parallel test churn. One
+/// background closer and one bounded channel serve the whole process, so
+/// this is also the bound on queued disposal work and on fds retained if
+/// the closer ever stalls.
+const HAPTIC_ENDPOINT_CAP: usize = 32;
+
+/// Bounded background disposal pool (F3).
+///
+/// One worker thread drops items; handoff is `try_send` and never blocks.
+/// Admission reserves a slot *before* acquisition, so live plus queued
+/// items never exceed `cap` and the handoff can never find a full
+/// channel. Setup failure yields `Err` and callers must degrade
+/// explicitly (no acquisition, no synchronous close on the caller).
+struct DisposalPool<T: Send + 'static> {
+    tx: std::sync::mpsc::SyncSender<T>,
+    live: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+impl<T: Send + 'static> std::fmt::Debug for DisposalPool<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DisposalPool")
+            .field("cap", &self.cap)
+            .field("live", &self.live.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static> DisposalPool<T> {
+    /// Start one daemon-lifetime worker. `spawner` runs the close loop;
+    /// tests inject a failing spawner for a deterministic setup-failure
+    /// path without touching host resource limits.
+    fn start<S>(cap: usize, spawner: S) -> std::io::Result<Arc<Self>>
+    where
+        S: FnOnce(
+            Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::io::Result<std::thread::JoinHandle<()>>,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(cap);
+        let live = Arc::new(AtomicUsize::new(0));
+        let live_worker = Arc::clone(&live);
+        let handle = spawner(Box::new(move || {
+            while let Ok(item) = rx.recv() {
+                drop(item);
+                live_worker.fetch_sub(1, Ordering::SeqCst);
+            }
+            // Senders gone: queue already drained by `recv`, so nothing
+            // is stranded. Forgotten items (handoff bug path) stay
+            // retained until exit by design, bounded by `cap`.
+        }))?;
+        // Detached daemon lifetime: teardown never joins the closer, so
+        // a stalled HID release cannot escape into the shutdown budget.
+        // `drop` on the handle detaches; no extra thread is created here.
+        drop(handle);
+        Ok(Arc::new(Self { tx, live, cap }))
+    }
+
+    /// Reserve a slot before acquisition. `None` means at capacity: the
+    /// caller must degrade explicitly instead of opening.
+    fn reserve(&self) -> Option<Reservation<'_, T>> {
+        let mut current = self.live.load(Ordering::SeqCst);
+        loop {
+            if current >= self.cap {
+                return None;
+            }
+            match self.live.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Reservation {
+                        pool: self,
+                        armed: true,
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Nonblocking handoff of a reserved item. Unreachable-by-construction
+    /// when every acquisition reserved first (queued never exceeds live,
+    /// live never exceeds `cap`, channel bound equals `cap`). The bug-path
+    /// fallback retains until exit instead of closing on the caller, still
+    /// bounded by `cap` because the slot stays consumed.
+    fn handoff(&self, item: T) {
+        if let Err(e) = self.tx.try_send(item) {
+            log::error!("haptic disposal queue full; retaining endpoint until exit (bounded)");
+            match e {
+                std::sync::mpsc::TrySendError::Full(item)
+                | std::sync::mpsc::TrySendError::Disconnected(item) => {
+                    std::mem::forget(item);
+                }
+            }
+        }
+    }
+}
+
+/// Outstanding-slot guard: releases back to the pool unless disarmed.
+/// Prepare disarms once the opened file is owned by an endpoint (the
+/// slot is then released by the closer worker after the close).
+struct Reservation<'a, T: Send + 'static> {
+    pool: &'a DisposalPool<T>,
+    armed: bool,
+}
+
+impl<T: Send + 'static> Reservation<'_, T> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<T: Send + 'static> Drop for Reservation<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Process-wide endpoint closer, established before any endpoint is
+/// admitted. `None` (worker setup failed) means haptics degrade to
+/// log-only explicitly: prepare acquires nothing.
+static ENDPOINT_POOL: OnceLock<Option<Arc<DisposalPool<std::fs::File>>>> = OnceLock::new();
+
+/// Borrow the process closer, starting it once. Never blocks on HID.
+fn endpoint_pool() -> Option<Arc<DisposalPool<std::fs::File>>> {
+    ENDPOINT_POOL
+        .get_or_init(|| {
+            match DisposalPool::start(HAPTIC_ENDPOINT_CAP, |job| {
+                std::thread::Builder::new()
+                    .name("ltd-haptic-close".into())
+                    .spawn(job)
+            }) {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    log::error!("haptic disposal worker failed to start ({e:#}); haptics log-only");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// Pinned kernel endpoint for one haptic session target.
+///
+/// A frozen pathname is NOT a device identity: the kernel may reuse a
+/// hidraw pathname for a replacement device after reconnect. The endpoint
+/// pins the session's device by holding the open [`std::fs::File`]
+/// acquired at attach/route time; both the feature ioctl and the
+/// plain-write fallback operate on that same fd, never a later pathname
+/// reopen. Clones share the same underlying file description, so queued
+/// pulses from one session share one identity and an in-flight pulse
+/// keeps the old fd even after retirement installs a replacement.
+///
+/// The final close never runs on the caller: the last drop hands the
+/// file to the bounded process closer, so retirement/teardown never
+/// block under the queue mutex, on the input pump thread, or inside the
+/// bounded worker join.
+#[derive(Debug)]
+struct HapticEndpoint {
+    file: Mutex<Option<std::fs::File>>,
+    pool: Option<Arc<DisposalPool<std::fs::File>>>,
+}
+
+impl HapticEndpoint {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            file: Mutex::new(None),
+            pool: None,
+        })
+    }
+
+    fn with_file(file: std::fs::File, pool: Arc<DisposalPool<std::fs::File>>) -> Arc<Self> {
+        Arc::new(Self {
+            file: Mutex::new(Some(file)),
+            pool: Some(pool),
+        })
+    }
+}
+
+impl Drop for HapticEndpoint {
+    fn drop(&mut self) {
+        let file = self.file.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(f) = file else { return };
+        let Some(pool) = self.pool.as_ref() else {
+            // Unreachable: a live file always carries its pool (prepare
+            // only opens after admission). Retain boundedly rather than
+            // closing on the caller if this ever breaks.
+            log::error!("haptic endpoint without pool; retaining until exit (bounded)");
+            std::mem::forget(f);
+            return;
+        };
+        pool.handoff(f);
+    }
+}
+
+/// Session snapshot for one queued actuator pulse.
+///
+/// The pump thread snapshots the current session target at enqueue time;
+/// the worker executes against the snapshot, never a live lookup. A stale
+/// pulse (older generation) is dropped without touching hardware. A pulse
+/// already inside the firmware send at retire completes only against its
+/// own pinned endpoint (the old fd), never a replacement device reusing
+/// the same pathname: both the feature ioctl and the plain-write fallback
+/// run on the snapshot's fd with no later pathname reopen.
+///
+/// Equality is routing equality (`node` + `bluetooth`) for queue
+/// bookkeeping; fd identity is intentionally not compared.
+#[derive(Debug, Clone)]
+pub struct HapticTarget {
+    pub node: String,
+    pub bluetooth: bool,
+    endpoint: Arc<HapticEndpoint>,
+}
+
+impl HapticTarget {
+    /// Prepare (open) a session endpoint. Performs filesystem I/O and must
+    /// be called outside the proxy mutex (live input path) and outside the
+    /// queue mutex; commit with [`AsyncHaptic::retarget_prepared`] or
+    /// [`AsyncHaptic::update_route_prepared`].
+    ///
+    /// Admission is reserved *before* opening against the bounded process
+    /// closer: at capacity, or when the closer failed to start, this
+    /// degrades to a file-less target explicitly (log-only sends, never a
+    /// later pathname reopen) instead of acquiring unbounded work or
+    /// closing synchronously on the caller.
+    pub fn prepare(node: &str, bluetooth: bool) -> Self {
+        if node.is_empty() {
+            return Self::empty();
+        }
+        let Some(pool) = endpoint_pool() else {
+            log::warn!("haptic disposal unavailable; degrading '{node}' to log-only");
+            return Self::degraded(node, bluetooth);
+        };
+        let Some(reservation) = pool.reserve() else {
+            log::warn!("haptic endpoint capacity reached; degrading '{node}' to log-only");
+            return Self::degraded(node, bluetooth);
+        };
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(node)
+        {
+            Ok(file) => {
+                reservation.disarm();
+                Self {
+                    node: node.to_string(),
+                    bluetooth,
+                    endpoint: HapticEndpoint::with_file(file, pool),
+                }
+            }
+            Err(e) => {
+                log::warn!("haptic endpoint unavailable for '{node}': {e:#}");
+                Self::degraded(node, bluetooth)
+            }
+        }
+    }
+
+    /// File-less target that keeps its routing identity but never touches
+    /// hardware: sends degrade to log-only and must not reopen the
+    /// pathname later. Used for empty routing, failed opens, full
+    /// disposal capacity, or a failed closer setup.
+    fn degraded(node: &str, bluetooth: bool) -> Self {
+        Self {
+            node: node.to_string(),
+            bluetooth,
+            endpoint: HapticEndpoint::empty(),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            node: String::new(),
+            bluetooth: false,
+            endpoint: HapticEndpoint::empty(),
+        }
+    }
+
+    /// Clone the pinned fd for one firmware send. The queue/endpoint
+    /// mutexes are held only for the clone; the blocking ioctl/write run
+    /// on the clone with no lock held. `None` means log-only (empty
+    /// routing or attach-time open failed): the caller must not reopen
+    /// the pathname.
+    fn try_clone_file(&self) -> Option<std::fs::File> {
+        self.endpoint
+            .file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|f| f.try_clone().ok())
+    }
+}
+
+impl PartialEq for HapticTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && self.bluetooth == other.bluetooth
+    }
+}
+
+impl Eq for HapticTarget {}
+
 /// Haptic feedback sender (host-click report path).
 ///
 /// `pressure` is the actuator pressure byte (the press threshold —
@@ -225,9 +534,35 @@ pub trait UinputSink: Send {
 /// threshold byte the down pulse carried; the sender scales it to
 /// `threshold*3/5` with intensity 0 — old-service parity). Unlike the
 /// down pulse it always sends: intensity 0 is the payload, not silence.
+///
+/// Session scope: [`AsyncHaptic`] tags every queued pulse with a session
+/// generation plus a [`HapticTarget`] snapshot and executes via
+/// `execute_down`/`execute_up` against that snapshot. Senders without
+/// hardware routing use the defaults (snapshot ignored); [`RealHaptic`]
+/// pins the report to the snapshot so stale work can never retarget.
+/// `retire_session` drops a detached session's queued work; synchronous
+/// senders use the default no-op.
 pub trait HapticSender: Send {
     fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()>;
     fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()>;
+
+    /// Execute one queued down-pulse against its session snapshot.
+    fn execute_down(
+        &self,
+        _target: &HapticTarget,
+        pressure: u8,
+        intensity: u8,
+        quiet: bool,
+    ) -> Result<()> {
+        self.click_feedback(pressure, intensity, quiet)
+    }
+    /// Execute one queued up-pulse against its session snapshot.
+    fn execute_up(&self, _target: &HapticTarget, down_pressure: u8, quiet: bool) -> Result<()> {
+        self.release_feedback(down_pressure, quiet)
+    }
+    /// Retire this session's queued actuator work (owned detach / pump
+    /// loss). No-op for synchronous senders.
+    fn retire_session(&self) {}
 }
 
 /// Log-only haptic sender (default when no hardware wired).
@@ -430,6 +765,22 @@ impl From<&Config> for ProxySettings {
 /// collapse the gap.
 const CUT_REPRESS_GAP: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// What one pump step did. Distinguishes hidraw traffic from idle so the
+/// pump can wait on input readiness instead of polling continuously:
+/// `Frame` (traffic, drain immediately) vs `Idle` (nothing to do, block
+/// until input/control/deadline). `Deadline` is idle work that still
+/// emitted at a timing deadline (release/stagger/cut); `Disconnect` retires
+/// a dead session; `Transient` is a dropped frame needing a short backoff
+/// so a persistently failing fd cannot busy-spin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpActivity {
+    Idle,
+    Frame,
+    Deadline,
+    Disconnect,
+    Transient,
+}
+
 /// evdev-grab + uinput click proxy. Generic over injectable backends so unit
 /// tests run without hardware.
 pub struct ClickProxy<G, U, H, S> {
@@ -454,7 +805,7 @@ pub struct ClickProxy<G, U, H, S> {
     held_first: Vec<(u16, u16)>,
     held_force: Vec<(u16, u16)>,
     held_slide: Vec<(u16, u16)>,
-    last_pos: HashMap<u8, (i32, i32)>,
+    last_pos: HashMap<u8, PointerAnchor>,
     /// Highest slot index written so far; vacated slots are terminated.
     max_slot: usize,
     /// Last `BTN_LEFT` value on the wire. `BTN_LEFT` is edge-triggered:
@@ -562,6 +913,78 @@ where
         self.passthrough
     }
 
+    /// Hidraw readiness fd for the pump's `poll(2)` wait. `None` while idle
+    /// (no device, gate-off, passthrough): the pump then blocks on
+    /// control/deadline notifications only, producing (near-)zero wakeups.
+    pub fn poll_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        if !self.settings.enhanced || !self.attached || self.passthrough {
+            return None;
+        }
+        self.source.poll_fd()
+    }
+
+    /// True when a decoded frame is queued without touching the fd (double
+    /// report second half). The pump drains these immediately.
+    pub fn has_pending_frame(&self) -> bool {
+        if !self.settings.enhanced || !self.attached || self.passthrough {
+            return false;
+        }
+        self.source.has_pending_frame()
+    }
+
+    /// Earliest idle instant needing pump work. `None` means idle polls do
+    /// nothing: no latch can release and no staged key-down is due, so the
+    /// pump blocks until input/control instead of polling. Covers the 30 ms
+    /// release hold, every `pending_buttons` stagger deadline, and both
+    /// cut stages (`released_at + 5 ms`, then `mods_at + stagger`).
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        if !self.settings.enhanced || !self.attached || self.passthrough {
+            return None;
+        }
+        let mut best: Option<std::time::Instant> = None;
+        let mut consider = |d: Option<std::time::Instant>| {
+            if let Some(d) = d {
+                best = Some(best.map_or(d, |b| b.min(d)));
+            }
+        };
+        consider(self.machine.next_release_deadline());
+        if let Some(pending) = &self.pending_buttons {
+            for key in &pending.keys {
+                consider(Some(key.deadline));
+            }
+        }
+        if let Some(p) = &self.pending_force {
+            if self.machine.force_active().is_some() {
+                match p.mods_at {
+                    Some(t) => consider(Some(t + p.stagger)),
+                    None => consider(Some(p.released_at + CUT_REPRESS_GAP)),
+                }
+            }
+        }
+        best
+    }
+
+    /// One pump step with an explicit clock, reporting traffic vs idle.
+    /// Same edge/output semantics as [`ClickProxy::handle_frame_at`]; the
+    /// activity lets the event-driven pump wait instead of polling.
+    pub fn pump_step_at(
+        &mut self,
+        cfg: &Config,
+        now: std::time::Instant,
+    ) -> (Result<Option<ClickEvent>>, PumpActivity) {
+        let result = self.handle_frame_inner(cfg, now);
+        match result {
+            Ok((ev, activity)) => (Ok(ev), activity),
+            Err(e) => {
+                // Single owner for output-failure diagnostics: `output_failed`
+                // logs and retires the session; the pump layer propagates
+                // silently to avoid duplicate warnings per failure.
+                self.output_failed(&e);
+                (Err(e), PumpActivity::Disconnect)
+            }
+        }
+    }
+
     /// Test hook: fake a live attached session (grabbed + ready) without
     /// hardware, so shutdown-teardown tests can drive a surviving live
     /// session through the real release paths.
@@ -600,23 +1023,14 @@ where
 
     /// Mark the pump path ready/unready (transport-task wiring). Clearing
     /// while attached releases the grab so the device is never swallowed
-    /// without an emit path.
+    /// without an emit path. Clearing always runs the single idempotent
+    /// session teardown, so live virtual contacts are terminated on the
+    /// wire (Type-B is stateful: stopping emission alone leaves them
+    /// active downstream).
     pub fn set_pump_ready(&mut self, ready: bool) {
         self.pump_ready = ready;
-        if !ready && self.attached {
-            log::info!("proxy: pump lost, releasing grab (passthrough)");
-            self.grab.ungrab();
-            if let Err(error) = self.release_held(false).and_then(|()| self.uinput.sync()) {
-                self.output_failed(&error);
-            }
-            self.machine.reset();
-            self.pressed_haptic = false;
-            self.force_haptic = false;
-            self.pending_force = None;
-            self.last_pos.clear();
-            self.attached = false;
-            self.attached_node = None;
-            self.passthrough = true;
+        if !ready {
+            self.teardown_session("pump lost");
         }
     }
 
@@ -674,10 +1088,11 @@ where
         }
     }
 
-    /// Detach on `Detached`: release grab, drop latch + held keys, trailing
-    /// `SYN` so no key-up is lost (stuck keys otherwise). Ownership-gated:
-    /// a `Detached` for any node other than the grabbed one is ignored, so
-    /// a sibling interface vanishing can never release the live grab.
+    /// Detach on `Detached`: the single idempotent session teardown
+    /// (grab release, held keys up, every virtual contact terminated,
+    /// tool bits cleared, trailing `SYN`). Ownership-gated: a `Detached`
+    /// for any node other than the grabbed one is ignored, so a sibling
+    /// interface vanishing can never release the live grab.
     pub fn detach(&mut self, event: &DeviceReadyEvent) {
         if event.kind != ReadyKind::Detached {
             return;
@@ -690,22 +1105,92 @@ where
             );
             return;
         }
-        if self.attached {
-            log::info!("proxy: releasing grab ({})", event.devnode);
-            self.grab.ungrab();
-        }
-        if let Err(error) = self.release_held(false).and_then(|()| self.uinput.sync()) {
-            self.output_failed(&error);
+        self.teardown_session(&format!("detached {}", event.devnode));
+    }
+
+    /// One idempotent teardown for every source-loss path: disconnect
+    /// (`set_pump_ready(false)`), explicit detach, output failure,
+    /// shutdown, and attachment rollback. Releases the grab first (native
+    /// input must resume even when the virtual emit path is broken), then
+    /// releases held keys, ends every virtual contact and tool bit on the
+    /// wire (kernel Type-B is stateful: stopping emission does not
+    /// communicate removal), syncs one trailing frame, and resets session
+    /// state.
+    /// Safe to call when already down (no duplicate wire traffic): only
+    /// sessions with live wire state emit, and state is cleared so a
+    /// second call is a no-op. On wire failure the virtual nodes are
+    /// retired (`destroy`) so contacts end via device removal instead of
+    /// lingering on a broken path. Node destruction itself stays with
+    /// the owner (daemon destroys after teardown); this only destroys on
+    /// the failure path where emits cannot land.
+    pub fn teardown_session(&mut self, reason: &str) {
+        let had_wire_state = self.attached
+            || !self.held_first.is_empty()
+            || !self.held_force.is_empty()
+            || !self.held_slide.is_empty()
+            || self.btn_left_down
+            || self.physical_left_down
+            || self.max_slot > 0
+            || !self.last_pos.is_empty()
+            || self.pending_force.is_some()
+            || self.pending_buttons.is_some();
+        // Always release the physical grab first: native input must resume
+        // even when the virtual emit path is already broken. Idempotent.
+        self.grab.ungrab();
+        if had_wire_state && self.uinput.is_ready() {
+            log::info!("proxy: tearing down session ({reason})");
+            let wire = self
+                .release_held(false)
+                .and_then(|()| self.release_contacts())
+                .and_then(|()| self.uinput.sync());
+            if let Err(error) = wire {
+                log::warn!(
+                    "proxy: teardown wire failed ({reason}), retiring virtual nodes: {error:#}"
+                );
+                let _ = self.uinput.sync();
+                self.uinput.destroy();
+            }
+        } else if had_wire_state {
+            // Output already gone: device removal is the termination.
+            self.uinput.destroy();
         }
         self.machine.reset();
+        self.held_first.clear();
+        self.held_force.clear();
+        self.held_slide.clear();
+        self.btn_left_down = false;
+        self.physical_left_down = false;
         self.pressed_haptic = false;
         self.force_haptic = false;
+        // Owned detach ends the session: retire queued pulses (tagged with
+        // the old generation/target) so they never fire on the next node.
+        self.haptic.retire_session();
         self.pending_force = None;
+        self.pending_buttons = None;
         self.last_pos.clear();
         self.max_slot = 0;
+        self.pump_ready = false;
         self.attached = false;
         self.attached_node = None;
         self.passthrough = true;
+    }
+
+    /// Terminate every virtual contact on the wire: each slot written so
+    /// far gets `TRACKING_ID = -1`, `BTN_TOUCH` goes to 0, and the full
+    /// `BTN_TOOL_*` row clears. No trailing `SYN`: the caller syncs once
+    /// after keys + contacts. Pure emission: reset ownership stays in
+    /// [`ClickProxy::teardown_session`] (which runs even when the wire
+    /// fails), and physical-only `BTN_LEFT` is already released by
+    /// [`ClickProxy::release_held`] with `phys_down = false`, so no
+    /// fallback emit belongs here.
+    fn release_contacts(&mut self) -> Result<()> {
+        for slot in 0..=self.max_slot {
+            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
+            self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
+        }
+        self.uinput.emit(EV_KEY, BTN_TOUCH, 0)?;
+        self.emit_tool_bits(0)?;
+        Ok(())
     }
 
     /// One poll step: `poll_frame` errors are logged + dropped (`Ok(None)`),
@@ -728,55 +1213,51 @@ where
         now: std::time::Instant,
     ) -> Result<Option<ClickEvent>> {
         let result = self.handle_frame_inner(cfg, now);
-        if let Err(error) = &result {
-            self.output_failed(error);
+        match result {
+            Ok((ev, _)) => Ok(ev),
+            Err(error) => {
+                self.output_failed(&error);
+                Err(error)
+            }
         }
-        result
     }
 
-    /// Retire the entire failed pointer session. Closing the virtual nodes
-    /// removes their held keys/contacts even when key-up writes cannot land.
-    /// `is_attached` is the health signal consumed by attachment decisions.
+    /// Retire the entire failed pointer session. Runs the single
+    /// idempotent teardown (contacts + keys terminated on the wire when
+    /// still possible, queued haptic pulses retired with a generation
+    /// bump), then destroys the virtual nodes so held
+    /// keys/contacts end via device removal even when key-up writes
+    /// cannot land. The teardown already destroys on its own wire-failure
+    /// branch, so this second `destroy` is a deliberate idempotent
+    /// re-assert: every [`UinputSink::destroy`] impl (real, dual, fake)
+    /// is safe to call twice (pinned by test). `is_attached` is the
+    /// health signal consumed by attachment decisions. Extras-only
+    /// failures never reach here ([`DualSink`] degrades to pointer-only),
+    /// so the live pointer session is preserved there.
     fn output_failed(&mut self, error: &anyhow::Error) {
         log::warn!("proxy: output failed, releasing grab and retiring session: {error:#}");
-        self.grab.ungrab();
-        // Best effort for the surviving extras node before destroying both.
-        let _ = self.release_held(false);
-        let _ = self.uinput.sync();
+        let reason = format!("output failed: {error:#}");
+        self.teardown_session(&reason);
         self.uinput.destroy();
-        self.machine.reset();
-        self.held_first.clear();
-        self.held_force.clear();
-        self.held_slide.clear();
-        self.btn_left_down = false;
-        self.physical_left_down = false;
-        self.pressed_haptic = false;
-        self.force_haptic = false;
-        self.pending_force = None;
-        self.pending_buttons = None;
-        self.last_pos.clear();
-        self.max_slot = 0;
-        self.pump_ready = false;
-        self.attached = false;
-        self.attached_node = None;
-        self.passthrough = true;
     }
 
     fn handle_frame_inner(
         &mut self,
         cfg: &Config,
         now: std::time::Instant,
-    ) -> Result<Option<ClickEvent>> {
+    ) -> Result<(Option<ClickEvent>, PumpActivity)> {
         if !self.settings.enhanced || !self.attached || self.passthrough {
-            return Ok(None);
+            return Ok((None, PumpActivity::Idle));
         }
         anyhow::ensure!(self.uinput.is_ready(), "pointer output is unavailable");
         let frame = match self.source.poll_frame() {
             Ok(Some(f)) => f,
             Ok(None) => {
-                // The nonblocking pump polls every IDLE_SLEEP (2 ms), even
-                // without input reports. Advance deadlines from the last
-                // live latch, after polling so disconnect always wins.
+                // Event-driven idle: the pump blocks on input readiness +
+                // control/deadline notifications and only wakes here when a
+                // deadline expired (or input arrived but decoded empty).
+                // Advance deadlines from the last live latch, after polling
+                // so disconnect always wins.
                 let was_first = self.machine.active().is_some();
                 let was_force = self.machine.force_active().is_some();
                 let released = self.machine.advance_releases_at(now);
@@ -794,8 +1275,9 @@ where
                     self.flush_pending_buttons(now)?;
                     self.emit_btn_left()?;
                     self.uinput.sync()?;
+                    return Ok((None, PumpActivity::Deadline));
                 }
-                return Ok(None);
+                return Ok((None, PumpActivity::Idle));
             }
             Err(e) => {
                 // Persistent disconnect (unplug/replug reusing the same
@@ -810,13 +1292,13 @@ where
                     if self.attached {
                         log::warn!("proxy: disconnect detected, self-releasing: {e:#}");
                         self.set_pump_ready(false);
-                    } else {
-                        log::debug!("proxy: disconnect poll while idle: {e:#}");
+                        return Ok((None, PumpActivity::Disconnect));
                     }
-                    return Ok(None);
+                    log::debug!("proxy: disconnect poll while idle: {e:#}");
+                    return Ok((None, PumpActivity::Idle));
                 }
                 log::warn!("proxy: poll_frame failed, dropping frame: {e:#}");
-                return Ok(None);
+                return Ok((None, PumpActivity::Transient));
             }
         };
         let was_first = self.machine.active().is_some();
@@ -829,7 +1311,7 @@ where
             Ok(e) => e,
             Err(e) => {
                 log::warn!("proxy: click/force parse failed, dropping edge: {e:#}");
-                return Ok(None);
+                return Ok((None, PumpActivity::Frame));
             }
         };
         self.physical_left_down =
@@ -945,7 +1427,7 @@ where
             self.flush_pending_buttons(now)?;
             self.emit_btn_left()?;
             self.uinput.sync()?;
-            return Ok(edges.primary());
+            return Ok((edges.primary(), PumpActivity::Frame));
         }
         // A held slide that vanished without a handoff releases its keys.
         let slide_gone = was_slide.is_some() && self.machine.slide_active().is_none();
@@ -964,7 +1446,7 @@ where
         self.flush_pending_buttons(now)?;
         self.emit_btn_left()?;
         self.uinput.sync()?;
-        Ok(None)
+        Ok((None, PumpActivity::Frame))
     }
 
     /// Complete pressure-latch transitions on both reports and idle polls.
@@ -1431,7 +1913,9 @@ where
     }
 
     /// Down pulse for one level's press edge. Returns whether the pulse
-    /// fired (false = silent config, so the release owes no up-pulse).
+    /// fired (false = silent config OR the pulse was dropped: a bounded
+    /// queue overflow / shutdown reports `Err`, so the release owes no
+    /// up-pulse and down/up pairing stays intact).
     fn fire_haptic(&self, ev: &ClickEvent, pressure: u8) -> bool {
         if !clicks::should_emit_haptic(ev.haptic) {
             return false;
@@ -1439,6 +1923,7 @@ where
         let intensity = ev.haptic.min(255) as u8;
         if let Err(e) = self.haptic.click_feedback(pressure, intensity, ev.quiet) {
             log::warn!("proxy: haptic send failed: {e:#}");
+            return false;
         }
         true
     }
@@ -1725,24 +2210,82 @@ where
         Ok(())
     }
 
-    /// Speed-scaled position: `prev + (cur - prev) * speed/100` per finger.
-    /// `speed` comes from the per-frame `&Config` (single source), never a
-    /// frozen snapshot.
+    /// Speed-scaled position: `emitted + scaled(raw - last_raw)` per finger,
+    /// with fractional-remainder carry. `speed` comes from the per-frame
+    /// `&Config` (single source), never a frozen snapshot.
     fn scaled_pos(&mut self, id: u8, x: i32, y: i32, speed: u32) -> (i32, i32) {
         match self.last_pos.get(&id).copied() {
             None => {
-                self.last_pos.insert(id, (x, y));
-                (x, y)
+                // Clamp the first EMITTED report to the advertised bounds so
+                // a stationary out-of-range contact cannot step on its second
+                // frame; raw stays unclamped as the delta origin.
+                let ex = x.clamp(POSITION_MIN_X, POSITION_MAX_X);
+                let ey = y.clamp(POSITION_MIN_Y, POSITION_MAX_Y);
+                self.last_pos.insert(
+                    id,
+                    PointerAnchor {
+                        raw: (x, y),
+                        emitted: (ex, ey),
+                        rem: (0, 0),
+                    },
+                );
+                (ex, ey)
             }
-            Some((px, py)) => {
-                let nx = px + clicks::scale_delta(x - px, speed);
-                let ny = py + clicks::scale_delta(y - py, speed);
-                self.last_pos.insert(id, (x, y));
+            Some(mut anchor) => {
+                let speed = i64::from(speed);
+                let dx = i64::from(x) - i64::from(anchor.raw.0);
+                let dy = i64::from(y) - i64::from(anchor.raw.1);
+                let num_x = dx * speed + anchor.rem.0;
+                let num_y = dy * speed + anchor.rem.1;
+                // Truncating division (toward zero); the remainder carries
+                // the sub-unit fraction so slow motion accumulates instead
+                // of sticking.
+                let step_x = num_x / 100;
+                let step_y = num_y / 100;
+                anchor.rem = (num_x % 100, num_y % 100);
+                anchor.raw = (x, y);
+                let nx = (i64::from(anchor.emitted.0) + step_x)
+                    .clamp(i64::from(POSITION_MIN_X), i64::from(POSITION_MAX_X))
+                    as i32;
+                let ny = (i64::from(anchor.emitted.1) + step_y)
+                    .clamp(i64::from(POSITION_MIN_Y), i64::from(POSITION_MAX_Y))
+                    as i32;
+                anchor.emitted = (nx, ny);
+                self.last_pos.insert(id, anchor);
                 (nx, ny)
             }
         }
     }
 }
+
+/// Speed-scaled pointer state per contact id: the last RAW device position
+/// (delta source), the last EMITTED virtual position (delta base), and the
+/// fractional remainder (leftover `delta * speed % 100` numerator,
+/// `(-100, 100)`) so sub-unit motion at low speeds accumulates instead of
+/// truncating to zero every frame. Raw and emitted are distinct: the emitted
+/// cursor is an accumulation of scaled raw deltas, never a rescaling of the
+/// raw anchor.
+///
+/// Bounds: emitted positions clamp to the virtual `ABS_X`/`ABS_Y`
+/// (`-3678..=3934`, `-2478..=2587`, see [`uinput_abs_setup`]). Overshoot is
+/// dropped (raw still advances, so reversal responds immediately).
+/// Reanchoring: a fresh id anchors `raw` unclamped (delta origin) and
+/// `emitted = clamp(raw), rem = 0`; lift
+/// (non-touching or absent id), detach, pump loss, or output failure evicts
+/// the anchor so reuse never inherits a stale base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointerAnchor {
+    raw: (i32, i32),
+    emitted: (i32, i32),
+    rem: (i64, i64),
+}
+
+/// Virtual axis bounds for the emitted pointer position (must match
+/// [`uinput_abs_setup`]).
+pub const POSITION_MIN_X: i32 = -3678;
+pub const POSITION_MAX_X: i32 = 3934;
+pub const POSITION_MIN_Y: i32 = -2478;
+pub const POSITION_MAX_Y: i32 = 2587;
 
 /// Subscribe a shared proxy to the hub. Callbacks do bounded attach/detach
 /// only, so init is never blocked.
@@ -2514,24 +3057,43 @@ pub fn vibration_up_report(down_pressure: u8, quiet: bool) -> [u8; 15] {
 /// up-pulse always sends (intensity 0 is its payload, not silence).
 /// Empty node = log-only (daemon has not attached yet); never fails attach.
 pub struct RealHaptic {
-    node: Mutex<String>,
-    bt: std::sync::atomic::AtomicBool,
+    target: Mutex<HapticTarget>,
 }
 
 impl RealHaptic {
     pub fn new() -> Self {
         Self {
-            node: Mutex::new(String::new()),
-            bt: std::sync::atomic::AtomicBool::new(false),
+            target: Mutex::new(HapticTarget::empty()),
         }
     }
 
     pub fn set_node(&self, node: &str) {
-        *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
+        // Read routing first, then prepare (open) with no lock held, so a
+        // blocked open never stalls a concurrent sender on this mutex.
+        let bluetooth = self
+            .target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bluetooth;
+        let target = HapticTarget::prepare(node, bluetooth);
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = target;
     }
 
     pub fn set_bluetooth(&self, bt: bool) {
-        self.bt.store(bt, std::sync::atomic::Ordering::SeqCst);
+        self.target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bluetooth = bt;
+    }
+
+    /// Live routing snapshot (direct-send path only; the daemon path
+    /// snapshots per pulse inside [`AsyncHaptic`]). The snapshot shares
+    /// the pinned endpoint, so the send below runs on the same fd.
+    fn current_target(&self) -> HapticTarget {
+        self.target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -2543,62 +3105,106 @@ impl Default for RealHaptic {
 
 impl HapticSender for RealHaptic {
     fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+        let target = self.current_target();
+        self.execute_down(&target, pressure, intensity, quiet)
+    }
+    fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
+        let target = self.current_target();
+        self.execute_up(&target, down_pressure, quiet)
+    }
+    fn execute_down(
+        &self,
+        target: &HapticTarget,
+        pressure: u8,
+        intensity: u8,
+        quiet: bool,
+    ) -> Result<()> {
         if intensity == 0 {
             return Ok(());
         }
-        let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let bt = self.bt.load(std::sync::atomic::Ordering::SeqCst);
         let report = vibration_report(pressure, intensity, quiet);
         log::info!(
-            "haptic feedback: pressure={pressure} intensity={intensity} quiet={quiet} (report 53, node={node} bt={bt})"
+            "haptic feedback: pressure={pressure} intensity={intensity} quiet={quiet} (report 53, node={} bt={})",
+            target.node,
+            target.bluetooth,
         );
-        if node.is_empty() {
+        if target.node.is_empty() {
             return Ok(());
         }
-        self.send_report(&node, bt, &report);
+        self.send_report(target, &report);
         Ok(())
     }
-    fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
-        let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let bt = self.bt.load(std::sync::atomic::Ordering::SeqCst);
+    fn execute_up(&self, target: &HapticTarget, down_pressure: u8, quiet: bool) -> Result<()> {
         let report = vibration_up_report(down_pressure, quiet);
         log::info!(
-            "haptic release: down_pressure={down_pressure} quiet={quiet} (report 53, node={node} bt={bt})"
+            "haptic release: down_pressure={down_pressure} quiet={quiet} (report 53, node={} bt={})",
+            target.node,
+            target.bluetooth,
         );
-        if node.is_empty() {
+        if target.node.is_empty() {
             return Ok(());
         }
-        self.send_report(&node, bt, &report);
+        self.send_report(target, &report);
         Ok(())
     }
 }
 
 impl RealHaptic {
-    fn send_report(&self, node: &str, bt: bool, report: &[u8; 15]) {
-        let payload: &[u8] = if bt { &report[..] } else { &report[1..] };
-        // Strict send: EPIPE/EIO (device NAK) must propagate so the
-        // fallback below runs. The lenient init variant would swallow
-        // the NAK as success → silent no-haptic with no fallback.
-        if let Err(e) = crate::init::send_feature_report_hidraw_strict(node, payload) {
-            log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
-            if let Err(e2) = plain_write(node, payload) {
+    fn send_report(&self, target: &HapticTarget, report: &[u8; 15]) {
+        let payload: &[u8] = if target.bluetooth {
+            &report[..]
+        } else {
+            &report[1..]
+        };
+        let node = target.node.as_str();
+        // Both sends run on the SAME pinned fd from the session snapshot.
+        // No pathname reopen: a replacement device reusing this pathname
+        // after reconnect can never receive this (old-session) pulse.
+        let Some(mut file) = target.try_clone_file() else {
+            if !target.node.is_empty() {
                 log::error!(
-                    "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
+                    "haptic FAILED on {node} (no pinned endpoint); clicks stay silent until re-attach"
                 );
             }
+            return;
+        };
+        // Strict send: EPIPE/EIO (device NAK) must fall through to the
+        // plain-write fallback below. The lenient init variant would
+        // swallow the NAK as success → silent no-haptic with no fallback.
+        let req = crate::init::hidiocsfeature_request(payload.len());
+        let ret = unsafe {
+            libc::ioctl(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                req as libc::c_ulong,
+                payload.as_ptr() as *const libc::c_void,
+            )
+        };
+        if ret >= 0 {
+            log::debug!("feature report {:02X?} sent to {node}", payload);
+            return;
+        }
+        let e = std::io::Error::last_os_error();
+        log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
+        if let Err(e2) = plain_write_pinned(&mut file, payload) {
+            log::error!(
+                "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
+            );
         }
     }
 }
 
-fn plain_write(node: &str, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(node)
-        .map_err(|e| anyhow::anyhow!("opening haptic '{node}': {e}"))?;
-    f.write_all(bytes)
-        .map_err(|e| anyhow::anyhow!("haptic write to '{node}': {e}"))?;
+/// Plain-write fallback on the already-pinned fd (no pathname reopen).
+/// Rewinds regular files so each pulse overwrites from the start (same
+/// bytes the old reopen-per-send path produced); hidraw ignores the
+/// offset and the rewind error is ignored there.
+fn plain_write_pinned(file: &mut std::fs::File, bytes: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let rewound = file.seek(SeekFrom::Start(0)).is_ok();
+    file.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("haptic write: {e}"))?;
+    if rewound {
+        let _ = file.set_len(bytes.len() as u64);
+    }
     Ok(())
 }
 
@@ -2616,22 +3222,114 @@ enum HapticCmd {
     },
 }
 
+/// Bound on queued actuator pulses ([`AsyncHaptic`]).
+///
+/// Worst-case drain at ~10 ms per firmware round-trip is ~160 ms; hover
+/// chatter bursts (dozens of edges per drag) fit without blocking the
+/// pump, while a wedged actuator cannot accumulate unbounded stale work.
+pub const HAPTIC_QUEUE_CAP: usize = 16;
+
+/// Bounded shutdown join for the haptic worker at `Drop` ([`AsyncHaptic`]).
+/// Covers a full-queue drain under a slow actuator with margin; a
+/// hung firmware send detaches instead of stalling teardown. Orderly
+/// shutdown drains longer via [`AsyncHaptic::shutdown`].
+const HAPTIC_SHUTDOWN_JOIN_MS: u64 = 500;
+
+/// One queued actuator pulse: pulse data plus the session generation and
+/// routing snapshot taken at enqueue time.
+#[derive(Debug, Clone)]
+struct QueuedPulse {
+    generation: u64,
+    target: HapticTarget,
+    cmd: HapticCmd,
+}
+
+struct HapticState {
+    pulses: VecDeque<QueuedPulse>,
+    target: HapticTarget,
+    closed: bool,
+    dropped_overflow: u64,
+    dropped_stale: u64,
+}
+
+struct HapticShared {
+    state: Mutex<HapticState>,
+    cvar: Condvar,
+    generation: AtomicU64,
+}
+
+impl HapticShared {
+    /// End the current session: purge queued pulses and advance the
+    /// generation so pulses already popped by the worker are dropped at
+    /// execution instead of running. Optionally installs the next
+    /// session's target (new attach) or clears routing (detach, so a
+    /// stray enqueue degrades to log-only). Returns pulses purged.
+    /// Enqueue/retarget serialize here. Replaced endpoints and cleared
+    /// pulses drop their last references here, but the blocking device
+    /// close itself runs on the bounded process closer (see
+    /// [`DisposalPool`]), so this never stalls the queue lock owner or
+    /// the input pump, and teardown's bounded join does not include
+    /// endpoint close.
+    fn retire(&self, target: Option<HapticTarget>) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = state.pulses.len() as u64;
+        state.pulses.clear();
+        if stale > 0 {
+            state.dropped_stale += stale;
+            log::info!("proxy: haptic retired {stale} stale pulse(s) on session change");
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(t) = target {
+            state.target = t;
+        }
+        stale
+    }
+}
+
 /// Async actuator sender: the pump thread enqueues down/up pulses and
 /// never waits for the firmware round-trip.
 ///
-/// Why: every [`HapticSender`] call opens the hidraw node and issues a
-/// blocking `HIDIOCSFEATURE` (+ a fallback open+write on NAK). On the
-/// pump thread that steals frame time per click edge; during
-/// release/re-press chatter (noisy pressure hovering at the release
-/// point mid-drag) dozens of edges × ~10 ms round-trips stall motion in
-/// 150-800 ms bursts. The worker drains a FIFO channel instead, so input
-/// latency never depends on actuator timing. Order is preserved
-/// (down/up pairs stay paired); bytes, node selection, and silent rules
-/// are unchanged (the inner sender is untouched).
+/// Why: every [`HapticSender`] call issues a blocking `HIDIOCSFEATURE`
+/// (+ a fallback write on NAK) on the worker thread. On the pump thread
+/// that steals frame time per click edge; during release/re-press
+/// chatter (noisy pressure hovering at the release point mid-drag)
+/// dozens of edges × ~10 ms round-trips stall motion in 150-800 ms
+/// bursts. The worker drains a bounded FIFO instead, so input latency
+/// never depends on actuator timing. Order is preserved (down/up pairs
+/// stay paired); bytes and silent rules are unchanged.
+///
+/// Session scope: each pulse carries the session generation plus a
+/// [`HapticTarget`] snapshot pinning the kernel endpoint (open fd, not
+/// just a pathname).
+///
+/// [`ClickProxy::detach`], pump loss, pointer-output failure, and
+/// [`AsyncHaptic::retarget`] retire the old session (purge + generation
+/// bump). The worker drops stale pulses without touching hardware, so a
+/// backlog can never fire on a newly selected node after reconnect, even
+/// when the kernel reuses the same hidraw pathname.
+///
+/// A pulse already inside the firmware send at retire completes only
+/// against its own pinned (old) fd; it is never reopened or redirected.
+/// A same-session route correction ([`AsyncHaptic::update_route`])
+/// re-points pending pulses to a newly pinned endpoint without retiring
+/// them; an already in-flight pulse keeps the old endpoint.
+///
+/// Policy (input responsiveness wins over click feel in every case):
+/// - Overflow: the pump never blocks — the incoming pulse is dropped and
+///   reported as `Err`. A dropped down-pulse reports failure so the proxy
+///   owes no up-pulse (down/up pairing preserved); a dropped up-pulse is
+///   a missing release snap, never stuck state (pulses are momentary).
+/// - Error: a panicking/broken actuator send is caught per pulse and the
+///   worker continues; a pulse that cannot run is dropped with a log.
+///   The pump never degrades to synchronous sends.
+/// - Shutdown: the session is retired first (queued pulses are dropped,
+///   never drained against the dead target), then close is signaled and
+///   `Drop` joins up to [`HAPTIC_SHUTDOWN_JOIN_MS`]; past that the thread
+///   detaches and teardown returns instead of hanging.
 pub struct AsyncHaptic<H> {
-    inner: std::sync::Arc<H>,
-    tx: Option<std::sync::mpsc::Sender<HapticCmd>>,
+    shared: std::sync::Arc<HapticShared>,
     worker: Option<std::thread::JoinHandle<()>>,
+    _sender: std::marker::PhantomData<H>,
 }
 
 impl<H> AsyncHaptic<H>
@@ -2640,47 +3338,231 @@ where
 {
     pub fn new(inner: H) -> Self {
         let inner = std::sync::Arc::new(inner);
-        let (tx, rx) = std::sync::mpsc::channel::<HapticCmd>();
+        let shared = std::sync::Arc::new(HapticShared {
+            state: Mutex::new(HapticState {
+                pulses: VecDeque::new(),
+                target: HapticTarget::empty(),
+                closed: false,
+                dropped_overflow: 0,
+                dropped_stale: 0,
+            }),
+            cvar: Condvar::new(),
+            generation: AtomicU64::new(0),
+        });
+        let worker_shared = std::sync::Arc::clone(&shared);
         let worker_inner = std::sync::Arc::clone(&inner);
         let worker = std::thread::Builder::new()
             .name("ltd-haptic".into())
-            .spawn(move || {
-                for cmd in rx {
-                    match cmd {
-                        HapticCmd::Down {
-                            pressure,
-                            intensity,
-                            quiet,
-                        } => {
-                            if let Err(e) = worker_inner.click_feedback(pressure, intensity, quiet)
-                            {
-                                log::warn!("proxy: async haptic down failed: {e:#}");
-                            }
-                        }
-                        HapticCmd::Up {
-                            down_pressure,
-                            quiet,
-                        } => {
-                            if let Err(e) = worker_inner.release_feedback(down_pressure, quiet) {
-                                log::warn!("proxy: async haptic up failed: {e:#}");
-                            }
-                        }
-                    }
-                }
-                log::debug!("proxy: haptic worker drained, exiting");
-            })
+            .spawn(move || haptic_worker(worker_shared, worker_inner))
             .expect("haptic worker thread spawn");
         Self {
-            inner,
-            tx: Some(tx),
+            shared,
             worker: Some(worker),
+            _sender: std::marker::PhantomData,
         }
     }
 
-    /// Borrow the inner sender (daemon points [`RealHaptic`] at its node).
-    pub fn inner(&self) -> &H {
-        &self.inner
+    fn enqueue(&self, cmd: HapticCmd) -> Result<()> {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            anyhow::bail!("haptic worker shutting down");
+        }
+        if state.pulses.len() >= HAPTIC_QUEUE_CAP {
+            state.dropped_overflow += 1;
+            let total = state.dropped_overflow;
+            anyhow::bail!(
+                "haptic queue full ({HAPTIC_QUEUE_CAP}); dropping pulse (overflow={total})"
+            );
+        }
+        // Generation + snapshot read under the queue lock: a concurrent
+        // retire either purged first (this pulse tags the new session) or
+        // bumped after (this pulse is purged / dropped stale). No mix.
+        let generation = self.shared.generation.load(Ordering::SeqCst);
+        let target = state.target.clone();
+        state.pulses.push_back(QueuedPulse {
+            generation,
+            target,
+            cmd,
+        });
+        self.shared.cvar.notify_one();
+        Ok(())
     }
+
+    /// New session: retire queued work and pin the actuator target.
+    /// Convenience wrapper that prepares (opens) outside the queue lock;
+    /// callers holding the live proxy mutex must use
+    /// [`AsyncHaptic::retarget_prepared`] with a target prepared before
+    /// locking instead, so the open never stalls input processing.
+    /// The retire then commits the new endpoint together with the
+    /// generation bump. Final disposal of the replaced endpoint runs on
+    /// the bounded process closer, never under the queue lock or on the
+    /// caller.
+    pub fn retarget(&self, node: &str, bluetooth: bool) {
+        let target = HapticTarget::prepare(node, bluetooth);
+        self.shared.retire(Some(target));
+    }
+
+    /// New session commit for a target prepared outside all live locks.
+    /// No filesystem I/O under any mutex; replaced endpoints close on the
+    /// bounded process closer.
+    pub fn retarget_prepared(&self, target: HapticTarget) {
+        self.shared.retire(Some(target));
+    }
+
+    /// Same-session route correction (late actuator sibling): re-point
+    /// pending pulses at the corrected node without retiring them. Pins
+    /// a new endpoint fd for the corrected node; pulses already popped
+    /// by the worker keep the old endpoint. The generation is unchanged.
+    /// Convenience wrapper; proxy-mutex holders must prepare outside and
+    /// use [`AsyncHaptic::update_route_prepared`] instead.
+    pub fn update_route(&self, node: &str) {
+        let (generation, bluetooth, current) = {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.target.node == node {
+                return;
+            }
+            (
+                self.shared.generation.load(Ordering::SeqCst),
+                state.target.bluetooth,
+                state.target.node.clone(),
+            )
+        };
+        // Open outside the queue lock; commit below only if the session
+        // has not retired meanwhile (otherwise the correction would clobber
+        // the new session's endpoint).
+        let corrected = HapticTarget::prepare(node, bluetooth);
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if state.target.node != current {
+            return;
+        }
+        state.target = corrected.clone();
+        for pulse in state.pulses.iter_mut() {
+            if pulse.generation == generation {
+                pulse.target = corrected.clone();
+            }
+        }
+    }
+
+    /// Same-session route commit for a target prepared outside all live
+    /// locks. Generation-fenced: returns false (discarding the prepared
+    /// endpoint, which then closes on a background thread) when the
+    /// session retired between prepare and commit, or when the route is
+    /// already correct. No filesystem I/O under any mutex.
+    pub fn update_route_prepared(&self, prepared: HapticTarget, baseline_generation: u64) -> bool {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.generation.load(Ordering::SeqCst) != baseline_generation {
+            return false;
+        }
+        if state.target.node == prepared.node {
+            return false;
+        }
+        state.target = prepared.clone();
+        for pulse in state.pulses.iter_mut() {
+            if pulse.generation == baseline_generation {
+                pulse.target = prepared.clone();
+            }
+        }
+        true
+    }
+
+    /// Current session generation (atomic load, no locks, no I/O).
+    /// Daemon captures this before preparing a route correction outside
+    /// the proxy mutex, then fences the commit with it.
+    pub fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
+    }
+
+    /// Current routing (node + bluetooth) under a brief queue lock; no I/O.
+    /// Daemon reads this before preparing outside the proxy mutex.
+    pub fn current_routing(&self) -> (String, bool) {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.target.node.clone(), state.target.bluetooth)
+    }
+
+    #[cfg(test)]
+    pub fn pending(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pulses
+            .len()
+    }
+
+    #[cfg(test)]
+    pub fn dropped_overflow(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dropped_overflow
+    }
+
+    #[cfg(test)]
+    pub fn dropped_stale(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dropped_stale
+    }
+}
+
+/// Worker: pop in FIFO order, drop stale generations without touching
+/// hardware, execute the rest against their snapshots. A panicking send
+/// is caught per pulse so one bad report cannot kill the worker; close
+/// exits once the queue is empty (teardown retires first, so close-time
+/// drain only ever sees pulses enqueued after the retire — normally
+/// none), then the thread exits.
+fn haptic_worker<H>(shared: std::sync::Arc<HapticShared>, inner: std::sync::Arc<H>)
+where
+    H: HapticSender + Send + Sync + 'static,
+{
+    loop {
+        let pulse = {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            while state.pulses.is_empty() && !state.closed {
+                state = shared.cvar.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            match state.pulses.pop_front() {
+                Some(pulse) => pulse,
+                None => {
+                    if state.closed {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        };
+        if pulse.generation != shared.generation.load(Ordering::SeqCst) {
+            shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .dropped_stale += 1;
+            continue;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pulse.cmd {
+            HapticCmd::Down {
+                pressure,
+                intensity,
+                quiet,
+            } => inner.execute_down(&pulse.target, pressure, intensity, quiet),
+            HapticCmd::Up {
+                down_pressure,
+                quiet,
+            } => inner.execute_up(&pulse.target, down_pressure, quiet),
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("proxy: async haptic pulse failed: {e:#}"),
+            Err(_) => log::error!("proxy: async haptic pulse panicked; worker continues"),
+        }
+    }
+    log::debug!("proxy: haptic worker drained, exiting");
 }
 
 impl<H> AsyncHaptic<H> {
@@ -2690,7 +3572,13 @@ impl<H> AsyncHaptic<H> {
     /// shutdown; a panicked worker is reported. Idempotent: safe to call
     /// after a previous shutdown or before drop.
     pub fn shutdown(&mut self, timeout: std::time::Duration) {
-        self.tx.take();
+        // Disconnect first so the worker drains the queued trailing pulses
+        // and exits once the queue is empty.
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            self.shared.cvar.notify_all();
+        }
         let Some(worker) = self.worker.take() else {
             return;
         };
@@ -2713,46 +3601,55 @@ pub const HAPTIC_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 impl<H> Drop for AsyncHaptic<H> {
     fn drop(&mut self) {
-        // Disconnect first so the worker drains the queued trailing
-        // up-pulses, then join bounded: a wedged actuator detaches with a
-        // log instead of hanging process exit forever.
-        self.shutdown(HAPTIC_SHUTDOWN_TIMEOUT);
+        // Retire first: queued pulses belong to a session that no longer
+        // exists, so purge them (and invalidate the generation) instead of
+        // draining them against the old endpoint during teardown. Then
+        // close and join bounded: a wedged actuator detaches with a log
+        // instead of hanging process exit forever. Drop-scale budget (see
+        // HAPTIC_SHUTDOWN_JOIN_MS); orderly shutdown drains longer via
+        // `shutdown`.
+        self.shared.retire(Some(HapticTarget::empty()));
+        self.shutdown(std::time::Duration::from_millis(HAPTIC_SHUTDOWN_JOIN_MS));
     }
 }
 
 impl<H> HapticSender for AsyncHaptic<H>
 where
-    H: HapticSender + Send + Sync,
+    H: HapticSender + Send + Sync + 'static,
 {
     fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
+        if intensity == 0 {
+            return Ok(());
+        }
         let cmd = HapticCmd::Down {
             pressure,
             intensity,
             quiet,
         };
-        match self.tx.as_ref().map(|tx| tx.send(cmd)) {
-            Some(Ok(())) => Ok(()),
-            _ => {
-                // Worker gone (only via a failed spawn, which already
-                // panicked, or drop racing a call): degrade to a direct
-                // synchronous send rather than losing the pulse.
-                log::warn!("proxy: haptic worker gone, sending directly");
-                self.inner.click_feedback(pressure, intensity, quiet)
-            }
+        if let Err(e) = self.enqueue(cmd) {
+            // Overflow: drop the pulse, never block the pump.
+            // `Err` tells the proxy the down never fired, so no up-pulse
+            // is owed and pairs stay paired.
+            log::warn!("proxy: haptic down dropped ({e:#}); input path unaffected");
+            return Err(e);
         }
+        Ok(())
     }
     fn release_feedback(&self, down_pressure: u8, quiet: bool) -> Result<()> {
         let cmd = HapticCmd::Up {
             down_pressure,
             quiet,
         };
-        match self.tx.as_ref().map(|tx| tx.send(cmd)) {
-            Some(Ok(())) => Ok(()),
-            _ => {
-                log::warn!("proxy: haptic worker gone, sending directly");
-                self.inner.release_feedback(down_pressure, quiet)
-            }
+        if let Err(e) = self.enqueue(cmd) {
+            // A dropped up-pulse is a missing release snap (best effort),
+            // never stuck state: actuator pulses are momentary.
+            log::warn!("proxy: haptic up dropped ({e:#}); input path unaffected");
+            return Err(e);
         }
+        Ok(())
+    }
+    fn retire_session(&self) {
+        self.shared.retire(Some(HapticTarget::empty()));
     }
 }
 
@@ -2761,6 +3658,7 @@ mod tests {
     use super::*;
     use crate::apple_parse::{CapabilityTier, FingerContact, PressureUnits, TouchFrame};
     use crate::config::Config;
+    use crate::daemon::PumpManager;
     use crate::init::{detached, usb_ready, Transport};
     use std::cell::RefCell;
 
@@ -3297,6 +4195,280 @@ mod tests {
         px.handle_frame(&cfg).unwrap();
         // Second frame: dx=100 @200% → emitted x=200.
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_POSITION_X, 200));
+    }
+
+    /// Emitted MT X values for one handled frame, in slot order.
+    fn frame_mt_x(sinks: &TestSinks, before: usize) -> Vec<i32> {
+        sinks.pointer.events.lock().unwrap()[before..]
+            .iter()
+            .filter(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|&(_, _, v)| v)
+            .collect()
+    }
+
+    fn drive_speed_frames(raw_x: &[i32], speed: u32) -> Vec<i32> {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = raw_x
+            .iter()
+            .map(|&x| Ok(Some(frame(vec![finger(1, 200, x, 0)], 0))))
+            .collect();
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(raw_x.len());
+        for (i, _) in raw_x.iter().enumerate() {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i as u64)).unwrap();
+            let xs = frame_mt_x(&sinks, before);
+            assert_eq!(xs.len(), 1, "one touching contact per frame");
+            out.push(xs[0]);
+        }
+        out
+    }
+
+    /// Emitted MT Y values for one handled frame, in slot order.
+    fn frame_mt_y(sinks: &TestSinks, before: usize) -> Vec<i32> {
+        sinks.pointer.events.lock().unwrap()[before..]
+            .iter()
+            .filter(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_Y)
+            .map(|&(_, _, v)| v)
+            .collect()
+    }
+
+    fn drive_speed_points(raw: &[(i32, i32)], speed: u32) -> Vec<(i32, i32)> {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = raw
+            .iter()
+            .map(|&(x, y)| Ok(Some(frame(vec![finger(1, 200, x, y)], 0))))
+            .collect();
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(raw.len());
+        for (i, _) in raw.iter().enumerate() {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i as u64)).unwrap();
+            let xs = frame_mt_x(&sinks, before);
+            let ys = frame_mt_y(&sinks, before);
+            assert_eq!(xs.len(), 1, "one touching contact per frame");
+            assert_eq!(ys.len(), 1, "one touching contact per frame");
+            out.push((xs[0], ys[0]));
+        }
+        out
+    }
+
+    #[test]
+    fn speed_accumulates_emitted_position_across_frames() {
+        // Finding #6 repro: raw [0,10,20,30,30] @200% must emit
+        // [0,20,40,60,60] (old code emitted [0,20,30,40,30]).
+        assert_eq!(
+            drive_speed_frames(&[0, 10, 20, 30, 30], 200),
+            vec![0, 20, 40, 60, 60]
+        );
+    }
+
+    #[test]
+    fn speed_stop_holds_emitted_position() {
+        // Final stopped frame (dx=0) holds; no backward step toward raw.
+        let emitted = drive_speed_frames(&[0, 10, 20, 20, 20], 200);
+        assert_eq!(emitted, vec![0, 20, 40, 40, 40]);
+    }
+
+    #[test]
+    fn speed_reversal_is_continuous() {
+        // Out @200% then back to origin: [0,10,0] -> [0,20,0].
+        assert_eq!(drive_speed_frames(&[0, 10, 0], 200), vec![0, 20, 0]);
+    }
+
+    #[test]
+    fn speed_100_is_exact_passthrough() {
+        // Default speed must stay bit-exact with raw, including negatives.
+        let raw = vec![5, 15, 7, 100, -50, -50];
+        assert_eq!(drive_speed_frames(&raw, 100), raw);
+    }
+
+    #[test]
+    fn speed_low_speed_accumulates_fraction() {
+        // +1 raw steps @50%: per-frame truncation would stick at 0 forever;
+        // remainder carry emits every second step.
+        assert_eq!(
+            drive_speed_frames(&[0, 1, 2, 3, 4], 50),
+            vec![0, 0, 1, 1, 2]
+        );
+    }
+
+    #[test]
+    fn speed_lift_reanchors_fresh_touch() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 10, 0)], 0))),
+            Ok(Some(frame(vec![], 0))), // lift: evicts the anchor
+            Ok(Some(frame(vec![finger(1, 200, 500, 0)], 0))), // reuse: fresh anchor
+            Ok(Some(frame(vec![finger(1, 200, 510, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed: 200 },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        for i in 0..5 {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+            out.push(frame_mt_x(&sinks, before));
+        }
+        assert_eq!(out[0], vec![0]);
+        assert_eq!(out[1], vec![20]);
+        assert!(out[2].is_empty(), "lift frame emits no MT X");
+        // Retouch anchors at raw (no jump from the old emitted 20).
+        assert_eq!(out[3], vec![500]);
+        assert_eq!(out[4], vec![520]);
+    }
+
+    #[test]
+    fn speed_tracks_contacts_independently() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 100, 0)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 10, 0), finger(2, 200, 110, 0)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 20, 0), finger(2, 200, 100, 0)],
+                0,
+            ))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed: 200 },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        for i in 0..3u64 {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+            out.push(frame_mt_x(&sinks, before));
+        }
+        assert_eq!(out[0], vec![0, 100]);
+        assert_eq!(out[1], vec![20, 120]);
+        // Contact 1 advances, contact 2 reverses to its origin.
+        assert_eq!(out[2], vec![40, 100]);
+    }
+
+    #[test]
+    fn speed_clamps_at_axis_bounds_and_reverses_cleanly() {
+        // Raw 3900 -> 3920 @200% wants 3940; virtual X caps at 3934.
+        // Hold stays pinned; reversal responds immediately (no stick).
+        let emitted = drive_speed_frames(&[3900, 3920, 3920, 3900], 200);
+        assert_eq!(emitted, vec![3900, POSITION_MAX_X, POSITION_MAX_X, 3894]);
+        // Lower bound pins symmetrically.
+        let emitted = drive_speed_frames(&[-3600, -3650, -3650, -3600], 200);
+        assert_eq!(emitted, vec![-3600, POSITION_MIN_X, POSITION_MIN_X, -3578]);
+    }
+
+    #[test]
+    fn speed_fresh_out_of_range_anchor_clamps_and_holds() {
+        // Fresh out-of-range contacts must emit the clamped bound on first
+        // contact and stay put while raw is stationary (zero delta = no move).
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 4000], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X]
+        );
+        assert_eq!(
+            drive_speed_frames(&[-4000, -4000, -4000], 100),
+            vec![POSITION_MIN_X, POSITION_MIN_X, POSITION_MIN_X]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, 3000), (0, 3000), (0, 3000)], 100),
+            vec![
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y)
+            ]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, -3000), (0, -3000), (0, -3000)], 100),
+            vec![
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y)
+            ]
+        );
+    }
+
+    #[test]
+    fn speed_fresh_out_of_range_first_move_uses_raw_delta() {
+        // Raw stays the delta origin: inward motion from a clamped anchor
+        // steps off the bound; outward overshoot stays pinned.
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 3990], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X - 10]
+        );
+        assert_eq!(
+            drive_speed_frames(&[-4000, -4000, -3990], 100),
+            vec![POSITION_MIN_X, POSITION_MIN_X, POSITION_MIN_X + 10]
+        );
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 4010], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X]
+        );
+        // Y mirrors X, and scaling still applies to the raw delta.
+        assert_eq!(
+            drive_speed_points(&[(0, 3000), (0, 3000), (0, 2990)], 100),
+            vec![
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y - 10)
+            ]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, -3000), (0, -3000), (0, -2990)], 100),
+            vec![
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y + 10)
+            ]
+        );
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 3990], 200),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X - 20]
+        );
+    }
+
+    #[test]
+    fn position_bounds_match_virtual_axes() {
+        let get = |code: u16| {
+            uinput_abs_setup()
+                .iter()
+                .find(|(c, _, _, _)| *c == code)
+                .copied()
+                .unwrap()
+        };
+        assert_eq!(
+            (get(ABS_X).1, get(ABS_X).2),
+            (POSITION_MIN_X, POSITION_MAX_X)
+        );
+        assert_eq!(
+            (get(ABS_Y).1, get(ABS_Y).2),
+            (POSITION_MIN_Y, POSITION_MAX_Y)
+        );
     }
 
     #[test]
@@ -4695,6 +5867,25 @@ mod tests {
         vals.windows(2).filter(|w| w[0] != w[1]).count()
     }
 
+    /// Exactly one trailing SYN: successful teardown emits key-ups +
+    /// contact termination with no intermediate sync, then a single frame
+    /// sync. Both the count and the trailing position are pinned.
+    fn assert_single_trailing_syn(tail: &[(u16, u16, i32)], ctx: &str) {
+        let syns = tail
+            .iter()
+            .filter(|&&(ty, code, _)| ty == EV_SYN && code == SYN_REPORT)
+            .count();
+        assert_eq!(
+            syns, 1,
+            "{ctx}: expected exactly one SYN, got {syns}: {tail:?}"
+        );
+        assert_eq!(
+            tail.last(),
+            Some(&(EV_SYN, SYN_REPORT, 0)),
+            "{ctx}: SYN must trail the teardown wire: {tail:?}"
+        );
+    }
+
     #[test]
     fn combo_hold_emits_no_btn_left() {
         // click_1 = ctrl+c must not chord a phantom BTN_LEFT — press frame
@@ -4897,6 +6088,579 @@ mod tests {
         assert!(
             evs[up_at + 1..].contains(&(EV_SYN, SYN_REPORT, 0)),
             "no SYN after key-up: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn teardown_with_live_contacts_terminates_slots_and_tool_bits() {
+        // Finding #7: disconnect fallback left virtual contacts active
+        // (only SYN on teardown, no slot termination / BTN_TOUCH=0).
+        // Every source-loss path must end every contact + tool bit via
+        // the single idempotent teardown.
+        const TOOLS: [u16; 5] = [
+            BTN_TOOL_FINGER,
+            BTN_TOOL_DOUBLETAP,
+            BTN_TOOL_TRIPLETAP,
+            BTN_TOOL_QUADTAP,
+            BTN_TOOL_QUINTTAP,
+        ];
+        for teardown in ["pump_loss", "detach"] {
+            for (label, fingers) in [
+                ("light-touch", vec![finger(1, 10, 100, 60)]),
+                ("press", vec![finger(1, 200, 100, 60)]),
+                ("two-finger", vec![finger(1, 10, 0, 0), finger(2, 10, 9, 9)]),
+            ] {
+                let slots = fingers.len();
+                let sinks = TestSinks::new();
+                let haptic = Arc::new(FakeHaptic::new());
+                let frames = vec![Ok(Some(frame(fingers, 0)))];
+                let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+                let cfg = Config::default();
+                let t0 = std::time::Instant::now();
+                px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+                assert!(
+                    sinks.pointer.has(EV_KEY, BTN_TOUCH, 1),
+                    "{label}/{teardown}: live contact must drive BTN_TOUCH=1"
+                );
+                let base_len = sinks.pointer.events.lock().unwrap().len();
+                match teardown {
+                    "pump_loss" => px.set_pump_ready(false),
+                    "detach" => px.detach(&detached("/dev/hidraw1", Transport::Usb)),
+                    _ => unreachable!(),
+                }
+                assert!(!px.is_attached(), "{label}/{teardown}: still attached");
+                assert!(px.is_passthrough(), "{label}/{teardown}: not passthrough");
+                assert_eq!(px.max_slot, 0, "{label}/{teardown}: max_slot not reset");
+                assert!(px.last_pos.is_empty(), "{label}/{teardown}: anchors leak");
+                assert!(!px.btn_left_down, "{label}/{teardown}: BTN_LEFT flag stuck");
+                let evs = sinks.pointer.events.lock().unwrap().clone();
+                let tail = &evs[base_len..];
+                assert_single_trailing_syn(tail, &format!("{label}/{teardown}"));
+                for slot in 0..slots {
+                    assert!(
+                        tail.windows(2)
+                            .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, slot as i32)
+                                && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
+                        "{label}/{teardown}: slot {slot} never terminated: {tail:?}"
+                    );
+                }
+                let touch_vals = key_values(&sinks.pointer, BTN_TOUCH);
+                assert_eq!(
+                    touch_vals.last(),
+                    Some(&0),
+                    "{label}/{teardown}: BTN_TOUCH never cleared: {touch_vals:?}"
+                );
+                for tool in TOOLS {
+                    let vals = key_values(&sinks.pointer, tool);
+                    assert_eq!(
+                        vals.last(),
+                        Some(&0),
+                        "{label}/{teardown}: tool {tool} never cleared: {vals:?}"
+                    );
+                }
+                // Idempotent: a second teardown emits nothing.
+                let len_after_first = sinks.pointer.events.lock().unwrap().len();
+                match teardown {
+                    "pump_loss" => px.set_pump_ready(false),
+                    "detach" => px.detach(&detached("/dev/hidraw1", Transport::Usb)),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    sinks.pointer.events.lock().unwrap().len(),
+                    len_after_first,
+                    "{label}/{teardown}: second teardown emitted duplicate wire traffic"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disconnect_with_live_contacts_terminates_slots() {
+        // Same-name replug while a light-touch contact is live: the
+        // disconnect self-release must terminate the slot, clear
+        // BTN_TOUCH + tool bits, and stop polling the dead source.
+        use anyhow::Error as AnyhowError;
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let disc = || {
+            Err::<Option<TouchFrame>, AnyhowError>(
+                crate::pump::DisconnectError("test unplug".into()).into(),
+            )
+        };
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 10, 100, 60)], 0))),
+            disc(),
+            disc(),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::new(FakeGrab::ok())),
+            sinks.dual(),
+            SharedHaptic(Arc::clone(&haptic)),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap();
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap();
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        let tail = &evs[base_len..];
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 0)
+                    && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
+            "disconnect left slot 0 active: {tail:?}"
+        );
+        assert_eq!(key_values(&sinks.pointer, BTN_TOUCH).last(), Some(&0));
+        for tool in [
+            BTN_TOOL_FINGER,
+            BTN_TOOL_DOUBLETAP,
+            BTN_TOOL_TRIPLETAP,
+            BTN_TOOL_QUADTAP,
+            BTN_TOOL_QUINTTAP,
+        ] {
+            assert_eq!(key_values(&sinks.pointer, tool).last(), Some(&0));
+        }
+        assert_single_trailing_syn(tail, "disconnect");
+        // Dead source never polled again.
+        let remaining = px.source.frames.borrow().len();
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(px.source.frames.borrow().len(), remaining);
+    }
+
+    type TestManager =
+        PumpManager<SharedGrab, DualSink<SharedUinput, SharedUinput>, SharedHaptic, ScriptSource>;
+
+    /// Manager under test with fakes: the SAME `finish_attach` / `detach` /
+    /// `Drop` dispatch production uses, with an empty script source as idle.
+    fn test_manager(
+        grab: &Arc<FakeGrab>,
+        sinks: &TestSinks,
+        haptic: &Arc<FakeHaptic>,
+    ) -> TestManager {
+        let proxy = std::sync::Arc::new(std::sync::Mutex::new(ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(grab)),
+            sinks.dual(),
+            SharedHaptic(Arc::clone(haptic)),
+            ScriptSource::new(vec![]),
+        )));
+        PumpManager::new(
+            proxy,
+            Config {
+                enhanced_clicks: true,
+                ..Config::default()
+            },
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || ScriptSource::new(vec![]),
+        )
+    }
+
+    /// Poison the manager's proxy mutex the way a panicked pump iteration
+    /// would: lock, panic while holding, rejoin. The next manager op must
+    /// recover the mutex and still tear down.
+    fn poison_manager_proxy(manager: &TestManager) {
+        let proxy = std::sync::Arc::clone(manager.proxy());
+        let _ = std::thread::spawn(move || {
+            let _guard = proxy.lock().unwrap();
+            panic!("test poison");
+        })
+        .join();
+    }
+
+    /// True when `control` becomes readable within `timeout` (drains the
+    /// byte so phases stay independent).
+    fn control_wakes_within(
+        control: &std::sync::Arc<crate::pump::PumpControl>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: control.read_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let woke = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as libc::c_int) } > 0;
+        if woke {
+            control.drain();
+        }
+        woke
+    }
+
+    #[test]
+    fn manager_drop_wakes_blocked_pump_via_control() {
+        // Actual manager `Drop` establishes stop AND wakes a poll-blocked
+        // event-driven pump: the worker must observe shutdown without
+        // waiting for the next deadline. The wake fires even though the
+        // session teardown itself is silent here (drop-before-attach).
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let control = Arc::new(crate::pump::PumpControl::new().unwrap());
+        let manager = test_manager(&grab, &sinks, &haptic).with_control(Arc::clone(&control));
+        drop(manager);
+        assert!(
+            control_wakes_within(&control, std::time::Duration::from_secs(2)),
+            "Drop did not notify a poll-blocked pump"
+        );
+    }
+
+    #[test]
+    fn attach_rollback_via_manager_idles_and_destroys() {
+        // Grab-refused attach through the ACTUAL manager dispatch
+        // (`PumpManager::finish_attach`, the same tail production calls
+        // after opening the source). A fresh refused session holds no wire
+        // state, so rollback emits nothing, then idles the source and
+        // destroys both nodes; a repeat refused attach stays silent.
+        let grab = Arc::new(FakeGrab::failing());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        let live = || ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 10, 100, 60)], 0)))]);
+        manager.finish_attach(&usb_ready("/dev/hidraw1"), live(), |_| {});
+        {
+            let px = manager.proxy().lock().unwrap();
+            assert!(!px.is_attached());
+            assert!(px.is_passthrough());
+            assert!(
+                px.source.frames.borrow().is_empty(),
+                "rollback must idle the source"
+            );
+        }
+        assert!(!grab.is_grabbed());
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        assert!(
+            sinks.pointer.events.lock().unwrap().is_empty(),
+            "fresh rollback must emit no wire traffic"
+        );
+        // A repeat refused attach stays silent.
+        manager.finish_attach(&usb_ready("/dev/hidraw1"), live(), |_| {});
+        assert!(
+            sinks.pointer.events.lock().unwrap().is_empty(),
+            "second rollback emitted duplicate wire traffic"
+        );
+    }
+
+    #[test]
+    fn attach_rollback_terminates_stale_physical_hold() {
+        // Stale wire state through the actual rollback dispatch: seed a
+        // bare-hardware-click hold (`BTN_LEFT` wire-down with no latch, the
+        // physical-only path [`ClickProxy::release_held`] must release),
+        // refuse the grab, and require `BTN_LEFT = 0`, slot termination,
+        // tool clear, exactly one trailing SYN, and silence on repeat.
+        let grab = Arc::new(FakeGrab::failing());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![]),
+            |_| {},
+        );
+        {
+            let mut px = manager.proxy().lock().unwrap();
+            px.btn_left_down = true;
+            px.physical_left_down = true;
+            px.last_pos.insert(
+                1,
+                PointerAnchor {
+                    raw: (100, 60),
+                    emitted: (100, 60),
+                    rem: (0, 0),
+                },
+            );
+        }
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![]),
+            |_| {},
+        );
+        {
+            let px = manager.proxy().lock().unwrap();
+            assert!(!px.is_attached());
+            assert!(!px.btn_left_down);
+            assert!(!px.physical_left_down);
+            assert!(px.last_pos.is_empty());
+            assert_eq!(px.max_slot, 0);
+        }
+        assert!(!grab.is_grabbed());
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        let tail = &evs[base_len..];
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 0)
+                    && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
+            "rollback left slot 0 active: {tail:?}"
+        );
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT).last(),
+            Some(&0),
+            "stale physical hold survived rollback"
+        );
+        assert_eq!(key_values(&sinks.pointer, BTN_TOUCH).last(), Some(&0));
+        for tool in [
+            BTN_TOOL_FINGER,
+            BTN_TOOL_DOUBLETAP,
+            BTN_TOOL_TRIPLETAP,
+            BTN_TOOL_QUADTAP,
+            BTN_TOOL_QUINTTAP,
+        ] {
+            assert_eq!(key_values(&sinks.pointer, tool).last(), Some(&0));
+        }
+        assert_single_trailing_syn(tail, "stale rollback");
+        // Idled source drains to no-op; a repeat rollback stays silent.
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        assert!(manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .is_none());
+        let len_after_first = sinks.pointer.events.lock().unwrap().len();
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![]),
+            |_| {},
+        );
+        assert_eq!(
+            sinks.pointer.events.lock().unwrap().len(),
+            len_after_first,
+            "second rollback emitted duplicate wire traffic"
+        );
+    }
+
+    #[test]
+    fn manager_drop_terminates_live_press() {
+        // Actual `PumpManager` Drop with a live press (keys + contact +
+        // BTN_LEFT): slot terminated, touch/tool/left cleared, exactly one
+        // trailing SYN, grab released, source idled, both nodes destroyed.
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))]),
+            |_| {},
+        );
+        assert!(manager.proxy().lock().unwrap().is_attached());
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap();
+        assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        drop(manager);
+        assert!(!grab.is_grabbed());
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        let tail = &evs[base_len..];
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 0)
+                    && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
+            "shutdown left slot 0 active: {tail:?}"
+        );
+        assert_eq!(key_values(&sinks.pointer, BTN_TOUCH).last(), Some(&0));
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT).last(), Some(&0));
+        for tool in [
+            BTN_TOOL_FINGER,
+            BTN_TOOL_DOUBLETAP,
+            BTN_TOOL_TRIPLETAP,
+            BTN_TOOL_QUADTAP,
+            BTN_TOOL_QUINTTAP,
+        ] {
+            assert_eq!(key_values(&sinks.pointer, tool).last(), Some(&0));
+        }
+        assert_single_trailing_syn(tail, "shutdown drop");
+    }
+
+    #[test]
+    fn manager_drop_recovers_poisoned_proxy() {
+        // A panicked holder poisons the proxy mutex; Drop must recover it
+        // and still terminate the live session (same wire assertions as
+        // the clean Drop above).
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))]),
+            |_| {},
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap();
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        poison_manager_proxy(&manager);
+        drop(manager);
+        assert!(!grab.is_grabbed());
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        let tail = &evs[base_len..];
+        assert!(
+            tail.windows(2)
+                .any(|w| w[0] == (EV_ABS, ABS_MT_SLOT, 0)
+                    && w[1] == (EV_ABS, ABS_MT_TRACKING_ID, -1)),
+            "poisoned shutdown left slot 0 active: {tail:?}"
+        );
+        assert_eq!(key_values(&sinks.pointer, BTN_TOUCH).last(), Some(&0));
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT).last(), Some(&0));
+        assert_single_trailing_syn(tail, "poisoned shutdown drop");
+    }
+
+    #[test]
+    fn manager_detach_then_drop_stays_silent() {
+        // Drop-after-detach through the actual dispatch: `detach` owns the
+        // live press (exactly one trailing SYN, source idled, both nodes
+        // destroyed), and the later Drop finds no wire state, so it emits
+        // nothing further.
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let manager = test_manager(&grab, &sinks, &haptic);
+        manager.finish_attach(
+            &usb_ready("/dev/hidraw1"),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 100, 60)], 0)))]),
+            |_| {},
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        manager
+            .proxy()
+            .lock()
+            .unwrap()
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap();
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let base_len = sinks.pointer.events.lock().unwrap().len();
+        manager.detach(&detached("/dev/hidraw1", Transport::Usb));
+        {
+            let px = manager.proxy().lock().unwrap();
+            assert!(!px.is_attached());
+            assert!(px.is_passthrough());
+        }
+        assert!(sinks.pointer.was_destroyed() && sinks.extras.was_destroyed());
+        let evs = sinks.pointer.events.lock().unwrap().clone();
+        assert_single_trailing_syn(&evs[base_len..], "manager detach");
+        // A sibling Detached must not touch the torn-down session, and
+        // the later Drop must emit nothing further.
+        manager.detach(&detached("/dev/hidraw9", Transport::Usb));
+        let len_after_detach = sinks.pointer.events.lock().unwrap().len();
+        drop(manager);
+        assert_eq!(
+            sinks.pointer.events.lock().unwrap().len(),
+            len_after_detach,
+            "Drop after detach emitted duplicate wire traffic"
+        );
+    }
+
+    #[test]
+    fn output_failure_double_destroy_is_safe() {
+        // output_failed runs teardown (which destroys on its own
+        // wire-failure branch) then destroys again: destroy must be
+        // idempotent, and a repeat teardown must not re-destroy or
+        // re-emit. Pinned with a destroy-counting sink.
+        #[derive(Clone)]
+        struct CountingSink {
+            inner: FaultUinput,
+            destroys: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl UinputSink for CountingSink {
+            fn is_ready(&self) -> bool {
+                self.inner.is_ready()
+            }
+            fn emit(&self, ty: u16, code: u16, value: i32) -> Result<()> {
+                self.inner.emit(ty, code, value)
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+            fn destroy(&self) {
+                self.destroys
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.destroy();
+            }
+        }
+        let pointer = CountingSink {
+            inner: FaultUinput::new(),
+            destroys: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let extras = CountingSink {
+            inner: FaultUinput::new(),
+            destroys: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let grab = Arc::new(FakeGrab::ok());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 10, 0)], 0))),
+        ];
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            DualSink::new(pointer.clone(), extras.clone()),
+            FakeHaptic::new(),
+            ScriptSource::new(frames),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        let cfg = output_failure_config();
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(pointer.inner.inner.has(EV_KEY, BTN_TOUCH, 1));
+        // Break the pointer path: teardown's wire fails, both nodes retire.
+        pointer.inner.fail(2);
+        assert!(px.handle_frame_at(&cfg, spaced_at(now, 1)).is_err());
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        assert!(!grab.is_grabbed());
+        assert!(pointer.inner.inner.was_destroyed() && extras.inner.inner.was_destroyed());
+        let pointer_destroys = pointer.destroys.load(std::sync::atomic::Ordering::SeqCst);
+        let extras_destroys = extras.destroys.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            pointer_destroys >= 1 && extras_destroys >= 1,
+            "both nodes must retire (pointer={pointer_destroys}, extras={extras_destroys})"
+        );
+        // Repeat teardown: no new wire traffic, no further destroys.
+        let pointer_events = pointer.inner.inner.events.lock().unwrap().len();
+        let extras_events = extras.inner.inner.events.lock().unwrap().len();
+        px.teardown_session("repeat");
+        assert_eq!(
+            pointer.inner.inner.events.lock().unwrap().len(),
+            pointer_events
+        );
+        assert_eq!(
+            extras.inner.inner.events.lock().unwrap().len(),
+            extras_events
+        );
+        assert_eq!(
+            pointer.destroys.load(std::sync::atomic::Ordering::SeqCst),
+            pointer_destroys
+        );
+        assert_eq!(
+            extras.destroys.load(std::sync::atomic::Ordering::SeqCst),
+            extras_destroys
         );
     }
 
@@ -6349,20 +8113,30 @@ mod tests {
             "pump stalled on actuator I/O: {elapsed:?} for 220 frames"
         );
         // The worker still fires every pulse, in order, off the hot path
-        // (drop joins the drain; assertions below see the full stream).
+        // (test-end teardown retires the session, then drains post-retire;
+        // nothing here depends on post-drop execution).
     }
 
     #[test]
     fn async_haptic_preserves_down_up_order() {
         // FIFO: the worker must fire pulses in enqueue order so down/up
-        // pairs stay paired even though the pump never waits.
+        // pairs stay paired even though the pump never waits. (Teardown
+        // retires the session, then drains post-retire with a bounded
+        // join, so drain completion is awaited BEFORE drop.)
         let rec = Arc::new(FakeHaptic::new());
         let ah = AsyncHaptic::new(SharedHaptic(Arc::clone(&rec)));
         ah.click_feedback(64, 5, false).unwrap();
         ah.release_feedback(64, false).unwrap();
         ah.click_feedback(64, 5, true).unwrap();
         ah.release_feedback(64, true).unwrap();
-        drop(ah); // join: queue fully drained before return
+        let t0 = std::time::Instant::now();
+        while rec.calls.lock().unwrap().len() < 2 || rec.releases.lock().unwrap().len() < 2 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "haptic worker never drained the queue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert_eq!(
             rec.calls.lock().unwrap().as_slice(),
             &[(64, 5, false), (64, 5, true)]
@@ -6371,6 +8145,7 @@ mod tests {
             rec.releases.lock().unwrap().as_slice(),
             &[(64, false), (64, true)]
         );
+        drop(ah); // retire + bounded join
     }
 
     #[test]
@@ -6394,9 +8169,1038 @@ mod tests {
             "enqueue blocked on actuator I/O: {:?}",
             t0.elapsed()
         );
-        drop(ah); // drain + join before asserting the full stream landed
+        // Await the drain before drop (teardown retires; it must not be
+        // relied on to execute queued work).
+        let t0 = std::time::Instant::now();
+        while calls.lock().unwrap().len() < 2 || releases.lock().unwrap().len() < 2 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "haptic worker never drained the queue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(ah); // retire (empty) + bounded join
         assert_eq!(calls.lock().unwrap().len(), 2);
         assert_eq!(releases.lock().unwrap().len(), 2);
+    }
+
+    /// Target-recording, gate-blocked haptic for session tests. The worker
+    /// blocks inside `execute_*` until the test opens the gate, so
+    /// backlogs build deterministically; every execution records the
+    /// session snapshot it ran against: `(node, bluetooth, is_down,
+    /// pressure_or_down_pressure, intensity, quiet)`.
+    #[derive(Clone)]
+    struct GateHaptic {
+        shared: Arc<GateShared>,
+    }
+
+    struct GateShared {
+        state: Mutex<GateState>,
+        cvar: Condvar,
+    }
+
+    struct GateState {
+        open: bool,
+        entered: usize,
+        executed: Vec<(String, bool, bool, u8, u8, bool)>,
+    }
+
+    impl GateHaptic {
+        fn new_closed() -> Self {
+            Self {
+                shared: Arc::new(GateShared {
+                    state: Mutex::new(GateState {
+                        open: false,
+                        entered: 0,
+                        executed: Vec::new(),
+                    }),
+                    cvar: Condvar::new(),
+                }),
+            }
+        }
+        fn open(&self) {
+            let mut state = self.shared.state.lock().unwrap();
+            state.open = true;
+            self.shared.cvar.notify_all();
+        }
+        fn entered(&self) -> usize {
+            self.shared.state.lock().unwrap().entered
+        }
+        fn executed(&self) -> Vec<(String, bool, bool, u8, u8, bool)> {
+            self.shared.state.lock().unwrap().executed.clone()
+        }
+        fn wait_entered(&self, n: usize) {
+            let t0 = std::time::Instant::now();
+            while self.entered() < n {
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(5),
+                    "haptic worker never picked up pulse"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        /// Await drain completion BEFORE drop: teardown retires first
+        /// (queued remainder purged), then drains post-retire with a
+        /// bounded join, so tests asserting execution must wait here,
+        /// not rely on `Drop`.
+        fn wait_executed(&self, n: usize) {
+            let t0 = std::time::Instant::now();
+            while self.executed().len() < n {
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(5),
+                    "haptic worker never executed {n} pulses"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        fn record(&self, target: &HapticTarget, down: bool, a: u8, b: u8, quiet: bool) {
+            let mut state = self.shared.state.lock().unwrap();
+            state.entered += 1;
+            while !state.open {
+                state = self.shared.cvar.wait(state).unwrap();
+            }
+            state
+                .executed
+                .push((target.node.clone(), target.bluetooth, down, a, b, quiet));
+        }
+    }
+
+    impl HapticSender for GateHaptic {
+        fn click_feedback(&self, _pressure: u8, _intensity: u8, _quiet: bool) -> Result<()> {
+            Ok(())
+        }
+        fn release_feedback(&self, _down_pressure: u8, _quiet: bool) -> Result<()> {
+            Ok(())
+        }
+        fn execute_down(
+            &self,
+            target: &HapticTarget,
+            pressure: u8,
+            intensity: u8,
+            quiet: bool,
+        ) -> Result<()> {
+            self.record(target, true, pressure, intensity, quiet);
+            Ok(())
+        }
+        fn execute_up(&self, target: &HapticTarget, down_pressure: u8, quiet: bool) -> Result<()> {
+            self.record(target, false, down_pressure, 0, quiet);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn haptic_backlog_retires_across_sessions() {
+        // Reconnect with a queued backlog: the retire purges queued pulses
+        // and bumps the generation, so stale work never fires — in
+        // particular never on the newly selected node. The pulse already
+        // inside the firmware send at detach completes against its own
+        // (old) snapshot; it is never redirected.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("/dev/hidraw-old", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1); // worker holds the first pulse inside the gate
+        for _ in 0..5 {
+            ah.click_feedback(64, 5, false).unwrap();
+        }
+        for _ in 0..5 {
+            ah.release_feedback(64, false).unwrap();
+        }
+        assert_eq!(ah.pending(), 10);
+        let gen_old = ah.generation();
+        ah.retarget("/dev/hidraw-new", true); // reconnect: new session
+        assert_eq!(ah.pending(), 0);
+        assert_eq!(ah.generation(), gen_old + 1);
+        assert_eq!(ah.dropped_stale(), 10);
+        gate.open(); // first pulse resumes against its old snapshot
+        ah.click_feedback(70, 6, true).unwrap();
+        ah.release_feedback(70, true).unwrap();
+        gate.wait_executed(3); // drain BEFORE drop (drop retires, not drains)
+        drop(ah); // retire (empty) + bounded join
+        let got = gate.executed();
+        assert_eq!(
+            got,
+            vec![
+                ("/dev/hidraw-old".to_string(), false, true, 64, 5, false),
+                ("/dev/hidraw-new".to_string(), true, true, 70, 6, true),
+                ("/dev/hidraw-new".to_string(), true, false, 70, 0, true),
+            ],
+            "stale backlog fired: {got:?}"
+        );
+    }
+
+    #[test]
+    fn haptic_update_route_repoints_pending_pulses() {
+        // Same-session route correction (late actuator sibling): pending
+        // pulses move to the corrected node with the generation unchanged
+        // — nothing retired, nothing dropped stale. The pulse already
+        // inside the send keeps its own (old) snapshot.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("/dev/hidraw-if1", false);
+        let gen = ah.generation();
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1); // worker holds the first pulse inside the gate
+        ah.click_feedback(64, 7, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        assert_eq!(ah.pending(), 2);
+        ah.update_route("/dev/hidraw-if2");
+        assert_eq!(ah.generation(), gen, "route correction must not retire");
+        assert_eq!(ah.pending(), 2, "route correction must not drop");
+        assert_eq!(ah.dropped_stale(), 0);
+        gate.open();
+        gate.wait_executed(3); // drain BEFORE drop (drop retires, not drains)
+        drop(ah); // retire (empty) + bounded join
+        let got = gate.executed();
+        assert_eq!(
+            got,
+            vec![
+                ("/dev/hidraw-if1".to_string(), false, true, 64, 5, false),
+                ("/dev/hidraw-if2".to_string(), false, true, 64, 7, false),
+                ("/dev/hidraw-if2".to_string(), false, false, 64, 0, false),
+            ],
+            "pending pulses missed the corrected node: {got:?}"
+        );
+    }
+
+    #[test]
+    fn haptic_overflow_drops_newest_without_blocking() {
+        // A wedged actuator must not stall the pump: the bounded queue
+        // reports overflow as `Err` instead of blocking, drops the
+        // incoming pulse, and keeps already-queued pairs complete.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("/dev/hidraw9", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        for _ in 0..HAPTIC_QUEUE_CAP {
+            ah.click_feedback(64, 5, false).unwrap();
+        }
+        assert_eq!(ah.pending(), HAPTIC_QUEUE_CAP);
+        let t0 = std::time::Instant::now();
+        let err = ah
+            .click_feedback(64, 5, false)
+            .expect_err("full queue must report, not block");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(250),
+            "enqueue blocked on full queue: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("queue full"),
+            "overflow error should say so: {err:#}"
+        );
+        assert_eq!(ah.dropped_overflow(), 1);
+        ah.release_feedback(64, false)
+            .expect_err("full queue must report on up-pulses too");
+        assert_eq!(ah.dropped_overflow(), 2);
+        gate.open();
+        gate.wait_executed(HAPTIC_QUEUE_CAP + 1); // drain BEFORE drop
+        drop(ah); // retire (empty) + bounded join
+        let got = gate.executed();
+        assert_eq!(
+            got.len(),
+            HAPTIC_QUEUE_CAP + 1,
+            "queued pulses stay complete; only the incoming drops: {got:?}"
+        );
+        assert!(
+            got.iter().all(|e| e.2),
+            "no up-pulse was queued, none may fire: {got:?}"
+        );
+    }
+
+    #[test]
+    fn haptic_down_overflow_owes_no_up() {
+        // Pairing across the drop: an overflowed down-pulse reports
+        // failure, so the proxy records it unfired and the later release
+        // owes no up-pulse (no phantom release snap for a click that
+        // never buzzed).
+        let gate = GateHaptic::new_closed();
+        let haptic = AsyncHaptic::new(gate.clone());
+        haptic.retarget("/dev/hidraw9", false);
+        haptic.click_feedback(1, 1, false).unwrap();
+        gate.wait_entered(1);
+        for _ in 0..HAPTIC_QUEUE_CAP {
+            haptic.click_feedback(1, 1, false).unwrap();
+        }
+        let sinks = TestSinks::new();
+        let px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            sinks.dual(),
+            haptic,
+            ScriptSource::new(vec![]),
+        );
+        let ev = ClickEvent {
+            finger_count: 1,
+            action: crate::config::ClickAction {
+                raw: "empty".into(),
+                stagger_ms: None,
+                kind: crate::config::ActionKind::Empty,
+            },
+            haptic: 120,
+            quiet: false,
+            level: ClickLevel::First,
+        };
+        assert!(
+            !px.fire_haptic(&ev, 120),
+            "overflowed down must report unfired"
+        );
+        assert!(!px.pressed_haptic, "no up-pulse owed for a dropped down");
+        gate.open();
+    }
+
+    #[test]
+    fn haptic_overflow_press_release_owes_no_up() {
+        // Full proxy path across a full queue: the press edge's down-pulse
+        // is rejected, so the proxy owes nothing and the later release
+        // enqueues no up-pulse (no phantom release snap, no extra drop).
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.click_feedback(1, 1, false).unwrap();
+        gate.wait_entered(1);
+        for _ in 0..HAPTIC_QUEUE_CAP {
+            ah.click_feedback(1, 1, false).unwrap();
+        }
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            TestSinks::new().dual(),
+            ah,
+            ScriptSource::new(vec![
+                Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0))),
+                Ok(Some(frame(vec![], 0))),
+            ]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("fixture"));
+        let now = std::time::Instant::now();
+        let cfg = Config::default();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(!px.pressed_haptic);
+        assert_eq!(px.haptic.dropped_overflow(), 1);
+        px.handle_frame_at(&cfg, spaced_at(now, 2)).unwrap();
+        px.handle_frame_at(&cfg, spaced_at(now, 3)).unwrap();
+        assert!(!px.pressed_haptic);
+        assert_eq!(
+            px.haptic.dropped_overflow(),
+            1,
+            "release must not attempt up for rejected down"
+        );
+        gate.open();
+        gate.wait_executed(HAPTIC_QUEUE_CAP + 1);
+        assert!(gate.executed().iter().all(|pulse| pulse.2));
+    }
+
+    #[test]
+    fn haptic_panic_then_next_pulse_progresses() {
+        // Panic containment through the real queue: a panicking pulse is
+        // caught per pulse and the worker still runs later work in order.
+        struct PanicOnce {
+            panicked: std::sync::atomic::AtomicBool,
+            calls: Mutex<Vec<(u8, u8, bool)>>,
+            releases: Mutex<Vec<(u8, bool)>>,
+        }
+        impl HapticSender for PanicOnce {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(
+                &self,
+                _target: &HapticTarget,
+                pressure: u8,
+                intensity: u8,
+                quiet: bool,
+            ) -> Result<()> {
+                if !self
+                    .panicked
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    panic!("test panic in haptic pulse");
+                }
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((pressure, intensity, quiet));
+                Ok(())
+            }
+            fn execute_up(
+                &self,
+                _target: &HapticTarget,
+                down_pressure: u8,
+                quiet: bool,
+            ) -> Result<()> {
+                self.releases.lock().unwrap().push((down_pressure, quiet));
+                Ok(())
+            }
+        }
+        let rec = Arc::new(PanicOnce {
+            panicked: std::sync::atomic::AtomicBool::new(false),
+            calls: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
+        });
+        struct PanicOnceSender(Arc<PanicOnce>);
+        impl HapticSender for PanicOnceSender {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(&self, target: &HapticTarget, p: u8, i: u8, q: bool) -> Result<()> {
+                self.0.execute_down(target, p, i, q)
+            }
+            fn execute_up(&self, target: &HapticTarget, d: u8, q: bool) -> Result<()> {
+                self.0.execute_up(target, d, q)
+            }
+        }
+        let ah = AsyncHaptic::new(PanicOnceSender(Arc::clone(&rec)));
+        ah.click_feedback(64, 5, false).unwrap(); // panics inside worker
+        ah.click_feedback(70, 6, true).unwrap();
+        ah.release_feedback(70, true).unwrap();
+        let t0 = std::time::Instant::now();
+        loop {
+            {
+                let calls = rec.calls.lock().unwrap();
+                let releases = rec.releases.lock().unwrap();
+                if !calls.is_empty() && !releases.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "worker died after panicking pulse"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(rec.panicked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            rec.calls.lock().unwrap().as_slice(),
+            &[(70, 6, true)],
+            "only post-panic pulses run, in order"
+        );
+        assert_eq!(
+            rec.releases.lock().unwrap().as_slice(),
+            &[(70, true)],
+            "up-pulse after panic still fires"
+        );
+        drop(ah);
+    }
+
+    #[test]
+    fn haptic_shutdown_bounded_on_hung_actuator() {
+        // A wedged firmware send (never returns until released) must not
+        // hang teardown: `Drop` joins up to 500 ms, then detaches. The
+        // entered gate proves the worker is inside the send (not draining),
+        // so the measured Drop time exercises the join budget itself.
+        struct HungHaptic {
+            state: Mutex<bool>,
+            cvar: Condvar,
+        }
+        impl HungHaptic {
+            fn enter(&self) {
+                let mut entered = self.state.lock().unwrap();
+                *entered = true;
+                self.cvar.notify_all();
+                while *entered {
+                    entered = self.cvar.wait(entered).unwrap();
+                }
+            }
+        }
+        impl HapticSender for HungHaptic {
+            fn click_feedback(&self, _pressure: u8, _intensity: u8, _quiet: bool) -> Result<()> {
+                self.enter();
+                Ok(())
+            }
+            fn release_feedback(&self, _down_pressure: u8, _quiet: bool) -> Result<()> {
+                self.enter();
+                Ok(())
+            }
+        }
+        let hung = Arc::new(HungHaptic {
+            state: Mutex::new(false),
+            cvar: Condvar::new(),
+        });
+        struct HungSender(Arc<HungHaptic>);
+        impl HapticSender for HungSender {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(&self, _t: &HapticTarget, p: u8, i: u8, q: bool) -> Result<()> {
+                self.0.click_feedback(p, i, q)
+            }
+            fn execute_up(&self, _t: &HapticTarget, d: u8, q: bool) -> Result<()> {
+                self.0.release_feedback(d, q)
+            }
+        }
+        let ah = AsyncHaptic::new(HungSender(Arc::clone(&hung)));
+        ah.click_feedback(64, 5, false).unwrap();
+        // Explicit entered signal: the worker is inside the hung send.
+        let t0 = std::time::Instant::now();
+        while !*hung.state.lock().unwrap() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "haptic worker never entered hung send"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let t0 = std::time::Instant::now();
+        drop(ah);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(450),
+            "Drop returned before the join budget engaged: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2000),
+            "shutdown hung on wedged actuator: {elapsed:?}"
+        );
+        // Release the fixture gate so the detached worker exits cleanly
+        // instead of lingering parked until process exit.
+        {
+            let mut entered = hung.state.lock().unwrap();
+            *entered = false;
+            hung.cvar.notify_all();
+        }
+    }
+
+    #[test]
+    fn haptic_fallback_uses_pinned_endpoint_across_pathname_reuse() {
+        // F1: a frozen pathname is not a device identity. The worker pauses
+        // at the fallback boundary (feature ioctl failed, before plain
+        // write); the session retires and the kernel reuses the same
+        // pathname for a replacement. The fallback must write the old fd
+        // (the renamed old file), never the replacement at the same path.
+        struct GateLog {
+            state: Mutex<(bool, bool)>,
+            cv: Condvar,
+            // Fixture worker identity: the process-global logger sees every
+            // test thread's records, and other haptic tests emit the same
+            // prefix. Only the fixture worker's own thread may trip the gate;
+            // otherwise a foreign warning could signal entered before this
+            // worker reaches the fallback, and the retire would purge its
+            // pulse.
+            worker: std::thread::ThreadId,
+        }
+        impl log::Log for GateLog {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if std::thread::current().id() != self.worker {
+                    return;
+                }
+                if record
+                    .args()
+                    .to_string()
+                    .starts_with("haptic feature report failed")
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.0 = true;
+                    self.cv.notify_all();
+                    while !state.1 {
+                        state = self.cv.wait(state).unwrap();
+                    }
+                }
+            }
+            fn flush(&self) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("reused-node");
+        let old_path = dir.path().join("old-node");
+        std::fs::write(&node, []).unwrap();
+        let ah = AsyncHaptic::new(RealHaptic::new());
+        // The worker is idle before the first enqueue; pin its identity
+        // before installing the process-global logger.
+        let worker = ah.worker.as_ref().unwrap().thread().id();
+        let logger = Box::leak(Box::new(GateLog {
+            state: Mutex::new((false, false)),
+            cv: Condvar::new(),
+            worker,
+        }));
+        log::set_logger(logger).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        ah.retarget(node.to_str().unwrap(), false);
+        ah.click_feedback(64, 5, false).unwrap();
+        let state = logger.state.lock().unwrap();
+        let (state, timeout) = logger
+            .cv
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |s| !s.0)
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "worker did not reach fallback boundary"
+        );
+        drop(state);
+        // Feature ioctl on the original fixture failed (ENOTTY); retire,
+        // then simulate the kernel reusing the same hidraw pathname.
+        ah.retire_session();
+        std::fs::rename(&node, &old_path).unwrap();
+        std::fs::write(&node, []).unwrap();
+        ah.retarget(node.to_str().unwrap(), false);
+        {
+            let mut state = logger.state.lock().unwrap();
+            state.1 = true;
+            logger.cv.notify_all();
+        }
+        drop(ah); // Bounded join waits for the already-entered send.
+        let replacement = std::fs::read(&node).unwrap();
+        assert!(
+            replacement.is_empty(),
+            "old-session fallback must not write the replacement node: {replacement:02x?}"
+        );
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        assert_eq!(
+            old_bytes,
+            &vibration_report(64, 5, false)[1..],
+            "in-flight pulse must complete only against the old endpoint"
+        );
+    }
+
+    #[test]
+    fn haptic_first_send_uses_pinned_endpoint_after_retire() {
+        // F1 check-to-first-send race: the worker is descheduled after the
+        // generation check but before the first send; retire + pathname
+        // reuse must not redirect the in-flight pulse. The wrapper gates
+        // inside `execute_down` before delegating to the pinned fd, which
+        // simulates the deschedule. No pathname reopen occurs at send time
+        // by construction (the fd was pinned at retarget).
+        struct GateReal {
+            state: Mutex<(bool, bool)>,
+            cvar: Condvar,
+            inner: RealHaptic,
+        }
+        impl HapticSender for GateReal {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(
+                &self,
+                target: &HapticTarget,
+                pressure: u8,
+                intensity: u8,
+                quiet: bool,
+            ) -> Result<()> {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.0 = true;
+                    self.cvar.notify_all();
+                    while !state.1 {
+                        state = self.cvar.wait(state).unwrap();
+                    }
+                }
+                self.inner.execute_down(target, pressure, intensity, quiet)
+            }
+        }
+        let gate = std::sync::Arc::new(GateReal {
+            state: Mutex::new((false, false)),
+            cvar: Condvar::new(),
+            inner: RealHaptic::new(),
+        });
+        struct GateRealSender(std::sync::Arc<GateReal>);
+        impl HapticSender for GateRealSender {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(&self, target: &HapticTarget, p: u8, i: u8, q: bool) -> Result<()> {
+                self.0.execute_down(target, p, i, q)
+            }
+            fn execute_up(&self, target: &HapticTarget, d: u8, q: bool) -> Result<()> {
+                self.0.inner.execute_up(target, d, q)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("reused-first-open");
+        let old_path = dir.path().join("old-first-open");
+        std::fs::write(&node, []).unwrap();
+        let ah = AsyncHaptic::new(GateRealSender(std::sync::Arc::clone(&gate)));
+        ah.retarget(node.to_str().unwrap(), false);
+        ah.click_feedback(64, 5, false).unwrap();
+        let t0 = std::time::Instant::now();
+        while !gate.state.lock().unwrap().0 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "worker never entered first send"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Worker holds the in-flight pulse past its generation check.
+        ah.retire_session();
+        std::fs::rename(&node, &old_path).unwrap();
+        std::fs::write(&node, []).unwrap();
+        ah.retarget(node.to_str().unwrap(), false);
+        {
+            let mut state = gate.state.lock().unwrap();
+            state.1 = true;
+            gate.cvar.notify_all();
+        }
+        drop(ah);
+        let replacement = std::fs::read(&node).unwrap();
+        assert!(
+            replacement.is_empty(),
+            "retired first send must not touch the reused pathname: {replacement:02x?}"
+        );
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        assert_eq!(
+            old_bytes,
+            &vibration_report(64, 5, false)[1..],
+            "in-flight first send completes only on the old endpoint"
+        );
+    }
+
+    #[test]
+    fn haptic_output_failure_retires_backlog_frame() {
+        // F2 (frame path): a pointer emit failure ends the proxy session;
+        // queued pulses must be purged and the generation bumped before
+        // ownership is cleared. Only the already in-flight pulse may
+        // complete (against its old snapshot); queued work never runs.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("old-session", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        let before = ah.generation();
+        let pointer = FaultUinput::new();
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), FaultUinput::new()),
+            ah,
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("old-session"));
+        pointer.fail(1);
+        assert!(px.handle_frame(&Config::default()).is_err());
+        assert!(!px.is_attached());
+        let pending = px.haptic.pending();
+        let after = px.haptic.generation();
+        assert_eq!(
+            pending, 0,
+            "failed pointer session must purge queued haptics"
+        );
+        assert!(
+            after > before,
+            "failed pointer session must retire generation"
+        );
+        gate.open();
+        gate.wait_executed(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let executed = gate.executed();
+        assert_eq!(
+            executed.len(),
+            1,
+            "only the in-flight pulse may complete after failure: {executed:?}"
+        );
+        assert_eq!(executed[0].0, "old-session");
+        drop(px);
+    }
+
+    #[test]
+    fn haptic_idle_output_failure_retires_backlog() {
+        // F2 (idle path): a staged-action idle poll whose trailing SYN
+        // fails must retire the same way as a frame failure. Both paths
+        // converge on `output_failed`.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("old-session", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        let before = ah.generation();
+        let pointer = FaultUinput::new();
+        let extras = FaultUinput::new();
+        let mut cfg = output_failure_config();
+        cfg.click.click_1.stagger_ms = Some(100);
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), extras.clone()),
+            ah,
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("old-session"));
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(px.pending_buttons.is_some());
+        pointer.fail(2);
+        assert!(px.handle_frame_at(&cfg, spaced_at(now, 2)).is_err());
+        assert!(!px.is_attached());
+        let pending = px.haptic.pending();
+        let after = px.haptic.generation();
+        assert_eq!(pending, 0, "idle failure must purge queued haptics");
+        assert!(after > before, "idle failure must retire generation");
+        gate.open();
+        gate.wait_executed(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            gate.executed().len(),
+            1,
+            "only the in-flight pulse may complete after idle failure"
+        );
+        drop(px);
+    }
+
+    #[test]
+    fn haptic_extras_only_failure_keeps_pointer_session() {
+        // Extras-only degradation must not retire the live pointer session
+        // or its queued haptics: the pointer path stays attached and the
+        // backlog survives.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("/dev/hidraw9", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 5, false).unwrap();
+        let gen = ah.generation();
+        let pointer = FaultUinput::new();
+        let extras = FaultUinput::new();
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), extras.clone()),
+            ah,
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        extras.fail(1);
+        let cfg = output_failure_config();
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(
+            px.is_attached(),
+            "extras-only failure must keep pointer session"
+        );
+        assert!(!px.is_passthrough());
+        // The press edge above enqueues its own down-pulse alongside the
+        // pre-queued backlog (worker still holds the first): extras
+        // degradation must preserve all of it, never purge or retire.
+        assert_eq!(
+            px.haptic.pending(),
+            2,
+            "extras failure must not purge haptics"
+        );
+        assert_eq!(
+            px.haptic.generation(),
+            gen,
+            "extras failure must not retire"
+        );
+        gate.open();
+        gate.wait_executed(3);
+        drop(px);
+    }
+
+    #[test]
+    fn haptic_route_prepared_commits_same_session() {
+        // F3 prepared route path: prepare (open) outside all live locks,
+        // then commit generation-fenced without I/O. Pending pulses move
+        // to the corrected endpoint; generation unchanged; in-flight keeps
+        // the old endpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let corrected = dir.path().join("corrected");
+        std::fs::write(&old, []).unwrap();
+        std::fs::write(&corrected, []).unwrap();
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget(old.to_str().unwrap(), false);
+        let gen = ah.generation();
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 7, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        assert_eq!(ah.pending(), 2);
+        // Prepare outside any proxy/queue lock (fast here; gated slow-open
+        // placement is covered by the io evidence run).
+        let (_, bt) = ah.current_routing();
+        let prepared = HapticTarget::prepare(corrected.to_str().unwrap(), bt);
+        assert!(ah.update_route_prepared(prepared, gen));
+        assert_eq!(ah.generation(), gen, "route commit must not retire");
+        assert_eq!(ah.pending(), 2, "route commit must not drop");
+        gate.open();
+        gate.wait_executed(3);
+        drop(ah);
+        let got = gate.executed();
+        assert_eq!(
+            got,
+            vec![
+                (old.to_str().unwrap().to_string(), false, true, 64, 5, false),
+                (
+                    corrected.to_str().unwrap().to_string(),
+                    false,
+                    true,
+                    64,
+                    7,
+                    false
+                ),
+                (
+                    corrected.to_str().unwrap().to_string(),
+                    false,
+                    false,
+                    64,
+                    0,
+                    false
+                ),
+            ],
+            "prepared route missed: {got:?}"
+        );
+    }
+
+    #[test]
+    fn haptic_route_prepared_fence_discards_stale() {
+        // F3 generation fence: a correction prepared before a retire must
+        // not clobber the new session's endpoint, generation, or mode.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let late = dir.path().join("late");
+        let fresh = dir.path().join("fresh");
+        for node in [&old, &late, &fresh] {
+            std::fs::write(node, []).unwrap();
+        }
+        let ah = AsyncHaptic::new(RealHaptic::new());
+        ah.retarget(old.to_str().unwrap(), false);
+        let baseline = ah.generation();
+        let (_, bt) = ah.current_routing();
+        assert!(!bt);
+        let prepared = HapticTarget::prepare(late.to_str().unwrap(), bt);
+        ah.retire_session();
+        ah.retarget(fresh.to_str().unwrap(), true);
+        let generation = ah.generation();
+        assert!(!ah.update_route_prepared(prepared, baseline));
+        assert_eq!(ah.generation(), generation);
+        // Prepared endpoint discarded; new session intact with its own fd.
+        let target = ah.shared.state.lock().unwrap().target.clone();
+        assert_eq!(target.node, fresh.to_str().unwrap());
+        assert!(target.bluetooth);
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            target.try_clone_file().unwrap().metadata().unwrap().ino(),
+            std::fs::metadata(&fresh).unwrap().ino()
+        );
+        drop(ah);
+    }
+
+    #[test]
+    fn disposal_pool_startup_failure_degrades_explicitly() {
+        // F3 failure path: a cleanup worker that cannot start must deny
+        // admission deterministically (mock spawner, no host limit
+        // changes). Queue/pump/Drop work stays bounded on the degraded
+        // file-less target; nothing closes synchronously on the caller.
+        let failing =
+            |_job: Box<dyn FnOnce() + Send + 'static>| -> std::io::Result<std::thread::JoinHandle<()>> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "mock closer spawn failure",
+                ))
+            };
+        assert!(
+            DisposalPool::<std::fs::File>::start(2, failing).is_err(),
+            "worker setup failure must be an explicit error, never silent"
+        );
+        // Degraded target keeps routing identity but acquires nothing.
+        let target = HapticTarget::degraded("/dev/hidraw9", false);
+        assert_eq!(target.node, "/dev/hidraw9");
+        assert!(target.try_clone_file().is_none());
+        // Queue lifecycle on file-less targets stays prompt and bounded.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget_prepared(target);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        let t0 = std::time::Instant::now();
+        ah.retire_session();
+        assert_eq!(ah.pending(), 0);
+        gate.open();
+        gate.wait_executed(1);
+        drop(ah);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "degraded retire/Drop must stay bounded"
+        );
+    }
+
+    #[test]
+    fn disposal_pool_capacity_bounds_outstanding() {
+        // F3 capacity: reserve-before-open bounds simultaneous items;
+        // handoff never blocks even while the closer is stuck in a slow
+        // close (mock slow Drop, no shim); slots recycle after the close.
+        struct SlowClose {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Drop for SlowClose {
+            fn drop(&mut self) {
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            }
+        }
+        let pool = DisposalPool::start(2, |job| {
+            std::thread::Builder::new()
+                .name("ltd-test-closer".into())
+                .spawn(job)
+        })
+        .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let r1 = pool.reserve();
+        let r2 = pool.reserve();
+        assert!(r1.is_some() && r2.is_some());
+        assert!(
+            pool.reserve().is_none(),
+            "third reservation past cap must deny, never block"
+        );
+        r1.unwrap().disarm();
+        r2.unwrap().disarm();
+        // Nonblocking handoff of both reserved items while closes stall.
+        let t0 = std::time::Instant::now();
+        pool.handoff(SlowClose {
+            gate: Arc::clone(&gate),
+        });
+        pool.handoff(SlowClose {
+            gate: Arc::clone(&gate),
+        });
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(250),
+            "handoff must not wait for the stuck closer"
+        );
+        assert_eq!(pool.live.load(Ordering::SeqCst), 2);
+        // Stuck closer holds both; capacity stays denied (bounded).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(pool.reserve().is_none());
+        assert_eq!(pool.live.load(Ordering::SeqCst), 2);
+        // Release: the single worker closes both, slots recycle.
+        {
+            let mut open = gate.0.lock().unwrap();
+            *open = true;
+            gate.1.notify_all();
+        }
+        let t0 = std::time::Instant::now();
+        while pool.live.load(Ordering::SeqCst) != 0 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "slots must recycle after the close"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(pool.reserve().is_some());
     }
 
     #[test]
@@ -6454,39 +9258,76 @@ mod tests {
     }
 
     #[test]
-    fn async_haptic_worker_panic_falls_back_to_direct_send() {
-        // A panicking actuator worker must not hang shutdown: the bounded
-        // drain reports it, and later pulses fall back to direct
-        // synchronous delivery instead of queuing into a dead channel.
-        struct PanicOnceHaptic {
-            armed: std::sync::atomic::AtomicBool,
-            direct: Mutex<Vec<(u8, u8, bool)>>,
-        }
-        impl HapticSender for PanicOnceHaptic {
-            fn click_feedback(&self, pressure: u8, intensity: u8, quiet: bool) -> Result<()> {
-                if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    panic!("simulated haptic worker panic");
-                }
-                self.direct
-                    .lock()
-                    .unwrap()
-                    .push((pressure, intensity, quiet));
-                Ok(())
-            }
-            fn release_feedback(&self, _down_pressure: u8, _quiet: bool) -> Result<()> {
-                Ok(())
-            }
-        }
-        let mut ah = AsyncHaptic::new(PanicOnceHaptic {
-            armed: std::sync::atomic::AtomicBool::new(true),
-            direct: Mutex::new(Vec::new()),
-        });
-        ah.click_feedback(64, 5, false).unwrap(); // enqueued; the worker panics on it
-        ah.shutdown(std::time::Duration::from_secs(5)); // bounded: reports, never hangs
-        ah.click_feedback(64, 5, false).unwrap(); // worker gone: direct fallback
+    fn async_haptic_post_shutdown_calls_fail_fast_without_actuator_work() {
+        // Closed queue admits nothing: after shutdown, calls return promptly
+        // with an error (the proxy owes no up-pulse) and no actuator send
+        // runs — no synchronous fallback on the caller, no reopen. Input
+        // callbacks must never run firmware I/O.
+        let rec = Arc::new(FakeHaptic::new());
+        let mut ah = AsyncHaptic::new(SharedHaptic(Arc::clone(&rec)));
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        ah.shutdown(std::time::Duration::from_secs(5));
+        let calls = rec.calls.lock().unwrap().len();
+        let releases = rec.releases.lock().unwrap().len();
+        let t0 = std::time::Instant::now();
+        assert!(ah.click_feedback(70, 6, true).is_err());
+        assert!(ah.release_feedback(70, true).is_err());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "post-shutdown calls must not block: {:?}",
+            t0.elapsed()
+        );
         assert_eq!(
-            ah.inner().direct.lock().unwrap().as_slice(),
-            &[(64, 5, false)]
+            rec.calls.lock().unwrap().len(),
+            calls,
+            "no actuator down-pulse may run after shutdown"
+        );
+        assert_eq!(
+            rec.releases.lock().unwrap().len(),
+            releases,
+            "no actuator release may run after shutdown"
+        );
+    }
+
+    #[test]
+    fn drop_retires_queued_backlog_before_close() {
+        // Drop retires the session first: pulses already queued behind a
+        // gated in-flight send never execute after Drop. Only the
+        // already-admitted in-flight operation may finish, on its pinned
+        // old endpoint.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.click_feedback(64, 5, false).unwrap(); // picked up, blocks in gate
+        gate.wait_entered(1);
+        ah.click_feedback(70, 6, true).unwrap(); // queued backlog
+        ah.release_feedback(70, true).unwrap(); // queued backlog
+        let t0 = std::time::Instant::now();
+        drop(ah); // retire purges the backlog, then close + bounded join
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(400),
+            "Drop returned before the join budget engaged: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "Drop must not hang on a wedged actuator: {:?}",
+            t0.elapsed()
+        );
+        // Release the gate: the detached worker may still finish the one
+        // in-flight send, but the retired backlog must never run.
+        gate.open();
+        gate.wait_executed(1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let executed = gate.executed();
+        assert_eq!(
+            executed.len(),
+            1,
+            "only the admitted in-flight pulse may finish after Drop: {executed:?}"
+        );
+        assert_eq!(
+            executed[0].3, 64,
+            "wrong pulse survived retire: {executed:?}"
         );
     }
 
@@ -8975,6 +11816,234 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
     }
 
     #[test]
+    fn slide_handoff_alias_action_is_seamless() {
+        // slide_1 = super+left, click_1 = meta+left: identical kernel codes
+        // under different spellings — the hold must continue with no
+        // release/re-press (finding #18: token-string compare broke this).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "meta+left".into(),
+                ..Config::default().click
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "super+left".into(),
+                ..Config::default().slide
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        assert!(!px
+            .handle_frame_at(&cfg, spaced_at(t0, 1))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        // Exactly one down/up pair per wire code: no mid-hold flutter.
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1);
+        assert_eq!(haptic.releases.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn slide_handoff_alias_absorbs_into_matching_press_level() {
+        // Staged composition with alias spellings throughout: slide_1 =
+        // super+left merges seamlessly into click_1 = meta+left on the stab
+        // frame (no wire flutter), then force_1 = meta+left joins the held
+        // codes on the next frame with its own pulse. Left + meta: exactly
+        // one down/up pair each; right never appears.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "meta+left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "meta+left".into(),
+                force_offset: 20,
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "super+left".into(),
+                ..Config::default().slide
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(!first.is_force(), "staged: first edge lands alone");
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert!(
+            lefts.iter().all(|&v| v == 1),
+            "no left up mid-hold: {tail:?}"
+        );
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap().unwrap();
+        assert!(ev.is_force(), "force supersedes in reporting");
+        // Force joins the alias-held codes: still down, never fluttered.
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        // Two downs (first + force; the slide edge stays silent) / two ups.
+        assert_eq!(haptic.calls.lock().unwrap().len(), 2);
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+        assert_eq!(haptic.releases.lock().unwrap().len(), 2);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
+    }
+
+    #[test]
+    fn slide_reselect_alias_keyset_merges() {
+        // slide_1 = control+c, slide_2 = ctrl+c: a count change mid-slide
+        // keeps the wire down (alias-equivalent re-select merges silently).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(
+                vec![finger(1, 20, 0, 0), finger(2, 20, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            slide: crate::config::SlideConfig {
+                slide_1: "control+c".into(),
+                slide_2: "ctrl+c".into(),
+                ..Config::default().slide
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(first.is_slide() && first.finger_count == 1);
+        let second = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(second.is_slide() && second.finger_count == 2);
+        assert_eq!(
+            key_values(&sinks.extras, 29),
+            vec![1],
+            "alias re-select must not flutter"
+        );
+        assert!(haptic.calls.lock().unwrap().is_empty());
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 29), vec![1, 0]);
+        assert!(haptic.releases.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn alias_comparison_agrees_with_wire_codes() {
+        // Pin the listed `canonical_key_token` pairs to the live
+        // `key_token_to_code` map: listed aliases sharing a code must merge,
+        // listed distinct codes must not (checked symmetrically both ways).
+        // This guards only the pairs below; token-map changes must extend
+        // this matrix, since a new alias added to only one map stays green.
+        use crate::config::parse_click_action;
+        let kind = |s: &str| parse_click_action(s).unwrap().kind;
+        for (a, b) in [
+            ("ctrl", "control"),
+            ("ctrl", "lctrl"),
+            ("shift", "lshift"),
+            ("alt", "lalt"),
+            ("meta", "super"),
+            ("meta", "cmd"),
+            ("meta", "command"),
+            ("meta", "win"),
+            ("meta", "lmeta"),
+            ("esc", "escape"),
+            ("enter", "return"),
+            ("pageup", "pgup"),
+            ("pagedown", "pgdn"),
+            ("up", "arrow_up"),
+            ("down", "arrow_down"),
+            ("volup", "volumeup"),
+            ("voldown", "volumedown"),
+            ("play", "playpause"),
+            ("stop", "stopcd"),
+            ("next", "nextsong"),
+            ("prev", "previous"),
+            ("prev", "previoussong"),
+            ("browserback", "browser_back"),
+            ("browserforward", "browser_forward"),
+            ("screenlock", "lock"),
+        ] {
+            assert_eq!(
+                key_token_to_code(a),
+                key_token_to_code(b),
+                "alias pair must share a wire code: '{a}' vs '{b}'"
+            );
+            assert!(
+                kind(a).is_same_action(&kind(b)),
+                "alias pair must merge: '{a}' vs '{b}'"
+            );
+            assert!(
+                kind(b).is_same_action(&kind(a)),
+                "alias pair must merge (symmetric): '{b}' vs '{a}'"
+            );
+        }
+        for (a, b) in [
+            ("ctrl", "rctrl"),
+            ("shift", "rshift"),
+            ("alt", "ralt"),
+            ("meta", "rmeta"),
+            ("left", "left_arrow"),
+            ("pause", "pausecd"),
+            ("play", "playcd"),
+            ("mute", "micmute"),
+        ] {
+            assert_ne!(
+                key_token_to_code(a),
+                key_token_to_code(b),
+                "distinct pair must map apart: '{a}' vs '{b}'"
+            );
+            assert!(
+                !kind(a).is_same_action(&kind(b)),
+                "distinct pair must not merge: '{a}' vs '{b}'"
+            );
+            assert!(
+                !kind(b).is_same_action(&kind(a)),
+                "distinct pair must not merge (symmetric): '{b}' vs '{a}'"
+            );
+        }
+    }
+
+    #[test]
     fn slide_handoff_absorbs_into_matching_press_level() {
         // Staged composition: slide == first merges seamlessly on the stab
         // frame (no pulse, no wire traffic — left never ups); force follows
@@ -10042,5 +13111,341 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(sinks.pointer.has(EV_KEY, BTN_TOOL_DOUBLETAP, 1));
         assert!(!sinks.pointer.has(EV_KEY, BTN_TOOL_FINGER, 1));
+    }
+
+    #[test]
+    fn pump_step_distinguishes_traffic_from_idle() {
+        use super::PumpActivity;
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))), Ok(None)],
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        let (ev, activity) = match px.pump_step_at(&cfg, t0) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert!(ev.is_some());
+        assert_eq!(activity, PumpActivity::Frame);
+        // Steady hold, no pending deadlines: idle poll is a true no-op.
+        let (_, activity) = match px.pump_step_at(&cfg, ms_after(t0, 5)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(activity, PumpActivity::Idle);
+        assert!(px.next_deadline().is_none());
+    }
+
+    #[test]
+    fn pump_step_reports_deadline_work_and_transient() {
+        use super::PumpActivity;
+        // Staggered combo: idle polls before the deadline stay Idle, the
+        // deadline poll lands the button as Deadline work.
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))],
+        );
+        let t0 = std::time::Instant::now();
+        let (_, a0) = match px.pump_step_at(&cfg, t0) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(a0, PumpActivity::Frame);
+        assert!(px.pending_buttons.is_some());
+        let deadline = px.next_deadline().expect("stagger deadline");
+        assert_eq!(deadline, t0 + std::time::Duration::from_millis(50));
+        // Before the deadline the pump would block, not poll: a step here
+        // must not emit the button.
+        px.replace_source(ScriptSource::new(vec![Ok(None)]));
+        let (_, early) = match px.pump_step_at(&cfg, ms_after(t0, 49)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        assert!(matches!(early, PumpActivity::Deadline | PumpActivity::Idle));
+        // At the deadline the button lands with identical wire bytes to the
+        // old 2 ms poll path (no resampling, no timing change).
+        px.replace_source(ScriptSource::new(vec![Ok(None)]));
+        let (_, at_deadline) = match px.pump_step_at(&cfg, ms_after(t0, 50)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(at_deadline, PumpActivity::Deadline);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert!(px.next_deadline().is_none());
+        // Transient read failure drops the frame without aborting.
+        px.replace_source(ScriptSource::new(vec![Err(anyhow::anyhow!("fake EIO"))]));
+        let (_, transient) = match px.pump_step_at(&cfg, ms_after(t0, 60)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(transient, PumpActivity::Transient);
+    }
+
+    #[test]
+    fn next_deadline_covers_release_and_cut_stages() {
+        // Release debounce: press then liftoff holds the latch for 30 ms.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                Ok(Some(frame(vec![], 0))),
+            ],
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 10)).unwrap();
+        assert!(px.machine.active().is_some());
+        let deadline = px.next_deadline().expect("release deadline");
+        assert_eq!(deadline, t0 + std::time::Duration::from_millis(30));
+        // Gate-off / passthrough never arms a deadline.
+        let mut off = ClickProxy::new(
+            settings(false),
+            FakeGrab::ok(),
+            FakeUinput::new(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        off.set_pump_ready(true);
+        off.attach(&usb_ready("/dev/hidraw1"));
+        assert!(off.next_deadline().is_none());
+        assert!(off.poll_fd().is_none());
+        assert!(!off.has_pending_frame());
+    }
+
+    #[test]
+    fn idle_proxy_has_no_fd_no_deadline_no_pending() {
+        // No device (Idle source, passthrough): the event-driven pump
+        // blocks on control only — (near-)zero wakeups.
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            FakeUinput::new(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        assert!(px.poll_fd().is_none());
+        assert!(px.next_deadline().is_none());
+        assert!(!px.has_pending_frame());
+        let cfg = Config::default();
+        let (_, activity) = match px.pump_step_at(&cfg, std::time::Instant::now()) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(activity, super::PumpActivity::Idle);
+    }
+
+    #[test]
+    fn event_loop_fires_stagger_deadline_without_polling() {
+        // End-to-end through the event-driven pump thread (no fd): a 50 ms
+        // stagger pending must land via the poll timeout, not continuous
+        // polling. Generous 500 ms bound; production fires at ~50 ms.
+        use std::sync::atomic::AtomicBool;
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))],
+        );
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        assert!(px.pending_buttons.is_some());
+        // Idle source from here: no more reports, deadline must still fire.
+        px.replace_source(ScriptSource::new(vec![]));
+        let proxy = Arc::new(Mutex::new(px));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (handle, control) = crate::pump::spawn_pump(
+            "deadline-test".to_string(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        let give_up = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while key_values(&sinks.pointer, BTN_LEFT).is_empty() && std::time::Instant::now() < give_up
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        crate::pump::stop_pump(&stop, &control);
+        handle.join().unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "stagger deadline never fired through the event loop"
+        );
+    }
+
+    #[test]
+    fn stagger_deadline_waits_without_spinning() {
+        // Regression for the sub-millisecond truncation spin: a 50 ms stagger
+        // deadline must be reached with a bounded number of source reads, not
+        // hundreds of 0-timeout polls in the final millisecond. Counts every
+        // `poll_frame` while `spawn_pump` waits 90 ms around the deadline.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountIdle(Arc<AtomicUsize>, Option<TouchFrame>);
+        impl TouchSource for CountIdle {
+            fn tier(&self) -> CapabilityTier {
+                CapabilityTier::L2p
+            }
+            fn pressure_units(&self) -> PressureUnits {
+                PressureUnits::Arbitrary
+            }
+            fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(self.1.take())
+            }
+        }
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            sinks.dual(),
+            FakeHaptic::new(),
+            CountIdle(
+                Arc::clone(&count),
+                Some(frame(vec![finger(1, 200, 0, 0)], 0)),
+            ),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw-review"));
+        assert!(px.is_attached());
+        px.handle_frame_at(&cfg, std::time::Instant::now()).unwrap();
+        assert!(px.pending_buttons.is_some());
+        let proxy = Arc::new(Mutex::new(px));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, control) = crate::pump::spawn_pump(
+            "review-repro".into(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        crate::pump::stop_pump(&stop, &control);
+        handle.join().unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        let reads = count.load(Ordering::SeqCst);
+        assert!(
+            reads <= 10,
+            "50 ms deadline spun: {reads} source reads in 90 ms (buggy ceiling-truncated loop did ~680)"
+        );
+    }
+
+    #[test]
+    fn pump_step_disconnect_reports_disconnect_and_self_releases() {
+        // Same dead-fd path as `disconnect_self_releases_once_with_bounded_polls`,
+        // but through the event-loop entry (`pump_step_at`): the step must
+        // report `Disconnect` (not `Idle`), self-release exactly once, and
+        // then settle into `Idle` without touching the dead source again.
+        use super::PumpActivity;
+        use anyhow::Error as AnyhowError;
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let disc = || {
+            Err::<Option<TouchFrame>, AnyhowError>(
+                crate::pump::DisconnectError("test unplug".into()).into(),
+            )
+        };
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            sinks.dual(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))), disc()]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        let (first, a0) = px.pump_step_at(&cfg, t0);
+        assert!(first.unwrap().is_some(), "press edge must report");
+        assert_eq!(a0, PumpActivity::Frame);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        let (ev, activity) = px.pump_step_at(&cfg, ms_after(t0, 60));
+        assert!(ev.unwrap().is_none());
+        assert_eq!(activity, PumpActivity::Disconnect);
+        assert!(!grab.is_grabbed(), "dead fd must release the grab");
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        // Settled passthrough: further steps are Idle and never poll the
+        // dead source again (logs bounded by construction).
+        let remaining = px.source.frames.borrow().len();
+        let (_, a2) = px.pump_step_at(&cfg, ms_after(t0, 120));
+        assert_eq!(a2, PumpActivity::Idle);
+        assert_eq!(px.source.frames.borrow().len(), remaining);
+    }
+
+    #[test]
+    fn next_deadline_covers_pending_force_cut_stages() {
+        // Arm a force-cut staged press: the edge frame at t0+10 leaves
+        // `pending_force` with `mods_at=None`, so the deadline must be
+        // `released_at + 5 ms`; once the modifiers land at the floor, the
+        // deadline must move to `mods_at + stagger` (50 ms here).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![slide_report(5, 60, 0), slide_report(5, 200, 0)],
+        );
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = "super+left".into();
+        cfg.force.force_5 = "super+left".into();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, ms_after(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 10)).unwrap();
+        assert!(px.pending_force.is_some(), "cut edge must stage a press");
+        assert!(px.machine.force_active().is_some(), "force latch must hold");
+        assert!(
+            px.pending_force.as_ref().unwrap().mods_at.is_none(),
+            "modifiers not landed yet"
+        );
+        let d0 = px.next_deadline().expect("cut stage-1 deadline");
+        assert_eq!(
+            d0,
+            ms_after(t0, 15),
+            "stage 1 due at released_at + 5 ms floor"
+        );
+        // Idle to the floor: modifiers land, buttons wait the stagger.
+        px.handle_frame_at(&cfg, ms_after(t0, 15)).unwrap();
+        let pending = px.pending_force.as_ref().expect("stage 2 still pending");
+        let mods_at = pending.mods_at.expect("modifiers landed");
+        assert_eq!(mods_at, ms_after(t0, 15));
+        let d1 = px.next_deadline().expect("cut stage-2 deadline");
+        assert_eq!(
+            d1,
+            mods_at + std::time::Duration::from_millis(50),
+            "stage 2 due at mods_at + stagger"
+        );
+        assert_eq!(d1, ms_after(t0, 65));
     }
 }

@@ -175,13 +175,26 @@ default — values carry over one-to-one.
 ## Usage
 
 ```sh
-sudo ltd run                                   # daemon: setup + click engine
+sudo ltd run                                   # daemon: setup + click engine (reads installed config when present)
 sudo ltd run -c /etc/linux-trackpad-driver/config.toml
-sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init
-sudo ltd reconnect /dev/hidrawN -f -p 90 -d
-ltd doctor                                     # read-only checklist
+sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init (daemon running)
+sudo ltd reconnect /dev/hidrawN -f -p 90      # explicit forcing while the daemon is stopped
+sudo ltd reconnect /dev/hidrawN -d             # explicit manual disengage (host-click off)
+sudo ltd resume -f                             # explicit resume forcing while stopped
+ltd doctor                                     # read-only checklist (validates the on-disk file)
 ltd --version                                  # embedded build identity (alias: -V)
 ```
+
+Every command shares one config selection: `-c <file>` first, then
+nonempty `LTD_CONFIG`, then `/etc/linux-trackpad-driver/config.toml`,
+then built-in defaults. `run`, `reconnect`, and `resume` log the selected
+source at startup as the live settings for that process
+(`config source: <path>; on disk (...)` or
+`<built-in defaults>; <LTD_CONFIG|installed> config missing: <path>`);
+`doctor` prints the same source for the on-disk file it validated. A manual
+`sudo ltd run` therefore uses the installed file, matching what `ltd doctor`
+checked — pass `-c` only to try a different file. `sudo` strips
+`LTD_CONFIG` by default, so manual runs rely on `-c` or the installed path.
 
 `ltd --version` needs no root privileges or configuration and does not access hardware
 or Git at runtime. It works outside the source checkout. For example:
@@ -211,12 +224,15 @@ Kernel pathnames can also outlive an unlink or refer to another mount
 namespace; this diagnostic does not authenticate the process or resolve such
 pathname aliases.
 
-Config selection is `-c <file>` first, then nonempty `LTD_CONFIG`, then
-`/etc/linux-trackpad-driver/config.toml`. If the environment-selected or
-installed file is missing, doctor reports built-in defaults and the missing
-path; a missing explicit file or an invalid/unreadable selected file is an
-error. Files are checked **on disk**, so edits may differ from the running
-daemon's config until restart. `ltd doctor -c <file>` validates a specific file.
+Config selection is shared by every command: `-c <file>` first, then
+nonempty `LTD_CONFIG`, then `/etc/linux-trackpad-driver/config.toml`, then
+built-in defaults. If the environment-selected or installed file is missing,
+the command reports built-in defaults and the missing path; a missing
+explicit file or an invalid/unreadable selected file is an error. `run`,
+`reconnect`, and `resume` log the source as the live settings for that
+process; doctor checks files **on disk**, so edits may differ from the
+running daemon's config until restart. `ltd doctor -c <file>` validates a
+specific file.
 
 Exit 0 means the config is valid and a trackpad node was seen. Socket status
 is informational; check `systemctl is-active linux-trackpad-driver.service`
@@ -228,7 +244,7 @@ for service status.
 | `doctor`: config invalid | line names the key + accepted range | edit `/etc/linux-trackpad-driver/config.toml` (unknown keys are rejected — usually a typo); validate with `ltd doctor -c <file>` first |
 | Edited config, nothing changed | service restarted? | `sudo systemctl restart linux-trackpad-driver.service` (required for now) |
 | Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | the enhanced proxy suppresses duplicates with a reversible evdev grab after its source and virtual pointer are ready; init, reconnect and resume never unbind the HID driver. Check for the `proxy: grabbed` log; BT remains experimental (issue #42) |
-| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup |
+| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually (daemon running) or `sudo ltd resume -f` while stopped | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup |
 
 Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).
 

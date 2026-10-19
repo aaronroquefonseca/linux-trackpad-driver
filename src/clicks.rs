@@ -114,11 +114,6 @@ pub fn touch_present(f: &FingerContact) -> bool {
     f.contact || f.pressure > TOUCH_PRESSURE_FLOOR
 }
 
-/// Scale a pointer delta by `speed` percent (`100` = 1:1). Proxy path only.
-pub fn scale_delta(delta: i32, speed: u32) -> i32 {
-    ((i64::from(delta) * i64::from(speed)) / 100) as i32
-}
-
 /// Negate raw orientation for `ABS_MT_ORIENTATION` (kernel parity).
 pub fn negate_orientation(raw: i8) -> i8 {
     raw.wrapping_neg()
@@ -363,18 +358,11 @@ impl ClickMachine {
     /// `255 + offset` never overflows; thresholds above 255 simply never
     /// fire). Clamps mirror [`press_threshold`] (`1..=255`) and
     /// [`release_threshold`] (`margin` capped at 255). `None` when
-    /// `force_offset == 0` (force disabled entirely).
+    /// `force_offset == 0` (force disabled entirely). Single source is
+    /// [`crate::config::force_threshold_value`], shared with
+    /// [`crate::init::usb_applicability_warnings`].
     pub fn force_threshold(cfg: &Config) -> Option<u16> {
-        if cfg.force.force_offset > 0 {
-            Some(
-                cfg.click
-                    .sensitivity
-                    .clamp(1, 255)
-                    .saturating_add(cfg.force.force_offset.min(255)),
-            )
-        } else {
-            None
-        }
+        crate::config::force_threshold_value(cfg.click.sensitivity, cfg.force.force_offset)
     }
 
     /// Force release point: `sensitivity + force_offset - margin`, saturating
@@ -730,6 +718,43 @@ impl ClickMachine {
         (was_first && self.active.is_none()) || (was_force && self.force_active.is_none())
     }
 
+    /// Earliest idle instant at which [`ClickMachine::advance_releases_at`]
+    /// could end a latch. `None` means idle time cannot release anything:
+    /// either no latch holds, or pressed bits still hold it (needs a new
+    /// report, not a timer). The pump waits until this deadline instead of
+    /// polling continuously; firing at the deadline preserves the 30 ms
+    /// release-hold behavior exactly.
+    pub(crate) fn next_release_deadline(&self) -> Option<Instant> {
+        let mut best: Option<Instant> = None;
+        let mut consider = |d: Instant| {
+            best = Some(best.map_or(d, |b: Instant| b.min(d)));
+        };
+        // First level: latched with no remaining bits. Holds while inside
+        // the 30 ms window anchored at the press edge (unless a force latch
+        // was held at entry, which releases immediately — no deadline).
+        if self.active.is_some() && !self.pressed.values().any(|&p| p) {
+            if self.force_active.is_some() {
+                // Force-held release drops immediately on the next idle
+                // poll: wake now.
+                consider(Instant::now());
+            } else if let Some(p) = self.last_press_at {
+                consider(p + std::time::Duration::from_millis(RELEASE_DEBOUNCE_MS));
+            } else {
+                consider(Instant::now());
+            }
+        }
+        // Force level: latched with no remaining force bits. Holds inside
+        // the same 30 ms window anchored at the last held frame.
+        if self.force_active.is_some() && !self.force_pressed.values().any(|&p| p) {
+            if let Some(h) = self.last_force_hold_at {
+                consider(h + std::time::Duration::from_millis(RELEASE_DEBOUNCE_MS));
+            } else {
+                consider(Instant::now());
+            }
+        }
+        best
+    }
+
     fn release_unpressed(&mut self, now: Option<Instant>, force_latched_at_entry: bool) {
         // Release latches with no remaining bits (force first so a full
         // release clears both; first-level release implies force is gone too
@@ -942,14 +967,6 @@ mod tests {
         assert!(ClickMachine::physical_button(0xC1));
         assert!(!ClickMachine::physical_button(0xC0));
         assert!(!ClickMachine::physical_button(0x00));
-    }
-
-    #[test]
-    fn scale_delta_speed() {
-        assert_eq!(scale_delta(100, 100), 100);
-        assert_eq!(scale_delta(100, 200), 200);
-        assert_eq!(scale_delta(-40, 50), -20);
-        assert_eq!(scale_delta(0, 1000), 0);
     }
 
     #[test]

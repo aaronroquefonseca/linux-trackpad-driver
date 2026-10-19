@@ -6,34 +6,46 @@
 //! - USB `0x02` = 12-byte prefix, BT `0x31` = 4-byte prefix, `0xf7` =
 //!   two back-to-back sub-reports (first length byte at offset 1).
 //! - One pump thread per attached session ([`spawn_pump`]), frame rate
-//!   bounded by the device (no throttle; idle steps sleep briefly to
-//!   avoid a busy spin). NOTE: the daemon stops the thread at shutdown via
-//!   the stop flag and observes the handle with a bounded join
-//!   ([`join_bounded`]), so a worker panic surfaces instead of vanishing.
+//!   bounded by the device (no throttle; idle blocks in `poll(2)` on the
+//!   hidraw fd + a control pipe, waking only on input, attach/detach, or
+//!   a timing deadline — (near-)zero wakeups with no device or idling
+//!   with no touch). NOTE: the daemon never flips the stop flag —
+//!   the thread lives until process exit by design. A dead pump
+//!   surfaces through the session teardown paths (grab released,
+//!   passthrough), never through the handle, which is only joined in
+//!   tests.
 //! - Malformed frames are logged + dropped per frame, never abort.
 //!
 //! Decode itself reuses [`crate::apple_parse::parse_frame`] /
 //! [`crate::apple_parse::parse_double_report`].
 
 use std::collections::VecDeque;
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::apple_parse::{TouchFrame, TouchSource, DOUBLE_REPORT_ID};
+use crate::proxy::PumpActivity;
 
 /// Max hidraw report size (matches old service buffer reuse).
 pub const MAX_REPORT_BYTES: usize = 512;
 
-/// Idle sleep when a poll step yields no frame (avoids busy spin;
-/// live frames are device-paced, so this never throttles input).
-pub const IDLE_SLEEP: Duration = Duration::from_millis(2);
+/// Backoff after a transient (non-disconnect) read failure so a
+/// persistently failing fd cannot busy-spin. Idle (no data) never sleeps:
+/// it blocks in `poll(2)` until input/control/deadline. Only errors wait.
+pub const ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Injectable hidraw read backend (real fd vs scripted mock for CI).
 pub trait HidrawReader: Send {
     fn read_report(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+    /// Readiness fd for the pump's `poll(2)` wait. `None` for scripted
+    /// backends (tests): the event loop then waits on control/deadlines.
+    fn poll_fd(&self) -> Option<RawFd> {
+        None
+    }
 }
 
 /// Persistent device loss (unplug/replug under a live fd): a 0-byte
@@ -83,6 +95,11 @@ impl HidrawReader for FileReader {
             return Err(std::io::Error::last_os_error());
         }
         Ok(ret as usize)
+    }
+
+    fn poll_fd(&self) -> Option<RawFd> {
+        use std::os::unix::io::AsRawFd;
+        Some(self.file.as_raw_fd())
     }
 }
 
@@ -184,6 +201,21 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
         crate::apple_parse::PressureUnits::Arbitrary
     }
 
+    fn poll_fd(&self) -> Option<RawFd> {
+        if self.pending.is_empty() {
+            self.reader.poll_fd()
+        } else {
+            // Queued double-report half drains without touching the fd;
+            // report no fd so the loop drains immediately instead of
+            // blocking, then re-checks readiness.
+            None
+        }
+    }
+
+    fn has_pending_frame(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
         if let Some(f) = self.pending.pop_front() {
             return Ok(Some(f));
@@ -252,6 +284,18 @@ impl TouchSource for PumpSource {
     fn pressure_units(&self) -> crate::apple_parse::PressureUnits {
         crate::apple_parse::PressureUnits::Arbitrary
     }
+    fn poll_fd(&self) -> Option<RawFd> {
+        match self {
+            PumpSource::Idle => None,
+            PumpSource::Live(s) => s.poll_fd(),
+        }
+    }
+    fn has_pending_frame(&self) -> bool {
+        match self {
+            PumpSource::Idle => false,
+            PumpSource::Live(s) => s.has_pending_frame(),
+        }
+    }
     fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
         match self {
             PumpSource::Idle => Ok(None),
@@ -260,12 +304,103 @@ impl TouchSource for PumpSource {
     }
 }
 
-/// One pump step for tests/drives: single `handle_frame` call.
-/// Returns true when a frame was handled (caller decides sleeps).
+/// Explicit wakeup for the event-driven pump: a nonblocking self-pipe.
+/// The manager calls [`PumpControl::notify`] after every attach/detach
+/// (source fd / deadline set changed) and on shutdown; the pump thread
+/// `poll(2)`s the read end alongside the hidraw fd and drains it on wake.
+/// Pipe writes are thread-safe (kernel); drain/poll run on the pump thread.
+/// Atomic `pipe2(O_NONBLOCK | O_CLOEXEC)` sets both flags at creation, so no
+/// post-creation `fcntl` race and no manual close bookkeeping: `OwnedFd`
+/// closes exactly once and is `Send + Sync`, so no explicit unsafe impls.
+pub struct PumpControl {
+    read: std::os::unix::io::OwnedFd,
+    write: std::os::unix::io::OwnedFd,
+}
+
+impl PumpControl {
+    pub fn new() -> std::io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0 as RawFd; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `pipe2` succeeded, so both entries are valid owned fds.
+        let [read_fd, write_fd] = fds;
+        Ok(Self {
+            read: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(read_fd) },
+            write: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(write_fd) },
+        })
+    }
+
+    pub fn read_fd(&self) -> RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.read.as_raw_fd()
+    }
+
+    /// Wake the pump thread (attach/detach/shutdown). Nonblocking: a full
+    /// pipe means the pump is already awake, so `EAGAIN` is success.
+    pub fn notify(&self) {
+        use std::os::unix::io::AsRawFd;
+        let byte = [1u8];
+        loop {
+            let ret =
+                unsafe { libc::write(self.write.as_raw_fd(), byte.as_ptr().cast(), byte.len()) };
+            if ret == 1 {
+                break;
+            }
+            if ret < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            break;
+        }
+    }
+
+    /// Drain all pending wakeups (pump thread only).
+    pub fn drain(&self) {
+        use std::os::unix::io::AsRawFd;
+        let mut buf = [0u8; 64];
+        loop {
+            let ret =
+                unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if ret <= 0 {
+                if ret < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// One pump step: single `pump_step_at` call with `Instant::now`.
+/// Returns traffic vs idle so callers (and tests) can distinguish a handled
+/// hidraw frame or deadline from a no-op poll.
 pub fn pump_once<G, U, H, S>(
     proxy: &Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
     cfg: &crate::config::Config,
-) -> bool
+) -> PumpActivity
+where
+    G: crate::proxy::GrabDevice,
+    U: crate::proxy::UinputSink,
+    H: crate::proxy::HapticSender,
+    S: TouchSource,
+{
+    pump_once_at(proxy, cfg, Instant::now())
+}
+
+/// [`pump_once`] with an explicit clock (deterministic deadline tests).
+pub fn pump_once_at<G, U, H, S>(
+    proxy: &Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
+    cfg: &crate::config::Config,
+    now: Instant,
+) -> PumpActivity
 where
     G: crate::proxy::GrabDevice,
     U: crate::proxy::UinputSink,
@@ -273,40 +408,275 @@ where
     S: TouchSource,
 {
     let mut px = proxy.lock().unwrap_or_else(|e| e.into_inner());
-    match px.handle_frame(cfg) {
-        Ok(_) => true,
-        Err(e) => {
-            log::warn!("pump: handle_frame error (dropped): {e:#}");
-            true
+    let (result, activity) = px.pump_step_at(cfg, now);
+    // Output-failure logging has one owner: the proxy logs and retires the
+    // session in `output_failed`; the pump only propagates the activity.
+    let _ = result;
+    activity
+}
+
+/// Run one step and back off once on a transient read failure, so a
+/// persistently failing fd cannot busy-spin. Returns the step activity:
+/// `Frame` still drains immediately (no sleep), `Transient` sleeps once.
+fn pump_once_with_backoff<G, U, H, S>(
+    proxy: &Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
+    cfg: &crate::config::Config,
+) -> PumpActivity
+where
+    G: crate::proxy::GrabDevice,
+    U: crate::proxy::UinputSink,
+    H: crate::proxy::HapticSender,
+    S: TouchSource,
+{
+    let activity = pump_once(proxy, cfg);
+    if activity == PumpActivity::Transient {
+        std::thread::sleep(ERROR_BACKOFF);
+    }
+    activity
+}
+
+/// Set `stop` and wake the pump thread so a `poll(2)`-blocked loop exits
+/// promptly. The loop also checks `stop` after every wakeup.
+pub fn stop_pump(stop: &Arc<AtomicBool>, control: &Arc<PumpControl>) {
+    stop.store(true, Ordering::SeqCst);
+    control.notify();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollWake {
+    Control,
+    Hidraw,
+    Both,
+    Timeout,
+    /// `poll(2)` itself failed with a persistent non-EINTR error (EINVAL,
+    /// ENOMEM, ...). Distinct from `Timeout` so the caller can bound retries
+    /// even when idle: a `Timeout` with no fd/deadline does no work and must
+    /// not sleep, while a `WaitError` must back off unconditionally or the
+    /// loop would spin on the immediately-failing wait.
+    WaitError,
+}
+
+type RawPollFn = unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, i32) -> i32;
+
+fn poll_wait_with(
+    hidraw_fd: Option<RawFd>,
+    control_fd: RawFd,
+    timeout_ms: i32,
+    poll_fn: RawPollFn,
+) -> PollWake {
+    use std::mem::zeroed;
+    let mut fds = unsafe { [zeroed::<libc::pollfd>(), zeroed::<libc::pollfd>()] };
+    let mut nfds = 0usize;
+    if let Some(fd) = hidraw_fd {
+        fds[nfds].fd = fd;
+        fds[nfds].events = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
+        nfds += 1;
+    }
+    let control_idx = nfds;
+    fds[control_idx].fd = control_fd;
+    fds[control_idx].events = libc::POLLIN | libc::POLLERR | libc::POLLHUP;
+    nfds += 1;
+    let ret = unsafe { poll_fn(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            // Signal interrupted the wait: re-evaluate stop/fd/deadline
+            // promptly instead of restarting the full timeout.
+            return PollWake::Timeout;
+        }
+        // Persistent wait failure: report distinctly so the caller backs off
+        // even when idle/control-only. EINTR stays a responsive Timeout.
+        log::warn!("pump: poll(2) failed, backing off: {e:#}");
+        return PollWake::WaitError;
+    }
+    if ret == 0 {
+        return PollWake::Timeout;
+    }
+    let hidraw_ready = hidraw_fd.is_some_and(|_| fds[0].revents != 0);
+    let control_ready = fds[control_idx].revents != 0;
+    match (hidraw_ready, control_ready) {
+        (true, true) => PollWake::Both,
+        (true, false) => PollWake::Hidraw,
+        (false, true) => PollWake::Control,
+        (false, false) => PollWake::Timeout,
+    }
+}
+
+fn deadline_timeout_ms(deadline: Option<Instant>) -> i32 {
+    match deadline {
+        None => -1,
+        Some(d) => {
+            let now = Instant::now();
+            if d <= now {
+                0
+            } else {
+                let remaining = d - now;
+                // Ceiling to whole milliseconds: `as_millis` truncates, so a
+                // positive sub-millisecond remainder would become a 0 timeout
+                // and busy-spin until the deadline. Overdue stays 0, absent
+                // stays -1; future deadlines wait at least 1 ms and never fire
+                // early, preserving the 5/30 ms floors and release ordering.
+                let floor_ms = remaining.as_millis();
+                let ceil_ms = if remaining.subsec_nanos().is_multiple_of(1_000_000) {
+                    floor_ms
+                } else {
+                    floor_ms.saturating_add(1)
+                };
+                ceil_ms.min(i64::from(i32::MAX) as u128) as i32
+            }
         }
     }
 }
 
+/// Bounded sleep for a failed `poll(2)` wait. Independent of source activity
+/// (idle/control-only failures must not hot-loop) but deadline-aware so an
+/// imminent deadline is not overshot by a full [`ERROR_BACKOFF`].
+fn wait_error_backoff(deadline: Option<Instant>) -> Duration {
+    match deadline {
+        Some(d) => {
+            let now = Instant::now();
+            if d <= now {
+                ERROR_BACKOFF
+            } else {
+                (d - now).min(ERROR_BACKOFF)
+            }
+        }
+        None => ERROR_BACKOFF,
+    }
+}
+
 /// Spawn a per-node pump thread draining `proxy` until `stop` flips.
-/// Frame rate is device-bounded; idle polls sleep [`IDLE_SLEEP`].
-/// The owner stops the thread at shutdown ([`join_bounded`]): the loop
-/// checks `stop` every step, so the join lands within milliseconds unless
-/// a frame handler is wedged on hardware I/O.
+/// Returns the join handle plus the control pipe: the manager must call
+/// [`PumpControl::notify`] after every attach/detach (fd/deadline change)
+/// and [`stop_pump`] on shutdown, or the thread can block in `poll(2)`
+/// past the change.
+///
+/// Idle behavior: with no device (or gate-off/passthrough) both the hidraw
+/// fd and the deadline are `None`, so the thread blocks indefinitely on
+/// the control pipe — (near-)zero wakeups. Live idle (device attached, no
+/// touch, no pending deadlines) blocks on the hidraw fd. Timing deadlines
+/// (30 ms release hold, stagger gaps, cut stages) wake via the poll
+/// timeout with no continuous polling. Frame rate stays device-bounded:
+/// handled frames loop immediately with no sleep, so high-rate bursts
+/// drain without the old unconditional 2 ms delay per poll.
 pub fn spawn_pump<G, U, H, S>(
     name: String,
     proxy: Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
     cfg: crate::config::Config,
     stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()>
+) -> (std::thread::JoinHandle<()>, Arc<PumpControl>)
 where
     G: crate::proxy::GrabDevice + Send + 'static,
     U: crate::proxy::UinputSink + Send + 'static,
     H: crate::proxy::HapticSender + Send + 'static,
     S: TouchSource + Send + 'static,
 {
-    std::thread::spawn(move || {
+    spawn_pump_with_poll(name, proxy, cfg, stop, libc::poll)
+}
+
+/// Test-injectable pump loop: `poll_fn` replaces `libc::poll` so persistent
+/// wait failures can be simulated without touching process/host rlimits.
+/// Production always uses [`libc::poll`] via [`spawn_pump`].
+pub(crate) fn spawn_pump_with_poll<G, U, H, S>(
+    name: String,
+    proxy: Arc<Mutex<crate::proxy::ClickProxy<G, U, H, S>>>,
+    cfg: crate::config::Config,
+    stop: Arc<AtomicBool>,
+    poll_fn: RawPollFn,
+) -> (std::thread::JoinHandle<()>, Arc<PumpControl>)
+where
+    G: crate::proxy::GrabDevice + Send + 'static,
+    U: crate::proxy::UinputSink + Send + 'static,
+    H: crate::proxy::HapticSender + Send + 'static,
+    S: TouchSource + Send + 'static,
+{
+    let control = Arc::new(PumpControl::new().expect("pump control pipe"));
+    let thread_control = Arc::clone(&control);
+    let handle = std::thread::spawn(move || {
         log::info!("pump {name}: thread started");
         while !stop.load(Ordering::SeqCst) {
-            pump_once(&proxy, &cfg);
-            std::thread::sleep(IDLE_SLEEP);
+            // Snapshot fd + queued frame + deadline without holding the
+            // proxy lock across the blocking wait.
+            let (hidraw_fd, has_pending, deadline) = {
+                let px = proxy.lock().unwrap_or_else(|e| e.into_inner());
+                (px.poll_fd(), px.has_pending_frame(), px.next_deadline())
+            };
+            if has_pending {
+                // Queued double-report half: drain without blocking. The
+                // helper sleeps once on transient reads; frames drain
+                // immediately with no throttle.
+                pump_once_with_backoff(&proxy, &cfg);
+                continue;
+            }
+            if hidraw_fd.is_none() {
+                // No readiness fd (idle source, passthrough/gate-off, or a
+                // scripted test backend): try one nonblocking step so
+                // queued in-memory frames still drain, then block until
+                // control/deadline. Only traffic (`Frame`) loops
+                // immediately; deadline work re-arms via `poll(2)` so a
+                // not-yet-due stagger never busy-spins. Steady idle does
+                // one trial per wakeup, not a continuous poll. The helper
+                // already slept on `Transient`, so that arm just continues.
+                match pump_once_with_backoff(&proxy, &cfg) {
+                    PumpActivity::Frame | PumpActivity::Transient => continue,
+                    PumpActivity::Idle | PumpActivity::Deadline | PumpActivity::Disconnect => {}
+                }
+            }
+            match poll_wait_with(
+                hidraw_fd,
+                thread_control.read_fd(),
+                deadline_timeout_ms(deadline),
+                poll_fn,
+            ) {
+                PollWake::Control => {
+                    thread_control.drain();
+                }
+                PollWake::Both => {
+                    // Drain control first so a concurrent attach/detach
+                    // snapshot refreshes next loop; then drain input.
+                    thread_control.drain();
+                    pump_once_with_backoff(&proxy, &cfg);
+                }
+                PollWake::Hidraw => {
+                    pump_once_with_backoff(&proxy, &cfg);
+                }
+                PollWake::Timeout => {
+                    // Deadline expired: advance deadlines. With no fd and no
+                    // deadline this is unreachable (infinite wait); a
+                    // spurious/EINTR wake re-evaluates.
+                    if deadline.is_some() || hidraw_fd.is_some() {
+                        pump_once_with_backoff(&proxy, &cfg);
+                    }
+                }
+                PollWake::WaitError => {
+                    // Persistent wait failure (EINVAL/ENOMEM/...): bound the
+                    // retry even when idle/control-only. Drain any control
+                    // notify that arrived before the failure, make best-effort
+                    // deadline progress, then sleep deadline-aware so an
+                    // imminent deadline is not overshot by a full backoff.
+                    thread_control.drain();
+                    if stop.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let overdue = deadline.is_some_and(|d| d <= Instant::now());
+                    if overdue || hidraw_fd.is_some() {
+                        let _ = pump_once(&proxy, &cfg);
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let backoff = wait_error_backoff(deadline);
+                    if backoff.is_zero() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    } else {
+                        std::thread::sleep(backoff);
+                    }
+                }
+            }
         }
         log::info!("pump {name}: thread stopped");
-    })
+    });
+    (handle, control)
 }
 
 /// Outcome of a bounded thread join ([`join_bounded`]).
@@ -324,7 +694,7 @@ pub enum WorkerJoin<T> {
 
 /// Join `handle`, waiting at most `timeout`. A finished thread is joined
 /// (surfacing panics as [`WorkerJoin::Panicked`]); an unfinished one is
-/// detached after the bound expires. Polls [`IDLE_SLEEP`] so shutdown
+/// detached after the bound expires. Polls every 2 ms so shutdown
 /// latency stays near the bound without busy-spinning.
 pub fn join_bounded<T>(handle: std::thread::JoinHandle<T>, timeout: Duration) -> WorkerJoin<T> {
     let deadline = std::time::Instant::now() + timeout;
@@ -342,7 +712,7 @@ pub fn join_bounded<T>(handle: std::thread::JoinHandle<T>, timeout: Duration) ->
             drop(pending.take());
             return WorkerJoin::TimedOut;
         }
-        std::thread::sleep(IDLE_SLEEP);
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -473,6 +843,573 @@ mod tests {
         let mut src = PumpSource::Idle;
         assert_eq!(src.tier(), crate::apple_parse::CapabilityTier::L2p);
         assert!(src.poll_frame().unwrap().is_none());
+        assert!(src.poll_fd().is_none());
+        assert!(!src.has_pending_frame());
+    }
+
+    #[test]
+    fn double_report_second_half_has_pending_no_fd() {
+        // After the first half, the second half is queued: the pump must
+        // drain it immediately (has_pending) rather than blocking on the fd.
+        let sub1 = {
+            let mut r = vec![0x31, 0x01, 0, 0];
+            r.extend_from_slice(&contact(1, 11));
+            r
+        };
+        let sub2 = {
+            let mut r = vec![0x31, 0x00, 0, 0];
+            r.extend_from_slice(&contact(2, 22));
+            r
+        };
+        let mut dbl = vec![0xF7, sub1.len() as u8];
+        dbl.extend_from_slice(&sub1);
+        dbl.extend_from_slice(&sub2);
+        let mut src = HidrawSource::new("/dev/hidraw9", ScriptReader::bytes(vec![dbl]));
+        assert!(!src.has_pending_frame());
+        let _ = src.poll_frame().unwrap().unwrap();
+        assert!(src.has_pending_frame());
+        assert!(src.poll_fd().is_none());
+    }
+
+    #[test]
+    fn control_notify_wakes_blocked_poll() {
+        // A control-only poll (no hidraw fd, no deadline) blocks until
+        // notified: the event-driven idle path for no-device operation.
+        let control = PumpControl::new().unwrap();
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                control.notify();
+            });
+            let wake = poll_wait_with(None, control.read_fd(), -1, libc::poll);
+            assert_eq!(wake, PollWake::Control);
+        });
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        control.drain();
+        // After drain, a 0-timeout poll with nothing ready times out.
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, libc::poll),
+            PollWake::Timeout
+        );
+    }
+
+    #[test]
+    fn control_pipe_is_nonblocking_cloexec_and_coalesces() {
+        use std::os::unix::io::AsRawFd;
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PumpControl>();
+        let control = PumpControl::new().unwrap();
+        for fd in [control.read.as_raw_fd(), control.write.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0);
+        }
+        // Full-pipe coalescing: repeated notifies must never block, even when
+        // the pipe fills; drain then restores Timeout.
+        let start = Instant::now();
+        for _ in 0..100_000 {
+            control.notify();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "notify must not block on a full pipe"
+        );
+        control.drain();
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, libc::poll),
+            PollWake::Timeout
+        );
+        // A fresh notify still wakes after the drain (lifetime intact).
+        control.notify();
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, libc::poll),
+            PollWake::Control
+        );
+        control.drain();
+    }
+
+    #[test]
+    fn deadline_timeout_is_capped_and_immediate_when_overdue() {
+        assert_eq!(deadline_timeout_ms(None), -1);
+        let past = Instant::now() - Duration::from_millis(5);
+        assert_eq!(deadline_timeout_ms(Some(past)), 0);
+        let future = Instant::now() + Duration::from_millis(30);
+        let ms = deadline_timeout_ms(Some(future));
+        assert!((1..=30).contains(&ms), "deadline ms: {ms}");
+    }
+
+    #[test]
+    fn deadline_timeout_ceils_submillisecond_without_early_fire() {
+        // Root cause of the pre-deadline spin: `as_millis` truncates a
+        // positive sub-ms remainder to a 0 timeout, so `poll` returns
+        // immediately until the clock reaches the deadline. Ceiling keeps a
+        // strictly-future deadline at >=1 ms and never fires early.
+        let deadline = Instant::now() + Duration::from_micros(800);
+        let timeout = deadline_timeout_ms(Some(deadline));
+        if deadline > Instant::now() {
+            assert_eq!(
+                timeout, 1,
+                "sub-ms future must ceil to 1 ms, not truncate to 0"
+            );
+        } else {
+            // Slept past an 800 us deadline between the two `now()`s
+            // (pathological deschedule); overdue correctly reports 0.
+            assert_eq!(timeout, 0);
+        }
+        // Exact-ms deadlines stay exact; overdue stays 0; absent stays -1.
+        let exact = Instant::now() + Duration::from_millis(50);
+        let exact_ms = deadline_timeout_ms(Some(exact));
+        assert!(
+            (49..=50).contains(&exact_ms),
+            "50 ms deadline must not fire early or spin: {exact_ms}"
+        );
+        assert_eq!(deadline_timeout_ms(Some(Instant::now())), 0);
+        assert_eq!(deadline_timeout_ms(None), -1);
+    }
+
+    #[test]
+    fn poll_wait_maps_errors_distinctly_with_mocked_poll() {
+        // Safe mocked poll: no rlimit/host changes. EINTR stays a responsive
+        // Timeout; persistent failures become WaitError (never Timeout, or
+        // the idle loop would hot-spin).
+        unsafe extern "C" fn mock_eintr(
+            _fds: *mut libc::pollfd,
+            _nfds: libc::nfds_t,
+            _timeout: i32,
+        ) -> i32 {
+            *libc::__errno_location() = libc::EINTR;
+            -1
+        }
+        unsafe extern "C" fn mock_einval(
+            _fds: *mut libc::pollfd,
+            _nfds: libc::nfds_t,
+            _timeout: i32,
+        ) -> i32 {
+            *libc::__errno_location() = libc::EINVAL;
+            -1
+        }
+        unsafe extern "C" fn mock_enomem(
+            _fds: *mut libc::pollfd,
+            _nfds: libc::nfds_t,
+            _timeout: i32,
+        ) -> i32 {
+            *libc::__errno_location() = libc::ENOMEM;
+            -1
+        }
+        let control = PumpControl::new().unwrap();
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), -1, mock_eintr),
+            PollWake::Timeout
+        );
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), -1, mock_einval),
+            PollWake::WaitError
+        );
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), -1, mock_enomem),
+            PollWake::WaitError
+        );
+        // Control-only failure is also distinct (idle must back off, not spin).
+        assert_eq!(
+            poll_wait_with(None, control.read_fd(), 0, mock_einval),
+            PollWake::WaitError
+        );
+    }
+
+    #[test]
+    fn wait_error_backoff_is_bounded_and_deadline_aware() {
+        assert_eq!(wait_error_backoff(None), ERROR_BACKOFF);
+        assert_eq!(
+            wait_error_backoff(Some(Instant::now() - Duration::from_millis(1))),
+            ERROR_BACKOFF
+        );
+        // Far deadline caps at the 10 ms backoff, never overshoots.
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(wait_error_backoff(Some(far)), ERROR_BACKOFF);
+        // Imminent deadline sleeps only until the deadline.
+        let near = Instant::now() + Duration::from_millis(3);
+        let backoff = wait_error_backoff(Some(near));
+        assert!(
+            backoff <= Duration::from_millis(3) && !backoff.is_zero(),
+            "imminent deadline must bound sleep, got {backoff:?}"
+        );
+    }
+
+    static FAILING_POLL_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn mock_poll_always_fail(
+        _fds: *mut libc::pollfd,
+        _nfds: libc::nfds_t,
+        _timeout: i32,
+    ) -> i32 {
+        FAILING_POLL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *libc::__errno_location() = libc::EINVAL;
+        -1
+    }
+
+    #[test]
+    fn failing_poll_backs_off_when_idle_and_stops_promptly() {
+        // Idle/control-only session (no fd, no deadline) with a persistently
+        // failing wait: must back off at ~10 ms intervals, not hot-spin, and
+        // `stop_pump` during the backoff must exit promptly. Uses injected
+        // mock poll, never touching process/host rlimits.
+        use crate::proxy::{ClickProxy, ProxySettings};
+        FAILING_POLL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = Arc::new(Mutex::new(ClickProxy::new(
+            ProxySettings { enhanced: true },
+            PumpTestGrab,
+            PumpTestSink,
+            PumpTestHaptic,
+            CountingSource {
+                polls: Arc::new(AtomicBool::new(false)),
+                count: Arc::clone(&count),
+            },
+        )));
+        {
+            let mut px = proxy.lock().unwrap();
+            px.set_pump_ready(true);
+            px.attach(&crate::init::usb_ready("/dev/hidraw1"));
+            assert!(px.is_attached());
+            assert!(px.poll_fd().is_none());
+            assert!(px.next_deadline().is_none());
+        }
+        let cfg = crate::config::Config {
+            enhanced_clicks: true,
+            ..crate::config::Config::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let (handle, control) = spawn_pump_with_poll(
+            "failing-idle-test".to_string(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+            mock_poll_always_fail,
+        );
+        // Control notify during backoff must not deadlock or get lost.
+        control.notify();
+        std::thread::sleep(Duration::from_millis(120));
+        let calls = FAILING_POLL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        // 120 ms at 10 ms backoff ≈ 12 waits; spinning would be thousands.
+        assert!(
+            calls <= 30,
+            "persistently failing idle wait spun: {calls} polls in 120 ms"
+        );
+        assert!(
+            calls >= 2,
+            "failing wait should still retry with backoff, got {calls}"
+        );
+        stop_pump(&stop, &control);
+        handle.join().unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop during backoff took too long: {elapsed:?}"
+        );
+    }
+
+    // Minimal proxy doubles for pump-thread tests (no hardware).
+    struct PumpTestGrab;
+    struct PumpTestSink;
+    struct PumpTestHaptic;
+    struct CountingSource {
+        polls: Arc<AtomicBool>,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::proxy::GrabDevice for PumpTestGrab {
+        fn grab(&self) -> Result<()> {
+            Ok(())
+        }
+        fn ungrab(&self) {}
+        fn is_grabbed(&self) -> bool {
+            false
+        }
+    }
+
+    impl crate::proxy::UinputSink for PumpTestSink {
+        fn emit(&self, _: u16, _: u16, _: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::HapticSender for PumpTestHaptic {
+        fn click_feedback(&self, _: u8, _: u8, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn release_feedback(&self, _: u8, _: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Nonblocking pipe: read end as a `File`, write end as a raw fd.
+    fn pipe_nonblocking() -> (std::fs::File, RawFd) {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let file = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        set_nonblocking(&file).unwrap();
+        (file, fds[1])
+    }
+
+    fn write_all(fd: RawFd, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let ret = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            assert!(ret > 0, "pipe write failed");
+            bytes = &bytes[ret as usize..];
+        }
+    }
+
+    fn drain_fd(fd: RawFd) {
+        let mut buf = [0u8; 64];
+        loop {
+            let ret = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if ret <= 0 {
+                break;
+            }
+        }
+    }
+
+    struct CountingSink {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::proxy::UinputSink for CountingSink {
+        fn emit(&self, _: u16, _: u16, _: i32) -> Result<()> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn poll_wait_classifies_hidraw_control_and_both() {
+        // Deterministic wake classification (no thread): data-only reads as
+        // Hidraw, notify-only as Control, both-at-once as Both.
+        let (rfile, wfd) = pipe_nonblocking();
+        use std::os::unix::io::AsRawFd;
+        let rfd = rfile.as_raw_fd();
+        let control = PumpControl::new().unwrap();
+        assert_eq!(
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
+            PollWake::Timeout,
+            "idle fds must time out"
+        );
+        write_all(wfd, &[0xAA]);
+        assert_eq!(
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
+            PollWake::Hidraw
+        );
+        control.notify();
+        assert_eq!(
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
+            PollWake::Both
+        );
+        drain_fd(rfd);
+        control.drain();
+        control.notify();
+        assert_eq!(
+            poll_wait_with(Some(rfd), control.read_fd(), 0, libc::poll),
+            PollWake::Control
+        );
+        control.drain();
+        unsafe { libc::close(wfd) };
+    }
+
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) {
+        let give_up = Instant::now() + timeout;
+        while !cond() {
+            assert!(
+                Instant::now() < give_up,
+                "condition never became true within {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn spawn_pump_with_live_fd_drains_hidraw_wake_without_notify() {
+        // End-to-end through `spawn_pump` with a real readiness fd: a report
+        // written to the hidraw pipe must be consumed via the Hidraw wake
+        // with no control notify and no armed deadline. A second report
+        // paired with a notify must drain too (Both wake).
+        use crate::proxy::{ClickProxy, ProxySettings};
+        let (rfile, wfd) = pipe_nonblocking();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = Arc::new(Mutex::new(ClickProxy::new(
+            ProxySettings { enhanced: true },
+            PumpTestGrab,
+            CountingSink {
+                count: Arc::clone(&count),
+            },
+            PumpTestHaptic,
+            HidrawSource::new("/dev/hidraw-test", FileReader { file: rfile }),
+        )));
+        {
+            let mut px = proxy.lock().unwrap();
+            px.set_pump_ready(true);
+            px.attach(&crate::init::usb_ready("/dev/hidraw-test"));
+            assert!(px.is_attached());
+            assert!(px.poll_fd().is_some(), "live fd must be polled");
+            assert!(px.next_deadline().is_none());
+        }
+        let cfg = crate::config::Config {
+            enhanced_clicks: true,
+            ..crate::config::Config::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (handle, control) = spawn_pump(
+            "live-fd-test".to_string(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        // Phase 1 (Hidraw): data only, no notify — must still drain.
+        write_all(wfd, &usb_report(0, &[&contact(1, 200)]));
+        wait_until(Duration::from_secs(3), || {
+            count.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+        let phase1 = count.load(std::sync::atomic::Ordering::SeqCst);
+        // Phase 2 (Both): data plus a control notify drains as well.
+        write_all(wfd, &usb_report(0, &[&contact(2, 200)]));
+        control.notify();
+        wait_until(Duration::from_secs(3), || {
+            count.load(std::sync::atomic::Ordering::SeqCst) > phase1
+        });
+        stop_pump(&stop, &control);
+        handle.join().unwrap();
+        unsafe { libc::close(wfd) };
+    }
+
+    impl TouchSource for CountingSource {
+        fn tier(&self) -> crate::apple_parse::CapabilityTier {
+            crate::apple_parse::CapabilityTier::L2p
+        }
+        fn pressure_units(&self) -> crate::apple_parse::PressureUnits {
+            crate::apple_parse::PressureUnits::Arbitrary
+        }
+        fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.polls.load(Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn idle_pump_thread_produces_near_zero_wakeups() {
+        // Attached enhanced proxy with a silent-but-live source: every pump
+        // step reaches source.poll_frame (no early short-circuit), so the
+        // count genuinely measures pump wakeups. The pump must block on
+        // control/deadline, not poll every 2 ms (~500 wakeups/s). Budget:
+        // at most the single startup trial over 200 ms (old code: ~100).
+        use crate::proxy::{ClickProxy, ProxySettings};
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = Arc::new(Mutex::new(ClickProxy::new(
+            ProxySettings { enhanced: true },
+            PumpTestGrab,
+            PumpTestSink,
+            PumpTestHaptic,
+            CountingSource {
+                polls: Arc::new(AtomicBool::new(false)),
+                count: Arc::clone(&count),
+            },
+        )));
+        {
+            let mut px = proxy.lock().unwrap();
+            px.set_pump_ready(true);
+            px.attach(&crate::init::usb_ready("/dev/hidraw1"));
+            assert!(px.is_attached());
+            assert!(px.poll_fd().is_none());
+            assert!(px.next_deadline().is_none());
+        }
+        let cfg = crate::config::Config {
+            enhanced_clicks: true,
+            ..crate::config::Config::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (handle, control) = spawn_pump(
+            "idle-test".to_string(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        stop_pump(&stop, &control);
+        handle.join().unwrap();
+        let polls = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            polls <= 2,
+            "idle pump polled {polls}x in 200 ms (old 2 ms poll: ~100x)"
+        );
+    }
+
+    #[test]
+    fn pump_once_reports_frame_for_queued_script_bytes() {
+        // High-rate path: queued reports each report Frame (traffic), never
+        // Idle, with no per-frame sleep in the pump step itself.
+        use crate::proxy::{ClickProxy, ProxySettings};
+        let frames: Vec<TouchFrame> = (0..50)
+            .map(|x| TouchFrame {
+                fingers: vec![],
+                clicks: (x % 2) as u8,
+                timestamp_ms: 0,
+            })
+            .collect();
+        struct QueueSource {
+            queue: VecDeque<TouchFrame>,
+        }
+        impl TouchSource for QueueSource {
+            fn tier(&self) -> crate::apple_parse::CapabilityTier {
+                crate::apple_parse::CapabilityTier::L2p
+            }
+            fn pressure_units(&self) -> crate::apple_parse::PressureUnits {
+                crate::apple_parse::PressureUnits::Arbitrary
+            }
+            fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+                Ok(self.queue.pop_front())
+            }
+        }
+        struct ReadySink;
+        impl crate::proxy::UinputSink for ReadySink {
+            fn emit(&self, _: u16, _: u16, _: i32) -> Result<()> {
+                Ok(())
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        let proxy = Arc::new(Mutex::new(ClickProxy::new(
+            ProxySettings { enhanced: true },
+            PumpTestGrab,
+            ReadySink,
+            PumpTestHaptic,
+            QueueSource {
+                queue: frames.into_iter().collect(),
+            },
+        )));
+        {
+            let mut px = proxy.lock().unwrap();
+            px.set_pump_ready(true);
+            px.attach(&crate::init::usb_ready("/dev/hidraw1"));
+            assert!(px.is_attached());
+        }
+        let cfg = crate::config::Config::default();
+        let start = Instant::now();
+        for _ in 0..50 {
+            assert_eq!(pump_once(&proxy, &cfg), PumpActivity::Frame);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "50 frames took {elapsed:?} (old 2 ms sleep: ~100 ms)"
+        );
+        assert_eq!(pump_once(&proxy, &cfg), PumpActivity::Idle);
     }
 
     #[test]
