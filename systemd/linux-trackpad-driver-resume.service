@@ -31,5 +31,29 @@ Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
 ExecStart=/usr/bin/ltd resume
 Nice=10
 
+# Finding #19 containment, one-shot subset (same rationale as the reconnect
+# template: filesystem + privilege restrictions, AF_UNIX only — resume probes
+# the daemon socket and re-sends hidraw feature reports, never monitors
+# netlink or grabs evdev / creates uinput itself).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# ProtectClock deferred (see main unit + SECURITY.md): pre-v252 RTC-only
+# device allowlist denies hidraw/evdev/uinput.
+ProtectHostname=yes
+ProtectKernelLogs=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+# Deliberately OMITTED (see main unit + SECURITY.md): User=, device rules,
+# CapabilityBoundingSet, SystemCallFilter, ProtectProc, PrivateUsers.
+# Deferred for compat: ProtectClock (pre-v252 RTC allowlist denies devices).
+
 [Install]
 WantedBy=multi-user.target

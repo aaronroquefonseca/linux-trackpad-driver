@@ -24,11 +24,14 @@
 set -eu
 
 LTD_BIN="${LTD_BIN:-/usr/bin/ltd}"
-# Sleep hooks inherit PID1's environment, not the daemon's: without this,
-# `ltd resume` would re-init at defaults (110 Hz) while the daemon and its
-# tick verify against the system config — a perpetual mismatch re-init loop
-# — and BT re-suppression would never fire on the primary path. A missing
-# file falls back to defaults (same as the units below).
+# Sleep hooks inherit PID1's environment, not any unit's Environment=: a
+# custom LTD_CONFIG set only on the main unit does not reach this hook.
+# This default keeps the hook explicit and matching the units; without it
+# `ltd resume` would still read the installed file via the shared fallback
+# (not built-in defaults when the installed file exists). A missing file
+# falls back to defaults (same as the units). To use a custom path, set the
+# same LTD_CONFIG on every unit/hook that launches ltd; there is no
+# automatic cross-process propagation.
 LTD_CONFIG="${LTD_CONFIG:-/etc/linux-trackpad-driver/config.toml}"
 export LTD_CONFIG
 

@@ -118,8 +118,10 @@ incl. nested, unknown version errors.
 - `ltd doctor [-c config]` — ordinary-user, read-only checklist: device metadata,
   on-disk config validation, and listening stream socket metadata from
   `/proc/net/unix` in the caller's network namespace (no socket connection).
-  Doctor alone falls back to the installed `/etc/linux-trackpad-driver/config.toml`
-  when neither `-c` nor nonempty `$LTD_CONFIG` selects a file.
+  All commands share one selection (`-c`, nonempty `$LTD_CONFIG`, installed
+  `/etc/linux-trackpad-driver/config.toml`, built-in defaults) and report
+  the selected source; startup entries log it as the live settings, doctor
+  prints the on-disk file it validated.
 - Single-instance lock via `/run/linux-trackpad-driver/driver.sock`
   (`$LTD_SOCKET` overrides for tests/unprivileged runs).
 

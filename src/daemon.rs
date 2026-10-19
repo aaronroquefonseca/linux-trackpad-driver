@@ -703,21 +703,14 @@ pub fn resolve_resume_mode(daemon_live: bool, force: bool) -> ResumeMode {
     ResumeMode::Proceed
 }
 
-/// Validate a polling request for the USB arm: range, device floor
-/// (`MIN_EXPRESSIBLE_HZ`), cap warning. Kept out of the disengage/BT arms
-/// on purpose — both discard the rate, so rejecting there would break
-/// valid hotplug events. Pure so the USB-only gating is unit-tested
-/// without hardware.
+/// Validate a polling request for the USB arm: range plus the shared device
+/// floor ([`crate::init::check_usb_polling_usable`], the same gate doctor
+/// applies to configs), with a cap warning on top. Kept out of the
+/// disengage/BT arms on purpose — both discard the rate, so rejecting there
+/// would break valid hotplug events. Pure so the USB-only gating is
+/// unit-tested without hardware.
 pub fn validate_polling_rate(polling_hz: u32) -> Result<()> {
-    if polling_hz == 0 || polling_hz > u16::MAX as u32 {
-        anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
-    }
-    if polling_hz < crate::init::MIN_EXPRESSIBLE_HZ {
-        anyhow::bail!(
-            "polling rate {polling_hz} Hz below device floor (~{} Hz)",
-            crate::init::MIN_EXPRESSIBLE_HZ
-        );
-    }
+    crate::init::check_usb_polling_usable(polling_hz)?;
     if polling_hz > EFFECTIVE_CAP_HZ as u32 {
         log::warn!("requested {polling_hz} Hz above device cap; clamped to ~110 Hz (X=0x23)");
     }
@@ -1654,6 +1647,93 @@ mod tests {
     }
 
     #[test]
+    fn hotplug_wake_attaches_session_without_waiting_for_verify() {
+        // Finding #9: a plug event must reconcile to an attached session
+        // on the fast hotplug pass, not at the next 30 s verification.
+        // Both transports: USB (feature-report init) and BT (direct Ready).
+        use crate::hotplug::{Schedule, Work};
+        use std::time::{Duration, Instant};
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, false);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let start = Instant::now();
+            let mut schedule = Schedule::new(start);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            // No event: nothing due well before the 30 s verification.
+            assert_eq!(
+                schedule.take_due(start + Duration::from_secs(5), true),
+                None
+            );
+            // Plug event at 5 s; the coalesced fast pass fires, never a Verify.
+            schedule.wake(start + Duration::from_secs(5));
+            let due = start + Duration::from_secs(5) + Duration::from_millis(100);
+            assert_eq!(schedule.take_due(due, true), Some(Work::Hotplug));
+            let actions = watch.reconcile_with_hardware(
+                &cfg,
+                &hub,
+                vec![dev.clone()],
+                &health,
+                &hardware,
+                false,
+            );
+            assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+            schedule.completed(due, watch.has_pending(&cfg, &health));
+            assert!(session.lock().unwrap().proxy.is_attached());
+            assert_eq!(session.lock().unwrap().attempts, 1);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.verifies.get(), 0);
+        }
+    }
+
+    #[test]
+    fn hotplug_gate_off_discovers_new_hardware_promptly_without_session_work() {
+        // Finding #9: gate-off must still init new hardware on the fast
+        // hotplug pass (no 30 s wait); it just never builds a proxy session.
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let mut watch = ResumeWatch::new(&[]);
+        let devs = fixture_devs();
+        // Hotplug fast pass: no hardware verification, like production
+        // `watch.scan(..., verify_hardware=false)`.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs.clone(),
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Initialized(devs[0].devnode.clone()),
+                TickAction::Initialized(devs[1].devnode.clone()),
+            ]
+        );
+        assert_eq!(hardware.inits.get(), 2);
+        assert_eq!(hardware.verifies.get(), 0);
+        assert_eq!(hardware.reinits.get(), 0);
+        // Steady state on the fast pass: no readbacks, no attachment traffic.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs,
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(hardware.verifies.get(), 0);
+    }
+
+    #[test]
     fn hotplug_gate_off_skips_session_work_and_known_hardware_reads() {
         let hub = hub();
         let hardware = TestHardware::new(&hub);
@@ -2192,6 +2272,22 @@ mod tests {
         assert!(validate_polling_rate(1).is_err());
         assert!(validate_polling_rate(15).is_err());
         assert!(validate_polling_rate(16).is_ok());
+    }
+
+    #[test]
+    fn polling_validation_agrees_with_init_gate() {
+        // Startup and init share one floor check (finding #16): every
+        // boundary must agree, including the doctor-visible config gate.
+        for hz in [0u32, 1, 15] {
+            assert!(validate_polling_rate(hz).is_err());
+            assert!(crate::init::check_usb_polling_usable(hz).is_err());
+            assert!(crate::init::resolve_polling(hz).is_err());
+        }
+        for hz in [16u32, 60, 110, 500] {
+            assert!(validate_polling_rate(hz).is_ok());
+            assert!(crate::init::check_usb_polling_usable(hz).is_ok());
+        }
+        assert!(validate_polling_rate(70_000).is_err());
     }
 
     fn fixture_devs() -> Vec<DiscoveredDevice> {
