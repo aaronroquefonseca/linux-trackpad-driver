@@ -135,10 +135,14 @@ systemctl status linux-trackpad-driver-resume.service
   sibling updates the haptic target without re-grabbing a healthy touch
   session. Healthy sessions/siblings produce no extra attachment events or
   periodic hardware readbacks on these fast passes.
-- Recovery/fallback: failed full USB setup blocks attachment until the full
+- Recovery/fallback: hardware reinitialization and session attachment are
+  distinct steps — reinit (re-)sends the USB feature-report sequence to the
+  device, while attachment emits `Ready` so the proxy creates virtual nodes
+  and grabs input. Attachment-only retries emit `Ready` with no hardware
+  reports. Failed full USB setup blocks attachment until the full
   sequence succeeds, even if polling later matches. Dead USB sessions verify
-  before reattaching; Bluetooth keeps native bindings intact. Gate-off never
-  requests a proxy grab. Instance replacement tears down old ownership before
+  before reattaching; Bluetooth keeps native bindings intact. Gate-off still
+  inits new hardware promptly but never requests a proxy grab. Instance replacement tears down old ownership before
   initialization, including a name reused between scans. Monitor startup or
   receive failure and exhausted readiness retries are logged; the 30-second
   full scan/readback remains the fallback for missed events and later
