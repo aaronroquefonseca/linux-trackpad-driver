@@ -1,3 +1,54 @@
+## [0.1.2] - 2026-10-19
+
+### Highlights
+
+- Stop stuck fingers: terminate virtual contacts when the source device disappears ([#81](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/81)).
+- Smoother cursor: accumulate scaled pointer position instead of dropping subpixel remainders ([#77](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/77)).
+- Lower idle CPU: replace the 2ms pump poll with event-driven idle; bound the session haptic queue ([#86](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/86), [#85](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/85)).
+- More reliable daemon: own the socket lifecycle, drain queued instances, bound liveness probes and teardown ([#88](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/88), [#84](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/84), [#87](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/87)).
+- Cleaner startup and hardening: single activation contract for background paths plus incremental service sandboxing ([#83](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/83), [#78](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/78)).
+- Correct device and config handling: Bluetooth HID udev matching, single config selection for all commands, canonical handoff comparison, doctor validation shared with USB init ([#79](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/79), [#80](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/80), [#75](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/75), [#82](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/82)).
+- Packaging and release hygiene: ship the complete MIT license text, strictly validate release publicity metadata, and disable xtrace before secret handling ([#74](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/74), [#72](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/72), [#71](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/71)).
+
+### Details
+
+#### Bug Fixes
+
+- Owned shutdown with bounded teardown ([#87](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/87)) (daemon) ([a7244ca](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/a7244ca2aba34e67782f454aa3b8040da8da1717))
+- Terminate virtual contacts on source loss ([#81](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/81)) (proxy) ([ed7fcdb](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/ed7fcdbaf79308f1327de791a0d7fed6b1baac09))
+- Event-driven idle instead of 2ms poll ([#86](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/86)) (pump) ([face21e](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/face21e0f3e95df3523bc2dc2b22600f2913254d))
+- Bounded session-scoped actuator queue ([#85](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/85)) (haptics) ([62fcc79](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/62fcc791f9a8e72e3638afec6f64ef0e8eaba771))
+- Accumulate scaled pointer position ([#77](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/77)) (proxy) ([1ba9b88](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/1ba9b88e0b3ca1dc1865249e20912b76a3e365f6))
+- Own socket lifecycle and stale replacement ([#88](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/88)) (lock) ([af19a6e](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/af19a6e0e389c14c1984d3974dd432f4f10b4c75))
+- Drain socket queue and bound liveness probes ([#84](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/84)) (lock) ([d2b0c43](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/d2b0c43de7e07e9c06c52645f86f8728c8787af4))
+- Single activation contract for background paths ([#83](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/83)) (systemd) ([9e6b141](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/9e6b1416aa5ddfbce4d5af1402b6bfa04a5769af))
+- Share hardware applicability validation with USB init ([#82](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/82)) (doctor) ([51cc1cb](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/51cc1cbadcee9b72c7204b3f8d2204c11aa8caab))
+- Single config selection for all commands ([#80](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/80)) (config) ([b37aba8](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/b37aba854b6a91bf0ebc0e49d3dd28f1ab98b5f3))
+- Match Bluetooth HID identity correctly ([#79](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/79)) (udev) ([37be95d](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/37be95d413a3f843cc3720595472d2987dd76b12))
+- Incremental service sandboxing ([#78](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/78)) (systemd) ([0f37a2b](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/0f37a2b146bbf3ef9263b63d3b805635cbfad341))
+- Canonical action comparison for handoffs ([#75](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/75)) (config) ([39a9445](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/39a94457daac01159161d5a9c9fc2847b0613060))
+- Ship complete MIT license text ([#74](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/74)) (debian) ([4801237](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/4801237533114c78569bd847b8f7b6e25723489f))
+- Strict publicity metadata validation ([#72](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/72)) (release) ([05e17b4](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/05e17b49878f315f7cee4e865416ac4e40b96fa8))
+- Disable xtrace before secret handling ([#71](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/71)) (release) ([e3a3e47](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/e3a3e4777414dc4e147e3518bb3814adf8c0b2fa))
+
+#### Documentation
+
+- Define repository workflow and Git identity ([#89](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/89)) (agents) ([9c5e3cb](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/9c5e3cb2b9a2da02c2ea7cdc0420cb846f320721))
+- Working debug-log procedure ([#73](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/73)) (debugging) ([95b086c](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/95b086c07810c650cb5c905629fcd4cf29e80a3a))
+
+#### Tests
+
+- Wake idle pump before fixture join ([#93](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/93)) (daemon) ([7b47b23](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/7b47b23336f4cd510db8b542a0154b1068a7fc7c))
+- Hotplug attach regression coverage ([#76](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/76)) (daemon) ([55170ef](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/55170ef4ffbb151deaf14ae086f0063b0e2a5c91))
+
+#### Refactoring
+
+- Share action token definitions ([#92](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/92)) (tokens) ([2c49d8c](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/2c49d8c83229d7c79382e1c34fb839f9db2c584b))
+- Wait for socket drain readiness ([#91](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/91)) (lock) ([8012f16](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/8012f1686fb585d03fbbed3d4edd8abd88bd3f96))
+- Update contact scaling anchors in place ([#90](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/90)) (proxy) ([6025bb0](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/6025bb0f285c7affdba0f36a265b76c7013ccbcb))
+
+Full diff: https://github.com/aaronroquefonseca/linux-trackpad-driver/compare/v0.1.1...v0.1.2
+
 ## [0.1.1] - 2026-10-19
 
 ### Highlights
