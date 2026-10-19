@@ -16,7 +16,7 @@ Trackpad 2 implemented; others planned.
 
 - Explicit `-c <path>` wins, else `$LTD_CONFIG`, else the installed
   `/etc/linux-trackpad-driver/config.toml`, else built-in defaults
-  (shared `select_config_source`; every command reports the selected
+  (shared `select_config_source_with_installed`; every command reports the selected
   source — startup entries log it as the live settings, doctor prints the
   on-disk file it validated; a missing env/installed file falls back to
   defaults, a missing explicit `-c` file errors).

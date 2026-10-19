@@ -1,7 +1,7 @@
 //! Read-only diagnostics, deliberately separate from startup/reconnect policy.
 //!
 //! Config *selection* is shared with startup
-//! ([`crate::config::select_config_source`]): explicit `-c` wins, else
+//! ([`crate::config::select_config_source_with_installed`]): explicit `-c` wins, else
 //! nonempty `$LTD_CONFIG`, else the installed system file. Doctor always
 //! reports the selected on-disk file (or the missing path it fell back
 //! from), never the daemon's in-memory config.
@@ -15,7 +15,7 @@ use crate::config::{self, Config};
 const UNIX_TABLE: &str = "/proc/net/unix";
 
 /// Check the selected on-disk config, not the daemon's in-memory config.
-/// The selection matrix is the shared [`config::select_config_source`];
+/// The selection matrix is the shared [`config::select_config_source_with_installed`];
 /// only the read/validate wrapper differs from startup loading.
 pub fn check_config(explicit: Option<&str>) -> (String, Result<()>) {
     check_config_with(

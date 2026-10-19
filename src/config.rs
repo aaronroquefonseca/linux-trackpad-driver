@@ -21,7 +21,6 @@
 //! input with a clear error instead of failing opaquely at TOML parse.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -822,24 +821,6 @@ impl Config {
     }
 }
 
-/// Load config from `path`, or defaults when `None`. Missing file with an
-/// explicit path is an error; `None` never fails. Unknown keys are rejected
-/// at every level (likely typos); omitted keys/tables take documented
-/// defaults. `schema_version = 1` is required in files.
-///
-/// File-scope helper only: entry points must use [`load_selected_config`]
-/// so every command shares selection and reports its source.
-pub fn load_or_default(path: Option<&str>) -> Result<Config> {
-    let Some(path) = path else {
-        return Ok(Config::default());
-    };
-    let text = std::fs::read_to_string(Path::new(path))
-        .with_context(|| format!("reading config '{path}'"))?;
-    let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing config '{path}'"))?;
-    cfg.validate()?;
-    Ok(cfg)
-}
-
 /// Env var naming the config file for contexts that cannot take `-c`
 /// (udev/systemd one-shots run `ltd reconnect /dev/%I` with no room for
 /// per-call flags). An explicit `-c` path always wins over this.
@@ -848,20 +829,6 @@ pub const CONFIG_ENV: &str = "LTD_CONFIG";
 /// Config path from the environment, if set and non-empty.
 pub fn config_path_from_env() -> Option<String> {
     std::env::var(CONFIG_ENV).ok().filter(|v| !v.is_empty())
-}
-
-/// Load config for entry points, sharing [`select_config_source`] with
-/// doctor: explicit `-c` wins, else `$LTD_CONFIG`, else the installed
-/// system file ([`SYSTEM_CONFIG_PATH`]), else built-in defaults.
-///
-/// A *missing* env/installed file falls back to defaults (hotplug must
-/// keep working on machines with no system config installed); a
-/// present-but-unparsable file is still an error, as is a missing
-/// explicit `-c` file. Prefer [`load_selected_config`], which also
-/// returns the selected source for logging; this wrapper keeps the
-/// config-only call shape.
-pub fn load_or_default_with_env(explicit: Option<&str>) -> Result<Config> {
-    Ok(load_selected_config(explicit)?.0)
 }
 
 /// Installed system config: final fallback before built-in defaults.
@@ -888,7 +855,7 @@ pub struct SelectedConfigSource {
 
 /// Shared selection: explicit `-c` wins, else nonempty `$LTD_CONFIG`,
 /// else the installed system file. Pure over its inputs so every entry
-/// point resolves identically; [`select_config_source`] reads the process
+/// point resolves identically; [`load_selected_config`] reads the process
 /// environment. An empty env value counts as unset.
 pub fn select_config_source_with_installed(
     explicit: Option<&str>,
@@ -911,19 +878,6 @@ pub fn select_config_source_with_installed(
             kind: ConfigSourceKind::Installed,
         }
     }
-}
-
-/// Shared selection against the installed system path.
-pub fn select_config_source_with(
-    explicit: Option<&str>,
-    env: Option<&str>,
-) -> SelectedConfigSource {
-    select_config_source_with_installed(explicit, env, SYSTEM_CONFIG_PATH)
-}
-
-/// Shared selection reading the process environment.
-pub fn select_config_source(explicit: Option<&str>) -> SelectedConfigSource {
-    select_config_source_with(explicit, config_path_from_env().as_deref())
 }
 
 /// Source label for a successfully selected file (shared with doctor).
@@ -1752,14 +1706,24 @@ actions_follow_spoof = true
 
     #[test]
     fn shipped_default_toml_validates() {
+        let _env_guard = crate::test_env::lock_env();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/default.toml");
-        let cfg = load_or_default(Some(path)).unwrap();
+        let (cfg, source) = load_selected_config(Some(path)).unwrap();
         assert_eq!(cfg, Config::default());
+        assert_eq!(source, format!("{path}; on disk"));
     }
 
     #[test]
-    fn none_path_gives_defaults() {
-        assert_eq!(load_or_default(None).unwrap(), Config::default());
+    fn missing_installed_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent-installed.toml");
+        let absent = absent.to_str().unwrap();
+        let (cfg, source) = load_selected_config_with_installed(None, None, absent).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; installed config missing: {absent}")
+        );
     }
 
     #[test]
@@ -1774,13 +1738,14 @@ actions_follow_spoof = true
         .unwrap();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, &path) };
-        let cfg = load_or_default_with_env(None).unwrap();
+        let (cfg, source) = load_selected_config(None).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert!(cfg.enhanced_clicks);
         assert_eq!(cfg.device.polling_rate, 90);
+        assert_eq!(source, format!("{}; on disk", path.display()));
     }
 
     #[test]
@@ -1793,45 +1758,53 @@ actions_follow_spoof = true
         std::fs::write(&cli_path, "schema_version = 1\nenhanced_clicks = false\n").unwrap();
         let old = std::env::var(CONFIG_ENV).ok();
         unsafe { std::env::set_var(CONFIG_ENV, &env_path) };
-        let cfg = load_or_default_with_env(Some(cli_path.to_str().unwrap())).unwrap();
+        let (cfg, source) = load_selected_config(Some(cli_path.to_str().unwrap())).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert!(!cfg.enhanced_clicks);
+        assert_eq!(source, format!("{}; on disk", cli_path.display()));
     }
 
     #[test]
     fn missing_env_file_falls_back_to_defaults() {
         let _env_guard = crate::test_env::lock_env();
         let old = std::env::var(CONFIG_ENV).ok();
-        unsafe { std::env::set_var(CONFIG_ENV, "/nonexistent-ltd-config-xyz.toml") };
-        let cfg = load_or_default_with_env(None).unwrap();
+        let missing = "/nonexistent-ltd-config-xyz.toml";
+        unsafe { std::env::set_var(CONFIG_ENV, missing) };
+        let (cfg, source) = load_selected_config(None).unwrap();
         match old {
             Some(v) => unsafe { std::env::set_var(CONFIG_ENV, v) },
             None => unsafe { std::env::remove_var(CONFIG_ENV) },
         }
         assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; LTD_CONFIG config missing: {missing}")
+        );
     }
 
     #[test]
     fn missing_explicit_file_errors() {
-        assert!(load_or_default(Some("/nonexistent-ltd-config-xyz.toml")).is_err());
+        let _env_guard = crate::test_env::lock_env();
+        assert!(load_selected_config(Some("/nonexistent-ltd-config-xyz.toml")).is_err());
     }
 
     #[test]
     fn invalid_file_values_fail_load() {
+        let _env_guard = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");
         std::fs::write(&path, "schema_version = 1\n[device]\npolling_rate = 500\n").unwrap();
-        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+        assert!(load_selected_config(Some(path.to_str().unwrap())).is_err());
         let path = dir.path().join("badkey.toml");
         std::fs::write(
             &path,
             "schema_version = 1\n[click]\nclick_1 = \"frobnicate\"\n",
         )
         .unwrap();
-        assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+        assert!(load_selected_config(Some(path.to_str().unwrap())).is_err());
     }
 
     #[test]
