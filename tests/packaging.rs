@@ -65,6 +65,8 @@ const SERVICE: &str = include_str!("../systemd/linux-trackpad-driver.service");
 const RECONNECT: &str = include_str!("../systemd/linux-trackpad-driver-reconnect@.service");
 const RESUME_UNIT: &str = include_str!("../systemd/linux-trackpad-driver-resume.service");
 const SLEEP_HOOK: &str = include_str!("../systemd/system-sleep/ltd-resume");
+const COPYRIGHT: &str = include_str!("../debian/copyright");
+const LICENSE_MIT: &str = include_str!("../LICENSE-MIT");
 
 const COMBOS: [(&str, &str); 4] = [
     ("05ac", "0265"),
@@ -414,6 +416,71 @@ fn sleep_hook_is_executable() {
     assert!(
         mode & 0o111 != 0,
         "sleep hook must be executable (systemd ignores non-executable hooks)"
+    );
+}
+
+#[test]
+fn debian_copyright_carries_complete_mit_text() {
+    // Policy 12.5: MIT has no /usr/share/common-licenses entry, so the
+    // binary package must carry the text itself in debian/copyright
+    // (installed verbatim as /usr/share/doc/*/copyright by debhelper).
+    assert!(!repo_file("debian/copyright").is_empty());
+    assert!(
+        !COPYRIGHT.contains("/usr/share/common-licenses/MIT"),
+        "debian/copyright must not reference the nonexistent common-licenses/MIT"
+    );
+    for marker in [
+        "Copyright (c) 2026",
+        "Permission is hereby granted",
+        "WITHOUT WARRANTY OF ANY KIND",
+    ] {
+        assert!(
+            COPYRIGHT.contains(marker),
+            "debian/copyright missing MIT text marker: {marker}"
+        );
+    }
+    // Apache-2.0 ships in base-files, so that reference stays valid.
+    assert!(
+        COPYRIGHT.contains("/usr/share/common-licenses/Apache-2.0"),
+        "debian/copyright must keep the valid Apache-2.0 common-licenses reference"
+    );
+    // The embedded MIT text must stay byte-identical to LICENSE-MIT
+    // (modulo DEP-5 continuation wrapping), so future license edits
+    // cannot silently desync the shipped copyright file.
+    let para = COPYRIGHT
+        .split_once("License: MIT\n")
+        .expect("debian/copyright needs a License: MIT paragraph")
+        .1;
+    let mut unwrapped = String::new();
+    for line in para.lines() {
+        let Some(body) = line.strip_prefix(' ') else {
+            break; // blank line ends the License paragraph
+        };
+        if body == "." {
+            unwrapped.push('\n');
+        } else {
+            unwrapped.push_str(body);
+            unwrapped.push('\n');
+        }
+    }
+    assert_eq!(unwrapped, LICENSE_MIT);
+}
+
+#[test]
+fn debian_copyright_has_no_shadow_package_file() {
+    // dh_installdocs prefers debian/<pkg>.copyright over debian/copyright,
+    // so a stale package-specific file would silently replace the validated
+    // payload. Forbid the shadow; if one is ever needed, validate its MIT
+    // payload the same way instead.
+    let shadow: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "debian/linux-trackpad-driver.copyright",
+    ]
+    .iter()
+    .collect();
+    assert!(
+        !shadow.exists(),
+        "debian/linux-trackpad-driver.copyright would shadow debian/copyright via dh_installdocs"
     );
 }
 
