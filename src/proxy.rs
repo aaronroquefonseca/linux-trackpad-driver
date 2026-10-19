@@ -765,6 +765,22 @@ impl From<&Config> for ProxySettings {
 /// collapse the gap.
 const CUT_REPRESS_GAP: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// What one pump step did. Distinguishes hidraw traffic from idle so the
+/// pump can wait on input readiness instead of polling continuously:
+/// `Frame` (traffic, drain immediately) vs `Idle` (nothing to do, block
+/// until input/control/deadline). `Deadline` is idle work that still
+/// emitted at a timing deadline (release/stagger/cut); `Disconnect` retires
+/// a dead session; `Transient` is a dropped frame needing a short backoff
+/// so a persistently failing fd cannot busy-spin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpActivity {
+    Idle,
+    Frame,
+    Deadline,
+    Disconnect,
+    Transient,
+}
+
 /// evdev-grab + uinput click proxy. Generic over injectable backends so unit
 /// tests run without hardware.
 pub struct ClickProxy<G, U, H, S> {
@@ -895,6 +911,78 @@ where
     /// True when events flow untouched (gate off, pump unready, grab failed).
     pub fn is_passthrough(&self) -> bool {
         self.passthrough
+    }
+
+    /// Hidraw readiness fd for the pump's `poll(2)` wait. `None` while idle
+    /// (no device, gate-off, passthrough): the pump then blocks on
+    /// control/deadline notifications only, producing (near-)zero wakeups.
+    pub fn poll_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        if !self.settings.enhanced || !self.attached || self.passthrough {
+            return None;
+        }
+        self.source.poll_fd()
+    }
+
+    /// True when a decoded frame is queued without touching the fd (double
+    /// report second half). The pump drains these immediately.
+    pub fn has_pending_frame(&self) -> bool {
+        if !self.settings.enhanced || !self.attached || self.passthrough {
+            return false;
+        }
+        self.source.has_pending_frame()
+    }
+
+    /// Earliest idle instant needing pump work. `None` means idle polls do
+    /// nothing: no latch can release and no staged key-down is due, so the
+    /// pump blocks until input/control instead of polling. Covers the 30 ms
+    /// release hold, every `pending_buttons` stagger deadline, and both
+    /// cut stages (`released_at + 5 ms`, then `mods_at + stagger`).
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        if !self.settings.enhanced || !self.attached || self.passthrough {
+            return None;
+        }
+        let mut best: Option<std::time::Instant> = None;
+        let mut consider = |d: Option<std::time::Instant>| {
+            if let Some(d) = d {
+                best = Some(best.map_or(d, |b| b.min(d)));
+            }
+        };
+        consider(self.machine.next_release_deadline());
+        if let Some(pending) = &self.pending_buttons {
+            for key in &pending.keys {
+                consider(Some(key.deadline));
+            }
+        }
+        if let Some(p) = &self.pending_force {
+            if self.machine.force_active().is_some() {
+                match p.mods_at {
+                    Some(t) => consider(Some(t + p.stagger)),
+                    None => consider(Some(p.released_at + CUT_REPRESS_GAP)),
+                }
+            }
+        }
+        best
+    }
+
+    /// One pump step with an explicit clock, reporting traffic vs idle.
+    /// Same edge/output semantics as [`ClickProxy::handle_frame_at`]; the
+    /// activity lets the event-driven pump wait instead of polling.
+    pub fn pump_step_at(
+        &mut self,
+        cfg: &Config,
+        now: std::time::Instant,
+    ) -> (Result<Option<ClickEvent>>, PumpActivity) {
+        let result = self.handle_frame_inner(cfg, now);
+        match result {
+            Ok((ev, activity)) => (Ok(ev), activity),
+            Err(e) => {
+                // Single owner for output-failure diagnostics: `output_failed`
+                // logs and retires the session; the pump layer propagates
+                // silently to avoid duplicate warnings per failure.
+                self.output_failed(&e);
+                (Err(e), PumpActivity::Disconnect)
+            }
+        }
     }
 
     /// Borrow the touch source (manager swaps hidraw nodes per attach).
@@ -1058,10 +1146,13 @@ where
         now: std::time::Instant,
     ) -> Result<Option<ClickEvent>> {
         let result = self.handle_frame_inner(cfg, now);
-        if let Err(error) = &result {
-            self.output_failed(error);
+        match result {
+            Ok((ev, _)) => Ok(ev),
+            Err(error) => {
+                self.output_failed(&error);
+                Err(error)
+            }
         }
-        result
     }
 
     /// Retire the entire failed pointer session. Closing the virtual nodes
@@ -1106,17 +1197,19 @@ where
         &mut self,
         cfg: &Config,
         now: std::time::Instant,
-    ) -> Result<Option<ClickEvent>> {
+    ) -> Result<(Option<ClickEvent>, PumpActivity)> {
         if !self.settings.enhanced || !self.attached || self.passthrough {
-            return Ok(None);
+            return Ok((None, PumpActivity::Idle));
         }
         anyhow::ensure!(self.uinput.is_ready(), "pointer output is unavailable");
         let frame = match self.source.poll_frame() {
             Ok(Some(f)) => f,
             Ok(None) => {
-                // The nonblocking pump polls every IDLE_SLEEP (2 ms), even
-                // without input reports. Advance deadlines from the last
-                // live latch, after polling so disconnect always wins.
+                // Event-driven idle: the pump blocks on input readiness +
+                // control/deadline notifications and only wakes here when a
+                // deadline expired (or input arrived but decoded empty).
+                // Advance deadlines from the last live latch, after polling
+                // so disconnect always wins.
                 let was_first = self.machine.active().is_some();
                 let was_force = self.machine.force_active().is_some();
                 let released = self.machine.advance_releases_at(now);
@@ -1134,8 +1227,9 @@ where
                     self.flush_pending_buttons(now)?;
                     self.emit_btn_left()?;
                     self.uinput.sync()?;
+                    return Ok((None, PumpActivity::Deadline));
                 }
-                return Ok(None);
+                return Ok((None, PumpActivity::Idle));
             }
             Err(e) => {
                 // Persistent disconnect (unplug/replug reusing the same
@@ -1150,13 +1244,13 @@ where
                     if self.attached {
                         log::warn!("proxy: disconnect detected, self-releasing: {e:#}");
                         self.set_pump_ready(false);
-                    } else {
-                        log::debug!("proxy: disconnect poll while idle: {e:#}");
+                        return Ok((None, PumpActivity::Disconnect));
                     }
-                    return Ok(None);
+                    log::debug!("proxy: disconnect poll while idle: {e:#}");
+                    return Ok((None, PumpActivity::Idle));
                 }
                 log::warn!("proxy: poll_frame failed, dropping frame: {e:#}");
-                return Ok(None);
+                return Ok((None, PumpActivity::Transient));
             }
         };
         let was_first = self.machine.active().is_some();
@@ -1169,7 +1263,7 @@ where
             Ok(e) => e,
             Err(e) => {
                 log::warn!("proxy: click/force parse failed, dropping edge: {e:#}");
-                return Ok(None);
+                return Ok((None, PumpActivity::Frame));
             }
         };
         self.physical_left_down =
@@ -1285,7 +1379,7 @@ where
             self.flush_pending_buttons(now)?;
             self.emit_btn_left()?;
             self.uinput.sync()?;
-            return Ok(edges.primary());
+            return Ok((edges.primary(), PumpActivity::Frame));
         }
         // A held slide that vanished without a handoff releases its keys.
         let slide_gone = was_slide.is_some() && self.machine.slide_active().is_none();
@@ -1304,7 +1398,7 @@ where
         self.flush_pending_buttons(now)?;
         self.emit_btn_left()?;
         self.uinput.sync()?;
-        Ok(None)
+        Ok((None, PumpActivity::Frame))
     }
 
     /// Complete pressure-latch transitions on both reports and idle polls.
@@ -12224,5 +12318,341 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
         assert!(sinks.pointer.has(EV_KEY, BTN_TOOL_DOUBLETAP, 1));
         assert!(!sinks.pointer.has(EV_KEY, BTN_TOOL_FINGER, 1));
+    }
+
+    #[test]
+    fn pump_step_distinguishes_traffic_from_idle() {
+        use super::PumpActivity;
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))), Ok(None)],
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        let (ev, activity) = match px.pump_step_at(&cfg, t0) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert!(ev.is_some());
+        assert_eq!(activity, PumpActivity::Frame);
+        // Steady hold, no pending deadlines: idle poll is a true no-op.
+        let (_, activity) = match px.pump_step_at(&cfg, ms_after(t0, 5)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(activity, PumpActivity::Idle);
+        assert!(px.next_deadline().is_none());
+    }
+
+    #[test]
+    fn pump_step_reports_deadline_work_and_transient() {
+        use super::PumpActivity;
+        // Staggered combo: idle polls before the deadline stay Idle, the
+        // deadline poll lands the button as Deadline work.
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))],
+        );
+        let t0 = std::time::Instant::now();
+        let (_, a0) = match px.pump_step_at(&cfg, t0) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(a0, PumpActivity::Frame);
+        assert!(px.pending_buttons.is_some());
+        let deadline = px.next_deadline().expect("stagger deadline");
+        assert_eq!(deadline, t0 + std::time::Duration::from_millis(50));
+        // Before the deadline the pump would block, not poll: a step here
+        // must not emit the button.
+        px.replace_source(ScriptSource::new(vec![Ok(None)]));
+        let (_, early) = match px.pump_step_at(&cfg, ms_after(t0, 49)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert!(key_values(&sinks.pointer, BTN_LEFT).is_empty());
+        assert!(matches!(early, PumpActivity::Deadline | PumpActivity::Idle));
+        // At the deadline the button lands with identical wire bytes to the
+        // old 2 ms poll path (no resampling, no timing change).
+        px.replace_source(ScriptSource::new(vec![Ok(None)]));
+        let (_, at_deadline) = match px.pump_step_at(&cfg, ms_after(t0, 50)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(at_deadline, PumpActivity::Deadline);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert!(px.next_deadline().is_none());
+        // Transient read failure drops the frame without aborting.
+        px.replace_source(ScriptSource::new(vec![Err(anyhow::anyhow!("fake EIO"))]));
+        let (_, transient) = match px.pump_step_at(&cfg, ms_after(t0, 60)) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(transient, PumpActivity::Transient);
+    }
+
+    #[test]
+    fn next_deadline_covers_release_and_cut_stages() {
+        // Release debounce: press then liftoff holds the latch for 30 ms.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![
+                Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+                Ok(Some(frame(vec![], 0))),
+            ],
+        );
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 10)).unwrap();
+        assert!(px.machine.active().is_some());
+        let deadline = px.next_deadline().expect("release deadline");
+        assert_eq!(deadline, t0 + std::time::Duration::from_millis(30));
+        // Gate-off / passthrough never arms a deadline.
+        let mut off = ClickProxy::new(
+            settings(false),
+            FakeGrab::ok(),
+            FakeUinput::new(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        off.set_pump_ready(true);
+        off.attach(&usb_ready("/dev/hidraw1"));
+        assert!(off.next_deadline().is_none());
+        assert!(off.poll_fd().is_none());
+        assert!(!off.has_pending_frame());
+    }
+
+    #[test]
+    fn idle_proxy_has_no_fd_no_deadline_no_pending() {
+        // No device (Idle source, passthrough): the event-driven pump
+        // blocks on control only — (near-)zero wakeups.
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            FakeUinput::new(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![]),
+        );
+        assert!(px.poll_fd().is_none());
+        assert!(px.next_deadline().is_none());
+        assert!(!px.has_pending_frame());
+        let cfg = Config::default();
+        let (_, activity) = match px.pump_step_at(&cfg, std::time::Instant::now()) {
+            (Ok(ev), a) => (ev, a),
+            (Err(_), a) => (None, a),
+        };
+        assert_eq!(activity, super::PumpActivity::Idle);
+    }
+
+    #[test]
+    fn event_loop_fires_stagger_deadline_without_polling() {
+        // End-to-end through the event-driven pump thread (no fd): a 50 ms
+        // stagger pending must land via the poll timeout, not continuous
+        // polling. Generous 500 ms bound; production fires at ~50 ms.
+        use std::sync::atomic::AtomicBool;
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))],
+        );
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        assert!(px.pending_buttons.is_some());
+        // Idle source from here: no more reports, deadline must still fire.
+        px.replace_source(ScriptSource::new(vec![]));
+        let proxy = Arc::new(Mutex::new(px));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (handle, control) = crate::pump::spawn_pump(
+            "deadline-test".to_string(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        let give_up = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while key_values(&sinks.pointer, BTN_LEFT).is_empty() && std::time::Instant::now() < give_up
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        crate::pump::stop_pump(&stop, &control);
+        handle.join().unwrap();
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "stagger deadline never fired through the event loop"
+        );
+    }
+
+    #[test]
+    fn stagger_deadline_waits_without_spinning() {
+        // Regression for the sub-millisecond truncation spin: a 50 ms stagger
+        // deadline must be reached with a bounded number of source reads, not
+        // hundreds of 0-timeout polls in the final millisecond. Counts every
+        // `poll_frame` while `spawn_pump` waits 90 ms around the deadline.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountIdle(Arc<AtomicUsize>, Option<TouchFrame>);
+        impl TouchSource for CountIdle {
+            fn tier(&self) -> CapabilityTier {
+                CapabilityTier::L2p
+            }
+            fn pressure_units(&self) -> PressureUnits {
+                PressureUnits::Arbitrary
+            }
+            fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(self.1.take())
+            }
+        }
+        let cfg: Config = toml::from_str(
+            r#"schema_version = 1
+[click]
+click_1 = { action = "super+left", stagger_ms = 50 }"#,
+        )
+        .unwrap();
+        let sinks = TestSinks::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            sinks.dual(),
+            FakeHaptic::new(),
+            CountIdle(
+                Arc::clone(&count),
+                Some(frame(vec![finger(1, 200, 0, 0)], 0)),
+            ),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw-review"));
+        assert!(px.is_attached());
+        px.handle_frame_at(&cfg, std::time::Instant::now()).unwrap();
+        assert!(px.pending_buttons.is_some());
+        let proxy = Arc::new(Mutex::new(px));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (handle, control) = crate::pump::spawn_pump(
+            "review-repro".into(),
+            Arc::clone(&proxy),
+            cfg,
+            Arc::clone(&stop),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        crate::pump::stop_pump(&stop, &control);
+        handle.join().unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        let reads = count.load(Ordering::SeqCst);
+        assert!(
+            reads <= 10,
+            "50 ms deadline spun: {reads} source reads in 90 ms (buggy ceiling-truncated loop did ~680)"
+        );
+    }
+
+    #[test]
+    fn pump_step_disconnect_reports_disconnect_and_self_releases() {
+        // Same dead-fd path as `disconnect_self_releases_once_with_bounded_polls`,
+        // but through the event-loop entry (`pump_step_at`): the step must
+        // report `Disconnect` (not `Idle`), self-release exactly once, and
+        // then settle into `Idle` without touching the dead source again.
+        use super::PumpActivity;
+        use anyhow::Error as AnyhowError;
+        let grab = Arc::new(FakeGrab::ok());
+        let sinks = TestSinks::new();
+        let disc = || {
+            Err::<Option<TouchFrame>, AnyhowError>(
+                crate::pump::DisconnectError("test unplug".into()).into(),
+            )
+        };
+        let mut px = ClickProxy::new(
+            settings(true),
+            SharedGrab(Arc::clone(&grab)),
+            sinks.dual(),
+            FakeHaptic::new(),
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))), disc()]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw8"));
+        let cfg = Config::default();
+        let t0 = std::time::Instant::now();
+        let (first, a0) = px.pump_step_at(&cfg, t0);
+        assert!(first.unwrap().is_some(), "press edge must report");
+        assert_eq!(a0, PumpActivity::Frame);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        let (ev, activity) = px.pump_step_at(&cfg, ms_after(t0, 60));
+        assert!(ev.unwrap().is_none());
+        assert_eq!(activity, PumpActivity::Disconnect);
+        assert!(!grab.is_grabbed(), "dead fd must release the grab");
+        assert!(!px.is_attached());
+        assert!(px.is_passthrough());
+        // Settled passthrough: further steps are Idle and never poll the
+        // dead source again (logs bounded by construction).
+        let remaining = px.source.frames.borrow().len();
+        let (_, a2) = px.pump_step_at(&cfg, ms_after(t0, 120));
+        assert_eq!(a2, PumpActivity::Idle);
+        assert_eq!(px.source.frames.borrow().len(), remaining);
+    }
+
+    #[test]
+    fn next_deadline_covers_pending_force_cut_stages() {
+        // Arm a force-cut staged press: the edge frame at t0+10 leaves
+        // `pending_force` with `mods_at=None`, so the deadline must be
+        // `released_at + 5 ms`; once the modifiers land at the floor, the
+        // deadline must move to `mods_at + stagger` (50 ms here).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let mut px = drive_ready_proxy(
+            &sinks,
+            &haptic,
+            vec![slide_report(5, 60, 0), slide_report(5, 200, 0)],
+        );
+        let mut cfg = five_slide_cfg();
+        cfg.click.click_5 = "super+left".into();
+        cfg.force.force_5 = "super+left".into();
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, ms_after(t0, 0)).unwrap();
+        px.handle_frame_at(&cfg, ms_after(t0, 10)).unwrap();
+        assert!(px.pending_force.is_some(), "cut edge must stage a press");
+        assert!(px.machine.force_active().is_some(), "force latch must hold");
+        assert!(
+            px.pending_force.as_ref().unwrap().mods_at.is_none(),
+            "modifiers not landed yet"
+        );
+        let d0 = px.next_deadline().expect("cut stage-1 deadline");
+        assert_eq!(
+            d0,
+            ms_after(t0, 15),
+            "stage 1 due at released_at + 5 ms floor"
+        );
+        // Idle to the floor: modifiers land, buttons wait the stagger.
+        px.handle_frame_at(&cfg, ms_after(t0, 15)).unwrap();
+        let pending = px.pending_force.as_ref().expect("stage 2 still pending");
+        let mods_at = pending.mods_at.expect("modifiers landed");
+        assert_eq!(mods_at, ms_after(t0, 15));
+        let d1 = px.next_deadline().expect("cut stage-2 deadline");
+        assert_eq!(
+            d1,
+            mods_at + std::time::Duration::from_millis(50),
+            "stage 2 due at mods_at + stagger"
+        );
+        assert_eq!(d1, ms_after(t0, 65));
     }
 }
