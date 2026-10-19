@@ -158,8 +158,9 @@ pub const INPUT_PROP_POINTER: u16 = 0;
 /// Physical position density, units/mm at 1:1 (old-service
 /// `(48 * 100) / speed` at the default `speed = 100`; Y scaled by
 /// 44/48). Fixed here: pointer `speed` is applied in software
-/// ([`crate::clicks::scale_delta`]), so the advertised density stays
-/// truthful while speed still scales motion exactly once.
+/// (per-contact raw/emitted/remainder anchor in `scaled_pos`), so the
+/// advertised density stays truthful while speed still scales motion
+/// exactly once.
 pub const POSITION_RES_X: i32 = 48;
 pub const POSITION_RES_Y: i32 = 44;
 /// Normalized per-contact values (old-service parity, hardware-proven):
@@ -454,7 +455,7 @@ pub struct ClickProxy<G, U, H, S> {
     held_first: Vec<(u16, u16)>,
     held_force: Vec<(u16, u16)>,
     held_slide: Vec<(u16, u16)>,
-    last_pos: HashMap<u8, (i32, i32)>,
+    last_pos: HashMap<u8, PointerAnchor>,
     /// Highest slot index written so far; vacated slots are terminated.
     max_slot: usize,
     /// Last `BTN_LEFT` value on the wire. `BTN_LEFT` is edge-triggered:
@@ -1714,24 +1715,82 @@ where
         Ok(())
     }
 
-    /// Speed-scaled position: `prev + (cur - prev) * speed/100` per finger.
-    /// `speed` comes from the per-frame `&Config` (single source), never a
-    /// frozen snapshot.
+    /// Speed-scaled position: `emitted + scaled(raw - last_raw)` per finger,
+    /// with fractional-remainder carry. `speed` comes from the per-frame
+    /// `&Config` (single source), never a frozen snapshot.
     fn scaled_pos(&mut self, id: u8, x: i32, y: i32, speed: u32) -> (i32, i32) {
         match self.last_pos.get(&id).copied() {
             None => {
-                self.last_pos.insert(id, (x, y));
-                (x, y)
+                // Clamp the first EMITTED report to the advertised bounds so
+                // a stationary out-of-range contact cannot step on its second
+                // frame; raw stays unclamped as the delta origin.
+                let ex = x.clamp(POSITION_MIN_X, POSITION_MAX_X);
+                let ey = y.clamp(POSITION_MIN_Y, POSITION_MAX_Y);
+                self.last_pos.insert(
+                    id,
+                    PointerAnchor {
+                        raw: (x, y),
+                        emitted: (ex, ey),
+                        rem: (0, 0),
+                    },
+                );
+                (ex, ey)
             }
-            Some((px, py)) => {
-                let nx = px + clicks::scale_delta(x - px, speed);
-                let ny = py + clicks::scale_delta(y - py, speed);
-                self.last_pos.insert(id, (x, y));
+            Some(mut anchor) => {
+                let speed = i64::from(speed);
+                let dx = i64::from(x) - i64::from(anchor.raw.0);
+                let dy = i64::from(y) - i64::from(anchor.raw.1);
+                let num_x = dx * speed + anchor.rem.0;
+                let num_y = dy * speed + anchor.rem.1;
+                // Truncating division (toward zero); the remainder carries
+                // the sub-unit fraction so slow motion accumulates instead
+                // of sticking.
+                let step_x = num_x / 100;
+                let step_y = num_y / 100;
+                anchor.rem = (num_x % 100, num_y % 100);
+                anchor.raw = (x, y);
+                let nx = (i64::from(anchor.emitted.0) + step_x)
+                    .clamp(i64::from(POSITION_MIN_X), i64::from(POSITION_MAX_X))
+                    as i32;
+                let ny = (i64::from(anchor.emitted.1) + step_y)
+                    .clamp(i64::from(POSITION_MIN_Y), i64::from(POSITION_MAX_Y))
+                    as i32;
+                anchor.emitted = (nx, ny);
+                self.last_pos.insert(id, anchor);
                 (nx, ny)
             }
         }
     }
 }
+
+/// Speed-scaled pointer state per contact id: the last RAW device position
+/// (delta source), the last EMITTED virtual position (delta base), and the
+/// fractional remainder (leftover `delta * speed % 100` numerator,
+/// `(-100, 100)`) so sub-unit motion at low speeds accumulates instead of
+/// truncating to zero every frame. Raw and emitted are distinct: the emitted
+/// cursor is an accumulation of scaled raw deltas, never a rescaling of the
+/// raw anchor.
+///
+/// Bounds: emitted positions clamp to the virtual `ABS_X`/`ABS_Y`
+/// (`-3678..=3934`, `-2478..=2587`, see [`uinput_abs_setup`]). Overshoot is
+/// dropped (raw still advances, so reversal responds immediately).
+/// Reanchoring: a fresh id anchors `raw` unclamped (delta origin) and
+/// `emitted = clamp(raw), rem = 0`; lift
+/// (non-touching or absent id), detach, pump loss, or output failure evicts
+/// the anchor so reuse never inherits a stale base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointerAnchor {
+    raw: (i32, i32),
+    emitted: (i32, i32),
+    rem: (i64, i64),
+}
+
+/// Virtual axis bounds for the emitted pointer position (must match
+/// [`uinput_abs_setup`]).
+pub const POSITION_MIN_X: i32 = -3678;
+pub const POSITION_MAX_X: i32 = 3934;
+pub const POSITION_MIN_Y: i32 = -2478;
+pub const POSITION_MAX_Y: i32 = 2587;
 
 /// Subscribe a shared proxy to the hub. Callbacks do bounded attach/detach
 /// only, so init is never blocked.
@@ -3252,6 +3311,280 @@ mod tests {
         px.handle_frame(&cfg).unwrap();
         // Second frame: dx=100 @200% → emitted x=200.
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_POSITION_X, 200));
+    }
+
+    /// Emitted MT X values for one handled frame, in slot order.
+    fn frame_mt_x(sinks: &TestSinks, before: usize) -> Vec<i32> {
+        sinks.pointer.events.lock().unwrap()[before..]
+            .iter()
+            .filter(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_X)
+            .map(|&(_, _, v)| v)
+            .collect()
+    }
+
+    fn drive_speed_frames(raw_x: &[i32], speed: u32) -> Vec<i32> {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = raw_x
+            .iter()
+            .map(|&x| Ok(Some(frame(vec![finger(1, 200, x, 0)], 0))))
+            .collect();
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(raw_x.len());
+        for (i, _) in raw_x.iter().enumerate() {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i as u64)).unwrap();
+            let xs = frame_mt_x(&sinks, before);
+            assert_eq!(xs.len(), 1, "one touching contact per frame");
+            out.push(xs[0]);
+        }
+        out
+    }
+
+    /// Emitted MT Y values for one handled frame, in slot order.
+    fn frame_mt_y(sinks: &TestSinks, before: usize) -> Vec<i32> {
+        sinks.pointer.events.lock().unwrap()[before..]
+            .iter()
+            .filter(|&&(t, c, _)| t == EV_ABS && c == ABS_MT_POSITION_Y)
+            .map(|&(_, _, v)| v)
+            .collect()
+    }
+
+    fn drive_speed_points(raw: &[(i32, i32)], speed: u32) -> Vec<(i32, i32)> {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = raw
+            .iter()
+            .map(|&(x, y)| Ok(Some(frame(vec![finger(1, 200, x, y)], 0))))
+            .collect();
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(raw.len());
+        for (i, _) in raw.iter().enumerate() {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i as u64)).unwrap();
+            let xs = frame_mt_x(&sinks, before);
+            let ys = frame_mt_y(&sinks, before);
+            assert_eq!(xs.len(), 1, "one touching contact per frame");
+            assert_eq!(ys.len(), 1, "one touching contact per frame");
+            out.push((xs[0], ys[0]));
+        }
+        out
+    }
+
+    #[test]
+    fn speed_accumulates_emitted_position_across_frames() {
+        // Finding #6 repro: raw [0,10,20,30,30] @200% must emit
+        // [0,20,40,60,60] (old code emitted [0,20,30,40,30]).
+        assert_eq!(
+            drive_speed_frames(&[0, 10, 20, 30, 30], 200),
+            vec![0, 20, 40, 60, 60]
+        );
+    }
+
+    #[test]
+    fn speed_stop_holds_emitted_position() {
+        // Final stopped frame (dx=0) holds; no backward step toward raw.
+        let emitted = drive_speed_frames(&[0, 10, 20, 20, 20], 200);
+        assert_eq!(emitted, vec![0, 20, 40, 40, 40]);
+    }
+
+    #[test]
+    fn speed_reversal_is_continuous() {
+        // Out @200% then back to origin: [0,10,0] -> [0,20,0].
+        assert_eq!(drive_speed_frames(&[0, 10, 0], 200), vec![0, 20, 0]);
+    }
+
+    #[test]
+    fn speed_100_is_exact_passthrough() {
+        // Default speed must stay bit-exact with raw, including negatives.
+        let raw = vec![5, 15, 7, 100, -50, -50];
+        assert_eq!(drive_speed_frames(&raw, 100), raw);
+    }
+
+    #[test]
+    fn speed_low_speed_accumulates_fraction() {
+        // +1 raw steps @50%: per-frame truncation would stick at 0 forever;
+        // remainder carry emits every second step.
+        assert_eq!(
+            drive_speed_frames(&[0, 1, 2, 3, 4], 50),
+            vec![0, 0, 1, 1, 2]
+        );
+    }
+
+    #[test]
+    fn speed_lift_reanchors_fresh_touch() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 10, 0)], 0))),
+            Ok(Some(frame(vec![], 0))), // lift: evicts the anchor
+            Ok(Some(frame(vec![finger(1, 200, 500, 0)], 0))), // reuse: fresh anchor
+            Ok(Some(frame(vec![finger(1, 200, 510, 0)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed: 200 },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        for i in 0..5 {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+            out.push(frame_mt_x(&sinks, before));
+        }
+        assert_eq!(out[0], vec![0]);
+        assert_eq!(out[1], vec![20]);
+        assert!(out[2].is_empty(), "lift frame emits no MT X");
+        // Retouch anchors at raw (no jump from the old emitted 20).
+        assert_eq!(out[3], vec![500]);
+        assert_eq!(out[4], vec![520]);
+    }
+
+    #[test]
+    fn speed_tracks_contacts_independently() {
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(
+                vec![finger(1, 200, 0, 0), finger(2, 200, 100, 0)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 10, 0), finger(2, 200, 110, 0)],
+                0,
+            ))),
+            Ok(Some(frame(
+                vec![finger(1, 200, 20, 0), finger(2, 200, 100, 0)],
+                0,
+            ))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            pointer: crate::config::PointerConfig { speed: 200 },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        for i in 0..3u64 {
+            let before = sinks.pointer.events.lock().unwrap().len();
+            px.handle_frame_at(&cfg, spaced_at(t0, i)).unwrap();
+            out.push(frame_mt_x(&sinks, before));
+        }
+        assert_eq!(out[0], vec![0, 100]);
+        assert_eq!(out[1], vec![20, 120]);
+        // Contact 1 advances, contact 2 reverses to its origin.
+        assert_eq!(out[2], vec![40, 100]);
+    }
+
+    #[test]
+    fn speed_clamps_at_axis_bounds_and_reverses_cleanly() {
+        // Raw 3900 -> 3920 @200% wants 3940; virtual X caps at 3934.
+        // Hold stays pinned; reversal responds immediately (no stick).
+        let emitted = drive_speed_frames(&[3900, 3920, 3920, 3900], 200);
+        assert_eq!(emitted, vec![3900, POSITION_MAX_X, POSITION_MAX_X, 3894]);
+        // Lower bound pins symmetrically.
+        let emitted = drive_speed_frames(&[-3600, -3650, -3650, -3600], 200);
+        assert_eq!(emitted, vec![-3600, POSITION_MIN_X, POSITION_MIN_X, -3578]);
+    }
+
+    #[test]
+    fn speed_fresh_out_of_range_anchor_clamps_and_holds() {
+        // Fresh out-of-range contacts must emit the clamped bound on first
+        // contact and stay put while raw is stationary (zero delta = no move).
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 4000], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X]
+        );
+        assert_eq!(
+            drive_speed_frames(&[-4000, -4000, -4000], 100),
+            vec![POSITION_MIN_X, POSITION_MIN_X, POSITION_MIN_X]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, 3000), (0, 3000), (0, 3000)], 100),
+            vec![
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y)
+            ]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, -3000), (0, -3000), (0, -3000)], 100),
+            vec![
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y)
+            ]
+        );
+    }
+
+    #[test]
+    fn speed_fresh_out_of_range_first_move_uses_raw_delta() {
+        // Raw stays the delta origin: inward motion from a clamped anchor
+        // steps off the bound; outward overshoot stays pinned.
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 3990], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X - 10]
+        );
+        assert_eq!(
+            drive_speed_frames(&[-4000, -4000, -3990], 100),
+            vec![POSITION_MIN_X, POSITION_MIN_X, POSITION_MIN_X + 10]
+        );
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 4010], 100),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X]
+        );
+        // Y mirrors X, and scaling still applies to the raw delta.
+        assert_eq!(
+            drive_speed_points(&[(0, 3000), (0, 3000), (0, 2990)], 100),
+            vec![
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y),
+                (0, POSITION_MAX_Y - 10)
+            ]
+        );
+        assert_eq!(
+            drive_speed_points(&[(0, -3000), (0, -3000), (0, -2990)], 100),
+            vec![
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y),
+                (0, POSITION_MIN_Y + 10)
+            ]
+        );
+        assert_eq!(
+            drive_speed_frames(&[4000, 4000, 3990], 200),
+            vec![POSITION_MAX_X, POSITION_MAX_X, POSITION_MAX_X - 20]
+        );
+    }
+
+    #[test]
+    fn position_bounds_match_virtual_axes() {
+        let get = |code: u16| {
+            uinput_abs_setup()
+                .iter()
+                .find(|(c, _, _, _)| *c == code)
+                .copied()
+                .unwrap()
+        };
+        assert_eq!(
+            (get(ABS_X).1, get(ABS_X).2),
+            (POSITION_MIN_X, POSITION_MAX_X)
+        );
+        assert_eq!(
+            (get(ABS_Y).1, get(ABS_Y).2),
+            (POSITION_MIN_Y, POSITION_MAX_Y)
+        );
     }
 
     #[test]
