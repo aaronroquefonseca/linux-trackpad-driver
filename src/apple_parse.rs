@@ -140,6 +140,18 @@ pub trait TouchSource {
     fn tier(&self) -> CapabilityTier;
     fn pressure_units(&self) -> PressureUnits;
     fn poll_frame(&mut self) -> Result<Option<TouchFrame>>;
+    /// Nonblocking hidraw fd for readiness waits (`poll(2)`). `None` means
+    /// the source cannot wait on input (tests, stubs): the pump then waits
+    /// on control/deadline notifications only.
+    fn poll_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
+    /// True when a decoded frame is queued without touching the fd (e.g.
+    /// the second half of a `0xf7` double report). The pump drains these
+    /// immediately instead of blocking.
+    fn has_pending_frame(&self) -> bool {
+        false
+    }
 }
 
 /// Apple Magic Trackpad 2 hidraw source (decode only in this task).
