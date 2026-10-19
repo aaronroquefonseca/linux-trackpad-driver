@@ -8839,6 +8839,234 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
     }
 
     #[test]
+    fn slide_handoff_alias_action_is_seamless() {
+        // slide_1 = super+left, click_1 = meta+left: identical kernel codes
+        // under different spellings — the hold must continue with no
+        // release/re-press (finding #18: token-string compare broke this).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "meta+left".into(),
+                ..Config::default().click
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "super+left".into(),
+                ..Config::default().slide
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        assert!(!px
+            .handle_frame_at(&cfg, spaced_at(t0, 1))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        // Exactly one down/up pair per wire code: no mid-hold flutter.
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert_eq!(haptic.calls.lock().unwrap().len(), 1);
+        assert_eq!(haptic.releases.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn slide_handoff_alias_absorbs_into_matching_press_level() {
+        // Staged composition with alias spellings throughout: slide_1 =
+        // super+left merges seamlessly into click_1 = meta+left on the stab
+        // frame (no wire flutter), then force_1 = meta+left joins the held
+        // codes on the next frame with its own pulse. Left + meta: exactly
+        // one down/up pair each; right never appears.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 250, 0, 0)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "meta+left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "meta+left".into(),
+                force_offset: 20,
+                transition_mode: "continuous".into(),
+                ..Config::default().force
+            },
+            slide: crate::config::SlideConfig {
+                slide_1: "super+left".into(),
+                ..Config::default().slide
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        assert!(px
+            .handle_frame_at(&cfg, spaced_at(t0, 0))
+            .unwrap()
+            .unwrap()
+            .is_slide());
+        let mark = sinks.pointer.events.lock().unwrap().len();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(!first.is_force(), "staged: first edge lands alone");
+        let tail: Vec<(u16, u16, i32)> = sinks.pointer.events.lock().unwrap()[mark..].to_vec();
+        let lefts: Vec<i32> = tail
+            .iter()
+            .copied()
+            .filter(|&(ty, c, _)| ty == EV_KEY && c == BTN_LEFT)
+            .map(|(_, _, v)| v)
+            .collect();
+        assert!(
+            lefts.iter().all(|&v| v == 1),
+            "no left up mid-hold: {tail:?}"
+        );
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
+        let ev = px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap().unwrap();
+        assert!(ev.is_force(), "force supersedes in reporting");
+        // Force joins the alias-held codes: still down, never fluttered.
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1]);
+        // Two downs (first + force; the slide edge stays silent) / two ups.
+        assert_eq!(haptic.calls.lock().unwrap().len(), 2);
+        px.handle_frame_at(&cfg, spaced_at(t0, 3)).unwrap();
+        assert_eq!(haptic.releases.lock().unwrap().len(), 2);
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, 125), vec![1, 0]);
+        assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 0));
+    }
+
+    #[test]
+    fn slide_reselect_alias_keyset_merges() {
+        // slide_1 = control+c, slide_2 = ctrl+c: a count change mid-slide
+        // keeps the wire down (alias-equivalent re-select merges silently).
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 20, 0, 0)], 0))),
+            Ok(Some(frame(
+                vec![finger(1, 20, 0, 0), finger(2, 20, 9, 9)],
+                0,
+            ))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            slide: crate::config::SlideConfig {
+                slide_1: "control+c".into(),
+                slide_2: "ctrl+c".into(),
+                ..Config::default().slide
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        let first = px.handle_frame_at(&cfg, spaced_at(t0, 0)).unwrap().unwrap();
+        assert!(first.is_slide() && first.finger_count == 1);
+        let second = px.handle_frame_at(&cfg, spaced_at(t0, 1)).unwrap().unwrap();
+        assert!(second.is_slide() && second.finger_count == 2);
+        assert_eq!(
+            key_values(&sinks.extras, 29),
+            vec![1],
+            "alias re-select must not flutter"
+        );
+        assert!(haptic.calls.lock().unwrap().is_empty());
+        px.handle_frame_at(&cfg, spaced_at(t0, 2)).unwrap();
+        assert_eq!(key_values(&sinks.extras, 29), vec![1, 0]);
+        assert!(haptic.releases.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn alias_comparison_agrees_with_wire_codes() {
+        // Pin the listed `canonical_key_token` pairs to the live
+        // `key_token_to_code` map: listed aliases sharing a code must merge,
+        // listed distinct codes must not (checked symmetrically both ways).
+        // This guards only the pairs below; token-map changes must extend
+        // this matrix, since a new alias added to only one map stays green.
+        use crate::config::parse_click_action;
+        let kind = |s: &str| parse_click_action(s).unwrap().kind;
+        for (a, b) in [
+            ("ctrl", "control"),
+            ("ctrl", "lctrl"),
+            ("shift", "lshift"),
+            ("alt", "lalt"),
+            ("meta", "super"),
+            ("meta", "cmd"),
+            ("meta", "command"),
+            ("meta", "win"),
+            ("meta", "lmeta"),
+            ("esc", "escape"),
+            ("enter", "return"),
+            ("pageup", "pgup"),
+            ("pagedown", "pgdn"),
+            ("up", "arrow_up"),
+            ("down", "arrow_down"),
+            ("volup", "volumeup"),
+            ("voldown", "volumedown"),
+            ("play", "playpause"),
+            ("stop", "stopcd"),
+            ("next", "nextsong"),
+            ("prev", "previous"),
+            ("prev", "previoussong"),
+            ("browserback", "browser_back"),
+            ("browserforward", "browser_forward"),
+            ("screenlock", "lock"),
+        ] {
+            assert_eq!(
+                key_token_to_code(a),
+                key_token_to_code(b),
+                "alias pair must share a wire code: '{a}' vs '{b}'"
+            );
+            assert!(
+                kind(a).is_same_action(&kind(b)),
+                "alias pair must merge: '{a}' vs '{b}'"
+            );
+            assert!(
+                kind(b).is_same_action(&kind(a)),
+                "alias pair must merge (symmetric): '{b}' vs '{a}'"
+            );
+        }
+        for (a, b) in [
+            ("ctrl", "rctrl"),
+            ("shift", "rshift"),
+            ("alt", "ralt"),
+            ("meta", "rmeta"),
+            ("left", "left_arrow"),
+            ("pause", "pausecd"),
+            ("play", "playcd"),
+            ("mute", "micmute"),
+        ] {
+            assert_ne!(
+                key_token_to_code(a),
+                key_token_to_code(b),
+                "distinct pair must map apart: '{a}' vs '{b}'"
+            );
+            assert!(
+                !kind(a).is_same_action(&kind(b)),
+                "distinct pair must not merge: '{a}' vs '{b}'"
+            );
+            assert!(
+                !kind(b).is_same_action(&kind(a)),
+                "distinct pair must not merge (symmetric): '{b}' vs '{a}'"
+            );
+        }
+    }
+
+    #[test]
     fn slide_handoff_absorbs_into_matching_press_level() {
         // Staged composition: slide == first merges seamlessly on the stab
         // frame (no pulse, no wire traffic — left never ups); force follows
