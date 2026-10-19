@@ -57,18 +57,32 @@ body:
     attributes:
       label: Logs
       description: |
-        Run with `RUST_LOG=debug`, and include `journalctl -u linux-trackpad-driver`
-        output for service issues. Redact hostnames if you wish.
+        `RUST_LOG` is ignored; the daemon reads `log_level` from the selected config
+        (`-c <file>` wins, else `$LTD_CONFIG`, else built-in defaults; the service sets
+        `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml`). Set `log_level = "debug"`
+        in the file you actually run, then restart the service or start explicitly with
+        that file (`sudo ltd run -c <file>`). Include `ltd --version`, `ltd doctor`
+        (same file), and the debug excerpt. A listed socket alone does not prove the
+        proxy attached. Redact hostnames if you wish.
       render: shell
       placeholder: |
-        RUST_LOG=debug sudo ltd run ...
+        log_level = "debug" in <selected file>; then:
+        START=$(date '+%Y-%m-%d %H:%M:%S')
+        sudo systemctl restart linux-trackpad-driver.service
+        # ... reproduce the issue, then export the bounded session:
+        journalctl -u linux-trackpad-driver.service --since "$START" > /tmp/ltd-run.log
+        grep -E 'starting|config:|found|evdev:|actuator|USB init|BT ' /tmp/ltd-run.log | head -30
+        grep -E 'resume|proxy|polling|verify|failed|error' /tmp/ltd-run.log | tail -50
+        # or: sudo ltd run -c /etc/linux-trackpad-driver/config.toml 2>&1 | tee /tmp/ltd-run.log
+        ltd --version
+        ltd doctor  # or: ltd doctor -c <same file>
     validations:
       required: true
   - type: textarea
     id: config
     attributes:
       label: Config
-      description: Contents of your `config.toml` if non-default (or "default").
+      description: Contents of your `config.toml` if non-default (or "default"). Also state which file was actually selected (`-c <file>`, `$LTD_CONFIG`, or defaults/service file).
       render: toml
   - type: checkboxes
     id: checklist
