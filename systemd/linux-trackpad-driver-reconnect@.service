@@ -29,7 +29,8 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ProtectClock=yes
+# ProtectClock deferred (see main unit + SECURITY.md): pre-v252 RTC-only
+# device allowlist denies hidraw/evdev/uinput.
 ProtectHostname=yes
 ProtectKernelLogs=yes
 NoNewPrivileges=yes
@@ -40,3 +41,4 @@ RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX
 # Deliberately OMITTED (see main unit + SECURITY.md): User=, device rules,
 # CapabilityBoundingSet, SystemCallFilter, ProtectProc, PrivateUsers.
+# Deferred for compat: ProtectClock (pre-v252 RTC allowlist denies devices).

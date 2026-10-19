@@ -65,12 +65,19 @@ and input devices. There is no privilege dropping via users today. What
 chosen restriction-by-restriction against the daemon's audited access and
 pinned by `tests/packaging.rs`:
 
-- Filesystem: `ProtectSystem=strict` (API FS `/dev`, `/proc`, `/sys`,
-  `/run` stay usable, so hidraw/evdev/uinput reads+writes, sysfs discovery
-  reads, the `/etc` config read, and the `/run` socket are unchanged),
-  `ProtectHome=yes`, `PrivateTmp=yes`, `ProtectKernelTunables=yes`,
-  `ProtectKernelModules=yes`, `ProtectControlGroups=yes`, `ProtectClock=yes`,
-  `ProtectHostname=yes`, `ProtectKernelLogs=yes`.
+- Filesystem: `ProtectSystem=strict` (API FS `/dev`, `/proc`, `/sys`
+  stay usable, so hidraw/evdev/uinput reads+writes, sysfs discovery
+  reads, and the `/etc` config read are unchanged; the writable `/run`
+  socket dir comes from `RuntimeDirectory=linux-trackpad-driver`, not
+  from a general `/run` exemption), `ProtectHome=yes`, `PrivateTmp=yes`,
+  `ProtectKernelTunables=yes`, `ProtectKernelModules=yes`,
+  `ProtectControlGroups=yes`, `ProtectHostname=yes`, `ProtectKernelLogs=yes`.
+  `ProtectClock` is deliberately deferred (all three units): on pre-v252
+  systemd (e.g. Ubuntu Jammy) `ProtectClock=yes` adds an RTC-only device
+  allowlist that denies `/dev/hidraw*`, `/dev/input/event*`, and
+  `/dev/uinput` (upstream systemd#25075, fixed in v252). Time access stays
+  read-only without it; re-add only with a systemd version floor plus
+  hardware validation.
 - Privilege: `NoNewPrivileges=yes` (the daemon spawns no child processes),
   `RestrictSUIDSGID=yes`, `RestrictRealtime=yes`, `LockPersonality=yes`,
   `RestrictNamespaces=yes` (no namespace creation; the hotplug monitor only

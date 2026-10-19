@@ -39,8 +39,11 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-# No clock/hostname/kmsg writes: time is read-only, logs go to stderr.
-ProtectClock=yes
+# No hostname/kmsg writes: logs go to stderr, no kmsg/hostname use.
+# ProtectClock is deliberately deferred (see SECURITY.md): on pre-v252
+# systemd (e.g. Ubuntu Jammy) it adds an RTC-only device allowlist that
+# denies hidraw/evdev/uinput (systemd#25075, fixed in v252). Time stays
+# read-only without it; re-add only with a version floor + hw validation.
 ProtectHostname=yes
 ProtectKernelLogs=yes
 # Privilege reduction: no child processes (no Command::exec in src),
@@ -59,6 +62,8 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 # see SECURITY.md): User=/DynamicUser=, DevicePolicy=/DeviceAllow=/
 # PrivateDevices, CapabilityBoundingSet, SystemCallFilter, ProtectProc,
 # PrivateUsers. Adding any of those blindly breaks hidraw/evdev/uinput.
+# Deferred for compat (see SECURITY.md): ProtectClock — pre-v252 RTC-only
+# device allowlist denies hidraw/evdev/uinput.
 
 [Install]
 WantedBy=multi-user.target
