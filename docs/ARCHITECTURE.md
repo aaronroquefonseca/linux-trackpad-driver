@@ -107,9 +107,13 @@ incl. nested, unknown version errors.
 ## Daemon CLI
 
 - `ltd run [-c config]` — init loop + optional clicks pipeline.
-- `ltd reconnect <hidraw-dev> [-f] [-p Hz] [-d]` — udev entry; idempotent;
-  `-f` proceeds when daemon socket absent; `-d` disengage path.
-- `ltd resume [-p Hz] [-c config]` — re-run init after suspend (also via sleep hook).
+- `ltd reconnect <hidraw-dev> [-f] [-p Hz] [-d]` — udev entry; idempotent.
+  Activation contract: without a live daemon socket and without `-f`/`-d`
+  it leaves the hardware alone (exit 0), so installed-but-disabled is off;
+  `-f` forces init, `-d` disengages (explicit manual forms).
+- `ltd resume [-f] [-p Hz] [-c config]` — re-run init after suspend (also via
+  sleep hook). Plain `resume` without a live daemon is an inactive no-op;
+  `-f` forces re-init while the daemon is stopped.
 - `ltd doctor [-c config]` — ordinary-user, read-only checklist: device metadata,
   on-disk config validation, and listening stream socket metadata from
   `/proc/net/unix` in the caller's network namespace (no socket connection).

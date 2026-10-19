@@ -36,6 +36,9 @@ const SERVICE: &str = include_str!("../systemd/linux-trackpad-driver.service");
 const RECONNECT: &str = include_str!("../systemd/linux-trackpad-driver-reconnect@.service");
 const RESUME_UNIT: &str = include_str!("../systemd/linux-trackpad-driver-resume.service");
 const SLEEP_HOOK: &str = include_str!("../systemd/system-sleep/ltd-resume");
+const ARCH_INSTALL: &str = include_str!("../packaging/arch/ltd.install");
+const SPEC: &str = include_str!("../packaging/fedora/linux-trackpad-driver.spec");
+const POSTINST: &str = include_str!("../debian/postinst");
 
 const COMBOS: [(&str, &str); 4] = [
     ("05ac", "0265"),
@@ -319,6 +322,77 @@ fn sleep_hook_and_resume_unit_never_touch_user_sessions() {
         assert!(
             !unit_code.contains(banned),
             "resume unit must not touch user sessions: {banned:?}"
+        );
+    }
+}
+
+#[test]
+fn activation_background_paths_carry_no_force_flag() {
+    // Finding #14 contract: the shipped background invocations are the
+    // AUTOMATIC form (no -f/--force/-d), so without a live daemon they
+    // leave hardware alone. Explicit forcing lives on the direct CLI
+    // (`ltd reconnect -f`, `ltd resume -f`), never in these files.
+    let reconnect_exec = RECONNECT
+        .lines()
+        .find(|l| l.trim_start().starts_with("ExecStart="))
+        .expect("reconnect template needs ExecStart");
+    assert!(
+        reconnect_exec.trim_end() == "ExecStart=/usr/bin/ltd reconnect /dev/%I",
+        "reconnect template must run the automatic form (no force/disengage flags): {reconnect_exec}"
+    );
+    let resume_exec = RESUME_UNIT
+        .lines()
+        .find(|l| l.trim_start().starts_with("ExecStart="))
+        .expect("resume unit needs ExecStart");
+    assert!(
+        resume_exec.trim_end() == "ExecStart=/usr/bin/ltd resume",
+        "resume unit must run the automatic form (no --force): {resume_exec}"
+    );
+    let hook_invoke = code_lines(SLEEP_HOOK)
+        .lines()
+        .find(|l| l.contains("\"$LTD_BIN\" resume"))
+        .expect("sleep hook must invoke ltd resume")
+        .to_string();
+    assert!(
+        !hook_invoke.contains("-f") && !hook_invoke.contains("--force"),
+        "sleep hook must invoke the automatic form (no force flag): {hook_invoke}"
+    );
+}
+
+#[test]
+fn activation_install_upgrade_never_triggers_hardware() {
+    // Finding #14: install/upgrade/remove scriptlets only reload
+    // udev/systemd. A `udevadm trigger --action=add` here would queue
+    // reconnect one-shots at install time behind the admin's back.
+    assert!(!repo_file("packaging/arch/ltd.install").is_empty());
+    for (name, text) in [
+        ("arch install", ARCH_INSTALL),
+        ("fedora spec", SPEC),
+        ("debian postinst", POSTINST),
+    ] {
+        let code = code_lines(text);
+        assert!(
+            !code.contains("udevadm trigger"),
+            "{name} must not retrigger devices at install/upgrade time"
+        );
+    }
+    // The Arch scriptlet keeps its reload-only posture (rules + systemd).
+    let install_code = code_lines(ARCH_INSTALL);
+    assert!(
+        install_code.contains("udevadm control --reload-rules"),
+        "arch install must still reload udev rules"
+    );
+    assert!(
+        install_code.contains("systemctl daemon-reload"),
+        "arch install must still reload systemd"
+    );
+    // ... and still never enables or starts anything (mirrors check-aur.sh:
+    // anchored at line start, so prose/echo mentions do not count).
+    for line in install_code.lines() {
+        let stripped = line.trim_start();
+        assert!(
+            !stripped.starts_with("systemctl enable") && !stripped.starts_with("systemctl start"),
+            "arch install must never enable/start units: {line}"
         );
     }
 }

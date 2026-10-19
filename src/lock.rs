@@ -149,8 +149,9 @@ impl Drop for SocketLock {
     }
 }
 
-/// True when a live daemon answers at `sock_path`. Used by `reconnect`:
-/// absent socket without `-f` means disengage mode.
+/// True when a live daemon answers at `sock_path`. Used by `reconnect` and
+/// `resume`: absent socket without `-f`/`-d` means inactive (hardware left
+/// alone) under the activation contract.
 pub fn daemon_socket_present(sock_path: &str) -> bool {
     UnixStream::connect(sock_path).is_ok()
 }

@@ -367,7 +367,7 @@ pub fn init_usb(sender: &dyn FeatureSender, requested_hz: u32) -> Result<Polling
     Ok(plan)
 }
 
-/// USB disengage path (`-d`, or daemon-socket absent without `-f`):
+/// USB disengage path (`-d`, explicit manual disengage only):
 /// host-click off only; multitouch/polling untouched.
 pub fn disengage_usb(sender: &dyn FeatureSender) -> Result<()> {
     sender.send(HOST_CLICK_USB_OFF)?;

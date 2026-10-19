@@ -51,12 +51,14 @@ inside udev `RUN` — each match only sets `TAG+="systemd"` +
 `docs/RESEARCH.md` §6: long RUN blocks udev; and the systemd#37063 trap —
 no `ATTRS{idVendor}` matching on `input` event nodes; none lives here).
 
-Manual reconnect without replug:
+Manual reconnect without replug (daemon running):
 
 ```sh
 sudo systemctl start 'linux-trackpad-driver-reconnect@hidraw2.service'
 # or directly:
 sudo ltd reconnect /dev/hidraw2
+# explicit forcing while the daemon is stopped:
+sudo ltd reconnect -f /dev/hidraw2
 ```
 
 ## systemd units
@@ -75,6 +77,28 @@ systemctl status linux-trackpad-driver.service
   truth: `src/lock.rs` `DRIVER_SOCK`; `$LTD_SOCKET` overrides for
   tests/unprivileged runs).
 - Reconnect template: `Type=oneshot`, runs `ltd reconnect /dev/%I`.
+
+## Activation contract (off means off)
+
+The main service is the only automatic activator. Installing, disabling,
+or stopping it leaves the trackpad hardware alone:
+
+| Path | Daemon stopped | Daemon running |
+|---|---|---|
+| udev hotplug → `reconnect@` one-shot (no `-f`) | no-op, exit 0 | re-inits node |
+| sleep hook / resume unit → plain `ltd resume` | no-op, exit 0 | re-verifies + re-inits on mismatch |
+| `ltd reconnect -f …`, `ltd reconnect -d …`, `ltd resume -f` | runs as requested (explicit manual forcing) | runs as requested |
+
+Background one-shots check the live daemon socket and return before any
+node wait, scan, or feature-report write, so a queued unit can neither
+fail on missing hardware nor touch it. Packaging never triggers hardware
+either: install/upgrade scriptlets only reload udev/systemd (no
+`udevadm trigger`, no enable/start — same policy on Arch, Debian, and
+Fedora).
+
+Manual `udevadm trigger --action=add` above therefore only re-inits once
+the service runs; with the service stopped the queued one-shots exit 0
+without touching hardware — use `-f` to force while stopped.
 
 ## Config
 
@@ -96,6 +120,8 @@ sudo install -m644 systemd/linux-trackpad-driver-resume.service /etc/systemd/sys
 sudo systemctl daemon-reload
 # Manual re-init without sleeping (or to test the path):
 sudo ltd resume
+# explicit forcing while the daemon is stopped:
+sudo ltd resume -f
 systemctl status linux-trackpad-driver-resume.service
 ```
 

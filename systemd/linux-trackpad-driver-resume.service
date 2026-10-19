@@ -10,6 +10,12 @@
 # src/resume.rs). Enabling this unit adds a harmless idempotent re-init
 # pass at boot.
 #
+# Activation contract (finding #14): plain `ltd resume` is the AUTOMATIC
+# background form — without a live main-service daemon it is an inactive
+# no-op (hardware left alone, exit 0). Installed-but-disabled is therefore
+# off. Explicit manual forcing while the daemon is stopped is
+# `ltd resume -f` run directly.
+#
 # SYSTEM-SIDE ONLY: no user-session IPC (user.slice is frozen while sleep
 # hooks run; see docs/RESEARCH.md §6). No --user units, no session D-Bus.
 [Unit]
