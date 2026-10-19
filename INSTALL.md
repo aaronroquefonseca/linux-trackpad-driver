@@ -43,13 +43,31 @@ sudo udevadm trigger --subsystem-match=hidraw --action=add
 udevadm monitor --udev --subsystem-match=hidraw
 ```
 
-Rules match `ACTION=="add", SUBSYSTEM=="hidraw"` gated on the four
-VID:PID combos (`05ac`/`004c` × `0265`/`0324`) via the physical USB
-parent's `ATTRS{idVendor}`/`ATTRS{idProduct}`. They never run `ltd`
+Rules match `ACTION=="add", SUBSYSTEM=="hidraw"` with transport-correct
+identity. USB uses the physical USB parent's `ATTRS{idVendor}` /
+`ATTRS{idProduct}` (`05ac` × `0265`/`0324`); both `ATTRS` keys must share
+that one ancestor (systemd udev requires all parent keys to match one and
+the same parent). Bluetooth uses the HID parent's kernel name, e.g.
+`KERNELS=="0005:004C:0324.*"` (bus `0005` + VID:PID, uppercase), because any
+USB ancestor of a BT node is the host adapter, never the trackpad — an
+`ATTRS{idVendor}=="004c"` rule could never fire. They never run `ltd`
 inside udev `RUN` — each match only sets `TAG+="systemd"` +
 `ENV{SYSTEMD_WANTS}` for the reconnect template unit (see
 `docs/RESEARCH.md` §6: long RUN blocks udev; and the systemd#37063 trap —
 no `ATTRS{idVendor}` matching on `input` event nodes; none lives here).
+
+Validate on hardware, per transport (the daemon's polling scan is only a
+fallback and does not prove these rules fire):
+
+```sh
+udevadm info -a -n /dev/hidrawN | grep -E 'KERNEL|SUBSYSTEM|idVendor|idProduct'
+# USB expect: parent KERNEL=="0003:05AC:0324.xxxx" plus ATTRS{idVendor}=="05ac"
+#   and ATTRS{idProduct}=="0324" on ONE ancestor.
+# BT expect: parent KERNEL=="0005:004C:0324.xxxx"; USB ancestors (if any) show
+#   the host adapter VID, never the trackpad VID.
+udevadm test "$(udevadm info -q path -n /dev/hidrawN)" 2>&1 | grep -E 'SYSTEMD_WANTS|linux-trackpad-driver-reconnect'
+# expect the reconnect template instance for /dev/hidrawN on both transports.
+```
 
 Manual reconnect without replug:
 
@@ -104,10 +122,18 @@ systemctl status linux-trackpad-driver-resume.service
   `hybrid-sleep`, `suspend-then-hibernate`); `pre` is a no-op. The hook is
   system-side only — `user.slice` is frozen while sleep hooks run, so it
   never touches user sessions (no `--user` units, no session D-Bus).
-  Sleep hooks inherit PID1's environment, so the hook sets and exports
+  Sleep hooks inherit PID1's environment, not any unit's `Environment=`,
+  so the hook sets and exports
   `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml` (same path as the
-  units) before exec — otherwise resume would re-init at defaults while
-  the daemon verifies against the system rate. Hook runtime is bounded
+  units) before exec to keep its `ltd resume` on the same file. Without
+  this export the hook would still read the installed file via the shared
+  fallback (not built-in defaults when the installed file exists). A custom
+  `LTD_CONFIG` set only on the main unit does not reach the hook or the
+  other units — each separately launched unit/hook needs the same override;
+  there is no automatic cross-process propagation. (All commands share one
+  selection: `-c`, then `$LTD_CONFIG`, then the installed file, then
+  built-in defaults.) Hook
+  runtime is bounded
   (~1 s node wait + backoff retries per node); failures are logged and
   swallowed, the hook always exits 0 so a driver hiccup never perturbs
   the sleep cycle.
@@ -135,10 +161,14 @@ systemctl status linux-trackpad-driver-resume.service
   sibling updates the haptic target without re-grabbing a healthy touch
   session. Healthy sessions/siblings produce no extra attachment events or
   periodic hardware readbacks on these fast passes.
-- Recovery/fallback: failed full USB setup blocks attachment until the full
+- Recovery/fallback: hardware reinitialization and session attachment are
+  distinct steps — reinit (re-)sends the USB feature-report sequence to the
+  device, while attachment emits `Ready` so the proxy creates virtual nodes
+  and grabs input. Attachment-only retries emit `Ready` with no hardware
+  reports. Failed full USB setup blocks attachment until the full
   sequence succeeds, even if polling later matches. Dead USB sessions verify
-  before reattaching; Bluetooth keeps native bindings intact. Gate-off never
-  requests a proxy grab. Instance replacement tears down old ownership before
+  before reattaching; Bluetooth keeps native bindings intact. Gate-off still
+  inits new hardware promptly but never requests a proxy grab. Instance replacement tears down old ownership before
   initialization, including a name reused between scans. Monitor startup or
   receive failure and exhausted readiness retries are logged; the 30-second
   full scan/readback remains the fallback for missed events and later

@@ -1586,6 +1586,93 @@ mod tests {
     }
 
     #[test]
+    fn hotplug_wake_attaches_session_without_waiting_for_verify() {
+        // Finding #9: a plug event must reconcile to an attached session
+        // on the fast hotplug pass, not at the next 30 s verification.
+        // Both transports: USB (feature-report init) and BT (direct Ready).
+        use crate::hotplug::{Schedule, Work};
+        use std::time::{Duration, Instant};
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, false);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let start = Instant::now();
+            let mut schedule = Schedule::new(start);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            // No event: nothing due well before the 30 s verification.
+            assert_eq!(
+                schedule.take_due(start + Duration::from_secs(5), true),
+                None
+            );
+            // Plug event at 5 s; the coalesced fast pass fires, never a Verify.
+            schedule.wake(start + Duration::from_secs(5));
+            let due = start + Duration::from_secs(5) + Duration::from_millis(100);
+            assert_eq!(schedule.take_due(due, true), Some(Work::Hotplug));
+            let actions = watch.reconcile_with_hardware(
+                &cfg,
+                &hub,
+                vec![dev.clone()],
+                &health,
+                &hardware,
+                false,
+            );
+            assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+            schedule.completed(due, watch.has_pending(&cfg, &health));
+            assert!(session.lock().unwrap().proxy.is_attached());
+            assert_eq!(session.lock().unwrap().attempts, 1);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.verifies.get(), 0);
+        }
+    }
+
+    #[test]
+    fn hotplug_gate_off_discovers_new_hardware_promptly_without_session_work() {
+        // Finding #9: gate-off must still init new hardware on the fast
+        // hotplug pass (no 30 s wait); it just never builds a proxy session.
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let mut watch = ResumeWatch::new(&[]);
+        let devs = fixture_devs();
+        // Hotplug fast pass: no hardware verification, like production
+        // `watch.scan(..., verify_hardware=false)`.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs.clone(),
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Initialized(devs[0].devnode.clone()),
+                TickAction::Initialized(devs[1].devnode.clone()),
+            ]
+        );
+        assert_eq!(hardware.inits.get(), 2);
+        assert_eq!(hardware.verifies.get(), 0);
+        assert_eq!(hardware.reinits.get(), 0);
+        // Steady state on the fast pass: no readbacks, no attachment traffic.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs,
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(hardware.verifies.get(), 0);
+    }
+
+    #[test]
     fn hotplug_gate_off_skips_session_work_and_known_hardware_reads() {
         let hub = hub();
         let hardware = TestHardware::new(&hub);
