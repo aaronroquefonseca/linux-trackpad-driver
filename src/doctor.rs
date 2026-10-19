@@ -5,12 +5,21 @@ use std::{io, path::Path};
 use anyhow::{Context, Result};
 
 use crate::config::{self, Config};
+use crate::init;
 
 const SYSTEM_CONFIG: &str = "/etc/linux-trackpad-driver/config.toml";
 const UNIX_TABLE: &str = "/proc/net/unix";
 
 /// Check the selected on-disk config, not the daemon's in-memory config.
-pub fn check_config(explicit: Option<&str>) -> (String, Result<()>) {
+///
+/// Beyond syntax/range validity ([`Config::validate`]), this applies the
+/// shared USB hardware-applicability gate
+/// ([`init::validate_config_for_usb`], the same check USB startup uses):
+/// polling below the device floor fails here exactly as it fails init, so
+/// doctor can no longer bless a config USB init would reject. `Ok` carries
+/// semantic warnings (effectively unreachable thresholds) that do not fail
+/// validation.
+pub fn check_config(explicit: Option<&str>) -> (String, Result<Vec<String>>) {
     check_config_with(
         explicit,
         config::config_path_from_env().as_deref(),
@@ -39,7 +48,7 @@ fn check_config_with(
     env: Option<&str>,
     installed: &str,
     read: impl FnOnce(&str) -> io::Result<Option<String>>,
-) -> (String, Result<()>) {
+) -> (String, Result<Vec<String>>) {
     let env = env.filter(|p| !p.is_empty());
     let path = explicit.or(env).unwrap_or(installed);
     let source = format!("{path}; on disk");
@@ -52,7 +61,7 @@ fn check_config_with(
             };
             (
                 format!("<built-in defaults>; {selection} config missing: {path}"),
-                Ok(()),
+                init::validate_config_for_usb(&Config::default()),
             )
         }
         text => {
@@ -62,7 +71,8 @@ fn check_config_with(
                     .with_context(|| format!("config '{path}' does not exist"))?;
                 let cfg: Config =
                     toml::from_str(&text).with_context(|| format!("parsing config '{path}'"))?;
-                cfg.validate()
+                cfg.validate()?;
+                init::validate_config_for_usb(&cfg)
             })();
             (source, result)
         }
@@ -338,6 +348,56 @@ mod tests {
             );
             assert_eq!(source, "selected; on disk");
         }
+    }
+
+    #[test]
+    fn doctor_rejects_below_floor_polling_like_init() {
+        // Finding #16: polling 1..=15 is syntax-valid but must fail doctor,
+        // exactly as it fails USB init.
+        for hz in [1u32, 5, 15] {
+            let text = format!("schema_version = 1\n[device]\npolling_rate = {hz}\n");
+            let (source, result) =
+                check_config_with(None, None, "selected", |_| Ok(Some(text.clone())));
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("USB hardware"), "{hz}: {err}");
+            assert_eq!(source, "selected; on disk");
+            assert!(crate::init::resolve_polling(hz).is_err());
+        }
+        for hz in [16u32, 60, 110] {
+            let text = format!("schema_version = 1\n[device]\npolling_rate = {hz}\n");
+            let (source, result) =
+                check_config_with(None, None, "selected", |_| Ok(Some(text.clone())));
+            let warnings = result.unwrap();
+            assert!(warnings.is_empty(), "{hz}: {warnings:?}");
+            assert_eq!(source, "selected; on disk");
+            assert!(crate::init::resolve_polling(hz).is_ok());
+        }
+    }
+
+    #[test]
+    fn doctor_warns_unreachable_thresholds_without_failing() {
+        let (source, result) = check_config_with(None, None, "selected", |_| {
+            Ok(Some(
+                "schema_version = 1\n[click]\nsensitivity = 255\n".into(),
+            ))
+        });
+        let warnings = result.unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("sensitivity"), "{}", warnings[0]);
+        assert_eq!(source, "selected; on disk");
+
+        let (_, result) = check_config_with(None, None, "selected", |_| {
+            Ok(Some(
+                "schema_version = 1\n[force]\nforce_offset = 230\n".into(),
+            ))
+        });
+        let warnings = result.unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("[force]"), "{}", warnings[0]);
+
+        // Built-in defaults stay silent.
+        let (_, result) = check_config_with(None, None, "installed", |_| Ok(None));
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]

@@ -102,10 +102,13 @@ pub struct DoctorNode {
 ///
 /// Returns `(report, ok)`: `ok` is false when the config is invalid or no
 /// trackpad node was seen. The socket state is informational only — a
-/// lack of an observed listener is not a failure.
+/// lack of an observed listener is not a failure. Config warnings
+/// (effectively unreachable thresholds) render as `[warn]` lines and never
+/// fail the report on their own.
 pub fn doctor_report(
     config_source: &str,
     config_error: Option<&str>,
+    config_warnings: &[String],
     nodes: &[DoctorNode],
     socket_path: &str,
     socket_status: &doctor::SocketStatus,
@@ -118,6 +121,9 @@ pub fn doctor_report(
             out.push_str(&format!("[FAIL] config invalid ({config_source}): {e}\n"));
             ok = false;
         }
+    }
+    for warning in config_warnings {
+        out.push_str(&format!("[warn] config: {warning}\n"));
     }
     if nodes.is_empty() {
         out.push_str("[FAIL] no trackpad seen: no 05ac:0265/0324 or 004c:0265/0324 hidraw node\n");
@@ -391,7 +397,10 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
         Command::Doctor(doc) => {
             // Read-only: config + sysfs/stat + kernel socket metadata.
             let (source, result) = doctor::check_config(doc.config_path.as_deref());
-            let config_error = result.err().map(|e| format!("{e:#}"));
+            let (config_error, config_warnings) = match result {
+                Ok(warnings) => (None, warnings),
+                Err(e) => (Some(format!("{e:#}")), Vec::new()),
+            };
             let nodes: Vec<DoctorNode> = match discovery::scan_trackpads() {
                 Ok(devs) => devs
                     .iter()
@@ -411,8 +420,14 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             };
             let sock = lock::socket_path();
             let status = doctor::socket_status(&sock);
-            let (report, ok) =
-                doctor_report(&source, config_error.as_deref(), &nodes, &sock, &status);
+            let (report, ok) = doctor_report(
+                &source,
+                config_error.as_deref(),
+                &config_warnings,
+                &nodes,
+                &sock,
+                &status,
+            );
             print!("{report}");
             if ok {
                 Ok(ExitCode::SUCCESS)
@@ -583,6 +598,7 @@ mod tests {
         let (report, ok) = doctor_report(
             "<built-in defaults>",
             None,
+            &[],
             &[doctor_node()],
             "/run/linux-trackpad-driver/driver.sock",
             &doctor::SocketStatus::Listening,
@@ -601,6 +617,7 @@ mod tests {
             "<built-in defaults>",
             None,
             &[],
+            &[],
             "/sock",
             &doctor::SocketStatus::NotObserved,
         );
@@ -612,6 +629,7 @@ mod tests {
         let (_, ok) = doctor_report(
             "<built-in defaults>",
             None,
+            &[],
             &[doctor_node()],
             "/sock",
             &doctor::SocketStatus::NotObserved,
@@ -624,6 +642,7 @@ mod tests {
         let (report, ok) = doctor_report(
             "/etc/config.toml; on disk",
             None,
+            &[],
             &[doctor_node()],
             "/sock",
             &doctor::SocketStatus::Unknown("cannot read /proc/net/unix".into()),
@@ -642,6 +661,7 @@ mod tests {
             "/tmp/bad.toml",
             Some("invalid polling_rate 500 (want 1..=110)"),
             &[],
+            &[],
             "/sock",
             &doctor::SocketStatus::NotObserved,
         );
@@ -653,11 +673,30 @@ mod tests {
         let (_, ok) = doctor_report(
             "<built-in defaults>",
             None,
+            &[],
             &[gone],
             "/sock",
             &doctor::SocketStatus::Listening,
         );
         assert!(!ok);
+    }
+
+    #[test]
+    fn doctor_report_shows_warnings_without_failing() {
+        let warnings = ["[click] sensitivity 255 above nominal device max 253 \
+             (arbitrary units 0..=253; press may never fire)"
+            .to_string()];
+        let (report, ok) = doctor_report(
+            "<built-in defaults>",
+            None,
+            &warnings,
+            &[doctor_node()],
+            "/sock",
+            &doctor::SocketStatus::Listening,
+        );
+        assert!(ok);
+        assert!(report.contains("[ok] config valid"));
+        assert!(report.contains("[warn] config: [click] sensitivity 255"));
     }
 
     #[test]

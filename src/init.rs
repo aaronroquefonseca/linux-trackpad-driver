@@ -44,6 +44,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use crate::apple_parse::PRESSURE_VALID_MAX;
+use crate::config::Config;
+
 /// USB multitouch-enable feature report.
 pub const MULTITOUCH_USB: &[u8] = &[0x02, 0x01];
 /// USB host-click enable (`21 01`) / disable (`21 00`).
@@ -86,6 +89,75 @@ pub struct PollingPlan {
     pub effective_hz: f64,
 }
 
+/// Shared USB polling usability gate: the single floor check used by USB
+/// startup validation ([`crate::daemon::validate_polling_rate`]) and doctor
+/// ([`crate::doctor::check_config`]).
+///
+/// Errors on `0`, out-of-`u16` values, and anything below
+/// [`MIN_EXPRESSIBLE_HZ`] (the `X` byte saturates at 255 → ~15.1 Hz, so
+/// lower requests would silently round up ~15×). Above-cap requests are
+/// usable — [`resolve_polling`] clamps them to `X >= 0x23` — so they pass
+/// here; callers warn about the clamp themselves.
+pub fn check_usb_polling_usable(polling_hz: u32) -> Result<()> {
+    if polling_hz == 0 || polling_hz > u16::MAX as u32 {
+        anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
+    }
+    if polling_hz < MIN_EXPRESSIBLE_HZ {
+        anyhow::bail!(
+            "polling rate {polling_hz} Hz below device floor (~{MIN_EXPRESSIBLE_HZ} Hz; X saturates at 255)"
+        );
+    }
+    Ok(())
+}
+
+/// Semantic warnings for threshold values that are syntactically valid but
+/// effectively unreachable on hardware: press `sensitivity` in the
+/// unobserved/reserved `254..=255` band (nominal device range `0..=253`,
+/// see [`PRESSURE_VALID_MAX`]), and an armed force level whose
+/// `sensitivity + force_offset` threshold sits above that nominal maximum
+/// (mirroring [`crate::clicks::ClickMachine::force_threshold`]; thresholds
+/// above 255 can never fire against a `u8` pressure byte at all).
+/// Warnings only — intentional setups still validate and run.
+pub fn usb_applicability_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if cfg.click.sensitivity > u16::from(PRESSURE_VALID_MAX) {
+        warnings.push(format!(
+            "[click] sensitivity {} above nominal device max {PRESSURE_VALID_MAX} \
+             (arbitrary units 0..=253; press may never fire)",
+            cfg.click.sensitivity
+        ));
+    }
+    if cfg.force.force_offset > 0 {
+        let threshold = cfg
+            .click
+            .sensitivity
+            .clamp(1, 255)
+            .saturating_add(cfg.force.force_offset.min(255));
+        if threshold > u16::from(PRESSURE_VALID_MAX) {
+            warnings.push(format!(
+                "[force] threshold {threshold} (sensitivity {} + offset {}) \
+                 beyond nominal device max {PRESSURE_VALID_MAX}; force level may never fire",
+                cfg.click.sensitivity, cfg.force.force_offset
+            ));
+        }
+    }
+    warnings
+}
+
+/// Shared hardware-applicability check for a parsed config: hard error when
+/// USB init would fail (polling below the device floor — the same
+/// [`check_usb_polling_usable`] startup uses), plus
+/// [`usb_applicability_warnings`] otherwise. Syntax/range validity
+/// ([`Config::validate`]) is a separate layer: a config can parse and
+/// range-check yet still be unusable for USB hardware. Bluetooth ignores
+/// polling (USB-first), so this gate is USB-only by design — BT paths keep
+/// discarding the rate instead of rejecting it.
+pub fn validate_config_for_usb(cfg: &Config) -> Result<Vec<String>> {
+    check_usb_polling_usable(cfg.device.polling_rate)
+        .context("config unusable for USB hardware (Bluetooth ignores polling; USB-first)")?;
+    Ok(usb_applicability_warnings(cfg))
+}
+
 /// Map a requested rate to the `X` byte. The request is capped at
 /// [`EFFECTIVE_CAP_HZ`] (~110 Hz) *before* mapping, so `X >= 0x23` always;
 /// values that would imply `X < 35` are never sent (unverified, may NAK).
@@ -93,14 +165,7 @@ pub struct PollingPlan {
 /// Errors on `0` or out-of-`u16` values (already validated at CLI/config
 /// layer, but checked here so the function is total on its own).
 pub fn resolve_polling(requested_hz: u32) -> Result<PollingPlan> {
-    if requested_hz == 0 || requested_hz > u16::MAX as u32 {
-        anyhow::bail!("invalid polling rate {requested_hz} (want 1..=65535)");
-    }
-    if requested_hz < MIN_EXPRESSIBLE_HZ {
-        anyhow::bail!(
-            "polling rate {requested_hz} Hz below device floor (~{MIN_EXPRESSIBLE_HZ} Hz; X saturates at 255)"
-        );
-    }
+    check_usb_polling_usable(requested_hz)?;
     let raw_x = (POLLING_BASE_HZ / f64::from(requested_hz)).round() as u32;
     let raw_x = raw_x.clamp(1, 255) as u8;
     let theoretical_hz = POLLING_BASE_HZ / f64::from(raw_x);
@@ -1141,5 +1206,85 @@ mod tests {
         assert_eq!(MULTITOUCH_BT, &[0xF1, 0x02, 0x01]);
         assert_eq!(host_click_bt(true), [0xF2, 0x21, 0x01]);
         assert_eq!(host_click_bt(false), [0xF2, 0x21, 0x00]);
+    }
+
+    #[test]
+    fn usb_polling_gate_agrees_with_resolve() {
+        // Shared gate and the wire resolver must agree on every boundary:
+        // doctor and USB init can no longer diverge (finding #16).
+        for hz in [0, 1, 15] {
+            assert!(
+                check_usb_polling_usable(hz).is_err(),
+                "{hz} must be unusable"
+            );
+            assert!(resolve_polling(hz).is_err(), "{hz} must fail resolve");
+        }
+        for hz in [16, 60, 110, 500] {
+            assert!(check_usb_polling_usable(hz).is_ok(), "{hz} must be usable");
+            assert!(resolve_polling(hz).is_ok(), "{hz} must resolve");
+        }
+        assert!(check_usb_polling_usable(70_000).is_err());
+        assert!(resolve_polling(70_000).is_err());
+    }
+
+    #[test]
+    fn config_usb_gate_agrees_with_init() {
+        // The config-level gate is the same check init runs: polling 1..=15
+        // is syntax-valid yet fails doctor exactly as it fails USB init.
+        for hz in [1u32, 5, 15] {
+            let mut cfg = crate::config::Config::default();
+            cfg.device.polling_rate = hz;
+            cfg.validate().unwrap();
+            assert!(
+                validate_config_for_usb(&cfg).is_err(),
+                "{hz} must be unusable"
+            );
+            assert!(resolve_polling(hz).is_err());
+        }
+        for hz in [16u32, 60, 110] {
+            let mut cfg = crate::config::Config::default();
+            cfg.device.polling_rate = hz;
+            cfg.validate().unwrap();
+            assert!(validate_config_for_usb(&cfg).is_ok(), "{hz} must be usable");
+            assert!(resolve_polling(hz).is_ok());
+        }
+    }
+
+    #[test]
+    fn usb_warnings_cover_unreachable_thresholds_only() {
+        // Defaults and the nominal-max pressure are clean.
+        assert!(usb_applicability_warnings(&crate::config::Config::default()).is_empty());
+        let mut nominal = crate::config::Config::default();
+        nominal.click.sensitivity = u16::from(crate::apple_parse::PRESSURE_VALID_MAX);
+        assert!(usb_applicability_warnings(&nominal).is_empty());
+        // The reserved band warns but still validates.
+        for s in [254u16, 255] {
+            let mut cfg = crate::config::Config::default();
+            cfg.click.sensitivity = s;
+            cfg.validate().unwrap();
+            let warnings = usb_applicability_warnings(&cfg);
+            assert_eq!(warnings.len(), 1, "sensitivity {s}");
+            assert!(warnings[0].contains("sensitivity"), "{}", warnings[0]);
+            assert!(validate_config_for_usb(&cfg).is_ok());
+        }
+        // Armed force level beyond the nominal max warns (still valid);
+        // exactly at the max stays silent.
+        let mut armed = crate::config::Config::default();
+        armed.force.force_offset = 223; // 30 + 223 = 253
+        armed.validate().unwrap();
+        assert!(validate_config_for_usb(&armed).unwrap().is_empty());
+        armed.force.force_offset = 230; // 30 + 230 = 260 > 253
+        armed.validate().unwrap();
+        let warnings = validate_config_for_usb(&armed).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("[force]"), "{}", warnings[0]);
+        // Disabled force never warns.
+        let mut off = crate::config::Config::default();
+        off.force.force_offset = 0;
+        assert!(validate_config_for_usb(&off).unwrap().is_empty());
+        // Owner tune stays clean: 30 + 130 = 160 <= 253.
+        let mut tune = crate::config::Config::default();
+        tune.force.force_offset = 130;
+        assert!(validate_config_for_usb(&tune).unwrap().is_empty());
     }
 }

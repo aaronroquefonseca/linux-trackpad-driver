@@ -593,6 +593,12 @@ fn is_known_key(name: &str) -> bool {
 impl Config {
     /// Validate every user-facing value; each failure names the key and the
     /// accepted range/set.
+    ///
+    /// Syntax/range layer only: polling `1..=110` passes here while USB init
+    /// needs `>= 16`, and extreme-but-in-range thresholds pass while being
+    /// effectively unreachable. That hardware applicability is
+    /// [`crate::init::validate_config_for_usb`], shared by USB startup and
+    /// doctor so the two can never diverge again.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             anyhow::bail!(
