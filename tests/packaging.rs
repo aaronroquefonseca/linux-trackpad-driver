@@ -36,11 +36,42 @@ fn code_lines(text: &str) -> String {
         .join("\n")
 }
 
+/// Active (non-comment, non-empty) directive lines, trimmed.
+fn active_lines(text: &str) -> Vec<String> {
+    code_lines(text)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Assert an active directive line equals `directive` exactly. Comments do
+/// not count, and a later override of the same key fails.
+fn assert_active_directive(text: &str, context: &str, directive: &str) {
+    let key = directive.split('=').next().unwrap_or(directive);
+    let lines = active_lines(text);
+    let keyed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.split('=').next().unwrap_or("") == key)
+        .collect();
+    assert!(
+        !keyed.is_empty(),
+        "{context} must carry active {directive} (commented-out does not count)"
+    );
+    assert!(
+        keyed.last().map(|s| s.as_str()) == Some(directive),
+        "{context} must leave {directive} effective (later override: {:?})",
+        keyed.last()
+    );
+}
+
 const RULES: &str = include_str!("../udev/99-linux-trackpad-driver.rules");
 const SERVICE: &str = include_str!("../systemd/linux-trackpad-driver.service");
 const RECONNECT: &str = include_str!("../systemd/linux-trackpad-driver-reconnect@.service");
 const RESUME_UNIT: &str = include_str!("../systemd/linux-trackpad-driver-resume.service");
 const SLEEP_HOOK: &str = include_str!("../systemd/system-sleep/ltd-resume");
+const COPYRIGHT: &str = include_str!("../debian/copyright");
+const LICENSE_MIT: &str = include_str!("../LICENSE-MIT");
 
 const USB_COMBOS: [(&str, &str); 2] = [("05ac", "0265"), ("05ac", "0324")];
 
@@ -589,6 +620,123 @@ fn service_unit_shape() {
 }
 
 #[test]
+fn service_sandbox_subset_finding_19() {
+    // Incremental containment: every added restriction must preserve the
+    // daemon's audited access (/dev R/W for hidraw/evdev/uinput, /sys +
+    // /proc reads, /etc RO config read, /run socket, AF_UNIX + AF_NETLINK).
+    // See the unit comments and SECURITY.md for the per-restriction rationale.
+    // ProtectClock is deliberately deferred (pre-v252 RTC-only device
+    // allowlist denies hidraw/evdev/uinput; systemd#25075, fixed in v252).
+    for directive in [
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectControlGroups=yes",
+        "ProtectHostname=yes",
+        "ProtectKernelLogs=yes",
+        "NoNewPrivileges=yes",
+        "RestrictSUIDSGID=yes",
+        "RestrictRealtime=yes",
+        "LockPersonality=yes",
+        "RestrictNamespaces=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+    ] {
+        assert_active_directive(SERVICE, "main unit", directive);
+    }
+    // Deferred for compat: must stay absent in code (comments may name it
+    // only to explain the deferral, so check code lines).
+    let service_code = code_lines(SERVICE);
+    assert!(
+        !service_code.contains("ProtectClock"),
+        "main unit must NOT set ProtectClock without a systemd version floor + hw validation (pre-v252 denies devices)"
+    );
+    // Deliberately left out: these need a device-access refactor (non-root
+    // device ACLs / cgroup device rules / ioctl allowlist) plus hardware
+    // validation. They are named in unit *comments* only to prohibit them, so
+    // check code lines. If you add one, update SECURITY.md's follow-up list
+    // and record hardware re-validation evidence in the PR.
+    for banned in [
+        "User=",
+        "DynamicUser=",
+        "PrivateDevices",
+        "DevicePolicy",
+        "DeviceAllow",
+        "CapabilityBoundingSet",
+        "SystemCallFilter",
+        "SystemCallArchitectures",
+        "ProtectProc",
+        "PrivateUsers",
+    ] {
+        assert!(
+            !service_code.contains(banned),
+            "main unit must NOT carry {banned:?} without the SECURITY.md follow-up work"
+        );
+    }
+}
+
+#[test]
+fn oneshot_units_carry_narrower_sandbox_subset() {
+    // One-shots (reconnect/resume) share the filesystem + privilege subset
+    // but need AF_UNIX only: they probe the daemon socket and re-send
+    // hidraw reports, never opening the AF_NETLINK hotplug monitor.
+    // ProtectClock deferred like the main unit (pre-v252 denies devices).
+    for (name, text) in [
+        ("reconnect template", RECONNECT),
+        ("resume unit", RESUME_UNIT),
+    ] {
+        for directive in [
+            "ProtectSystem=strict",
+            "ProtectHome=yes",
+            "PrivateTmp=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
+            "ProtectHostname=yes",
+            "ProtectKernelLogs=yes",
+            "NoNewPrivileges=yes",
+            "RestrictSUIDSGID=yes",
+            "RestrictRealtime=yes",
+            "LockPersonality=yes",
+            "RestrictNamespaces=yes",
+            "RestrictAddressFamilies=AF_UNIX",
+        ] {
+            assert_active_directive(text, name, directive);
+        }
+        assert!(
+            !code_lines(text).contains("AF_NETLINK"),
+            "{name} must not allow AF_NETLINK in code (no hotplug monitor in one-shots)"
+        );
+        // Same deliberate omissions as the main unit: device-access refactor
+        // + hardware validation required (see SECURITY.md). Comments may name
+        // them only to prohibit them, so check code lines.
+        let unit_code = code_lines(text);
+        assert!(
+            !unit_code.contains("ProtectClock"),
+            "{name} must NOT set ProtectClock without a systemd version floor + hw validation (pre-v252 denies devices)"
+        );
+        for banned in [
+            "User=",
+            "DynamicUser=",
+            "PrivateDevices",
+            "DevicePolicy",
+            "DeviceAllow",
+            "CapabilityBoundingSet",
+            "SystemCallFilter",
+            "SystemCallArchitectures",
+            "ProtectProc",
+            "PrivateUsers",
+        ] {
+            assert!(
+                !unit_code.contains(banned),
+                "{name} must NOT carry {banned:?} without the SECURITY.md follow-up work"
+            );
+        }
+    }
+}
+
+#[test]
 fn reconnect_template_runs_reconnect_for_instance() {
     assert!(
         RECONNECT.contains("Type=oneshot"),
@@ -728,6 +876,71 @@ fn sleep_hook_is_executable() {
     assert!(
         mode & 0o111 != 0,
         "sleep hook must be executable (systemd ignores non-executable hooks)"
+    );
+}
+
+#[test]
+fn debian_copyright_carries_complete_mit_text() {
+    // Policy 12.5: MIT has no /usr/share/common-licenses entry, so the
+    // binary package must carry the text itself in debian/copyright
+    // (installed verbatim as /usr/share/doc/*/copyright by debhelper).
+    assert!(!repo_file("debian/copyright").is_empty());
+    assert!(
+        !COPYRIGHT.contains("/usr/share/common-licenses/MIT"),
+        "debian/copyright must not reference the nonexistent common-licenses/MIT"
+    );
+    for marker in [
+        "Copyright (c) 2026",
+        "Permission is hereby granted",
+        "WITHOUT WARRANTY OF ANY KIND",
+    ] {
+        assert!(
+            COPYRIGHT.contains(marker),
+            "debian/copyright missing MIT text marker: {marker}"
+        );
+    }
+    // Apache-2.0 ships in base-files, so that reference stays valid.
+    assert!(
+        COPYRIGHT.contains("/usr/share/common-licenses/Apache-2.0"),
+        "debian/copyright must keep the valid Apache-2.0 common-licenses reference"
+    );
+    // The embedded MIT text must stay byte-identical to LICENSE-MIT
+    // (modulo DEP-5 continuation wrapping), so future license edits
+    // cannot silently desync the shipped copyright file.
+    let para = COPYRIGHT
+        .split_once("License: MIT\n")
+        .expect("debian/copyright needs a License: MIT paragraph")
+        .1;
+    let mut unwrapped = String::new();
+    for line in para.lines() {
+        let Some(body) = line.strip_prefix(' ') else {
+            break; // blank line ends the License paragraph
+        };
+        if body == "." {
+            unwrapped.push('\n');
+        } else {
+            unwrapped.push_str(body);
+            unwrapped.push('\n');
+        }
+    }
+    assert_eq!(unwrapped, LICENSE_MIT);
+}
+
+#[test]
+fn debian_copyright_has_no_shadow_package_file() {
+    // dh_installdocs prefers debian/<pkg>.copyright over debian/copyright,
+    // so a stale package-specific file would silently replace the validated
+    // payload. Forbid the shadow; if one is ever needed, validate its MIT
+    // payload the same way instead.
+    let shadow: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "debian/linux-trackpad-driver.copyright",
+    ]
+    .iter()
+    .collect();
+    assert!(
+        !shadow.exists(),
+        "debian/linux-trackpad-driver.copyright would shadow debian/copyright via dh_installdocs"
     );
 }
 
