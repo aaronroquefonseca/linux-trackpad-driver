@@ -106,7 +106,7 @@
 //!   are reference-held: down once, retained while either level holds, a
 //!   single up on final release — no phantom release+press mid-hold.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -2214,24 +2214,22 @@ where
     /// with fractional-remainder carry. `speed` comes from the per-frame
     /// `&Config` (single source), never a frozen snapshot.
     fn scaled_pos(&mut self, id: u8, x: i32, y: i32, speed: u32) -> (i32, i32) {
-        match self.last_pos.get(&id).copied() {
-            None => {
+        match self.last_pos.entry(id) {
+            Entry::Vacant(vacant) => {
                 // Clamp the first EMITTED report to the advertised bounds so
                 // a stationary out-of-range contact cannot step on its second
                 // frame; raw stays unclamped as the delta origin.
                 let ex = x.clamp(POSITION_MIN_X, POSITION_MAX_X);
                 let ey = y.clamp(POSITION_MIN_Y, POSITION_MAX_Y);
-                self.last_pos.insert(
-                    id,
-                    PointerAnchor {
-                        raw: (x, y),
-                        emitted: (ex, ey),
-                        rem: (0, 0),
-                    },
-                );
+                vacant.insert(PointerAnchor {
+                    raw: (x, y),
+                    emitted: (ex, ey),
+                    rem: (0, 0),
+                });
                 (ex, ey)
             }
-            Some(mut anchor) => {
+            Entry::Occupied(mut occupied) => {
+                let anchor = occupied.get_mut();
                 let speed = i64::from(speed);
                 let dx = i64::from(x) - i64::from(anchor.raw.0);
                 let dy = i64::from(y) - i64::from(anchor.raw.1);
@@ -2251,7 +2249,6 @@ where
                     .clamp(i64::from(POSITION_MIN_Y), i64::from(POSITION_MAX_Y))
                     as i32;
                 anchor.emitted = (nx, ny);
-                self.last_pos.insert(id, anchor);
                 (nx, ny)
             }
         }
