@@ -670,21 +670,14 @@ pub fn resolve_reconnect_mode(daemon_live: bool, force: bool, disengage: bool) -
     ReconnectMode::Init
 }
 
-/// Validate a polling request for the USB arm: range, device floor
-/// (`MIN_EXPRESSIBLE_HZ`), cap warning. Kept out of the disengage/BT arms
-/// on purpose — both discard the rate, so rejecting there would break
-/// valid hotplug events. Pure so the USB-only gating is unit-tested
-/// without hardware.
+/// Validate a polling request for the USB arm: range plus the shared device
+/// floor ([`crate::init::check_usb_polling_usable`], the same gate doctor
+/// applies to configs), with a cap warning on top. Kept out of the
+/// disengage/BT arms on purpose — both discard the rate, so rejecting there
+/// would break valid hotplug events. Pure so the USB-only gating is
+/// unit-tested without hardware.
 pub fn validate_polling_rate(polling_hz: u32) -> Result<()> {
-    if polling_hz == 0 || polling_hz > u16::MAX as u32 {
-        anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
-    }
-    if polling_hz < crate::init::MIN_EXPRESSIBLE_HZ {
-        anyhow::bail!(
-            "polling rate {polling_hz} Hz below device floor (~{} Hz)",
-            crate::init::MIN_EXPRESSIBLE_HZ
-        );
-    }
+    crate::init::check_usb_polling_usable(polling_hz)?;
     if polling_hz > EFFECTIVE_CAP_HZ as u32 {
         log::warn!("requested {polling_hz} Hz above device cap; clamped to ~110 Hz (X=0x23)");
     }
@@ -2216,6 +2209,22 @@ mod tests {
         assert!(validate_polling_rate(1).is_err());
         assert!(validate_polling_rate(15).is_err());
         assert!(validate_polling_rate(16).is_ok());
+    }
+
+    #[test]
+    fn polling_validation_agrees_with_init_gate() {
+        // Startup and init share one floor check (finding #16): every
+        // boundary must agree, including the doctor-visible config gate.
+        for hz in [0u32, 1, 15] {
+            assert!(validate_polling_rate(hz).is_err());
+            assert!(crate::init::check_usb_polling_usable(hz).is_err());
+            assert!(crate::init::resolve_polling(hz).is_err());
+        }
+        for hz in [16u32, 60, 110, 500] {
+            assert!(validate_polling_rate(hz).is_ok());
+            assert!(crate::init::check_usb_polling_usable(hz).is_ok());
+        }
+        assert!(validate_polling_rate(70_000).is_err());
     }
 
     fn fixture_devs() -> Vec<DiscoveredDevice> {

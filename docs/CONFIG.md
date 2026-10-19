@@ -45,7 +45,7 @@ restart (live reload planned).
 | `log_level` | string enum | `debug\|info\|warn\|error` | `"info"` | always | Logging filter. |
 | `enhanced_clicks` | bool | `true\|false` | `true` | always | Opt-in gate for the entire clicks pipeline (see Gate semantics). |
 | `device` | table | — | — | always | USB device tuning (independent of `enhanced_clicks`). |
-| `device.polling_rate` | integer (Hz) | `16..=110` request | `110` | always | Requested Apple USB polling rate. Capped posture: values `> 110` rejected; init clamps runtime overrides; `< 16` rejected at init. No BT rate equivalent. |
+| `device.polling_rate` | integer (Hz) | `1..=110` syntax, `16..=110` usable for USB | `110` | always | Requested Apple USB polling rate. Syntax accepts `1..=110`; values `> 110` rejected. `< 16` passes syntax but fails USB init and doctor via one shared gate (`init::check_usb_polling_usable` — doctor via `init::validate_config_for_usb`, startup via `daemon::validate_polling_rate` / `init::resolve_polling`); runtime `-p` overrides above 110 are clamped. No BT rate equivalent (BT ignores the rate). |
 | `pointer` | table | — | — | `enhanced_clicks` | Pointer tuning. |
 | `pointer.speed` | integer (percent) | `1..=1000` | `100` | `enhanced_clicks` | Pointer speed percent (`100` = 1:1). Software delta scaling in the proxy path only, applied exactly once. |
 | `click` | table | — | — | `enhanced_clicks` | Press thresholds + standard maps. |
