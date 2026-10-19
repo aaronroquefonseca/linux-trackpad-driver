@@ -106,8 +106,11 @@ systemctl status linux-trackpad-driver-resume.service
   never touches user sessions (no `--user` units, no session D-Bus).
   Sleep hooks inherit PID1's environment, so the hook sets and exports
   `LTD_CONFIG=/etc/linux-trackpad-driver/config.toml` (same path as the
-  units) before exec — otherwise resume would re-init at defaults while
-  the daemon verifies against the system rate. Hook runtime is bounded
+  units) before exec — otherwise a custom unit path would not propagate and
+  resume would re-init from the installed file while the daemon verifies
+  against the custom rate. (All commands share one selection: `-c`, then
+  `$LTD_CONFIG`, then the installed file, then built-in defaults.) Hook
+  runtime is bounded
   (~1 s node wait + backoff retries per node); failures are logged and
   swallowed, the hook always exits 0 so a driver hiccup never perturbs
   the sleep cycle.

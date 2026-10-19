@@ -826,6 +826,9 @@ impl Config {
 /// explicit path is an error; `None` never fails. Unknown keys are rejected
 /// at every level (likely typos); omitted keys/tables take documented
 /// defaults. `schema_version = 1` is required in files.
+///
+/// File-scope helper only: entry points must use [`load_selected_config`]
+/// so every command shares selection and reports its source.
 pub fn load_or_default(path: Option<&str>) -> Result<Config> {
     let Some(path) = path else {
         return Ok(Config::default());
@@ -847,25 +850,160 @@ pub fn config_path_from_env() -> Option<String> {
     std::env::var(CONFIG_ENV).ok().filter(|v| !v.is_empty())
 }
 
-/// Load config for entry points: explicit `-c` path wins, else
-/// `$LTD_CONFIG`, else defaults.
+/// Load config for entry points, sharing [`select_config_source`] with
+/// doctor: explicit `-c` wins, else `$LTD_CONFIG`, else the installed
+/// system file ([`SYSTEM_CONFIG_PATH`]), else built-in defaults.
 ///
-/// A *missing* env-pointed file falls back to defaults with a log line
-/// (hotplug must keep working on machines with no system config installed);
-/// a present-but-unparsable file is still an error, as is a missing
-/// explicit `-c` file.
+/// A *missing* env/installed file falls back to defaults (hotplug must
+/// keep working on machines with no system config installed); a
+/// present-but-unparsable file is still an error, as is a missing
+/// explicit `-c` file. Prefer [`load_selected_config`], which also
+/// returns the selected source for logging; this wrapper keeps the
+/// config-only call shape.
 pub fn load_or_default_with_env(explicit: Option<&str>) -> Result<Config> {
+    Ok(load_selected_config(explicit)?.0)
+}
+
+/// Installed system config: final fallback before built-in defaults.
+/// Shared by every entry point (`run`, `reconnect`, `resume`, `doctor`).
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/linux-trackpad-driver/config.toml";
+
+/// Which selector chose the config path (shared selection matrix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSourceKind {
+    /// Explicit `-c`/`--config` flag.
+    Explicit,
+    /// Nonempty `$LTD_CONFIG`.
+    Env,
+    /// Installed system file ([`SYSTEM_CONFIG_PATH`]).
+    Installed,
+}
+
+/// Selected config path plus which selector chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedConfigSource {
+    pub path: String,
+    pub kind: ConfigSourceKind,
+}
+
+/// Shared selection: explicit `-c` wins, else nonempty `$LTD_CONFIG`,
+/// else the installed system file. Pure over its inputs so every entry
+/// point resolves identically; [`select_config_source`] reads the process
+/// environment. An empty env value counts as unset.
+pub fn select_config_source_with_installed(
+    explicit: Option<&str>,
+    env: Option<&str>,
+    installed: &str,
+) -> SelectedConfigSource {
     if let Some(path) = explicit {
-        return load_or_default(Some(path));
-    }
-    match config_path_from_env() {
-        None => Ok(Config::default()),
-        Some(path) if !Path::new(&path).exists() => {
-            log::info!("config env {CONFIG_ENV}='{path}' missing; using defaults");
-            Ok(Config::default())
+        SelectedConfigSource {
+            path: path.to_string(),
+            kind: ConfigSourceKind::Explicit,
         }
-        Some(path) => load_or_default(Some(&path)),
+    } else if let Some(path) = env.filter(|p| !p.is_empty()) {
+        SelectedConfigSource {
+            path: path.to_string(),
+            kind: ConfigSourceKind::Env,
+        }
+    } else {
+        SelectedConfigSource {
+            path: installed.to_string(),
+            kind: ConfigSourceKind::Installed,
+        }
     }
+}
+
+/// Shared selection against the installed system path.
+pub fn select_config_source_with(
+    explicit: Option<&str>,
+    env: Option<&str>,
+) -> SelectedConfigSource {
+    select_config_source_with_installed(explicit, env, SYSTEM_CONFIG_PATH)
+}
+
+/// Shared selection reading the process environment.
+pub fn select_config_source(explicit: Option<&str>) -> SelectedConfigSource {
+    select_config_source_with(explicit, config_path_from_env().as_deref())
+}
+
+/// Source label for a successfully selected file (shared with doctor).
+pub fn loaded_config_source(path: &str) -> String {
+    format!("{path}; on disk")
+}
+
+/// Source label when the env/installed file is missing and built-in
+/// defaults apply (shared with doctor). Explicit files never fall back;
+/// the `Explicit` arm is defensive only.
+pub fn fallback_config_source(path: &str, kind: ConfigSourceKind) -> String {
+    let selection = match kind {
+        ConfigSourceKind::Env => "LTD_CONFIG",
+        ConfigSourceKind::Installed => "installed",
+        ConfigSourceKind::Explicit => "explicit",
+    };
+    format!("<built-in defaults>; {selection} config missing: {path}")
+}
+
+/// Read a config file: `Ok(None)` means truly absent (no directory entry,
+/// not even a dangling symlink); `Err` means selected-but-broken (dangling
+/// symlink, directory, permissions, other I/O). Shared by startup loading
+/// and doctor so a dangling symlink errors everywhere instead of silently
+/// falling back to defaults in one command and failing in another.
+pub fn read_config_text(path: &str) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symlink is a selected but broken config, not absence.
+            match std::fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(e),
+                Err(other) => Err(other),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Load config for entry points and report the selected source, using the
+/// shared selection matrix. A *missing* env/installed file falls back to
+/// defaults (hotplug must keep working on machines with no system config
+/// installed); a present-but-unparsable file is an error, as is a missing
+/// explicit `-c` file. Returns `(config, source)` where `source` uses the
+/// same labels doctor reports (`"<path>; on disk"` or
+/// `"<built-in defaults>; <LTD_CONFIG|installed> config missing: <path>"`).
+pub fn load_selected_config_with_installed(
+    explicit: Option<&str>,
+    env: Option<&str>,
+    installed: &str,
+) -> Result<(Config, String)> {
+    let selected = select_config_source_with_installed(explicit, env, installed);
+    match read_config_text(&selected.path) {
+        Ok(None) if selected.kind != ConfigSourceKind::Explicit => Ok((
+            Config::default(),
+            fallback_config_source(&selected.path, selected.kind),
+        )),
+        Ok(text) => {
+            let source = loaded_config_source(&selected.path);
+            let text =
+                text.with_context(|| format!("config '{}' does not exist", selected.path))?;
+            let cfg: Config = toml::from_str(&text)
+                .with_context(|| format!("parsing config '{}'", selected.path))?;
+            cfg.validate()?;
+            Ok((cfg, source))
+        }
+        Err(e) => Err(anyhow::anyhow!(e).context(format!("reading config '{}'", selected.path))),
+    }
+}
+
+/// Load config plus selected source for real entry points (process env +
+/// installed system path). Every command logs/prints the returned source:
+/// startup entries log it as the live settings for the process, doctor
+/// prints it as the on-disk file it validated.
+pub fn load_selected_config(explicit: Option<&str>) -> Result<(Config, String)> {
+    load_selected_config_with_installed(
+        explicit,
+        config_path_from_env().as_deref(),
+        SYSTEM_CONFIG_PATH,
+    )
 }
 
 /// Best-effort logging init; safe to call twice (tests, reconnect entry).
@@ -1694,5 +1832,120 @@ actions_follow_spoof = true
         )
         .unwrap();
         assert!(load_or_default(Some(path.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn shared_selection_matrix_explicit_env_installed() {
+        // Flag > env > installed file. Empty env counts as unset.
+        let selected =
+            select_config_source_with_installed(Some("explicit"), Some("env"), "installed");
+        assert_eq!(
+            selected,
+            SelectedConfigSource {
+                path: "explicit".into(),
+                kind: ConfigSourceKind::Explicit,
+            }
+        );
+        let selected = select_config_source_with_installed(None, Some("env"), "installed");
+        assert_eq!(
+            selected,
+            SelectedConfigSource {
+                path: "env".into(),
+                kind: ConfigSourceKind::Env,
+            }
+        );
+        for env in [None, Some("")] {
+            let selected = select_config_source_with_installed(None, env, "installed");
+            assert_eq!(
+                selected,
+                SelectedConfigSource {
+                    path: "installed".into(),
+                    kind: ConfigSourceKind::Installed,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn startup_loading_follows_shared_selection_with_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed.toml");
+        let installed = installed.to_str().unwrap();
+        std::fs::write(
+            installed,
+            "schema_version = 1\n[device]\npolling_rate = 90\n",
+        )
+        .unwrap();
+        let env_path = dir.path().join("env.toml");
+        let env_path = env_path.to_str().unwrap();
+        std::fs::write(
+            env_path,
+            "schema_version = 1\n[device]\npolling_rate = 60\n",
+        )
+        .unwrap();
+        let explicit = dir.path().join("explicit.toml");
+        let explicit = explicit.to_str().unwrap();
+        std::fs::write(
+            explicit,
+            "schema_version = 1\n[device]\npolling_rate = 16\n",
+        )
+        .unwrap();
+        // Explicit wins over env and installed; env wins over installed;
+        // installed applies with no flag/env.
+        for (exp, env, rate, path) in [
+            (Some(explicit), Some(env_path), 16, explicit),
+            (None, Some(env_path), 60, env_path),
+            (None, None, 90, installed),
+        ] {
+            let (cfg, source) = load_selected_config_with_installed(exp, env, installed).unwrap();
+            assert_eq!(cfg.device.polling_rate, rate);
+            assert_eq!(source, format!("{path}; on disk"));
+        }
+        // Missing env/installed files fall back to defaults and name the
+        // missing selector; an empty env falls through to installed.
+        let missing = dir.path().join("missing.toml");
+        let missing = missing.to_str().unwrap();
+        let (cfg, source) =
+            load_selected_config_with_installed(None, Some(missing), installed).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; LTD_CONFIG config missing: {missing}")
+        );
+        let absent = dir.path().join("absent-installed.toml");
+        let absent = absent.to_str().unwrap();
+        let (cfg, source) = load_selected_config_with_installed(None, None, absent).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            source,
+            format!("<built-in defaults>; installed config missing: {absent}")
+        );
+        let (cfg, source) = load_selected_config_with_installed(None, Some(""), installed).unwrap();
+        assert_eq!(cfg.device.polling_rate, 90);
+        assert_eq!(source, format!("{installed}; on disk"));
+        // Missing explicit files, dangling symlinks, and invalid content
+        // are errors everywhere, never silent defaults.
+        assert!(load_selected_config_with_installed(Some(missing), None, installed).is_err());
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), missing).unwrap();
+        assert!(load_selected_config_with_installed(None, Some(missing), installed).is_err());
+        assert!(load_selected_config_with_installed(Some(missing), None, installed).is_err());
+        std::fs::remove_file(missing).unwrap();
+        std::fs::write(
+            missing,
+            "schema_version = 1\n[device]\npolling_rate = 500\n",
+        )
+        .unwrap();
+        assert!(load_selected_config_with_installed(None, Some(missing), installed).is_err());
+        // A directory as the selected file errors (shared read semantic),
+        // and an empty explicit path never falls back to defaults.
+        let subdir = dir.path().join("adir");
+        std::fs::create_dir(&subdir).unwrap();
+        assert!(load_selected_config_with_installed(
+            None,
+            Some(subdir.to_str().unwrap()),
+            installed
+        )
+        .is_err());
+        assert!(load_selected_config_with_installed(Some(""), None, installed).is_err());
     }
 }

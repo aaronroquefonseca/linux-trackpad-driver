@@ -14,8 +14,11 @@ Trackpad 2 implemented; others planned.
 
 ## Loading
 
-- Explicit `-c <path>` wins, else `$LTD_CONFIG`, else built-in defaults
-  (`load_or_default_with_env`; a missing env-pointed file falls back to
+- Explicit `-c <path>` wins, else `$LTD_CONFIG`, else the installed
+  `/etc/linux-trackpad-driver/config.toml`, else built-in defaults
+  (shared `select_config_source`; every command reports the selected
+  source — startup entries log it as the live settings, doctor prints the
+  on-disk file it validated; a missing env/installed file falls back to
   defaults, a missing explicit `-c` file errors).
 - `schema_version = 1` is required; unknown `schema_version` fails.
 - Omitted keys take their defaults; omitted tables fall back wholesale.
@@ -330,7 +333,8 @@ actions_follow_spoof = false
 - **`unknown field` on load** → typo (`deny_unknown_fields` at every level);
   compare spelling against the table above.
 - **Edited config, nothing changed** → restart required for every key
-  (no live reload). Check precedence: `-c` beats `$LTD_CONFIG` beats
-  defaults.
+  (no live reload). Check precedence: `-c` beats `$LTD_CONFIG` beats the
+  installed file beats defaults; compare the `config source` line in the
+  logs against the source `ltd doctor` validated.
 - **`unsupported schema_version`** → file is pre-v1 or future; set
   `schema_version = 1`.

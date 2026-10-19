@@ -1,4 +1,10 @@
 //! Read-only diagnostics, deliberately separate from startup/reconnect policy.
+//!
+//! Config *selection* is shared with startup
+//! ([`crate::config::select_config_source`]): explicit `-c` wins, else
+//! nonempty `$LTD_CONFIG`, else the installed system file. Doctor always
+//! reports the selected on-disk file (or the missing path it fell back
+//! from), never the daemon's in-memory config.
 
 use std::{io, path::Path};
 
@@ -6,32 +12,18 @@ use anyhow::{Context, Result};
 
 use crate::config::{self, Config};
 
-const SYSTEM_CONFIG: &str = "/etc/linux-trackpad-driver/config.toml";
 const UNIX_TABLE: &str = "/proc/net/unix";
 
 /// Check the selected on-disk config, not the daemon's in-memory config.
+/// The selection matrix is the shared [`config::select_config_source`];
+/// only the read/validate wrapper differs from startup loading.
 pub fn check_config(explicit: Option<&str>) -> (String, Result<()>) {
     check_config_with(
         explicit,
         config::config_path_from_env().as_deref(),
-        SYSTEM_CONFIG,
-        read_config,
+        config::SYSTEM_CONFIG_PATH,
+        config::read_config_text,
     )
-}
-
-fn read_config(path: &str) -> io::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // A dangling symlink is a selected but broken config, not absence.
-            match std::fs::symlink_metadata(path) {
-                Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
-                Ok(_) => Err(e),
-                Err(other) => Err(other),
-            }
-        }
-        Err(e) => Err(e),
-    }
 }
 
 fn check_config_with(
@@ -40,20 +32,13 @@ fn check_config_with(
     installed: &str,
     read: impl FnOnce(&str) -> io::Result<Option<String>>,
 ) -> (String, Result<()>) {
-    let env = env.filter(|p| !p.is_empty());
-    let path = explicit.or(env).unwrap_or(installed);
-    let source = format!("{path}; on disk");
+    // Shared selection matrix with startup loading: explicit `-c` wins,
+    // else nonempty `$LTD_CONFIG`, else the installed system file.
+    let selected = config::select_config_source_with_installed(explicit, env, installed);
+    let path = selected.path.as_str();
     match read(path) {
-        Ok(None) if explicit.is_none() => {
-            let selection = if env.is_some() {
-                "LTD_CONFIG"
-            } else {
-                "installed"
-            };
-            (
-                format!("<built-in defaults>; {selection} config missing: {path}"),
-                Ok(()),
-            )
+        Ok(None) if selected.kind != config::ConfigSourceKind::Explicit => {
+            (config::fallback_config_source(path, selected.kind), Ok(()))
         }
         text => {
             let result = (|| {
@@ -64,7 +49,7 @@ fn check_config_with(
                     toml::from_str(&text).with_context(|| format!("parsing config '{path}'"))?;
                 cfg.validate()
             })();
-            (source, result)
+            (config::loaded_config_source(path), result)
         }
     }
 }
@@ -288,6 +273,52 @@ mod tests {
     }
 
     #[test]
+    fn startup_loading_and_doctor_share_selection_and_sources() {
+        // Same inputs must select the same file and report the same source
+        // in startup loading and doctor (finding #17: no per-command drift).
+        for (explicit, env) in [
+            (Some("explicit"), Some("env")),
+            (Some("explicit"), None),
+            (None, Some("env")),
+            (None, Some("")),
+            (None, None),
+        ] {
+            let selected = config::select_config_source_with_installed(explicit, env, "installed");
+            let (source, result) = check_config_with(explicit, env, "installed", |path| {
+                assert_eq!(path, selected.path);
+                Ok(Some("schema_version = 1\n".into()))
+            });
+            result.unwrap();
+            assert_eq!(source, config::loaded_config_source(&selected.path));
+        }
+        // Missing-file fallback reports identical defaults sources.
+        for (env, kind) in [
+            (Some("env"), config::ConfigSourceKind::Env),
+            (None, config::ConfigSourceKind::Installed),
+        ] {
+            let selected = config::select_config_source_with_installed(None, env, "installed");
+            assert_eq!(selected.kind, kind);
+            let (source, result) = check_config_with(None, env, "installed", |path| {
+                assert_eq!(path, selected.path);
+                Ok(None)
+            });
+            result.unwrap();
+            assert_eq!(
+                source,
+                config::fallback_config_source(&selected.path, selected.kind)
+            );
+            let (cfg, loader_source) = config::load_selected_config_with_installed(
+                None,
+                env,
+                "/nonexistent-ltd-installed-xyz.toml",
+            )
+            .unwrap();
+            assert_eq!(cfg, Config::default());
+            assert!(loader_source.starts_with("<built-in defaults>"));
+        }
+    }
+
+    #[test]
     fn doctor_config_missing_fallback_names_actual_defaults_and_reason() {
         for (env, selection, path) in [
             (Some("env"), "LTD_CONFIG", "env"),
@@ -345,22 +376,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let installed = dir.path().join("config.toml");
         let installed = installed.to_str().unwrap();
-        let (source, result) = check_config_with(None, None, installed, read_config);
+        let (source, result) = check_config_with(None, None, installed, config::read_config_text);
         result.unwrap();
         assert!(source.starts_with("<built-in defaults>"));
         std::fs::write(installed, "schema_version = 1\n").unwrap();
-        let (source, result) = check_config_with(None, None, installed, read_config);
+        let (source, result) = check_config_with(None, None, installed, config::read_config_text);
         result.unwrap();
         assert_eq!(source, format!("{installed}; on disk"));
         std::fs::remove_file(installed).unwrap();
         std::os::unix::fs::symlink(dir.path().join("missing"), installed).unwrap();
-        let (source, result) = check_config_with(None, None, installed, read_config);
+        let (source, result) = check_config_with(None, None, installed, config::read_config_text);
         assert!(result.is_err());
         assert_eq!(source, format!("{installed}; on disk"));
         std::fs::remove_file(installed).unwrap();
         std::fs::create_dir(installed).unwrap();
-        assert!(check_config_with(None, None, installed, read_config)
-            .1
-            .is_err());
+        assert!(
+            check_config_with(None, None, installed, config::read_config_text)
+                .1
+                .is_err()
+        );
     }
 }

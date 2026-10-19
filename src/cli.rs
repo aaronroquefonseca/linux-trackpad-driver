@@ -338,11 +338,16 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(run) => {
-            // Like reconnect/resume: $LTD_CONFIG (set by the main unit) wins
-            // over defaults so the daemon, the hook, and the tick verify
-            // against the same rate. Explicit -c still wins over env.
-            let cfg = config::load_or_default_with_env(run.config_path.as_deref())?;
+            // Shared selection with doctor/reconnect/resume: explicit `-c`
+            // wins, else nonempty `$LTD_CONFIG` (set by the main unit), else
+            // the installed system file, else built-in defaults. The source
+            // is the live settings for this process; on-disk edits need a
+            // restart (doctor reports the on-disk file it validated).
+            let (cfg, source) = config::load_selected_config(run.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
+            log::info!(
+                "config source: {source} (live settings for this process; restart to apply on-disk edits)"
+            );
             match daemon::run_daemon(&cfg) {
                 Ok(()) => Ok(ExitCode::SUCCESS),
                 Err(e) => {
@@ -352,11 +357,14 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Reconnect(rc) => {
-            // No -c on the udev command line: fall back to $LTD_CONFIG (set
-            // by the reconnect template unit) so hotplug honors the system
-            // config, including enhanced_clicks.
-            let cfg = config::load_or_default_with_env(rc.config_path.as_deref())?;
+            // Shared selection with run/resume/doctor (see `run`): no `-c`
+            // on the udev command line falls back to `$LTD_CONFIG` (set by
+            // the reconnect template unit), then the installed system file.
+            let (cfg, source) = config::load_selected_config(rc.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
+            log::info!(
+                "config source: {source} (live settings for this process; restart to apply on-disk edits)"
+            );
             match daemon::run_reconnect(
                 &rc.devnode,
                 rc.force,
@@ -372,10 +380,14 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Resume(rs) => {
-            // System-sleep hook entry: same $LTD_CONFIG fallback as the
-            // reconnect unit (the hook passes no -c either).
-            let cfg = config::load_or_default_with_env(rs.config_path.as_deref())?;
+            // Shared selection with run/reconnect/doctor (see `run`): the
+            // system-sleep hook passes no `-c`, so `$LTD_CONFIG` (exported
+            // by the hook) then the installed system file apply.
+            let (cfg, source) = config::load_selected_config(rs.config_path.as_deref())?;
             config::init_logging(&cfg.log_level);
+            log::info!(
+                "config source: {source} (live settings for this process; restart to apply on-disk edits)"
+            );
             match daemon::run_resume(&cfg, rs.polling_override) {
                 Ok(report) if !report.failed() => Ok(ExitCode::SUCCESS),
                 Ok(report) => {
