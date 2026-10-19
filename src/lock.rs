@@ -160,10 +160,12 @@ impl SocketLock {
         &self.path
     }
 
-    /// Accept and close all currently queued probe connections (nonblocking).
-    /// Returns the number drained. The background thread calls this in a
-    /// loop; tests call it directly to assert drain behavior.
-    pub fn drain_pending(&self) -> usize {
+    /// Accept and close up to [`DRAIN_BATCH_LIMIT`] currently queued probe
+    /// connections (nonblocking). Returns the number drained. The background
+    /// thread drains via `drain_once` in a loop; tests call this directly
+    /// to assert drain behavior.
+    #[cfg(test)]
+    fn drain_pending(&self) -> usize {
         drain_once(&self._listener)
     }
 }
@@ -207,8 +209,11 @@ fn is_timeout(e: &io::Error) -> bool {
 /// Bounded liveness dial: nonblocking connect + `poll(2)` for writability.
 /// Returns `TimedOut` instead of blocking forever on a full listen queue.
 /// Immediate refusals (stale file) and permission errors surface unchanged.
+/// A saturated filesystem queue fails fast with `EAGAIN` from `connect`
+/// (no connection is in progress), which maps to `TimedOut` live/busy;
+/// only `EINPROGRESS` waits on `poll` with the remaining deadline.
 pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<UnixStream> {
-    use std::os::unix::io::FromRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     let bytes = path.as_bytes();
     if bytes.is_empty() || bytes.contains(&0) || bytes.len() > 107 {
@@ -218,20 +223,19 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
         ));
     }
     // SAFETY: checked length above; CLOEXEC + NONBLOCK so dial never blocks.
-    let fd = unsafe {
+    let raw = unsafe {
         libc::socket(
             libc::AF_UNIX,
             libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             0,
         )
     };
-    if fd < 0 {
+    if raw < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Scope the raw fd so every early return closes it.
-    let close_on_err = |fd: i32| unsafe {
-        libc::close(fd);
-    };
+    // SAFETY: `socket` returned a newly owned fd; wrap immediately so every
+    // early return closes it without manual `close` calls.
+    let fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
 
     // SAFETY: zeroed sockaddr_un, family + nul-terminated filesystem path.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -245,23 +249,25 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
     // SAFETY: addr is a valid sockaddr_un of addr_len bytes, fd is ours.
     let ret = unsafe {
         libc::connect(
-            fd,
+            fd.as_raw_fd(),
             &addr as *const _ as *const libc::sockaddr,
             addr_len as libc::socklen_t,
         )
     };
     if ret == 0 {
-        clear_nonblocking(fd);
-        // SAFETY: connect succeeded, fd is a live stream socket we own.
-        return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+        // Probe verdict only; callers drop the stream immediately, so the
+        // leftover O_NONBLOCK flag is irrelevant (no fcntl round-trip).
+        return Ok(UnixStream::from(fd));
     }
     let err = io::Error::last_os_error();
-    let raw = err.raw_os_error();
-    let in_progress = raw == Some(libc::EINPROGRESS)
-        || raw == Some(libc::EAGAIN)
-        || raw == Some(libc::EWOULDBLOCK);
-    if !in_progress {
-        close_on_err(fd);
+    let raw_err = err.raw_os_error();
+    // Saturated queue: no asynchronous connection is in progress, so polling
+    // for writability could report POLLOUT|HUP with SO_ERROR == 0 on an
+    // unconnected stream. Fail fast as live/busy instead.
+    if raw_err == Some(libc::EAGAIN) || raw_err == Some(libc::EWOULDBLOCK) {
+        return Err(io::Error::from(io::ErrorKind::TimedOut));
+    }
+    if raw_err != Some(libc::EINPROGRESS) {
         return Err(err);
     }
     let deadline = Instant::now() + timeout;
@@ -269,7 +275,7 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
         let remaining = deadline.saturating_duration_since(Instant::now());
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let mut pfd = libc::pollfd {
-            fd,
+            fd: fd.as_raw_fd(),
             events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
             revents: 0,
         };
@@ -279,16 +285,13 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 if Instant::now() >= deadline {
-                    close_on_err(fd);
                     return Err(io::Error::from(io::ErrorKind::TimedOut));
                 }
                 continue;
             }
-            close_on_err(fd);
             return Err(e);
         }
         if pr == 0 {
-            close_on_err(fd);
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
         let mut so_err: i32 = 0;
@@ -296,7 +299,7 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
         // SAFETY: so_err/len are valid out-params for SO_ERROR.
         let gr = unsafe {
             libc::getsockopt(
-                fd,
+                fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_ERROR,
                 &mut so_err as *mut _ as *mut libc::c_void,
@@ -304,12 +307,9 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
             )
         };
         if gr != 0 {
-            let e = io::Error::last_os_error();
-            close_on_err(fd);
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
         if so_err != 0 {
-            close_on_err(fd);
             // A completed-but-full queue surfaces here as EAGAIN/EWOULDBLOCK
             // on some kernels: report it as a timeout (live, busy) so
             // callers treat it as "live" rather than stale/deletable.
@@ -318,21 +318,9 @@ pub(crate) fn connect_with_timeout(path: &str, timeout: Duration) -> io::Result<
             }
             return Err(io::Error::from_raw_os_error(so_err));
         }
-        clear_nonblocking(fd);
-        // SAFETY: SO_ERROR == 0 means the stream connected; we own fd.
-        return Ok(unsafe { UnixStream::from_raw_fd(fd) });
-    }
-}
-
-fn clear_nonblocking(fd: i32) {
-    // Best effort: probes drop the stream immediately; a leftover O_NONBLOCK
-    // would only matter to a caller that keeps it.
-    // SAFETY: fd is a valid socket we own in this function.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
+        // SO_ERROR == 0 after EINPROGRESS means the stream connected; we own fd.
+        // No fcntl reset: the probe stream is dropped by every caller.
+        return Ok(UnixStream::from(fd));
     }
 }
 
@@ -383,9 +371,9 @@ pub fn daemon_socket_present(sock_path: &str) -> bool {
     daemon_socket_present_timeout(sock_path, LIVENESS_TIMEOUT)
 }
 
-/// Bounded variant of [`daemon_socket_present`] for tests/callers that need
+/// Bounded variant of [`daemon_socket_present`] for tests that need
 /// a custom budget.
-pub fn daemon_socket_present_timeout(sock_path: &str, timeout: Duration) -> bool {
+fn daemon_socket_present_timeout(sock_path: &str, timeout: Duration) -> bool {
     present_from_probe(connect_with_timeout(sock_path, timeout))
 }
 
@@ -500,9 +488,10 @@ mod tests {
         let sock = sock.to_str().unwrap();
         let guard = SocketLock::acquire(sock).unwrap();
         let start = Instant::now();
-        // Rapid sequential probes: each dials, the holder drains + closes.
-        // Without a drainer the kernel queue would accumulate one entry per
-        // probe; with it the queue stays empty and every probe stays fast.
+        // Rapid sequential probes stay fast and answer live. With the default
+        // backlog (~4k) this passes even without draining, so it pins
+        // boundedness only; drainer liveness is pinned separately by
+        // `background_drainer_accepts_and_closes`.
         for _ in 0..300 {
             assert!(
                 daemon_socket_present_timeout(sock, Duration::from_millis(200)),
@@ -581,11 +570,109 @@ mod tests {
     }
 
     #[test]
+    fn saturated_queue_maps_to_timeout_live_verdict() {
+        // Filesystem backlog full: nonblocking `connect` fails with EAGAIN
+        // without queueing anything. The helper must report live/busy
+        // (`TimedOut`), never `Ok` with an unconnected stream, and callers
+        // must keep the pathname (no stale reclaim).
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("tiny.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        // Shrink this fixture's backlog; no global somaxconn change.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+
+        // Fill until the kernel reports saturation. Held streams keep queued
+        // entries alive; the saturating dial queued nothing and is dropped.
+        let mut queued: Vec<UnixStream> = Vec::new();
+        let mut saturated = false;
+        for _ in 0..64 {
+            let raw = unsafe {
+                libc::socket(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                )
+            };
+            assert!(raw >= 0);
+            // SAFETY: `socket` returned a newly owned fd.
+            let fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let bytes = sock_str.as_bytes();
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (i, b) in bytes.iter().enumerate() {
+                addr.sun_path[i] = *b as libc::c_char;
+            }
+            let base = (&addr.sun_path as *const _ as usize) - (&addr as *const _ as usize);
+            let len = base + bytes.len() + 1;
+            let rc = unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    &addr as *const _ as *const libc::sockaddr,
+                    len as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                queued.push(UnixStream::from(fd));
+                continue;
+            }
+            match io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == libc::EINPROGRESS => {
+                    queued.push(UnixStream::from(fd));
+                }
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    saturated = true;
+                    drop(fd);
+                    break;
+                }
+                Some(code) => panic!("unexpected fill dial errno {code}"),
+                None => panic!("fill dial failed without errno"),
+            }
+        }
+        assert!(saturated, "tiny backlog must saturate within bound");
+
+        let start = Instant::now();
+        assert!(daemon_socket_present(sock_str));
+        assert!(SocketLock::acquire(sock_str).is_err());
+        assert!(Path::new(sock_str).exists());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "saturated-queue verdicts must stay fast"
+        );
+        let err = connect_with_timeout(sock_str, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // Pathname survives: a full queue is live/busy, never stale.
+        assert!(Path::new(sock_str).exists());
+        drop(queued);
+        drop(listener);
+    }
+
+    #[test]
+    fn background_drainer_accepts_and_closes() {
+        // Durable drainer proof: the holder's thread accepts the probe and
+        // closes it, so the client observes EOF. The 300-probe test above
+        // fits the default backlog and cannot prove this on its own.
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("thread.sock");
+        let sock_str = sock.to_str().unwrap();
+        let _guard = SocketLock::acquire(sock_str).unwrap();
+        let mut client = UnixStream::connect(sock_str).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(client.read(&mut [0_u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
     fn timeout_verdict_is_live_never_stale() {
-        // The full-queue timeout path needs ~4k pending connects on this
-        // host, so the timeout→live contract is pinned here directly: a
-        // timed-out probe implies a listener that is not draining (live),
-        // and must never be misread as absent or reclaimed as stale.
+        // Unit-pinned mapping for the timeout→live contract (a timed-out
+        // probe implies a listener that is not draining). The kernel path is
+        // covered separately by `saturated_queue_maps_to_timeout_live_verdict`
+        // with a tiny backlog, without needing ~4k pending connects.
         assert!(present_from_probe(Ok(mock_stream())));
         assert!(present_from_probe(Err(io::Error::from(
             io::ErrorKind::TimedOut
@@ -625,22 +712,26 @@ mod tests {
     }
 
     /// Nonblocking dial that never stalls the test thread: returns the client
-    /// end once the connect is dispatched (completion may still be in flight;
-    /// holding the fd keeps pressure on the server queue).
+    /// end once the connect is queued (`0`) or in progress (`EINPROGRESS`);
+    /// holding the fd keeps pressure on the server queue. A saturated queue
+    /// fails with `EAGAIN`/`EWOULDBLOCK` without queueing anything, so that
+    /// maps to `Err` (caller treats it as saturation, not a queued probe).
     fn nonblocking_dial(path: &str) -> io::Result<UnixStream> {
-        use std::os::unix::io::FromRawFd;
+        use std::os::fd::{AsRawFd as _, FromRawFd, OwnedFd};
         let bytes = path.as_bytes();
-        // SAFETY: test-only; fd is wrapped or closed on every path below.
-        let fd = unsafe {
+        // SAFETY: test-only; raw fd is wrapped immediately below.
+        let raw = unsafe {
             libc::socket(
                 libc::AF_UNIX,
                 libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
                 0,
             )
         };
-        if fd < 0 {
+        if raw < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `socket` returned a newly owned fd.
+        let fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
         // SAFETY: zeroed sockaddr_un with the nul-terminated path.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -652,29 +743,20 @@ mod tests {
         // SAFETY: addr is a valid sockaddr_un of len bytes; fd is ours.
         let rc = unsafe {
             libc::connect(
-                fd,
+                fd.as_raw_fd(),
                 &addr as *const _ as *const libc::sockaddr,
                 len as libc::socklen_t,
             )
         };
         if rc == 0 {
-            // SAFETY: connect succeeded; we own fd.
-            return Ok(unsafe { UnixStream::from_raw_fd(fd) });
+            return Ok(UnixStream::from(fd));
         }
         match io::Error::last_os_error().raw_os_error() {
-            Some(code)
-                if code == libc::EINPROGRESS
-                    || code == libc::EAGAIN
-                    || code == libc::EWOULDBLOCK =>
-            {
-                // SAFETY: dispatched; completion is in flight, fd stays ours.
-                Ok(unsafe { UnixStream::from_raw_fd(fd) })
+            Some(code) if code == libc::EINPROGRESS => {
+                // Dispatched; completion is in flight, fd stays ours.
+                Ok(UnixStream::from(fd))
             }
-            _ => {
-                // SAFETY: connect failed synchronously; fd is ours to close.
-                unsafe { libc::close(fd) };
-                Err(io::Error::last_os_error())
-            }
+            _ => Err(io::Error::last_os_error()),
         }
     }
 }
