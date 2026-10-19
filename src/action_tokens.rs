@@ -190,6 +190,12 @@ fn letter_digit_code(s: &str) -> Option<u16> {
 /// individually against `linux/input-event-codes.h`, never extrapolated.
 fn fn_code(s: &str) -> Option<u16> {
     let n: u8 = s[1..].parse().ok()?;
+    // Canonical spellings only: `f1`..`f24` with no padding. The base
+    // validator lists those literals, so `f01`/`f001` must stay rejected
+    // here too instead of widening accepted syntax as a side effect.
+    if s != format!("f{n}") {
+        return None;
+    }
     match n {
         1..=10 => Some(58 + u16::from(n)),
         11 => Some(87),
@@ -262,10 +268,12 @@ mod tests {
         for (token, _) in KEY_TOKEN_CODES {
             assert!(seen.insert(*token), "duplicate static token '{token}'");
         }
-        // No static token may collide with the dynamic universe.
+        // The combined universe holds each token exactly once: a static
+        // row colliding with dynamic enumeration (`a`, `f1`, ...) would
+        // insert twice and fail here.
+        let mut seen = HashSet::new();
         for token in all_known_tokens() {
-            let static_hits = KEY_TOKEN_CODES.iter().filter(|(t, _)| *t == token).count();
-            assert!(static_hits <= 1, "static/dynamic overlap: '{token}'");
+            assert!(seen.insert(token.clone()), "duplicate token '{token}'");
         }
         // Canonical representative is the first row of its code group.
         use std::collections::HashMap;
@@ -342,6 +350,49 @@ mod tests {
         }
         for token in ["f0", "f25"] {
             assert!(!is_known_token(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn function_keys_require_canonical_spelling() {
+        // Base validator lists `f1`..`f24` literally: zero-padded
+        // spellings must stay rejected through the real config parser
+        // (case/whitespace normalization applies first, so `F01` too),
+        // while canonical boundaries keep their exact codes.
+        for token in ["f01", "f001", "f00024", "f00", "f010", "F01", " f001 "] {
+            assert_eq!(
+                token_code(token.trim().to_lowercase().as_str()),
+                None,
+                "{token}"
+            );
+            assert!(crate::config::parse_click_action(token).is_err(), "{token}");
+            assert_eq!(
+                crate::proxy::key_token_to_code(&token.trim().to_lowercase()),
+                None,
+                "{token}"
+            );
+        }
+        for (token, code) in [
+            ("f1", 59),
+            ("F1", 59),
+            (" f10 ", 68),
+            ("f11", 87),
+            ("f12", 88),
+            ("f13", 183),
+            ("f24", 194),
+        ] {
+            assert_eq!(
+                token_code(&token.trim().to_lowercase()),
+                Some(code),
+                "{token}"
+            );
+            let action = crate::config::parse_click_action(token).unwrap();
+            assert_eq!(action.raw, token, "raw text preserved for '{token}'");
+            assert_eq!(
+                crate::proxy::key_token_to_code(&token.trim().to_lowercase()),
+                Some((crate::proxy::EV_KEY, code)),
+                "{token}"
+            );
         }
     }
 }
