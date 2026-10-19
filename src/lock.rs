@@ -362,11 +362,12 @@ impl Drop for SocketLock {
     }
 }
 
-/// True when a live daemon answers at `sock_path`. Used by `reconnect`:
-/// absent socket without `-f` means disengage mode. Bounded by
-/// [`LIVENESS_TIMEOUT`]; a timed-out probe implies a live listener with a
-/// full queue, so it reports present rather than hanging or misreading
-/// a busy daemon as absent.
+/// True when a live daemon answers at `sock_path`. Used by `reconnect` and
+/// `resume`: absent socket without `-f`/`-d` means inactive (hardware left
+/// alone) under the activation contract.
+/// Bounded by [`LIVENESS_TIMEOUT`]; a timed-out probe implies a live
+/// listener with a full queue, so it reports present rather than
+/// misreading a busy daemon as absent.
 pub fn daemon_socket_present(sock_path: &str) -> bool {
     daemon_socket_present_timeout(sock_path, LIVENESS_TIMEOUT)
 }

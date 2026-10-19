@@ -5,11 +5,20 @@
 //! shared [`DeviceReadyHub`], then idles until signal (SIGINT/SIGTERM/SIGHUP).
 //! No devices = log + idle (graceful, exit 0 on signal), never panic.
 //!
-//! `reconnect <dev>`: idempotent per-node re-init for udev `add`. Daemon
-//! socket absent without `-f` → disengage path (host-click off, no init).
-//! `-p` overrides the polling request (same ~110 Hz cap). Always re-sends
-//! multitouch enable first: the resume regression (report 0x02 21→8 bytes
-//! across power transition) is only fixed by re-init.
+//! `reconnect <dev>`: idempotent per-node re-init for udev `add`.
+//! Activation contract (finding #14): the main service is the only automatic
+//! activator. Daemon socket absent without `-f`/`-d` → inactive: leave the
+//! hardware alone and exit 0 (no init, no disengage write). `-f` forces init
+//! anyway (explicit manual bring-up); `-d` always disengages (explicit manual
+//! disengage). `-p` overrides the polling request (same ~110 Hz cap). Init
+//! always re-sends multitouch enable first: the resume regression (report
+//! 0x02 21→8 bytes across power transition) is only fixed by re-init.
+//!
+//! `resume`: post-sleep re-init over every discovered node. Same contract:
+//! daemon socket absent without `-f` → inactive no-op (exit 0, hardware left
+//! alone). Plain `resume` is the automatic background form used by the
+//! system-sleep hook and the resume unit; `-f` is explicit manual forcing
+//! while the daemon is stopped.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -648,16 +657,22 @@ pub fn classify_node(devnode: &str, devs: &[DiscoveredDevice]) -> Result<Transpo
 
 /// `reconnect` mode decision: pure, unit-tested.
 ///
-/// Semantics (udev entry):
-/// - `-d`/`--disengage` always wins → host-click off, no init.
-/// - Daemon socket absent without `-f` → disengage mode (safe default: never
-///   init behind a dead daemon; udev rule relies on this).
-/// - Daemon socket absent with `-f` → init anyway (forced bring-up).
+/// Activation contract (single, for daemon/hotplug/sleep paths):
+/// - `-d`/`--disengage` always wins → host-click off, no init (explicit
+///   manual disengage, touches hardware as requested).
+/// - Daemon socket absent without `-f` → inactive: leave the hardware alone
+///   (no init, no disengage write). This is the automatic background form
+///   the udev reconnect template relies on: installing (never started) or
+///   stopping the main service (socket absent) is a comprehensible off
+///   switch (`disable` alone does not stop a running service).
+/// - Daemon socket absent with `-f` → init anyway (explicit manual forcing).
 /// - Daemon live (with or without `-f`) → init, unless `-d` was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectMode {
     Init,
     Disengage,
+    /// Automatic background call with no live daemon: touch nothing, exit 0.
+    Inactive,
 }
 
 pub fn resolve_reconnect_mode(daemon_live: bool, force: bool, disengage: bool) -> ReconnectMode {
@@ -665,26 +680,37 @@ pub fn resolve_reconnect_mode(daemon_live: bool, force: bool, disengage: bool) -
         return ReconnectMode::Disengage;
     }
     if !daemon_live && !force {
-        return ReconnectMode::Disengage;
+        return ReconnectMode::Inactive;
     }
     ReconnectMode::Init
 }
 
-/// Validate a polling request for the USB arm: range, device floor
-/// (`MIN_EXPRESSIBLE_HZ`), cap warning. Kept out of the disengage/BT arms
-/// on purpose — both discard the rate, so rejecting there would break
-/// valid hotplug events. Pure so the USB-only gating is unit-tested
-/// without hardware.
+/// `resume` mode decision: pure, unit-tested. Same contract as reconnect:
+/// the system-sleep hook and the resume unit run plain `resume` (automatic
+/// background → inactive no-op unless the daemon is live); `-f`/`--force`
+/// is explicit manual forcing while the daemon is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    Proceed,
+    /// No live daemon and no `--force`: touch nothing, exit 0.
+    Inactive,
+}
+
+pub fn resolve_resume_mode(daemon_live: bool, force: bool) -> ResumeMode {
+    if !daemon_live && !force {
+        return ResumeMode::Inactive;
+    }
+    ResumeMode::Proceed
+}
+
+/// Validate a polling request for the USB arm: range plus the shared device
+/// floor ([`crate::init::check_usb_polling_usable`], the same gate doctor
+/// applies to configs), with a cap warning on top. Kept out of the
+/// disengage/BT arms on purpose — both discard the rate, so rejecting there
+/// would break valid hotplug events. Pure so the USB-only gating is
+/// unit-tested without hardware.
 pub fn validate_polling_rate(polling_hz: u32) -> Result<()> {
-    if polling_hz == 0 || polling_hz > u16::MAX as u32 {
-        anyhow::bail!("invalid polling rate {polling_hz} (want 1..=65535)");
-    }
-    if polling_hz < crate::init::MIN_EXPRESSIBLE_HZ {
-        anyhow::bail!(
-            "polling rate {polling_hz} Hz below device floor (~{} Hz)",
-            crate::init::MIN_EXPRESSIBLE_HZ
-        );
-    }
+    crate::init::check_usb_polling_usable(polling_hz)?;
     if polling_hz > EFFECTIVE_CAP_HZ as u32 {
         log::warn!("requested {polling_hz} Hz above device cap; clamped to ~110 Hz (X=0x23)");
     }
@@ -712,12 +738,18 @@ pub fn run_reconnect(
     let sock = lock::socket_path();
     let daemon_live = lock::daemon_socket_present(&sock);
     let mode = resolve_reconnect_mode(daemon_live, force, disengage);
-    if disengage && daemon_live {
-        log::info!("disengage requested while daemon live; applying host-click off");
-    } else if !daemon_live && !force {
+    if mode == ReconnectMode::Inactive {
+        // Automatic background call (udev one-shot) with no live daemon:
+        // installed-but-stopped (socket absent) is off. Touch nothing,
+        // exit 0 — before any node wait/scan so the no-op is fast and
+        // cannot fail on hardware.
         log::info!(
-            "daemon socket absent ({sock}); proceeding in disengage mode (use -f to init anyway)"
+            "daemon socket absent ({sock}); inactive: leaving hardware alone (use -f to init, -d to disengage)"
         );
+        return Ok(());
+    }
+    if disengage {
+        log::info!("disengage requested; applying host-click off");
     } else if !daemon_live {
         log::info!("daemon socket absent but -f given; proceeding with init");
     }
@@ -741,6 +773,11 @@ fn reconnect_classified_node(
     polling_override: Option<u32>,
     cfg: &Config,
 ) -> Result<()> {
+    if mode == ReconnectMode::Inactive {
+        // Defensive: `run_reconnect` returns before classify in this mode.
+        log::info!("{devnode}: inactive (no live daemon); leaving hardware alone");
+        return Ok(());
+    }
     if mode == ReconnectMode::Disengage {
         match transport {
             Transport::Bluetooth => {
@@ -803,19 +840,36 @@ fn reconnect_classified_node(
 
 /// `resume` entry (system-sleep hook + resume unit + manual re-init).
 /// System-side only: re-verifies every discovered node and re-runs the USB
-/// sequence from multitouch enable on mismatch. Unlike `reconnect`, this
-/// always inits — it is the post-sleep authority and must work whether or
-/// not the daemon socket is present (the daemon may not have survived
-/// suspend). Per-node failures are collected in the report, never fatal to
-/// siblings; only a failed scan is an `Err`.
-pub fn run_resume(cfg: &Config, polling_override: Option<u32>) -> Result<ResumeReport> {
+/// sequence from multitouch enable on mismatch. Unlike `reconnect`, the
+/// plain form has no per-node target: it covers every discovered node.
+///
+/// Activation contract: plain `resume` is automatic background (hook/unit)
+/// → inactive no-op without a live daemon (hardware left alone, exit 0).
+/// `-f`/`--force` is explicit manual forcing while the daemon is stopped.
+/// Per-node failures are collected in the report, never fatal to
+/// siblings; only a failed scan is an `Err`. Polling validation runs before
+/// the gate so bad rates always error, even when inactive.
+pub fn run_resume(
+    cfg: &Config,
+    polling_override: Option<u32>,
+    force: bool,
+) -> Result<ResumeReport> {
     let polling_hz = polling_override.unwrap_or(cfg.device.polling_rate);
     validate_polling_rate(polling_hz)?;
     let sock = lock::socket_path();
-    if lock::daemon_socket_present(&sock) {
+    let daemon_live = lock::daemon_socket_present(&sock);
+    if resolve_resume_mode(daemon_live, force) == ResumeMode::Inactive {
+        log::info!(
+            "resume: daemon socket absent ({sock}); inactive: leaving hardware alone (use -f to force re-init)"
+        );
+        return Ok(ResumeReport::default());
+    }
+    if daemon_live {
         log::debug!("resume: daemon socket present ({sock}); re-init covers live daemon too");
     } else {
-        log::info!("resume: daemon socket absent ({sock}); re-initing hardware directly");
+        log::info!(
+            "resume: daemon socket absent ({sock}) but -f given; re-initing hardware directly"
+        );
     }
     // Journal trace proving the hook/one-shot ran (hook failures are
     // swallowed to exit 0, so this line is the post-sleep evidence).
@@ -1593,6 +1647,93 @@ mod tests {
     }
 
     #[test]
+    fn hotplug_wake_attaches_session_without_waiting_for_verify() {
+        // Finding #9: a plug event must reconcile to an attached session
+        // on the fast hotplug pass, not at the next 30 s verification.
+        // Both transports: USB (feature-report init) and BT (direct Ready).
+        use crate::hotplug::{Schedule, Work};
+        use std::time::{Duration, Instant};
+        for dev in fixture_devs() {
+            let hub = hub();
+            let session = TestSession::subscribe(&hub, false);
+            let hardware = TestHardware::new(&hub);
+            let cfg = enhanced_config();
+            let mut watch = ResumeWatch::new(&[]);
+            let start = Instant::now();
+            let mut schedule = Schedule::new(start);
+            let health = |node: &str| session.lock().unwrap().needs_attach(node);
+            // No event: nothing due well before the 30 s verification.
+            assert_eq!(
+                schedule.take_due(start + Duration::from_secs(5), true),
+                None
+            );
+            // Plug event at 5 s; the coalesced fast pass fires, never a Verify.
+            schedule.wake(start + Duration::from_secs(5));
+            let due = start + Duration::from_secs(5) + Duration::from_millis(100);
+            assert_eq!(schedule.take_due(due, true), Some(Work::Hotplug));
+            let actions = watch.reconcile_with_hardware(
+                &cfg,
+                &hub,
+                vec![dev.clone()],
+                &health,
+                &hardware,
+                false,
+            );
+            assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+            schedule.completed(due, watch.has_pending(&cfg, &health));
+            assert!(session.lock().unwrap().proxy.is_attached());
+            assert_eq!(session.lock().unwrap().attempts, 1);
+            assert_eq!(hardware.inits.get(), 1);
+            assert_eq!(hardware.verifies.get(), 0);
+        }
+    }
+
+    #[test]
+    fn hotplug_gate_off_discovers_new_hardware_promptly_without_session_work() {
+        // Finding #9: gate-off must still init new hardware on the fast
+        // hotplug pass (no 30 s wait); it just never builds a proxy session.
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let mut watch = ResumeWatch::new(&[]);
+        let devs = fixture_devs();
+        // Hotplug fast pass: no hardware verification, like production
+        // `watch.scan(..., verify_hardware=false)`.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs.clone(),
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                TickAction::Initialized(devs[0].devnode.clone()),
+                TickAction::Initialized(devs[1].devnode.clone()),
+            ]
+        );
+        assert_eq!(hardware.inits.get(), 2);
+        assert_eq!(hardware.verifies.get(), 0);
+        assert_eq!(hardware.reinits.get(), 0);
+        // Steady state on the fast pass: no readbacks, no attachment traffic.
+        let actions = watch.reconcile_with_hardware(
+            &cfg,
+            &hub,
+            devs,
+            &|_| panic!("gate off must not query session health"),
+            &hardware,
+            false,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(hardware.verifies.get(), 0);
+    }
+
+    #[test]
     fn hotplug_gate_off_skips_session_work_and_known_hardware_reads() {
         let hub = hub();
         let hardware = TestHardware::new(&hub);
@@ -1983,8 +2124,10 @@ mod tests {
     #[test]
     fn resume_rejects_bad_polling_without_touching_hardware() {
         let cfg = Config::default();
-        assert!(run_resume(&cfg, Some(0)).is_err());
-        assert!(run_resume(&cfg, Some(70_000)).is_err());
+        // Validation runs before the activation gate, so bad rates error
+        // even when the call would otherwise be an inactive no-op.
+        assert!(run_resume(&cfg, Some(0), false).is_err());
+        assert!(run_resume(&cfg, Some(70_000), true).is_err());
     }
 
     #[test]
@@ -2131,6 +2274,22 @@ mod tests {
         assert!(validate_polling_rate(16).is_ok());
     }
 
+    #[test]
+    fn polling_validation_agrees_with_init_gate() {
+        // Startup and init share one floor check (finding #16): every
+        // boundary must agree, including the doctor-visible config gate.
+        for hz in [0u32, 1, 15] {
+            assert!(validate_polling_rate(hz).is_err());
+            assert!(crate::init::check_usb_polling_usable(hz).is_err());
+            assert!(crate::init::resolve_polling(hz).is_err());
+        }
+        for hz in [16u32, 60, 110, 500] {
+            assert!(validate_polling_rate(hz).is_ok());
+            assert!(crate::init::check_usb_polling_usable(hz).is_ok());
+        }
+        assert!(validate_polling_rate(70_000).is_err());
+    }
+
     fn fixture_devs() -> Vec<DiscoveredDevice> {
         vec![
             DiscoveredDevice {
@@ -2201,10 +2360,11 @@ mod tests {
                 "disengage must win for live={live} force={force}"
             );
         }
-        // Socket absent without -f → disengage (safe default for udev entry).
+        // Socket absent without -f → inactive (hardware left alone; the
+        // automatic background form the udev template relies on).
         assert_eq!(
             resolve_reconnect_mode(false, false, false),
-            ReconnectMode::Disengage
+            ReconnectMode::Inactive
         );
         // Socket absent with -f → init anyway.
         assert_eq!(
@@ -2223,15 +2383,97 @@ mod tests {
     }
 
     #[test]
-    fn socket_absent_without_force_disengages_not_inits() {
+    fn resume_mode_matrix() {
+        // Automatic background (hook/unit plain resume) without a live
+        // daemon stays inactive; explicit -f forces; live daemon proceeds.
+        assert_eq!(resolve_resume_mode(false, false), ResumeMode::Inactive);
+        assert_eq!(resolve_resume_mode(false, true), ResumeMode::Proceed);
+        assert_eq!(resolve_resume_mode(true, false), ResumeMode::Proceed);
+        assert_eq!(resolve_resume_mode(true, true), ResumeMode::Proceed);
+    }
+
+    #[test]
+    fn socket_absent_without_force_leaves_hardware_alone() {
         // Decision-level coverage for the udev socket-absent path: without
-        // -f the mode must be Disengage (host-click off only, no init).
+        // -f the mode must be Inactive (no init, no disengage write).
         assert_eq!(
             resolve_reconnect_mode(
                 /* daemon_live */ false, /* force */ false, /* disengage */ false
             ),
-            ReconnectMode::Disengage
+            ReconnectMode::Inactive
         );
+        assert_eq!(
+            resolve_resume_mode(/* daemon_live */ false, /* force */ false),
+            ResumeMode::Inactive
+        );
+    }
+
+    #[test]
+    fn inactive_reconnect_skips_node_wait_scan_and_classify() {
+        // Lifecycle: installed-but-stopped (socket absent) is off. With no
+        // live daemon and no -f, even a bogus node returns Ok immediately —
+        // no 2 s node wait, no sysfs scan, no fail-closed classify error,
+        // no writes.
+        let _env_guard = crate::test_env::lock_env();
+        let old = std::env::var(crate::lock::SOCKET_ENV).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("no-daemon.sock");
+        unsafe { std::env::set_var(crate::lock::SOCKET_ENV, &absent) };
+        let cfg = Config::default();
+        let result = run_reconnect("/nonexistent-hidraw-xyz", false, None, false, &cfg);
+        match old {
+            Some(v) => unsafe { std::env::set_var(crate::lock::SOCKET_ENV, v) },
+            None => unsafe { std::env::remove_var(crate::lock::SOCKET_ENV) },
+        }
+        assert!(
+            result.is_ok(),
+            "inactive reconnect must exit 0, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn inactive_resume_returns_empty_report_without_scan() {
+        // Lifecycle: sleep hook / resume unit with no live daemon must not
+        // rescan or re-init. Empty report, no errors, exit-0 shape.
+        let _env_guard = crate::test_env::lock_env();
+        let old = std::env::var(crate::lock::SOCKET_ENV).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("no-daemon.sock");
+        unsafe { std::env::set_var(crate::lock::SOCKET_ENV, &absent) };
+        let cfg = Config::default();
+        let report = run_resume(&cfg, None, false).unwrap();
+        match old {
+            Some(v) => unsafe { std::env::set_var(crate::lock::SOCKET_ENV, v) },
+            None => unsafe { std::env::remove_var(crate::lock::SOCKET_ENV) },
+        }
+        assert!(report.nodes.is_empty());
+        assert!(!report.failed());
+    }
+
+    #[test]
+    fn inactive_classified_node_touches_nothing() {
+        // Defensive arm: even if reached, Inactive performs no writes.
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let cfg = Config::default();
+        for transport in [Transport::Usb, Transport::Bluetooth] {
+            reconnect_classified_node(
+                node.path().to_str().unwrap(),
+                transport,
+                ReconnectMode::Inactive,
+                None,
+                &cfg,
+            )
+            .unwrap();
+        }
+        // A bogus node is equally fine — nothing is opened or classified.
+        reconnect_classified_node(
+            "/nonexistent-hidraw-xyz",
+            Transport::Usb,
+            ReconnectMode::Inactive,
+            None,
+            &cfg,
+        )
+        .unwrap();
     }
 
     #[test]
