@@ -114,11 +114,6 @@ pub fn touch_present(f: &FingerContact) -> bool {
     f.contact || f.pressure > TOUCH_PRESSURE_FLOOR
 }
 
-/// Scale a pointer delta by `speed` percent (`100` = 1:1). Proxy path only.
-pub fn scale_delta(delta: i32, speed: u32) -> i32 {
-    ((i64::from(delta) * i64::from(speed)) / 100) as i32
-}
-
 /// Negate raw orientation for `ABS_MT_ORIENTATION` (kernel parity).
 pub fn negate_orientation(raw: i8) -> i8 {
     raw.wrapping_neg()
@@ -942,14 +937,6 @@ mod tests {
         assert!(ClickMachine::physical_button(0xC1));
         assert!(!ClickMachine::physical_button(0xC0));
         assert!(!ClickMachine::physical_button(0x00));
-    }
-
-    #[test]
-    fn scale_delta_speed() {
-        assert_eq!(scale_delta(100, 100), 100);
-        assert_eq!(scale_delta(100, 200), 200);
-        assert_eq!(scale_delta(-40, 50), -20);
-        assert_eq!(scale_delta(0, 1000), 0);
     }
 
     #[test]

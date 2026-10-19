@@ -158,8 +158,9 @@ pub const INPUT_PROP_POINTER: u16 = 0;
 /// Physical position density, units/mm at 1:1 (old-service
 /// `(48 * 100) / speed` at the default `speed = 100`; Y scaled by
 /// 44/48). Fixed here: pointer `speed` is applied in software
-/// ([`crate::clicks::scale_delta`]), so the advertised density stays
-/// truthful while speed still scales motion exactly once.
+/// (per-contact raw/emitted/remainder anchor in `scaled_pos`), so the
+/// advertised density stays truthful while speed still scales motion
+/// exactly once.
 pub const POSITION_RES_X: i32 = 48;
 pub const POSITION_RES_Y: i32 = 44;
 /// Normalized per-contact values (old-service parity, hardware-proven):
@@ -1741,9 +1742,9 @@ where
                 let dy = i64::from(y) - i64::from(anchor.raw.1);
                 let num_x = dx * speed + anchor.rem.0;
                 let num_y = dy * speed + anchor.rem.1;
-                // Truncating division (toward zero) matches `scale_delta`
-                // semantics; the remainder carries the sub-unit fraction so
-                // slow motion accumulates instead of sticking.
+                // Truncating division (toward zero); the remainder carries
+                // the sub-unit fraction so slow motion accumulates instead
+                // of sticking.
                 let step_x = num_x / 100;
                 let step_y = num_y / 100;
                 anchor.rem = (num_x % 100, num_y % 100);
