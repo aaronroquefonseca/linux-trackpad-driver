@@ -4,6 +4,14 @@
 # linux-trackpad-driver-reconnect@hidraw2.service` runs
 # `ltd reconnect /dev/hidraw2`.
 #
+# Activation contract (finding #14): this unit is the AUTOMATIC background
+# form (no -f). Without a live main-service daemon it is an inactive no-op:
+# hardware left alone, exit 0. Installed-but-stopped (socket absent) is
+# therefore off (`disable` alone does not stop a running service), even
+# though udev still queues this unit on hotplug. Explicit manual forcing
+# while the daemon is stopped is `ltd reconnect /dev/HIDRAW -f` (or -d to
+# disengage) run directly — never via this template.
+#
 # Why a unit and not RUN+=: reconnect waits for the node + driver bind and
 # retries reports with backoff — seconds of work that must never block udev.
 [Unit]

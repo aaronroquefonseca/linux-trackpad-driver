@@ -15,6 +15,12 @@
 # dropout fix: motion lost until re-init, clicks survive).
 #
 # `pre` is intentionally a no-op: suspend needs no disengage.
+#
+# Activation contract (finding #14): plain `ltd resume` below is the
+# AUTOMATIC background form — without a live main-service daemon it leaves
+# the hardware alone and exits 0, so installed-but-stopped (socket absent)
+# stays off across sleep. Explicit manual forcing while stopped is
+# `ltd resume -f`.
 set -eu
 
 LTD_BIN="${LTD_BIN:-/usr/bin/ltd}"
@@ -42,7 +48,7 @@ case "${1:-} ${2:-}" in
                 echo "ltd-resume: post ${2:-unknown}: resume pass done" >&2
             else
                 rc=$?
-                echo "ltd-resume: post ${2:-unknown}: ltd resume failed (rc=$rc); retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume); see journal" >&2
+                echo "ltd-resume: post ${2:-unknown}: ltd resume failed (rc=$rc); retry with: sudo systemctl start linux-trackpad-driver-resume.service (or: sudo ltd resume -f); see journal" >&2
             fi
         else
             echo "ltd-resume: $LTD_BIN missing or not executable; nothing re-inited" >&2

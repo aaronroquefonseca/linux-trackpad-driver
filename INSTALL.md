@@ -69,12 +69,14 @@ udevadm test "$(udevadm info -q path -n /dev/hidrawN)" 2>&1 | grep -E 'SYSTEMD_W
 # expect the reconnect template instance for /dev/hidrawN on both transports.
 ```
 
-Manual reconnect without replug:
+Manual reconnect without replug (daemon running):
 
 ```sh
 sudo systemctl start 'linux-trackpad-driver-reconnect@hidraw2.service'
 # or directly:
 sudo ltd reconnect /dev/hidraw2
+# explicit forcing while the daemon is stopped:
+sudo ltd reconnect /dev/hidraw2 -f
 ```
 
 ## systemd units
@@ -93,6 +95,32 @@ systemctl status linux-trackpad-driver.service
   truth: `src/lock.rs` `DRIVER_SOCK`; `$LTD_SOCKET` overrides for
   tests/unprivileged runs).
 - Reconnect template: `Type=oneshot`, runs `ltd reconnect /dev/%I`.
+
+## Activation contract (off means off)
+
+The main service is the only automatic activator. Installing (never
+started), or stopping it (socket absent) leaves the trackpad hardware
+alone. Note: `disable` alone does not stop an already-running service; use
+`stop` or `disable --now` to make the entry gate inactive:
+
+| Path | Daemon stopped (socket absent at entry) | Daemon running (socket live at entry) |
+|---|---|---|
+| udev hotplug → `reconnect@` one-shot (no `-f`) | no-op, exit 0 | re-inits node |
+| sleep hook / resume unit → plain `ltd resume` | no-op, exit 0 | re-verifies + re-inits on mismatch |
+| `ltd reconnect /dev/hidrawN -f`, `ltd reconnect /dev/hidrawN -d`, `ltd resume -f` | runs as requested (explicit manual forcing) | runs as requested |
+
+Background one-shots probe the live daemon socket at entry and return before any
+node wait, scan, or feature-report write, so a queued unit can neither
+fail on missing hardware nor touch it. The probe is entry-time only: it does
+not cancel work already admitted (a daemon stop racing a waiting/rescanning
+one-shot is not revoked). Packaging never triggers hardware
+either: install/upgrade scriptlets only reload udev/systemd (no
+`udevadm trigger`, no enable/start — same policy on Arch, Debian, and
+Fedora).
+
+Manual `udevadm trigger --action=add` above therefore only re-inits once
+the service runs; with the service stopped the queued one-shots exit 0
+without touching hardware — use `-f` to force while stopped.
 
 ## Config
 
@@ -114,6 +142,8 @@ sudo install -m644 systemd/linux-trackpad-driver-resume.service /etc/systemd/sys
 sudo systemctl daemon-reload
 # Manual re-init without sleeping (or to test the path):
 sudo ltd resume
+# explicit forcing while the daemon is stopped:
+sudo ltd resume -f
 systemctl status linux-trackpad-driver-resume.service
 ```
 
@@ -216,3 +246,7 @@ Normally unset — the daemon resolves everything itself:
   interfaces stay passthrough until the touch interface attaches.
 - `LTD_UINPUT_NODE=/dev/uinput`: uinput control node for the virtual
   device (default `/dev/uinput`).
+- `LTD_HIDRAW_SYSFS=/path/to/class/hidraw`: override the hidraw sysfs class
+  dir (default `/sys/class/hidraw`) for hermetic runs. Tests set this to an
+  empty temp dir so `ltd reconnect` / `ltd resume` subprocesses never
+  discover host hardware; child processes inherit it via env.
