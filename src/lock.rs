@@ -24,6 +24,10 @@
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -69,9 +73,12 @@ pub struct SocketLock {
     /// this entry.
     sock_id: (u64, u64),
     _listener: UnixListener,
-    /// Write end of the drainer shutdown pipe. `Drop` writes one byte
-    /// before joining so an idle `poll` waiter wakes promptly; a full pipe
-    /// still means the waiter is already readable, so no wakeup is lost.
+    /// Shutdown flag observed independently of `poll` success, plus the write
+    /// end of the shutdown pipe. `Drop` sets the flag then writes one byte
+    /// before joining: the flag keeps shutdown observable even if `poll`
+    /// keeps failing, and the byte wakes an idle `poll` promptly. A full
+    /// pipe still leaves the waiter readable, so no wakeup is lost.
+    stop: Arc<AtomicBool>,
     shutdown_tx: std::os::fd::OwnedFd,
     drainer: Option<JoinHandle<()>>,
 }
@@ -220,6 +227,7 @@ impl SocketLock {
                         return Err(err)
                             .with_context(|| format!("setting nonblocking on socket '{path}'"));
                     }
+                    let stop = Arc::new(AtomicBool::new(false));
                     let (shutdown_tx, shutdown_rx) = match shutdown_pipe() {
                         Ok(pair) => pair,
                         Err(err) => {
@@ -245,9 +253,11 @@ impl SocketLock {
                     // on failure the closure (and both fds) drops with it, so
                     // only the bound listener and `shutdown_tx` need explicit
                     // drops here before unlinking our fresh pathname.
+                    // `stop` is only moved on success; on failure it drops.
+                    let drain_stop = Arc::clone(&stop);
                     let drainer = match thread::Builder::new()
                         .name("ltd-sock-drain".to_string())
-                        .spawn(move || drain_loop(drain_listener, shutdown_rx))
+                        .spawn(move || drain_loop(drain_listener, drain_stop, shutdown_rx))
                     {
                         Ok(handle) => handle,
                         Err(err) => {
@@ -262,6 +272,7 @@ impl SocketLock {
                         path: path.to_string(),
                         sock_id,
                         _listener: listener,
+                        stop,
                         shutdown_tx,
                         drainer: Some(drainer),
                     });
@@ -369,50 +380,116 @@ fn notify_shutdown(tx: &std::os::fd::OwnedFd) {
     }
 }
 
+/// Backoff applied when the readiness wait itself fails or the listener
+/// reports an error without input. Prevents hot-spinning; shutdown stays
+/// observable via `stop` (checked each pass) and typically resolves within
+/// about one backoff. Not a hard realtime bound: scheduling can delay it.
+const DRAIN_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Single readiness wait: one blocking `poll(-1)` over the listener and the
+/// shutdown pipe. Returns `(listener_revents, shutdown_revents)`. No retry or
+/// sleep here; the caller applies the stop/error policy so `EINTR` and
+/// persistent failures never bypass shutdown.
+fn poll_two(
+    listener_fd: std::os::fd::RawFd,
+    shutdown_fd: std::os::fd::RawFd,
+) -> io::Result<(i16, i16)> {
+    let mut fds = [
+        libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: shutdown_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `fds` is a valid two-element array for the duration of the call.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+    if rc >= 0 {
+        Ok((fds[0].revents, fds[1].revents))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Readiness waiter replacing the old 10ms idle sleep: block in `poll` until
-/// the listener is readable or the shutdown pipe fires. Each wake drains one
-/// bounded `drain_once` pass. `EINTR` retries without sleeping; any other
-/// `poll` error backs off briefly so a persistent failure cannot hot-spin,
-/// while a queued shutdown byte keeps `Drop`'s join bounded to ~backoff.
-fn drain_loop(listener: UnixListener, shutdown_rx: std::os::fd::OwnedFd) {
+/// the listener is readable or the shutdown pipe fires. Each input wake
+/// drains one bounded `drain_once` pass.
+fn drain_loop(listener: UnixListener, stop: Arc<AtomicBool>, shutdown_rx: std::os::fd::OwnedFd) {
+    drain_loop_with_wait(listener, stop, shutdown_rx, poll_two)
+}
+
+/// Wait-injected waiter core. `wait` performs one readiness wait over the
+/// two fds; production passes [`poll_two`], tests inject failures or error
+/// revents without touching host limits. Shutdown (`stop` + any shutdown
+/// revents) always wins over listener handling.
+fn drain_loop_with_wait(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    shutdown_rx: std::os::fd::OwnedFd,
+    mut wait: impl FnMut(std::os::fd::RawFd, std::os::fd::RawFd) -> io::Result<(i16, i16)>,
+) {
     use std::os::fd::AsRawFd;
+    let listener_fd = listener.as_raw_fd();
+    let shutdown_fd = shutdown_rx.as_raw_fd();
     loop {
-        let mut fds = [
-            libc::pollfd {
-                fd: listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: shutdown_rx.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // Retry interruption; persistent errors sleep briefly to avoid a hot
-        // loop while still allowing Drop to join promptly.
-        let ready = loop {
-            // SAFETY: `fds` is a valid array for the duration of the call.
-            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
-            if rc >= 0 {
-                break true;
-            }
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            thread::sleep(Duration::from_millis(50));
-            break false;
-        };
-        if !ready {
-            continue;
-        }
-        if fds[1].revents != 0 {
+        // Independent of `poll` success so a persistent wait failure cannot
+        // hide shutdown (F1): `Drop` sets `stop` before notifying.
+        if stop.load(Ordering::Relaxed) {
             return;
         }
-        // One bounded pass per wake; the next `poll` returns immediately
-        // while backlog remains, so bursts drain promptly without spinning.
-        if fds[0].revents != 0 {
-            drain_once(&listener);
+        match wait(listener_fd, shutdown_fd) {
+            Ok((listener_revents, shutdown_revents)) => {
+                // Any shutdown readability (including pipe errors) exits;
+                // the pipe is only ever used for this signal.
+                if shutdown_revents != 0 {
+                    return;
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if listener_revents & libc::POLLNVAL != 0 {
+                    // Invalid listener fd: unrecoverable without fd surgery.
+                    // Exit so `Drop` can still join; the holder keeps its
+                    // pathname semantics and the next acquire reclaims.
+                    log::debug!("drain waiter exiting: listener fd invalid");
+                    return;
+                }
+                if listener_revents & libc::POLLIN != 0 {
+                    // One bounded pass per wake; the next wait returns
+                    // immediately while backlog remains, so bursts drain
+                    // promptly without spinning.
+                    drain_once(&listener);
+                } else if listener_revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                    // Error with no input to drain: `poll` would return
+                    // immediately again, so back off instead of hot-spinning.
+                    // Shutdown stays prompt: `stop` is checked at the top
+                    // and a queued shutdown byte makes the next wait return
+                    // with `shutdown_revents` set.
+                    thread::sleep(DRAIN_ERROR_BACKOFF);
+                }
+                // Otherwise spurious (e.g. zero revents): re-wait.
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // `EINTR`: re-wait; `stop` is rechecked at the top, so a
+                // signal storm cannot delay shutdown beyond one wait.
+                continue;
+            }
+            Err(e) => {
+                // Persistent wait failure (e.g. ENOMEM): the queued shutdown
+                // byte may never surface through `poll`, so `stop` (not the
+                // pipe) is the shutdown signal here. Back off to avoid
+                // hot-spinning; the top-of-loop check exits typically within
+                // about one backoff after `Drop` sets `stop`.
+                log::debug!("drain wait failed ({e}); backing off");
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(DRAIN_ERROR_BACKOFF);
+            }
         }
     }
 }
@@ -564,11 +641,13 @@ impl Drop for SocketLock {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
         // Stop the drainer first so no cloned fd outlives our unlink check.
-        // Notify BEFORE joining: one byte wakes the idle `poll` waiter. The
-        // byte persists if the waiter has not entered `poll` yet, so the
-        // wakeup cannot be lost. A full pipe already leaves the waiter
-        // readable, and `EINTR` retries; all other write outcomes are
-        // ignored because the thread exits on the readable pipe regardless.
+        // Flag THEN notify BEFORE joining: the flag keeps shutdown observable
+        // even if `poll` keeps failing, and one byte wakes an idle `poll`
+        // waiter promptly. The byte persists if the waiter has not entered
+        // `poll` yet, so the wakeup cannot be lost. A full pipe already
+        // leaves the waiter readable, and `EINTR` retries; all other write
+        // outcomes are ignored because the thread exits on flag or pipe.
+        self.stop.store(true, Ordering::Relaxed);
         notify_shutdown(&self.shutdown_tx);
         if let Some(handle) = self.drainer.take() {
             let _ = handle.join();
@@ -1167,11 +1246,16 @@ mod tests {
         let sock_str = sock.to_str().unwrap();
         let listener = UnixListener::bind(sock_str).unwrap();
         listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = shutdown_pipe().unwrap();
+        let drain_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("test-drain-wake".to_string())
-            .spawn(move || drain_loop(listener, rx))
+            .spawn(move || drain_loop(listener, drain_stop, rx))
             .unwrap();
+        // Flag then notify, mirroring `Drop`: covers both an idle `poll`
+        // waiter (byte) and a failing waiter (flag).
+        stop.store(true, Ordering::Relaxed);
         notify_shutdown(&tx);
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1181,6 +1265,116 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("idle poll waiter must wake on shutdown");
+    }
+
+    #[test]
+    fn persistent_wait_error_plus_shutdown_returns_promptly() {
+        // F1 regression with an injected wait seam (no host rlimit/fd games):
+        // the readiness wait always fails (e.g. ENOMEM), so the shutdown pipe
+        // byte can never surface through `poll`. The `stop` flag must still
+        // end the worker. Stop fires immediately after spawn — before the
+        // waiter necessarily runs — so a flag check tied to `poll` success
+        // would hang the join. Bounded via channel so failure reports
+        // instead of hanging the suite.
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("wait-err.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let (_tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-drain-wait-err".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, |_, _| {
+                    Err(io::Error::from_raw_os_error(libc::ENOMEM))
+                })
+            })
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must exit on stop even when poll keeps failing");
+    }
+
+    #[test]
+    fn listener_error_revents_back_off_without_spin() {
+        // F2 regression with an injected wait seam: the listener reports
+        // POLLERR with no POLLIN, which `poll` would return immediately and
+        // forever. The waiter must back off instead of hot-spinning. Run in
+        // a bounded window and assert the wait-call count stays tiny (a
+        // spinning waiter would call thousands of times here).
+        use std::sync::{atomic::AtomicUsize, mpsc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("listen-err.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let (tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let drain_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let handle = std::thread::Builder::new()
+            .name("test-drain-listen-err".to_string())
+            .spawn(move || {
+                drain_loop_with_wait(listener, drain_stop, rx, move |_, _| {
+                    calls_in.fetch_add(1, Ordering::Relaxed);
+                    Ok((libc::POLLERR, 0))
+                })
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::Relaxed);
+        notify_shutdown(&tx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("error-revent waiter must still exit on stop");
+        let n = calls.load(Ordering::Relaxed);
+        assert!(
+            n <= 10,
+            "POLLERR without input must back off, not spin: {n} waits in ~150ms"
+        );
+        assert!(n >= 1, "waiter must have waited at least once");
+    }
+
+    #[test]
+    fn listener_nval_exits_worker_without_shutdown() {
+        // Terminal policy: POLLNVAL means the listener fd is unrecoverable.
+        // The worker exits on its own (no stop needed) so `Drop` can still
+        // join instead of spinning or blocking forever.
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("listen-nval.sock");
+        let sock_str = sock.to_str().unwrap();
+        let listener = UnixListener::bind(sock_str).unwrap();
+        let (_tx, rx) = shutdown_pipe().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::Builder::new()
+            .name("test-drain-listen-nval".to_string())
+            .spawn(move || drain_loop_with_wait(listener, stop, rx, |_, _| Ok((libc::POLLNVAL, 0))))
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("POLLNVAL waiter must exit without requiring shutdown");
     }
 
     #[test]
