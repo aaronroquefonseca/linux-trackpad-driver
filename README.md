@@ -177,8 +177,10 @@ default — values carry over one-to-one.
 ```sh
 sudo ltd run                                   # daemon: setup + click engine (reads installed config when present)
 sudo ltd run -c /etc/linux-trackpad-driver/config.toml
-sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init
-sudo ltd reconnect /dev/hidrawN -f -p 90 -d
+sudo ltd reconnect /dev/hidrawN                # udev entry / manual re-init (daemon running)
+sudo ltd reconnect /dev/hidrawN -f -p 90      # explicit forcing while the daemon is stopped
+sudo ltd reconnect /dev/hidrawN -d             # explicit manual disengage (host-click off)
+sudo ltd resume -f                             # explicit resume forcing while stopped
 ltd doctor                                     # read-only checklist (validates the on-disk file)
 ltd --version                                  # embedded build identity (alias: -V)
 ```
@@ -242,7 +244,7 @@ for service status.
 | `doctor`: config invalid | line names the key + accepted range | edit `/etc/linux-trackpad-driver/config.toml` (unknown keys are rejected — usually a typo); validate with `ltd doctor -c <file>` first |
 | Edited config, nothing changed | service restarted? | `sudo systemctl restart linux-trackpad-driver.service` (required for now) |
 | Double input on Bluetooth | `sudo evtest` on the trackpad node vs `journalctl` | the enhanced proxy suppresses duplicates with a reversible evdev grab after its source and virtual pointer are ready; init, reconnect and resume never unbind the HID driver. Check for the `proxy: grabbed` log; BT remains experimental (issue #42) |
-| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup |
+| Motion lost after suspend (clicks survive) | `journalctl -u linux-trackpad-driver-resume.service`; `sudo ltd resume` manually (daemon running) or `sudo ltd resume -f` while stopped | reinstall the system-sleep hook as executable (`INSTALL.md`); the daemon tick re-inits drifted nodes within ~30 s as backup |
 
 Full udev/systemd/permissions notes: [`INSTALL.md`](INSTALL.md).
 

@@ -28,6 +28,10 @@ pub struct ReconnectArgs {
 pub struct ResumeArgs {
     pub polling_override: Option<u32>,
     pub config_path: Option<String>,
+    /// Explicit manual forcing: re-init even without a live daemon.
+    /// Plain `resume` (hook/unit background form) leaves hardware alone
+    /// when the daemon is stopped.
+    pub force: bool,
 }
 
 /// Parsed `doctor` invocation.
@@ -66,7 +70,7 @@ impl From<String> for ParseFailure {
 fn top_usage(prog: &str) -> ParseFailure {
     ParseFailure {
         message: format!(
-            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-p Hz] [-c config]\n  {prog} doctor [-c config]\n  {prog} --version | -V"
+            "usage:\n  {prog} run [-c config]\n  {prog} reconnect <hidraw-dev> [-f] [-p Hz] [-d] [-c config]\n  {prog} resume [-f] [-p Hz] [-c config]\n  {prog} doctor [-c config]\n  {prog} --version | -V"
         ),
         is_help: true,
     }
@@ -262,9 +266,14 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
         "resume" => {
             let mut polling_override: Option<u32> = None;
             let mut config_path: Option<String> = None;
+            let mut force = false;
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
+                    "-f" | "--force" => {
+                        force = true;
+                        i += 1;
+                    }
                     "-p" | "--polling-rate" => {
                         i += 1;
                         let v = rest.get(i).ok_or_else(|| {
@@ -283,7 +292,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
                     }
                     "-h" | "--help" => {
                         return Err(ParseFailure {
-                            message: format!("usage: {prog} resume [-p Hz] [-c config]"),
+                            message: format!("usage: {prog} resume [-f] [-p Hz] [-c config]"),
                             is_help: true,
                         });
                     }
@@ -295,6 +304,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, ParseFailure> {
             Ok(Command::Resume(ResumeArgs {
                 polling_override,
                 config_path,
+                force,
             }))
         }
         "doctor" => {
@@ -394,7 +404,7 @@ pub fn dispatch(args: &[String]) -> anyhow::Result<ExitCode> {
             log::info!(
                 "config source: {source} (live settings for this process; restart to apply on-disk edits)"
             );
-            match daemon::run_resume(&cfg, rs.polling_override) {
+            match daemon::run_resume(&cfg, rs.polling_override, rs.force) {
                 Ok(report) if !report.failed() => Ok(ExitCode::SUCCESS),
                 Ok(report) => {
                     log::error!("resume failed for {} node(s)", report.errors.len());
@@ -505,6 +515,7 @@ mod tests {
             Ok(Command::Resume(ResumeArgs {
                 polling_override: None,
                 config_path: None,
+                force: false,
             }))
         );
         assert_eq!(
@@ -512,12 +523,20 @@ mod tests {
             Ok(Command::Resume(ResumeArgs {
                 polling_override: Some(90),
                 config_path: Some("/tmp/x.toml".into()),
+                force: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(&argv(&["ltd", "resume", "-f"])),
+            Ok(Command::Resume(ResumeArgs {
+                polling_override: None,
+                config_path: None,
+                force: true,
             }))
         );
         assert!(parse_args(&argv(&["ltd", "resume", "-p"])).is_err());
         assert!(parse_args(&argv(&["ltd", "resume", "-p", "abc"])).is_err());
         assert!(parse_args(&argv(&["ltd", "resume", "-p", "0"])).is_err());
-        assert!(parse_args(&argv(&["ltd", "resume", "-f"])).is_err());
         assert!(
             parse_args(&argv(&["ltd", "resume", "--help"]))
                 .unwrap_err()
