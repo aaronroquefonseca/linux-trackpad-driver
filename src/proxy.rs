@@ -217,17 +217,108 @@ pub trait UinputSink: Send {
     fn destroy(&self) {}
 }
 
+/// Pinned kernel endpoint for one haptic session target.
+///
+/// A frozen pathname is NOT a device identity: the kernel may reuse a
+/// hidraw pathname for a replacement device after reconnect. The endpoint
+/// pins the session's device by holding the open [`std::fs::File`]
+/// acquired at attach/route time; both the feature ioctl and the
+/// plain-write fallback operate on that same fd, never a later pathname
+/// reopen. Clones share the same underlying file description, so queued
+/// pulses from one session share one identity and an in-flight pulse
+/// keeps the old fd even after retirement installs a replacement.
+#[derive(Debug)]
+struct HapticEndpoint {
+    file: Mutex<Option<std::fs::File>>,
+}
+
+impl HapticEndpoint {
+    fn open(node: &str) -> Arc<Self> {
+        let file = if node.is_empty() {
+            None
+        } else {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(node)
+            {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    log::warn!("haptic endpoint unavailable for '{node}': {e:#}");
+                    None
+                }
+            }
+        };
+        Arc::new(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            file: Mutex::new(None),
+        })
+    }
+}
+
 /// Session snapshot for one queued actuator pulse.
 ///
 /// The pump thread snapshots the current session target at enqueue time;
 /// the worker executes against the snapshot, never a live lookup. A stale
-/// pulse (older generation) can therefore only name its own detached node,
-/// never a newly selected one after reconnect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// pulse (older generation) is dropped without touching hardware. A pulse
+/// already inside the firmware send at retire completes only against its
+/// own pinned endpoint (the old fd), never a replacement device reusing
+/// the same pathname: both the feature ioctl and the plain-write fallback
+/// run on the snapshot's fd with no later pathname reopen.
+///
+/// Equality is routing equality (`node` + `bluetooth`) for queue
+/// bookkeeping; fd identity is intentionally not compared.
+#[derive(Debug, Clone)]
 pub struct HapticTarget {
-    node: String,
-    bluetooth: bool,
+    pub node: String,
+    pub bluetooth: bool,
+    endpoint: Arc<HapticEndpoint>,
 }
+
+impl HapticTarget {
+    fn new(node: &str, bluetooth: bool) -> Self {
+        Self {
+            node: node.to_string(),
+            bluetooth,
+            endpoint: HapticEndpoint::open(node),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            node: String::new(),
+            bluetooth: false,
+            endpoint: HapticEndpoint::empty(),
+        }
+    }
+
+    /// Clone the pinned fd for one firmware send. The queue/endpoint
+    /// mutexes are held only for the clone; the blocking ioctl/write run
+    /// on the clone with no lock held. `None` means log-only (empty
+    /// routing or attach-time open failed): the caller must not reopen
+    /// the pathname.
+    fn try_clone_file(&self) -> Option<std::fs::File> {
+        self.endpoint
+            .file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|f| f.try_clone().ok())
+    }
+}
+
+impl PartialEq for HapticTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node && self.bluetooth == other.bluetooth
+    }
+}
+
+impl Eq for HapticTarget {}
 
 /// Haptic feedback sender (host-click report path).
 ///
@@ -771,8 +862,18 @@ where
     /// Retire the entire failed pointer session. Closing the virtual nodes
     /// removes their held keys/contacts even when key-up writes cannot land.
     /// `is_attached` is the health signal consumed by attachment decisions.
+    /// Queued haptic pulses are retired BEFORE ownership is cleared: the
+    /// later `set_pump_ready(false)`/detach paths require `attached` to
+    /// retire, so this central fatal-pointer cleanup must purge and bump
+    /// the generation itself. Extras-only failures never reach here
+    /// ([`DualSink`] degrades to pointer-only), so the live pointer
+    /// session is preserved there.
     fn output_failed(&mut self, error: &anyhow::Error) {
         log::warn!("proxy: output failed, releasing grab and retiring session: {error:#}");
+        // Fatal pointer failure ends the session: queued pulses belong to
+        // the dead session and must never run after it. Retire before
+        // clearing `attached`/`attached_node` below.
+        self.haptic.retire_session();
         self.grab.ungrab();
         // Best effort for the surviving extras node before destroying both.
         let _ = self.release_held(false);
@@ -2543,33 +2644,40 @@ pub fn vibration_up_report(down_pressure: u8, quiet: bool) -> [u8; 15] {
 /// up-pulse always sends (intensity 0 is its payload, not silence).
 /// Empty node = log-only (daemon has not attached yet); never fails attach.
 pub struct RealHaptic {
-    node: Mutex<String>,
-    bt: std::sync::atomic::AtomicBool,
+    target: Mutex<HapticTarget>,
 }
 
 impl RealHaptic {
     pub fn new() -> Self {
         Self {
-            node: Mutex::new(String::new()),
-            bt: std::sync::atomic::AtomicBool::new(false),
+            target: Mutex::new(HapticTarget::empty()),
         }
     }
 
     pub fn set_node(&self, node: &str) {
-        *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node.to_string();
+        let bluetooth = self
+            .target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bluetooth;
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = HapticTarget::new(node, bluetooth);
     }
 
     pub fn set_bluetooth(&self, bt: bool) {
-        self.bt.store(bt, std::sync::atomic::Ordering::SeqCst);
+        self.target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bluetooth = bt;
     }
 
     /// Live routing snapshot (direct-send path only; the daemon path
-    /// snapshots per pulse inside [`AsyncHaptic`]).
+    /// snapshots per pulse inside [`AsyncHaptic`]). The snapshot shares
+    /// the pinned endpoint, so the send below runs on the same fd.
     fn current_target(&self) -> HapticTarget {
-        HapticTarget {
-            node: self.node.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            bluetooth: self.bt.load(std::sync::atomic::Ordering::SeqCst),
-        }
+        self.target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -2607,7 +2715,7 @@ impl HapticSender for RealHaptic {
         if target.node.is_empty() {
             return Ok(());
         }
-        self.send_report(&target.node, target.bluetooth, &report);
+        self.send_report(target, &report);
         Ok(())
     }
     fn execute_up(&self, target: &HapticTarget, down_pressure: u8, quiet: bool) -> Result<()> {
@@ -2620,37 +2728,67 @@ impl HapticSender for RealHaptic {
         if target.node.is_empty() {
             return Ok(());
         }
-        self.send_report(&target.node, target.bluetooth, &report);
+        self.send_report(target, &report);
         Ok(())
     }
 }
 
 impl RealHaptic {
-    fn send_report(&self, node: &str, bt: bool, report: &[u8; 15]) {
-        let payload: &[u8] = if bt { &report[..] } else { &report[1..] };
-        // Strict send: EPIPE/EIO (device NAK) must propagate so the
-        // fallback below runs. The lenient init variant would swallow
-        // the NAK as success → silent no-haptic with no fallback.
-        if let Err(e) = crate::init::send_feature_report_hidraw_strict(node, payload) {
-            log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
-            if let Err(e2) = plain_write(node, payload) {
+    fn send_report(&self, target: &HapticTarget, report: &[u8; 15]) {
+        let payload: &[u8] = if target.bluetooth {
+            &report[..]
+        } else {
+            &report[1..]
+        };
+        let node = target.node.as_str();
+        // Both sends run on the SAME pinned fd from the session snapshot.
+        // No pathname reopen: a replacement device reusing this pathname
+        // after reconnect can never receive this (old-session) pulse.
+        let Some(mut file) = target.try_clone_file() else {
+            if !target.node.is_empty() {
                 log::error!(
-                    "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
+                    "haptic FAILED on {node} (no pinned endpoint); clicks stay silent until re-attach"
                 );
             }
+            return;
+        };
+        // Strict send: EPIPE/EIO (device NAK) must fall through to the
+        // plain-write fallback below. The lenient init variant would
+        // swallow the NAK as success → silent no-haptic with no fallback.
+        let req = crate::init::hidiocsfeature_request(payload.len());
+        let ret = unsafe {
+            libc::ioctl(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                req as libc::c_ulong,
+                payload.as_ptr() as *const libc::c_void,
+            )
+        };
+        if ret >= 0 {
+            log::debug!("feature report {:02X?} sent to {node}", payload);
+            return;
+        }
+        let e = std::io::Error::last_os_error();
+        log::warn!("haptic feature report failed ({e:#}); trying plain write fallback");
+        if let Err(e2) = plain_write_pinned(&mut file, payload) {
+            log::error!(
+                "haptic FAILED on {node} (feature: {e:#}; write: {e2:#}); clicks stay silent until re-attach"
+            );
         }
     }
 }
 
-fn plain_write(node: &str, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(node)
-        .map_err(|e| anyhow::anyhow!("opening haptic '{node}': {e}"))?;
-    f.write_all(bytes)
-        .map_err(|e| anyhow::anyhow!("haptic write to '{node}': {e}"))?;
+/// Plain-write fallback on the already-pinned fd (no pathname reopen).
+/// Rewinds regular files so each pulse overwrites from the start (same
+/// bytes the old reopen-per-send path produced); hidraw ignores the
+/// offset and the rewind error is ignored there.
+fn plain_write_pinned(file: &mut std::fs::File, bytes: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let rewound = file.seek(SeekFrom::Start(0)).is_ok();
+    file.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("haptic write: {e}"))?;
+    if rewound {
+        let _ = file.set_len(bytes.len() as u64);
+    }
     Ok(())
 }
 
@@ -2729,22 +2867,30 @@ impl HapticShared {
 /// Async actuator sender: the pump thread enqueues down/up pulses and
 /// never waits for the firmware round-trip.
 ///
-/// Why: every [`HapticSender`] call opens the hidraw node and issues a
-/// blocking `HIDIOCSFEATURE` (+ a fallback open+write on NAK). On the
-/// pump thread that steals frame time per click edge; during
-/// release/re-press chatter (noisy pressure hovering at the release
-/// point mid-drag) dozens of edges × ~10 ms round-trips stall motion in
-/// 150-800 ms bursts. The worker drains a bounded FIFO instead, so input
-/// latency never depends on actuator timing. Order is preserved
-/// (down/up pairs stay paired); bytes and silent rules are unchanged.
+/// Why: every [`HapticSender`] call issues a blocking `HIDIOCSFEATURE`
+/// (+ a fallback write on NAK) on the worker thread. On the pump thread
+/// that steals frame time per click edge; during release/re-press
+/// chatter (noisy pressure hovering at the release point mid-drag)
+/// dozens of edges × ~10 ms round-trips stall motion in 150-800 ms
+/// bursts. The worker drains a bounded FIFO instead, so input latency
+/// never depends on actuator timing. Order is preserved (down/up pairs
+/// stay paired); bytes and silent rules are unchanged.
 ///
 /// Session scope: each pulse carries the session generation plus a
-/// [`HapticTarget`] snapshot. [`ClickProxy::detach`], pump loss, and
+/// [`HapticTarget`] snapshot pinning the kernel endpoint (open fd, not
+/// just a pathname).
+///
+/// [`ClickProxy::detach`], pump loss, pointer-output failure, and
 /// [`AsyncHaptic::retarget`] retire the old session (purge + generation
-/// bump); the worker drops stale pulses without touching hardware, so a
-/// backlog can never fire on a newly selected node after reconnect.
+/// bump). The worker drops stale pulses without touching hardware, so a
+/// backlog can never fire on a newly selected node after reconnect, even
+/// when the kernel reuses the same hidraw pathname.
+///
+/// A pulse already inside the firmware send at retire completes only
+/// against its own pinned (old) fd; it is never reopened or redirected.
 /// A same-session route correction ([`AsyncHaptic::update_route`])
-/// re-points pending pulses without retiring them.
+/// re-points pending pulses to a newly pinned endpoint without retiring
+/// them; an already in-flight pulse keeps the old endpoint.
 ///
 /// Policy (input responsiveness wins over click feel in every case):
 /// - Overflow: the pump never blocks — the incoming pulse is dropped and
@@ -2773,10 +2919,7 @@ where
         let shared = std::sync::Arc::new(HapticShared {
             state: Mutex::new(HapticState {
                 pulses: VecDeque::new(),
-                target: HapticTarget {
-                    node: String::new(),
-                    bluetooth: false,
-                },
+                target: HapticTarget::empty(),
                 closed: false,
                 dropped_overflow: 0,
                 dropped_stale: 0,
@@ -2825,25 +2968,45 @@ where
 
     /// New session: retire queued work and pin the actuator target.
     /// The daemon calls this on attach before the pump can enqueue.
+    /// The endpoint fd is opened BEFORE the queue lock is taken, so the
+    /// lock is never held across filesystem I/O; the retire then commits
+    /// the new endpoint together with the generation bump.
     pub fn retarget(&self, node: &str, bluetooth: bool) {
-        self.shared.retire(Some(HapticTarget {
-            node: node.to_string(),
-            bluetooth,
-        }));
+        let target = HapticTarget::new(node, bluetooth);
+        self.shared.retire(Some(target));
     }
 
     /// Same-session route correction (late actuator sibling): re-point
-    /// pending pulses at the corrected node without retiring them.
+    /// pending pulses at the corrected node without retiring them. Pins
+    /// a new endpoint fd for the corrected node; pulses already popped
+    /// by the worker keep the old endpoint. The generation is unchanged.
     pub fn update_route(&self, node: &str) {
+        let (generation, bluetooth, current) = {
+            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.target.node == node {
+                return;
+            }
+            (
+                self.shared.generation.load(Ordering::SeqCst),
+                state.target.bluetooth,
+                state.target.node.clone(),
+            )
+        };
+        // Open outside the queue lock; commit below only if the session
+        // has not retired meanwhile (otherwise the correction would clobber
+        // the new session's endpoint).
+        let corrected = HapticTarget::new(node, bluetooth);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.target.node == node {
+        if self.shared.generation.load(Ordering::SeqCst) != generation {
             return;
         }
-        state.target.node = node.to_string();
-        let generation = self.shared.generation.load(Ordering::SeqCst);
+        if state.target.node != current {
+            return;
+        }
+        state.target = corrected.clone();
         for pulse in state.pulses.iter_mut() {
             if pulse.generation == generation {
-                pulse.target.node = node.to_string();
+                pulse.target = corrected.clone();
             }
         }
     }
@@ -2940,16 +3103,13 @@ impl<H> Drop for AsyncHaptic<H> {
     fn drop(&mut self) {
         // Retire first: queued pulses belong to a session that no longer
         // exists, so purge them instead of draining them against the old
-        // target during teardown (direct shared call: identical to
+        // endpoint during teardown (direct shared call: identical to
         // `retire_session`, without requiring trait bounds on `Drop`).
         // Then signal close and join bounded: a hung firmware send
         // detaches instead of hanging teardown. Dropping the handle
         // detaches the thread; it exits on its own once unblocked
         // (closed flag + poison-tolerant locks).
-        self.shared.retire(Some(HapticTarget {
-            node: String::new(),
-            bluetooth: false,
-        }));
+        self.shared.retire(Some(HapticTarget::empty()));
         {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             state.closed = true;
@@ -3008,10 +3168,7 @@ where
         Ok(())
     }
     fn retire_session(&self) {
-        self.shared.retire(Some(HapticTarget {
-            node: String::new(),
-            bluetooth: false,
-        }));
+        self.shared.retire(Some(HapticTarget::empty()));
     }
 }
 
@@ -6979,6 +7136,329 @@ mod tests {
             "shutdown hung on wedged actuator: {:?}",
             t0.elapsed()
         );
+    }
+
+    #[test]
+    fn haptic_fallback_uses_pinned_endpoint_across_pathname_reuse() {
+        // F1: a frozen pathname is not a device identity. The worker pauses
+        // at the fallback boundary (feature ioctl failed, before plain
+        // write); the session retires and the kernel reuses the same
+        // pathname for a replacement. The fallback must write the old fd
+        // (the renamed old file), never the replacement at the same path.
+        struct GateLog {
+            state: Mutex<(bool, bool)>,
+            cv: Condvar,
+        }
+        impl log::Log for GateLog {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if record
+                    .args()
+                    .to_string()
+                    .starts_with("haptic feature report failed")
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.0 = true;
+                    self.cv.notify_all();
+                    while !state.1 {
+                        state = self.cv.wait(state).unwrap();
+                    }
+                }
+            }
+            fn flush(&self) {}
+        }
+        let logger = Box::leak(Box::new(GateLog {
+            state: Mutex::new((false, false)),
+            cv: Condvar::new(),
+        }));
+        log::set_logger(logger).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("reused-node");
+        let old_path = dir.path().join("old-node");
+        std::fs::write(&node, []).unwrap();
+        let ah = AsyncHaptic::new(RealHaptic::new());
+        ah.retarget(node.to_str().unwrap(), false);
+        ah.click_feedback(64, 5, false).unwrap();
+        let state = logger.state.lock().unwrap();
+        let (state, timeout) = logger
+            .cv
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |s| !s.0)
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "worker did not reach fallback boundary"
+        );
+        drop(state);
+        // Feature ioctl on the original fixture failed (ENOTTY); retire,
+        // then simulate the kernel reusing the same hidraw pathname.
+        ah.retire_session();
+        std::fs::rename(&node, &old_path).unwrap();
+        std::fs::write(&node, []).unwrap();
+        ah.retarget(node.to_str().unwrap(), false);
+        {
+            let mut state = logger.state.lock().unwrap();
+            state.1 = true;
+            logger.cv.notify_all();
+        }
+        drop(ah); // Bounded join waits for the already-entered send.
+        let replacement = std::fs::read(&node).unwrap();
+        assert!(
+            replacement.is_empty(),
+            "old-session fallback must not write the replacement node: {replacement:02x?}"
+        );
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        assert_eq!(
+            old_bytes,
+            &vibration_report(64, 5, false)[1..],
+            "in-flight pulse must complete only against the old endpoint"
+        );
+    }
+
+    #[test]
+    fn haptic_first_send_uses_pinned_endpoint_after_retire() {
+        // F1 check-to-first-send race: the worker is descheduled after the
+        // generation check but before the first send; retire + pathname
+        // reuse must not redirect the in-flight pulse. The wrapper gates
+        // inside `execute_down` before delegating to the pinned fd, which
+        // simulates the deschedule. No pathname reopen occurs at send time
+        // by construction (the fd was pinned at retarget).
+        struct GateReal {
+            state: Mutex<(bool, bool)>,
+            cvar: Condvar,
+            inner: RealHaptic,
+        }
+        impl HapticSender for GateReal {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(
+                &self,
+                target: &HapticTarget,
+                pressure: u8,
+                intensity: u8,
+                quiet: bool,
+            ) -> Result<()> {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.0 = true;
+                    self.cvar.notify_all();
+                    while !state.1 {
+                        state = self.cvar.wait(state).unwrap();
+                    }
+                }
+                self.inner.execute_down(target, pressure, intensity, quiet)
+            }
+        }
+        let gate = std::sync::Arc::new(GateReal {
+            state: Mutex::new((false, false)),
+            cvar: Condvar::new(),
+            inner: RealHaptic::new(),
+        });
+        struct GateRealSender(std::sync::Arc<GateReal>);
+        impl HapticSender for GateRealSender {
+            fn click_feedback(&self, _p: u8, _i: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn release_feedback(&self, _d: u8, _q: bool) -> Result<()> {
+                Ok(())
+            }
+            fn execute_down(&self, target: &HapticTarget, p: u8, i: u8, q: bool) -> Result<()> {
+                self.0.execute_down(target, p, i, q)
+            }
+            fn execute_up(&self, target: &HapticTarget, d: u8, q: bool) -> Result<()> {
+                self.0.inner.execute_up(target, d, q)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("reused-first-open");
+        let old_path = dir.path().join("old-first-open");
+        std::fs::write(&node, []).unwrap();
+        let ah = AsyncHaptic::new(GateRealSender(std::sync::Arc::clone(&gate)));
+        ah.retarget(node.to_str().unwrap(), false);
+        ah.click_feedback(64, 5, false).unwrap();
+        let t0 = std::time::Instant::now();
+        while !gate.state.lock().unwrap().0 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "worker never entered first send"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Worker holds the in-flight pulse past its generation check.
+        ah.retire_session();
+        std::fs::rename(&node, &old_path).unwrap();
+        std::fs::write(&node, []).unwrap();
+        ah.retarget(node.to_str().unwrap(), false);
+        {
+            let mut state = gate.state.lock().unwrap();
+            state.1 = true;
+            gate.cvar.notify_all();
+        }
+        drop(ah);
+        let replacement = std::fs::read(&node).unwrap();
+        assert!(
+            replacement.is_empty(),
+            "retired first send must not touch the reused pathname: {replacement:02x?}"
+        );
+        let old_bytes = std::fs::read(&old_path).unwrap();
+        assert_eq!(
+            old_bytes,
+            &vibration_report(64, 5, false)[1..],
+            "in-flight first send completes only on the old endpoint"
+        );
+    }
+
+    #[test]
+    fn haptic_output_failure_retires_backlog_frame() {
+        // F2 (frame path): a pointer emit failure ends the proxy session;
+        // queued pulses must be purged and the generation bumped before
+        // ownership is cleared. Only the already in-flight pulse may
+        // complete (against its old snapshot); queued work never runs.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("old-session", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        let before = ah.generation();
+        let pointer = FaultUinput::new();
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), FaultUinput::new()),
+            ah,
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 10, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("old-session"));
+        pointer.fail(1);
+        assert!(px.handle_frame(&Config::default()).is_err());
+        assert!(!px.is_attached());
+        let pending = px.haptic.pending();
+        let after = px.haptic.generation();
+        assert_eq!(
+            pending, 0,
+            "failed pointer session must purge queued haptics"
+        );
+        assert!(
+            after > before,
+            "failed pointer session must retire generation"
+        );
+        gate.open();
+        gate.wait_executed(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let executed = gate.executed();
+        assert_eq!(
+            executed.len(),
+            1,
+            "only the in-flight pulse may complete after failure: {executed:?}"
+        );
+        assert_eq!(executed[0].0, "old-session");
+        drop(px);
+    }
+
+    #[test]
+    fn haptic_idle_output_failure_retires_backlog() {
+        // F2 (idle path): a staged-action idle poll whose trailing SYN
+        // fails must retire the same way as a frame failure. Both paths
+        // converge on `output_failed`.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("old-session", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 5, false).unwrap();
+        ah.release_feedback(64, false).unwrap();
+        let before = ah.generation();
+        let pointer = FaultUinput::new();
+        let extras = FaultUinput::new();
+        let mut cfg = output_failure_config();
+        cfg.click.click_1.stagger_ms = Some(100);
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), extras.clone()),
+            ah,
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("old-session"));
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(px.pending_buttons.is_some());
+        pointer.fail(2);
+        assert!(px.handle_frame_at(&cfg, spaced_at(now, 2)).is_err());
+        assert!(!px.is_attached());
+        let pending = px.haptic.pending();
+        let after = px.haptic.generation();
+        assert_eq!(pending, 0, "idle failure must purge queued haptics");
+        assert!(after > before, "idle failure must retire generation");
+        gate.open();
+        gate.wait_executed(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            gate.executed().len(),
+            1,
+            "only the in-flight pulse may complete after idle failure"
+        );
+        drop(px);
+    }
+
+    #[test]
+    fn haptic_extras_only_failure_keeps_pointer_session() {
+        // Extras-only degradation must not retire the live pointer session
+        // or its queued haptics: the pointer path stays attached and the
+        // backlog survives.
+        let gate = GateHaptic::new_closed();
+        let ah = AsyncHaptic::new(gate.clone());
+        ah.retarget("/dev/hidraw9", false);
+        ah.click_feedback(64, 5, false).unwrap();
+        gate.wait_entered(1);
+        ah.click_feedback(64, 5, false).unwrap();
+        let gen = ah.generation();
+        let pointer = FaultUinput::new();
+        let extras = FaultUinput::new();
+        let mut px = ClickProxy::new(
+            settings(true),
+            FakeGrab::ok(),
+            DualSink::new(pointer.clone(), extras.clone()),
+            ah,
+            ScriptSource::new(vec![Ok(Some(frame(vec![finger(1, 200, 0, 0)], 0)))]),
+        );
+        px.set_pump_ready(true);
+        px.attach(&usb_ready("/dev/hidraw1"));
+        extras.fail(1);
+        let cfg = output_failure_config();
+        let now = std::time::Instant::now();
+        px.handle_frame_at(&cfg, now).unwrap();
+        assert!(
+            px.is_attached(),
+            "extras-only failure must keep pointer session"
+        );
+        assert!(!px.is_passthrough());
+        // The press edge above enqueues its own down-pulse alongside the
+        // pre-queued backlog (worker still holds the first): extras
+        // degradation must preserve all of it, never purge or retire.
+        assert_eq!(
+            px.haptic.pending(),
+            2,
+            "extras failure must not purge haptics"
+        );
+        assert_eq!(
+            px.haptic.generation(),
+            gen,
+            "extras failure must not retire"
+        );
+        gate.open();
+        gate.wait_executed(3);
+        drop(px);
     }
 
     #[test]
