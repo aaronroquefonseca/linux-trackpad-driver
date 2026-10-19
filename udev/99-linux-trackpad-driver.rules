@@ -3,22 +3,53 @@
 # What: on `add` of a matching hidraw node, ask systemd to run a one-shot
 # `reconnect` for that node. The init itself is defer-retry-verify (waits for
 # the node + driver bind, backoff-retries reports, verifies polling), so it
-# must NEVER run long inside udev RUN — udev would kill/s stall it. Hence
+# must NEVER run long inside udev RUN — udev would kill/stall it. Hence
 # TAG+=systemd + SYSTEMD_WANTS (see RESEARCH.md §6), never RUN+=ltd.
 #
 # Trap avoided (systemd#37063): virtual `input` event nodes
 # (devices/virtual/input/...) have no parent with idVendor/idProduct, so
 # `SUBSYSTEM=="input", ATTRS{idVendor}` never matches there. These rules only
-# match SUBSYSTEM=="hidraw", where ATTRS{idVendor}/ATTRS{idProduct} resolve
-# via the physical USB parent. No SUBSYSTEM=="input" matching lives here at
+# match SUBSYSTEM=="hidraw". No SUBSYSTEM=="input" matching lives here at
 # all — if input-node matching is ever needed, match by
 # `SUBSYSTEM=="input", ATTR{name}` instead.
 #
-# Combos: VID 05ac/004c × PID 0265 (Lightning) /0324 (USB-C). udev match
-# values are ANDed and have no alternation, so one rule per combo.
+# Transport topology (why USB and BT match differently):
+# - USB: hidraw -> HID `0003:VID:PID.xxxx` -> USB interface -> USB device.
+#   The physical USB device ancestor carries `idVendor`/`idProduct` (lowercase
+#   hex, e.g. `05ac`). `ATTRS{...}` walks real ancestors upward, and multiple
+#   `ATTRS` keys in one rule must match the SAME ancestor (systemd udev:
+#   "all of them must match on the same device") — here that is the USB
+#   device. Genuine Apple USB VID is `05ac` (Lightning `0265`, USB-C `0324`).
+# - Bluetooth: hidraw -> HID `0005:VID:PID.xxxx` -> bluetooth/hciX/... The HID
+#   identity (bus `0005` + VID:PID) lives on the HID device itself, whose
+#   kernel name encodes it (e.g. `0005:004C:0324.000A`, uppercase `%04X`).
+#   Any USB ancestor is the HOST Bluetooth adapter (e.g. Intel `8087:0aaa`),
+#   never the trackpad — so `ATTRS{idVendor}=="004c"` can never match BT
+#   (that was finding #8: the old `004c` ATTRS rules were dead). BT rules
+#   therefore match the HID parent kernel name via `KERNELS=="0005:...*"`.
+#   `KERNELS` also walks real ancestors upward; glob `*?[]` is supported.
+#   BT rules deliberately use `KERNELS` alone (no `ATTRS` mix-in) so no
+#   same-ancestor coincidence is required. Both VIDs the daemon accepts over
+#   bus `0005` (`004C` native BT, `05AC` firmware variant) are covered per PID.
+#
+# udev match values are ANDed and have no alternation, so one rule per combo:
+# 2 USB (ATTRS `05ac` x `0265`/`0324`) + 4 BT (KERNELS bus `0005` x VID
+# `004C`/`05AC` x PID `0265` (Lightning)/`0324` (USB-C)).
 # %k = kernel name (e.g. hidraw2) → template instance.
+#
+# Hardware validation (run on EACH transport; the daemon polling scan is only
+# a fallback and does not prove these rules fire):
+#   udevadm info -a -n /dev/hidrawN | grep -E 'KERNEL|SUBSYSTEM|idVendor|idProduct'
+#   # USB expect: hidraw node, parent KERNEL=="0003:05AC:0324.xxxx", ancestor
+#   #   ATTRS{idVendor}=="05ac" + ATTRS{idProduct}=="0324" on ONE ancestor.
+#   # BT expect: parent KERNEL=="0005:004C:0324.xxxx"; USB ancestors (if any)
+#   #   show the host adapter VID, never the trackpad VID.
+#   udevadm test $(udevadm info -q path -n /dev/hidrawN) 2>&1 | grep -E 'SYSTEMD_WANTS|linux-trackpad-driver-reconnect'
+#   # expect the reconnect template instance for /dev/hidrawN on both transports.
 
 ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="0265", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
 ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="0324", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
-ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="004c", ATTRS{idProduct}=="0265", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
-ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="004c", ATTRS{idProduct}=="0324", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0265.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0324.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:05AC:0265.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:05AC:0324.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service"
