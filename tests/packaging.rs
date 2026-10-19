@@ -58,7 +58,6 @@ const BT_KERNELS: [&str; 4] = [
 struct FakeDev {
     kernel: String,
     subsystem: String,
-    driver: String,
     attrs: HashMap<String, String>,
 }
 
@@ -70,11 +69,10 @@ struct FakeEvent {
     parents: Vec<FakeDev>,
 }
 
-fn dev(kernel: &str, subsystem: &str, driver: &str, attrs: &[(&str, &str)]) -> FakeDev {
+fn dev(kernel: &str, subsystem: &str, attrs: &[(&str, &str)]) -> FakeDev {
     FakeDev {
         kernel: kernel.to_string(),
         subsystem: subsystem.to_string(),
-        driver: driver.to_string(),
         attrs: attrs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -82,30 +80,73 @@ fn dev(kernel: &str, subsystem: &str, driver: &str, attrs: &[(&str, &str)]) -> F
     }
 }
 
-/// One `==`/`!=` match condition parsed from a rule line.
+/// One `==` match condition parsed from a rule line.
 struct Cond {
     key: String,
     attr: Option<String>,
-    negated: bool,
     value: String,
 }
 
-/// Parse the match (`==`/`!=`) conditions of a rule line. Assignment keys
-/// (`=`, `+=`, `:=` — `TAG+=`, `ENV{SYSTEMD_WANTS}+=`) never gate matching
-/// and are skipped.
-fn parse_match_conds(line: &str) -> Vec<Cond> {
+/// Strict match values used by these rules: exact, or one trailing `*`
+/// prefix match (e.g. `KERNELS=="0005:004C:0324.*"`). Case-sensitive like
+/// udev `==` (hence uppercase `004C` in `KERNELS` vs lowercase sysfs
+/// `ATTRS{idVendor}`).
+fn strict_match(pattern: &str, value: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => value.starts_with(prefix),
+        None => pattern == value,
+    }
+}
+
+fn validate_pattern(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("empty match value".to_string());
+    }
+    for bad in ['|', '?', '[', ']'] {
+        if value.contains(bad) {
+            return Err(format!("unsupported pattern {value:?}: `{bad}`"));
+        }
+    }
+    if value.contains('*') {
+        let stars = value.bytes().filter(|&b| b == b'*').count();
+        if stars != 1 || !value.ends_with('*') {
+            return Err(format!(
+                "unsupported pattern {value:?}: only a single trailing `*`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse the match (`==`) conditions of a rule line. Assignment tokens
+/// (`=`, `+=`, `:=`, `-=` — `TAG+=`, `ENV{SYSTEMD_WANTS}+=`) never gate
+/// matching and are skipped; anything else without `==`/`!=` is malformed.
+/// Only `ACTION`, `SUBSYSTEM`, `KERNELS`, `ATTRS` with `==` and strict
+/// patterns are accepted; everything else is an explicit error so future
+/// rule edits cannot appear covered while the model ignores them.
+fn parse_match_conds(line: &str) -> Result<Vec<Cond>, String> {
     let mut out = Vec::new();
     for token in line.split(',') {
         let token = token.trim();
-        let (key, negated, value) = if let Some(i) = token.find("==") {
-            (token[..i].trim(), false, token[i + 2..].trim())
-        } else if let Some(i) = token.find("!=") {
-            (token[..i].trim(), true, token[i + 2..].trim())
-        } else {
-            continue; // assignment (`=`, `+=`, `:=`): not a match key
-        };
-        let value = value.strip_prefix('"').unwrap_or(value);
-        let value = value.strip_suffix('"').unwrap_or(value);
+        if token.is_empty() {
+            continue;
+        }
+        if !token.contains("==") && !token.contains("!=") {
+            if token.contains('=') {
+                continue; // assignment (`=`, `+=`, `:=`, `-=`): not a match key
+            }
+            return Err(format!("malformed token without operator: {token:?}"));
+        }
+        if token.contains("!=") {
+            return Err(format!(
+                "unsupported match operator `!=` (only `==`): {token:?}"
+            ));
+        }
+        let i = token.find("==").expect("checked for ==");
+        let key = token[..i].trim();
+        let mut value = token[i + 2..].trim();
+        value = value.strip_prefix('"').unwrap_or(value);
+        value = value.strip_suffix('"').unwrap_or(value);
         let (key, attr) = match key.find('{') {
             Some(i) => (
                 key[..i].trim().to_string(),
@@ -114,108 +155,56 @@ fn parse_match_conds(line: &str) -> Vec<Cond> {
             None => (key.to_string(), None),
         };
         match key.as_str() {
-            "ACTION" | "SUBSYSTEM" | "SUBSYSTEMS" | "KERNEL" | "KERNELS" | "DRIVER" | "DRIVERS"
-            | "ATTR" | "ATTRS" => out.push(Cond {
-                key,
-                attr,
-                negated,
-                value: value.to_string(),
-            }),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn bracket_class_matches(class: &[u8], byte: u8) -> bool {
-    let (class, negated) = match class.first() {
-        Some(b'!') | Some(b'^') => (&class[1..], true),
-        _ => (class, false),
-    };
-    let mut hit = false;
-    let mut i = 0;
-    while i < class.len() {
-        if class.get(i + 1) == Some(&b'-') && i + 2 < class.len() {
-            if class[i] <= byte && byte <= class[i + 2] {
-                hit = true;
-            }
-            i += 3;
-        } else {
-            if class[i] == byte {
-                hit = true;
-            }
-            i += 1;
-        }
-    }
-    hit != negated
-}
-
-/// Shell glob (`*?[]`, plus udev `|` alternation) on bytes. Case-sensitive
-/// like udev `==` (hence uppercase `004C` in `KERNELS` vs lowercase sysfs
-/// `ATTRS{idVendor}`).
-fn fnmatch(pattern: &[u8], value: &[u8]) -> bool {
-    fn rec(pat: &[u8], val: &[u8]) -> bool {
-        if pat.is_empty() {
-            return val.is_empty();
-        }
-        match pat[0] {
-            b'*' => {
-                let mut rest = &pat[1..];
-                while rest.first() == Some(&b'*') {
-                    rest = &rest[1..];
+            "ACTION" | "SUBSYSTEM" | "KERNELS" => {
+                if attr.is_some() {
+                    return Err(format!("unsupported braces on {key:?}: {token:?}"));
                 }
-                (0..=val.len()).any(|i| rec(rest, &val[i..]))
+                validate_pattern(value).map_err(|e| format!("{key}: {e}: {token:?}"))?;
+                out.push(Cond {
+                    key,
+                    attr: None,
+                    value: value.to_string(),
+                });
             }
-            b'?' => !val.is_empty() && rec(&pat[1..], &val[1..]),
-            b'[' => {
-                let Some(end) = pat.iter().position(|&c| c == b']') else {
-                    return false;
+            "ATTRS" => {
+                let Some(attr) = attr.filter(|a| !a.is_empty()) else {
+                    return Err(format!("ATTRS needs {{attr}}: {token:?}"));
                 };
-                !val.is_empty()
-                    && bracket_class_matches(&pat[1..end], val[0])
-                    && rec(&pat[end + 1..], &val[1..])
+                validate_pattern(value).map_err(|e| format!("ATTRS: {e}: {token:?}"))?;
+                out.push(Cond {
+                    key,
+                    attr: Some(attr),
+                    value: value.to_string(),
+                });
             }
-            c => !val.is_empty() && val[0] == c && rec(&pat[1..], &val[1..]),
+            _ => {
+                return Err(format!(
+                    "unsupported match key {key:?} (only ACTION, SUBSYSTEM, KERNELS, ATTRS): {token:?}"
+                ));
+            }
         }
     }
-    rec(pattern, value)
-}
-
-fn glob_match(pattern: &str, value: &str) -> bool {
-    pattern
-        .split('|')
-        .any(|alt| fnmatch(alt.as_bytes(), value.as_bytes()))
+    Ok(out)
 }
 
 fn dev_key_matches(cond: &Cond, d: &FakeDev, action: &str) -> bool {
-    let hit = match cond.key.as_str() {
-        "ACTION" => glob_match(&cond.value, action),
-        "SUBSYSTEM" => glob_match(&cond.value, &d.subsystem),
-        "KERNEL" => glob_match(&cond.value, &d.kernel),
-        "DRIVER" => glob_match(&cond.value, &d.driver),
-        "ATTR" => cond
-            .attr
-            .as_ref()
-            .and_then(|a| d.attrs.get(a))
-            .is_some_and(|v| glob_match(&cond.value, v)),
-        _ => return true, // parent-level key: handled per-ancestor below
-    };
-    hit != cond.negated
+    match cond.key.as_str() {
+        "ACTION" => strict_match(&cond.value, action),
+        "SUBSYSTEM" => strict_match(&cond.value, &d.subsystem),
+        _ => panic!("device key must be ACTION or SUBSYSTEM: {}", cond.key),
+    }
 }
 
 fn parent_key_matches(cond: &Cond, p: &FakeDev) -> bool {
-    let hit = match cond.key.as_str() {
-        "SUBSYSTEMS" => glob_match(&cond.value, &p.subsystem),
-        "KERNELS" => glob_match(&cond.value, &p.kernel),
-        "DRIVERS" => glob_match(&cond.value, &p.driver),
+    match cond.key.as_str() {
+        "KERNELS" => strict_match(&cond.value, &p.kernel),
         "ATTRS" => cond
             .attr
             .as_ref()
             .and_then(|a| p.attrs.get(a))
-            .is_some_and(|v| glob_match(&cond.value, v)),
-        _ => true, // device-level key: handled on the node itself
-    };
-    hit != cond.negated
+            .is_some_and(|v| strict_match(&cond.value, v)),
+        _ => panic!("parent key must be KERNELS or ATTRS: {}", cond.key),
+    }
 }
 
 /// udev matching: every device-level key must hold on the node, and — when
@@ -223,27 +212,17 @@ fn parent_key_matches(cond: &Cond, p: &FakeDev) -> bool {
 /// SAME ancestor (systemd udev: "all these keys must match at one and the
 /// same parent device"; multiple `ATTRS` likewise share one device).
 fn rule_matches(line: &str, ev: &FakeEvent) -> bool {
-    let conds = parse_match_conds(line);
+    let conds = parse_match_conds(line).unwrap_or_else(|e| panic!("invalid rule {line:?}: {e}"));
     if conds
         .iter()
-        .filter(|c| {
-            !matches!(
-                c.key.as_str(),
-                "SUBSYSTEMS" | "KERNELS" | "DRIVERS" | "ATTRS"
-            )
-        })
+        .filter(|c| c.key == "ACTION" || c.key == "SUBSYSTEM")
         .any(|c| !dev_key_matches(c, &ev.node, &ev.action))
     {
         return false;
     }
     let parent_conds: Vec<&Cond> = conds
         .iter()
-        .filter(|c| {
-            matches!(
-                c.key.as_str(),
-                "SUBSYSTEMS" | "KERNELS" | "DRIVERS" | "ATTRS"
-            )
-        })
+        .filter(|c| c.key == "KERNELS" || c.key == "ATTRS")
         .collect();
     if parent_conds.is_empty() {
         return true;
@@ -267,21 +246,11 @@ fn matching_rules(ev: &FakeEvent) -> Vec<String> {
 fn usb_trackpad(pid: &str, hid_pid: &str) -> FakeEvent {
     FakeEvent {
         action: "add".to_string(),
-        node: dev("hidraw9", "hidraw", "", &[]),
+        node: dev("hidraw9", "hidraw", &[]),
         parents: vec![
-            dev(
-                &format!("0003:05AC:{hid_pid}.0007"),
-                "hid",
-                "hid-generic",
-                &[],
-            ),
-            dev("1-2:1.1", "usb", "usbhid", &[("bInterfaceNumber", "01")]),
-            dev(
-                "1-2",
-                "usb",
-                "usb",
-                &[("idVendor", "05ac"), ("idProduct", pid)],
-            ),
+            dev(&format!("0003:05AC:{hid_pid}.0007"), "hid", &[]),
+            dev("1-2:1.1", "usb", &[("bInterfaceNumber", "01")]),
+            dev("1-2", "usb", &[("idVendor", "05ac"), ("idProduct", pid)]),
         ],
     }
 }
@@ -292,22 +261,12 @@ fn usb_trackpad(pid: &str, hid_pid: &str) -> FakeEvent {
 fn bt_trackpad(hid_vid: &str, pid: &str) -> FakeEvent {
     FakeEvent {
         action: "add".to_string(),
-        node: dev("hidraw5", "hidraw", "", &[]),
+        node: dev("hidraw5", "hidraw", &[]),
         parents: vec![
-            dev(
-                &format!("0005:{hid_vid}:{pid}.000A"),
-                "hid",
-                "hid-magicmouse",
-                &[],
-            ),
-            dev("AA:BB:CC:DD:EE:FF", "bluetooth", "", &[]),
-            dev("hci0", "bluetooth", "", &[("address", "AA:BB:CC:DD:EE:01")]),
-            dev(
-                "1-1",
-                "usb",
-                "usb",
-                &[("idVendor", "8087"), ("idProduct", "0aaa")],
-            ),
+            dev(&format!("0005:{hid_vid}:{pid}.000A"), "hid", &[]),
+            dev("AA:BB:CC:DD:EE:FF", "bluetooth", &[]),
+            dev("hci0", "bluetooth", &[("address", "AA:BB:CC:DD:EE:01")]),
+            dev("1-1", "usb", &[("idVendor", "8087"), ("idProduct", "0aaa")]),
         ],
     }
 }
@@ -315,15 +274,10 @@ fn bt_trackpad(hid_vid: &str, pid: &str) -> FakeEvent {
 fn non_trackpad_usb() -> FakeEvent {
     FakeEvent {
         action: "add".to_string(),
-        node: dev("hidraw3", "hidraw", "", &[]),
+        node: dev("hidraw3", "hidraw", &[]),
         parents: vec![
-            dev("0003:046D:C52B.0001", "hid", "hid-generic", &[]),
-            dev(
-                "1-4",
-                "usb",
-                "usb",
-                &[("idVendor", "046d"), ("idProduct", "c52b")],
-            ),
+            dev("0003:046D:C52B.0001", "hid", &[]),
+            dev("1-4", "usb", &[("idVendor", "046d"), ("idProduct", "c52b")]),
         ],
     }
 }
@@ -331,8 +285,8 @@ fn non_trackpad_usb() -> FakeEvent {
 fn virtual_input_node() -> FakeEvent {
     FakeEvent {
         action: "add".to_string(),
-        node: dev("event12", "input", "", &[]),
-        parents: vec![dev("input12", "input", "", &[("name", "ltd virtual")])],
+        node: dev("event12", "input", &[]),
+        parents: vec![dev("input12", "input", &[("name", "ltd virtual")])],
     }
 }
 
@@ -533,7 +487,8 @@ fn rules_keep_parent_keys_on_one_ancestor() {
     // device parent) could never fire on either transport — forbid the mix
     // so the transports stay matched by disjoint single-parent keys.
     for line in rule_lines(RULES) {
-        let conds = parse_match_conds(line);
+        let conds = parse_match_conds(line)
+            .unwrap_or_else(|e| panic!("real rule must parse: {line:?}: {e}"));
         let has_kernels = conds.iter().any(|c| c.key == "KERNELS");
         let has_attrs = conds.iter().any(|c| c.key == "ATTRS");
         assert!(
@@ -541,6 +496,76 @@ fn rules_keep_parent_keys_on_one_ancestor() {
             "KERNELS+ATTRS mix needs an impossible same-ancestor coincidence: {line}"
         );
     }
+}
+
+#[test]
+fn strict_match_is_exact_or_trailing_star_only() {
+    assert!(strict_match("add", "add"));
+    assert!(!strict_match("add", "Add"));
+    assert!(!strict_match("05ac", "05AC"));
+    assert!(strict_match("0005:004C:0324.*", "0005:004C:0324.000A"));
+    assert!(!strict_match("0005:004C:0324.*", "0005:004c:0324.000A"));
+    assert!(!strict_match("0005:004C:0324.*", "0005:004C:0325.000A"));
+    assert!(!strict_match("hidraw", "hidraw0"));
+}
+
+#[test]
+fn strict_parser_rejects_unsupported_match_syntax() {
+    // Operator, key, pattern, and shape errors must fail explicitly instead
+    // of being silently ignored (which would fake coverage of new rules).
+    for bad in [
+        // Unsupported operator.
+        r#"ACTION!="add", SUBSYSTEM=="hidraw""#,
+        // Unsupported match keys (only ACTION/SUBSYSTEM/KERNELS/ATTRS).
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNEL=="hidraw0""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", DRIVER=="usbhid""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", SUBSYSTEMS=="usb""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", DRIVERS=="usb""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTR{name}=="foo""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", PROGRAM=="/bin/true""#,
+        // Unsupported pattern grammar (only exact or single trailing `*`).
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0324.*|0005:004C:0265.*""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0324.000?""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:[04]4C:*""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="*004C*""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:*:0324.*""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac|05AC""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05**""#,
+        // Brace shape errors.
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS{foo}=="bar""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTRS=="05ac""#,
+    ] {
+        assert!(
+            parse_match_conds(bad).is_err(),
+            "must reject unsupported syntax: {bad}"
+        );
+    }
+    // Real rule lines must parse (USB ATTRS + BT trailing-star KERNELS).
+    for line in rule_lines(RULES) {
+        assert!(
+            parse_match_conds(line).is_ok(),
+            "real rule must parse: {line}"
+        );
+    }
+}
+
+#[test]
+fn strict_parser_skips_assignments_without_rejecting() {
+    // TAG/ENV assignments never gate matching: they parse to no conds and
+    // must not be mistaken for unsupported match keys.
+    assert!(parse_match_conds(r#"TAG+="systemd""#)
+        .expect("assignment must parse")
+        .is_empty());
+    let conds = parse_match_conds(
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0324.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="linux-trackpad-driver-reconnect@%k.service""#,
+    )
+    .expect("real BT rule must parse");
+    assert_eq!(conds.len(), 3);
+    let conds = parse_match_conds(
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="0324", TAG+="systemd""#,
+    )
+    .expect("real USB rule must parse");
+    assert_eq!(conds.len(), 4);
 }
 
 #[test]

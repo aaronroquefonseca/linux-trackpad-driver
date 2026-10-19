@@ -32,9 +32,11 @@
 #   same-ancestor coincidence is required. Both VIDs the daemon accepts over
 #   bus `0005` (`004C` native BT, `05AC` firmware variant) are covered per PID.
 #
-# udev match values are ANDed and have no alternation, so one rule per combo:
-# 2 USB (ATTRS `05ac` x `0265`/`0324`) + 4 BT (KERNELS bus `0005` x VID
-# `004C`/`05AC` x PID `0265` (Lightning)/`0324` (USB-C)).
+# udev match values are ANDed; separate rules are kept for clarity, one rule
+# per combo: 2 USB (ATTRS `05ac` x `0265`/`0324`) + 4 BT (KERNELS bus `0005` x
+# VID `004C`/`05AC` x PID `0265` (Lightning)/`0324` (USB-C)).
+# (udev does support `|` alternation since systemd 217; it is not used here
+# to keep each transport identity explicit.)
 # %k = kernel name (e.g. hidraw2) → template instance.
 #
 # Hardware validation (run on EACH transport; the daemon polling scan is only
