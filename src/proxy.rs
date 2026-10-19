@@ -589,153 +589,13 @@ impl HapticSender for LogHaptic {
 /// Mouse buttons map to `BTN_*`; keyboard tokens to `EV_KEY` codes.
 /// Returns `None` for unmapped tokens (caller logs + skips).
 ///
-/// Every code below was verified individually against
-/// `/usr/include/linux/input-event-codes.h`, never extrapolated.
-///
-/// Token collisions: `back`/`forward` stay mouse buttons (`BTN_SIDE` /
-/// `BTN_EXTRA`, the long-standing mapping `click_4`/`click_5` rely on), so
-/// the browser AC Back/Forward keys live under `browserback` /
-/// `browserforward` (plus `_`-spelled aliases). `play` stays an alias of
-/// `KEY_PLAYPAUSE` (164); the CD-specific variants have their own tokens.
-///
-/// Deliberately excluded (would confuse consumers on a uinput trackpad):
-/// - `KEY_FN` (464): the Fn modifier itself — no standalone meaning.
-/// - `KEY_FN_ESC` (465), `KEY_FN_F1..F12` (466..477), `KEY_FN_1/2/D/E/F/S/B`
-///   (478..484), `KEY_FN_RIGHT_SHIFT` (485): driver-internal Fn-row reports
-///   consumed inside keyboard firmware/drivers, not meaningful output keys.
-/// - `KEY_PLAY` (207), `KEY_STOP` (128, AC Stop), `KEY_PROPS` (130),
-///   `KEY_STOP_RECORD`/`KEY_PAUSE_RECORD` (609/610): obscure duplicates of
-///   covered keys (`playpause`/`stopcd`) or record-specific keys no
-///   gesture user plausibly wants; emitting them risks confusing mappings.
+/// Single source is [`crate::action_tokens::token_code`] (codes verified
+/// individually against `/usr/include/linux/input-event-codes.h`, never
+/// extrapolated; see that module for token collisions and the
+/// deliberately-excluded list). This wrapper only pairs the shared code
+/// with `EV_KEY`.
 pub fn key_token_to_code(token: &str) -> Option<(u16, u16)> {
-    match token {
-        "left" => Some((EV_KEY, BTN_LEFT)),
-        "right" => Some((EV_KEY, BTN_RIGHT)),
-        "middle" => Some((EV_KEY, BTN_MIDDLE)),
-        "back" => Some((EV_KEY, BTN_SIDE)),
-        "forward" => Some((EV_KEY, BTN_EXTRA)),
-        "ctrl" | "control" | "lctrl" => Some((EV_KEY, 29)),
-        "rctrl" => Some((EV_KEY, 97)),
-        "shift" | "lshift" => Some((EV_KEY, 42)),
-        "rshift" => Some((EV_KEY, 54)),
-        "alt" | "lalt" => Some((EV_KEY, 56)),
-        "ralt" => Some((EV_KEY, 100)),
-        "meta" | "super" | "cmd" | "command" | "win" | "lmeta" => Some((EV_KEY, 125)),
-        "rmeta" => Some((EV_KEY, 126)),
-        "esc" | "escape" => Some((EV_KEY, 1)),
-        "enter" | "return" => Some((EV_KEY, 28)),
-        "space" => Some((EV_KEY, 57)),
-        "tab" => Some((EV_KEY, 15)),
-        "backspace" => Some((EV_KEY, 14)),
-        "delete" => Some((EV_KEY, 111)),
-        "insert" => Some((EV_KEY, 110)),
-        "print" => Some((EV_KEY, 210)),
-        "home" => Some((EV_KEY, 102)),
-        "end" => Some((EV_KEY, 107)),
-        "pageup" | "pgup" => Some((EV_KEY, 104)),
-        "pagedown" | "pgdn" => Some((EV_KEY, 109)),
-        "up" | "arrow_up" => Some((EV_KEY, 103)),
-        "down" | "arrow_down" => Some((EV_KEY, 108)),
-        "left_arrow" => Some((EV_KEY, 105)),
-        "right_arrow" => Some((EV_KEY, 106)),
-        "volup" | "volumeup" => Some((EV_KEY, 115)),
-        "voldown" | "volumedown" => Some((EV_KEY, 114)),
-        "mute" => Some((EV_KEY, 113)),
-        "micmute" => Some((EV_KEY, 248)),
-        "play" | "playpause" => Some((EV_KEY, 164)),
-        "playcd" => Some((EV_KEY, 200)),
-        "pausecd" => Some((EV_KEY, 201)),
-        "stop" | "stopcd" => Some((EV_KEY, 166)),
-        "next" | "nextsong" => Some((EV_KEY, 163)),
-        "prev" | "previous" | "previoussong" => Some((EV_KEY, 165)),
-        "pause" => Some((EV_KEY, 119)),
-        "browserback" | "browser_back" => Some((EV_KEY, 158)),
-        "browserforward" | "browser_forward" => Some((EV_KEY, 159)),
-        "refresh" => Some((EV_KEY, 173)),
-        "homepage" => Some((EV_KEY, 172)),
-        "search" => Some((EV_KEY, 217)),
-        "favorites" => Some((EV_KEY, 364)),
-        "bookmarks" => Some((EV_KEY, 156)),
-        "www" => Some((EV_KEY, 150)),
-        "calc" => Some((EV_KEY, 140)),
-        "mail" => Some((EV_KEY, 155)),
-        "computer" => Some((EV_KEY, 157)),
-        "player" => Some((EV_KEY, 387)),
-        "screenlock" | "lock" => Some((EV_KEY, 152)),
-        s if s.len() == 1 => keycode_letter_digit(s),
-        s if s.starts_with('f') => keycode_fn(s),
-        _ => None,
-    }
-}
-
-fn keycode_letter_digit(s: &str) -> Option<(u16, u16)> {
-    let c = s.chars().next()?;
-    let code = match c {
-        'a' => 30,
-        'b' => 48,
-        'c' => 46,
-        'd' => 32,
-        'e' => 18,
-        'f' => 33,
-        'g' => 34,
-        'h' => 35,
-        'i' => 23,
-        'j' => 36,
-        'k' => 37,
-        'l' => 38,
-        'm' => 50,
-        'n' => 49,
-        'o' => 24,
-        'p' => 25,
-        'q' => 16,
-        'r' => 19,
-        's' => 31,
-        't' => 20,
-        'u' => 22,
-        'v' => 47,
-        'w' => 17,
-        'x' => 45,
-        'y' => 21,
-        'z' => 44,
-        '1' => 2,
-        '2' => 3,
-        '3' => 4,
-        '4' => 5,
-        '5' => 6,
-        '6' => 7,
-        '7' => 8,
-        '8' => 9,
-        '9' => 10,
-        '0' => 11,
-        _ => return None,
-    };
-    Some((EV_KEY, code))
-}
-
-/// `KEY_F1..F10` are contiguous (`59..=68`); `F11`/`F12` jump to 87/88
-/// (`69`/`70` are `NUMLOCK`/`SCROLLLOCK` — a prior rev mapped them wrong).
-/// `KEY_F13..F24` are contiguous (`183..=194`); each value verified
-/// individually against `linux/input-event-codes.h`, never extrapolated.
-fn keycode_fn(s: &str) -> Option<(u16, u16)> {
-    let n: u8 = s[1..].parse().ok()?;
-    match n {
-        1..=10 => Some((EV_KEY, 58 + u16::from(n))),
-        11 => Some((EV_KEY, 87)),
-        12 => Some((EV_KEY, 88)),
-        13 => Some((EV_KEY, 183)),
-        14 => Some((EV_KEY, 184)),
-        15 => Some((EV_KEY, 185)),
-        16 => Some((EV_KEY, 186)),
-        17 => Some((EV_KEY, 187)),
-        18 => Some((EV_KEY, 188)),
-        19 => Some((EV_KEY, 189)),
-        20 => Some((EV_KEY, 190)),
-        21 => Some((EV_KEY, 191)),
-        22 => Some((EV_KEY, 192)),
-        23 => Some((EV_KEY, 193)),
-        24 => Some((EV_KEY, 194)),
-        _ => None,
-    }
+    crate::action_tokens::token_code(token).map(|code| (EV_KEY, code))
 }
 
 // ---- proxy ----
@@ -4581,22 +4441,13 @@ mod tests {
 
     #[test]
     fn extras_keybits_cover_every_combo_code() {
-        // Every code `key_token_to_code` can produce must be advertisable
+        // Every code the shared token table can produce must be advertisable
         // on exactly one node: pointer-routed buttons on the pointer node,
-        // everything else on extras. Candidate universe mirrors the KEYS.md
-        // drift test (config tokens + printable singles + f0..=f99) so a
-        // newly mapped token breaks here until its node covers it.
-        const CONFIG_SRC: &str = include_str!("config.rs");
-        let marker = "fn is_known_key";
-        let start = CONFIG_SRC.find(marker).expect("is_known_key missing");
-        let tail = &CONFIG_SRC[start..];
-        let end = tail.find("\n}\n").expect("is_known_key end missing");
-        let mut candidates: Vec<String> = Vec::new();
-        for chunk in tail[..end].split('"').skip(1).step_by(2) {
-            if !chunk.is_empty() {
-                candidates.push(chunk.to_string());
-            }
-        }
+        // everything else on extras. Candidate universe is the shared token
+        // universe plus printable singles and f0..=f99 (unknowns must stay
+        // unmapped), so a newly mapped token breaks here until its node
+        // covers it.
+        let mut candidates: Vec<String> = crate::action_tokens::all_known_tokens();
         for b in 0x20u8..=0x7Eu8 {
             candidates.push((b as char).to_string());
         }
@@ -9962,10 +9813,10 @@ mod tests {
     #[test]
     fn keys_md_pins_generated_table() {
         // `docs/KEYS.md` is generated by `tools/gen_keys_md.py` from the
-        // live `key_token_to_code` map + `is_known_key`. This test fails on
-        // any drift: every doc row must match the live map, and the live
-        // mapped set (over config-source tokens + broad sweeps) must equal
-        // the doc set, so additions on either side fail here first.
+        // shared token table. This test fails on any drift: every doc row
+        // must match the live map, and the live mapped set (shared token
+        // universe plus broad sweeps) must equal the doc set, so additions
+        // on either side fail here first.
         const DOC: &str = include_str!("../docs/KEYS.md");
         let mut doc_rows: Vec<(&str, u16)> = Vec::new();
         for line in DOC.lines() {
@@ -9999,21 +9850,11 @@ mod tests {
         for (name, _) in &doc_rows {
             assert!(seen.insert(*name), "duplicate doc row '{name}'");
         }
-        // Candidate universe: every token named in `is_known_key` source
-        // (parsed, not hand-listed) + all printable single chars + f0..=f99.
+        // Candidate universe: the shared token universe (enumerated,
+        // not hand-listed) + all printable single chars + f0..=f99.
         // A newly mapped token on either side lands here and breaks the
         // set equality below until the doc is regenerated.
-        const CONFIG_SRC: &str = include_str!("config.rs");
-        let marker = "fn is_known_key";
-        let start = CONFIG_SRC.find(marker).expect("is_known_key missing");
-        let tail = &CONFIG_SRC[start..];
-        let end = tail.find("\n}\n").expect("is_known_key end missing");
-        let mut candidates: Vec<String> = Vec::new();
-        for chunk in tail[..end].split('"').skip(1).step_by(2) {
-            if !chunk.is_empty() {
-                candidates.push(chunk.to_string());
-            }
-        }
+        let mut candidates: Vec<String> = crate::action_tokens::all_known_tokens();
         for b in 0x20u8..=0x7Eu8 {
             candidates.push((b as char).to_string());
         }
@@ -11969,78 +11810,38 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
 
     #[test]
     fn alias_comparison_agrees_with_wire_codes() {
-        // Pin the listed `canonical_key_token` pairs to the live
-        // `key_token_to_code` map: listed aliases sharing a code must merge,
-        // listed distinct codes must not (checked symmetrically both ways).
-        // This guards only the pairs below; token-map changes must extend
-        // this matrix, since a new alias added to only one map stays green.
+        // Shared-driven drift guarantee: group the shared token universe
+        // by wire code. Tokens sharing a code must emit identically and
+        // merge under canonical comparison (both directions); tokens with
+        // distinct codes must emit apart and never merge. Adding a token
+        // to the shared table extends this coverage automatically.
+        use crate::action_tokens::{all_known_tokens, token_code};
         use crate::config::parse_click_action;
+        let tokens = all_known_tokens();
+        let kinds: Vec<crate::config::ActionKind> = tokens
+            .iter()
+            .map(|t| parse_click_action(t).unwrap().kind)
+            .collect();
+        for (i, a) in tokens.iter().enumerate() {
+            for (j, b) in tokens.iter().enumerate() {
+                let same_wire = token_code(a) == token_code(b);
+                assert_eq!(
+                    key_token_to_code(a) == key_token_to_code(b),
+                    same_wire,
+                    "wire codes must agree with shared table: '{a}' vs '{b}'"
+                );
+                assert_eq!(
+                    kinds[i].is_same_action(&kinds[j]),
+                    same_wire,
+                    "comparison must agree with wire codes: '{a}' vs '{b}'"
+                );
+            }
+        }
+        // Multi-token handoff shape still merges through canonicalization.
         let kind = |s: &str| parse_click_action(s).unwrap().kind;
-        for (a, b) in [
-            ("ctrl", "control"),
-            ("ctrl", "lctrl"),
-            ("shift", "lshift"),
-            ("alt", "lalt"),
-            ("meta", "super"),
-            ("meta", "cmd"),
-            ("meta", "command"),
-            ("meta", "win"),
-            ("meta", "lmeta"),
-            ("esc", "escape"),
-            ("enter", "return"),
-            ("pageup", "pgup"),
-            ("pagedown", "pgdn"),
-            ("up", "arrow_up"),
-            ("down", "arrow_down"),
-            ("volup", "volumeup"),
-            ("voldown", "volumedown"),
-            ("play", "playpause"),
-            ("stop", "stopcd"),
-            ("next", "nextsong"),
-            ("prev", "previous"),
-            ("prev", "previoussong"),
-            ("browserback", "browser_back"),
-            ("browserforward", "browser_forward"),
-            ("screenlock", "lock"),
-        ] {
-            assert_eq!(
-                key_token_to_code(a),
-                key_token_to_code(b),
-                "alias pair must share a wire code: '{a}' vs '{b}'"
-            );
-            assert!(
-                kind(a).is_same_action(&kind(b)),
-                "alias pair must merge: '{a}' vs '{b}'"
-            );
-            assert!(
-                kind(b).is_same_action(&kind(a)),
-                "alias pair must merge (symmetric): '{b}' vs '{a}'"
-            );
-        }
-        for (a, b) in [
-            ("ctrl", "rctrl"),
-            ("shift", "rshift"),
-            ("alt", "ralt"),
-            ("meta", "rmeta"),
-            ("left", "left_arrow"),
-            ("pause", "pausecd"),
-            ("play", "playcd"),
-            ("mute", "micmute"),
-        ] {
-            assert_ne!(
-                key_token_to_code(a),
-                key_token_to_code(b),
-                "distinct pair must map apart: '{a}' vs '{b}'"
-            );
-            assert!(
-                !kind(a).is_same_action(&kind(b)),
-                "distinct pair must not merge: '{a}' vs '{b}'"
-            );
-            assert!(
-                !kind(b).is_same_action(&kind(a)),
-                "distinct pair must not merge (symmetric): '{b}' vs '{a}'"
-            );
-        }
+        assert!(kind("super+left").is_same_action(&kind("meta+left")));
+        assert!(kind("ctrl+c").is_same_action(&kind("control+c")));
+        assert!(!kind("super+left").is_same_action(&kind("meta+right")));
     }
 
     #[test]
