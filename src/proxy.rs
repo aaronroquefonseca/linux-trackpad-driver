@@ -8992,9 +8992,11 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
 
     #[test]
     fn alias_comparison_agrees_with_wire_codes() {
-        // Pin `canonical_key_token` to the live `key_token_to_code` map:
-        // aliases sharing a code must merge, distinct codes must not. A new
-        // alias added to only one map fails here.
+        // Pin the listed `canonical_key_token` pairs to the live
+        // `key_token_to_code` map: listed aliases sharing a code must merge,
+        // listed distinct codes must not (checked symmetrically both ways).
+        // This guards only the pairs below; token-map changes must extend
+        // this matrix, since a new alias added to only one map stays green.
         use crate::config::parse_click_action;
         let kind = |s: &str| parse_click_action(s).unwrap().kind;
         for (a, b) in [
