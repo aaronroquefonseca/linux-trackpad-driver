@@ -7,9 +7,12 @@ Wants=systemd-udevd.service
 Type=simple
 ExecStart=/usr/bin/ltd run
 # System config for the daemon (polling rate, enhanced_clicks). `ltd run`
-# reads $LTD_CONFIG when no -c is given; without this the daemon would run
-# at defaults while the resume hook re-inits at the system rate, and the
-# tick would "mismatch" forever. A missing file falls back to defaults.
+# shares one selection with every command: `-c` wins, else $LTD_CONFIG,
+# else the installed system file, else built-in defaults. This export keeps
+# the unit explicit; it does not propagate to other units or the sleep hook
+# — each separately launched unit/hook needs the same override. Without it
+# the daemon would still read the installed file via the shared fallback.
+# A missing file falls back to defaults.
 Environment=LTD_CONFIG=/etc/linux-trackpad-driver/config.toml
 Restart=on-failure
 RestartSec=2
