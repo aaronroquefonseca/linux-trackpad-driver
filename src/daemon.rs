@@ -2,8 +2,23 @@
 //!
 //! `run`: acquires [`SocketLock`], discovers devices, runs init per node
 //! (USB feature reports / BT single-node), emits [`DeviceReadyEvent`] on the
-//! shared [`DeviceReadyHub`], then idles until signal (SIGINT/SIGTERM/SIGHUP).
-//! No devices = log + idle (graceful, exit 0 on signal), never panic.
+//! shared [`DeviceReadyHub`], then idles until a shutdown signal
+//! (SIGINT/SIGTERM/SIGHUP via [`install_shutdown_handler`]). No devices =
+//! log + idle (graceful, exit 0 on signal), never panic.
+//!
+//! Shutdown is owned by [`DaemonSession`]: the signal flips a
+//! process-lifetime static flag, the loop exits, the session establishes
+//! stop FIRST then stops + bounded-joins the pump thread with
+//! worker-panic reporting, tears down best-effort within a bounded proxy
+//! acquire (grab released, held keys/contacts up with trailing `SYN`, both
+//! virtual nodes destroyed, source idled), drains queued actuator pulses,
+//! and only then emits the observable `Detached` for the torn-down node.
+//! When the timed-out worker still owns the proxy, teardown is skipped,
+//! `cleanup_incomplete` is reported, and process exit reclaims the kernel
+//! grab. Releasing the grab restores native input (the daemon never unbinds
+//! drivers, so no hardware re-arm is owed). Teardown is idempotent and
+//! bounded on every path (explicit, `Drop`, repeat); [`Drop`] repeats it
+//! best-effort so a panic-unwind path still stops the pump thread.
 //!
 //! `reconnect <dev>`: idempotent per-node re-init for udev `add`.
 //! Activation contract (finding #14): the main service is the only automatic
@@ -21,7 +36,6 @@
 //! while the daemon is stopped.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -59,12 +73,13 @@ where
 {
     proxy: std::sync::Arc<std::sync::Mutex<ClickProxy<G, U, H, S>>>,
     cfg: Config,
-    active: std::sync::Mutex<Option<String>>,
+    active: std::sync::Mutex<Option<ActiveSession>>,
     haptic_node: std::sync::Mutex<Option<String>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     idle: fn() -> S,
     control: Option<std::sync::Arc<crate::pump::PumpControl>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    shutdown_once: AtomicBool,
 }
 
 impl<G, U, H, S> PumpManager<G, U, H, S>
@@ -88,12 +103,13 @@ where
             stop,
             idle,
             control: None,
-            thread: None,
+            thread: std::sync::Mutex::new(None),
+            shutdown_once: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn with_thread(mut self, handle: std::thread::JoinHandle<()>) -> Self {
-        self.thread = Some(handle);
+    pub(crate) fn with_thread(self, handle: std::thread::JoinHandle<()>) -> Self {
+        *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         self
     }
 
@@ -131,13 +147,30 @@ where
         source: S,
         wire: impl FnOnce(&mut ClickProxy<G, U, H, S>),
     ) {
-        let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+            log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
+            return;
+        };
         wire(&mut px);
         px.replace_source(source);
         px.set_pump_ready(true);
         px.attach(event);
         if px.is_attached() {
-            *self.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(event.devnode.clone());
+            // Release the proxy before taking `active` so shutdown's
+            // bounded active acquire never waits on this wiring.
+            drop(px);
+            let Some(mut active) = lock_bounded(&self.active, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!(
+                    "pump: active busy after attach for {}; session wired, tracking deferred",
+                    event.devnode
+                );
+                self.notify_pump();
+                return;
+            };
+            *active = Some(ActiveSession {
+                devnode: event.devnode.clone(),
+                transport: event.transport,
+            });
         } else {
             Self::teardown_locked(&mut px, self.idle, "attach rollback: grab refused");
         }
@@ -158,38 +191,71 @@ where
         if event.kind != ReadyKind::Detached {
             return;
         }
-        let owned = {
-            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            if active.as_deref() == Some(event.devnode.as_str()) {
-                active.take();
-                true
+        // Bounded active take: never wait indefinitely on a concurrent
+        // attach holding `active` while wedged on the worker-owned proxy.
+        let session = {
+            let Some(mut active) = lock_bounded(&self.active, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!(
+                    "pump: active busy, skipping Detached for {} (shutdown covers it)",
+                    event.devnode
+                );
+                return;
+            };
+            if active.as_ref().is_some_and(|s| s.devnode == event.devnode) {
+                active.take()
             } else {
-                false
+                None
             }
         };
-        if !owned {
+        let Some(session) = session else {
             // Sibling vanishing while another node owns the pump: touch
             // nothing. The proxy itself also ignores foreign Detached
             // events (ownership gate in `ClickProxy::detach`), so the
             // live grab survives even if this gate is ever bypassed.
-            log::debug!(
-                "pump: ignoring Detached for unowned {} (active: {:?})",
-                event.devnode,
-                self.active.lock().unwrap_or_else(|e| e.into_inner())
+            log::debug!("pump: ignoring Detached for unowned {}", event.devnode);
+            return;
+        };
+        // Best-effort bounded teardown: a wedged worker owns the proxy.
+        // `shutdown_inner` (or process exit) is the fallback; never hang.
+        if !self.try_teardown_session(&session, PROXY_ACQUIRE_TIMEOUT) {
+            log::error!(
+                "pump: proxy busy, Detached for {} deferred to shutdown/exit",
+                session.devnode
             );
             return;
         }
-        {
-            let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
-            // `detach` runs the single idempotent proxy teardown
-            // (contacts + keys ended on the wire); manager then idles
-            // the source and destroys the virtual nodes.
-            px.detach(event);
-            px.replace_source((self.idle)());
-            px.uinput().destroy();
-            log::info!("pump: {} torn down", event.devnode);
-        }
         self.notify_pump();
+    }
+
+    /// Snapshot of the owned session, if any.
+    fn active_session(&self) -> Option<ActiveSession> {
+        // `active` is never worker-owned (only attach/detach/shutdown take
+        // it, all bounded); a blocking poison-recovering lock is safe here
+        // and keeps the read path simple for reconciliation.
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Tear down one owned session: proxy detach (held keys/contacts up
+    /// with trailing `SYN`), pump marked unready, source idled, both
+    /// virtual nodes destroyed. The caller takes `active` first, so this
+    /// runs at most once per session.
+    /// Bounded: returns `false` when the worker still owns the proxy
+    /// within `timeout`; the caller reports incomplete cleanup instead of
+    /// hanging.
+    fn try_teardown_session(&self, session: &ActiveSession, timeout: std::time::Duration) -> bool {
+        let event = init::detached(&session.devnode, session.transport);
+        let Some(mut proxy) = lock_bounded(&self.proxy, timeout) else {
+            return false;
+        };
+        proxy.detach(&event);
+        proxy.set_pump_ready(false);
+        proxy.replace_source((self.idle)());
+        proxy.uinput().destroy();
+        log::info!("pump: {} torn down", session.devnode);
+        true
     }
 }
 
@@ -208,23 +274,214 @@ where
     /// process teardown (existing lifecycle, see finding #12).
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake a poll-blocked event-driven pump immediately: it must
+        // observe stop without waiting for the next deadline, on every
+        // Drop path — before any wait or early return below.
         self.notify_pump();
-        let mut px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
-        Self::teardown_locked(&mut px, self.idle, "shutdown");
+        // An orderly shutdown already ran the full bounded path; never
+        // wait twice.
+        if self.shutdown_once.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) {
+            Some(mut px) => Self::teardown_locked(&mut px, self.idle, "shutdown"),
+            None => log::error!("pump: proxy busy at drop; process exit reclaims the grab"),
+        }
     }
 }
 
-impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource> {
+// ---- orderly shutdown: signals ----
+
+/// Signals that request orderly daemon shutdown: terminal interrupt,
+/// service-manager stop, and terminal hangup. All three flip the
+/// process-lifetime flag (see [`install_shutdown_handler`]); the main loop
+/// then runs the owned teardown in [`DaemonSession::shutdown`].
+pub fn shutdown_signals() -> [libc::c_int; 3] {
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+}
+
+/// Process-lifetime shutdown flag for the handlers installed by
+/// [`install_shutdown_handler`]. A `static` (not a reclaimed raw pointer)
+/// so the handler target is valid for every concurrent/in-flight handler
+/// by construction: no allocation, no lifetime, no reclamation race.
+/// Reset to `true` in [`install_shutdown_handler`] (outside any handler);
+/// flipped to `false` only by the async-signal-safe handler.
+static SHUTDOWN_RUNNING: AtomicBool = AtomicBool::new(true);
+
+/// Serializes tests sharing process-global signal state (dispositions +
+/// [`SHUTDOWN_RUNNING`]). Production installs once per process; tests must
+/// hold this across install/raise/drop so parallel tests never race the
+/// global dispositions.
+#[cfg(test)]
+pub(crate) static SIGNAL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// True once a shutdown signal arrived (handler flipped the static flag).
+pub fn shutdown_requested() -> bool {
+    !SHUTDOWN_RUNNING.load(Ordering::SeqCst)
+}
+
+/// True while the daemon should keep running (no shutdown signal yet).
+pub fn shutdown_running() -> bool {
+    SHUTDOWN_RUNNING.load(Ordering::SeqCst)
+}
+
+/// Shutdown request handler: flip the static flag, nothing else. Logging
+/// and teardown happen on the main loop, never in the handler, keeping this
+/// async-signal-safe (atomic store only: no allocation, locks, logging or
+/// `Arc` operations).
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    // Static lifetime: safe for handlers already loaded/running across
+    // guard drop or re-install; a late store is harmless.
+    SHUTDOWN_RUNNING.store(false, Ordering::SeqCst);
+}
+
+/// Restores previous signal dispositions on drop. The static flag is left
+/// alone: in-flight handlers storing to it after restore remain safe, and
+/// the next [`install_shutdown_handler`] resets it explicitly.
+pub struct ShutdownSignalGuard {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Drop for ShutdownSignalGuard {
+    fn drop(&mut self) {
+        for (sig, prev) in std::mem::take(&mut self.previous) {
+            unsafe {
+                libc::sigaction(sig, &prev, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+/// Install [`shutdown_signals`] handlers flipping the process-lifetime flag.
+/// Production calls this once per process; repeated installs reset the flag
+/// to `true` and reinstall (idempotent). Tests sharing global state must
+/// serialize via `SIGNAL_TEST_SERIAL`. A partial-install failure rolls back
+/// what was set.
+pub fn install_shutdown_handler() -> Result<ShutdownSignalGuard> {
+    // Reset outside any handler, before installing.
+    SHUTDOWN_RUNNING.store(true, Ordering::SeqCst);
+    let mut previous = Vec::new();
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = shutdown_signal_handler as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        for sig in shutdown_signals() {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, &action, &mut old) != 0 {
+                let errno = std::io::Error::last_os_error();
+                for (done, prev) in previous {
+                    libc::sigaction(done, &prev, std::ptr::null_mut());
+                }
+                anyhow::bail!("installing handler for signal {sig}: {errno}");
+            }
+            previous.push((sig, old));
+        }
+    }
+    Ok(ShutdownSignalGuard { previous })
+}
+
+// ---- owned daemon session ----
+
+type DaemonProxy =
+    ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
+
+/// Device wiring owned by [`PumpManager`]: which hidraw node holds the grab
+/// plus the transport for its shutdown `Detached` event.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveSession {
+    devnode: String,
+    transport: Transport,
+}
+
+/// Bound for stopping the pump thread at shutdown: the loop checks the
+/// flag every step (2 ms idle sleep), so anything beyond this means a
+/// frame handler is wedged on hardware I/O.
+pub const PUMP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound for acquiring the worker-owned proxy mutex during shutdown and
+/// synchronous detach. The pump holds this mutex across `handle_frame`,
+/// so a wedged frame owns it; shutdown must never wait on it indefinitely.
+/// One second is generous for a healthy frame (milliseconds) yet keeps the
+/// total bounded teardown under ~8 s (5 s join + 1 s proxy + 2 s haptic).
+pub const PROXY_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Result of [`DaemonSession::shutdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownOutcome {
+    /// A device session was still wired when shutdown began.
+    pub had_session: bool,
+    /// The pump worker thread panicked; the message went to the log.
+    pub worker_panicked: bool,
+    /// The pump thread did not stop within the bound and was detached.
+    pub pump_join_timed_out: bool,
+    /// Proxy/haptic cleanup could not finish within its bound because the
+    /// timed-out worker still owns the proxy mutex. The grab is left for
+    /// process-exit reclaim (kernel releases it); the exit must fail so
+    /// the incomplete cleanup surfaces instead of claiming success.
+    pub cleanup_incomplete: bool,
+}
+
+impl ShutdownOutcome {
+    fn none() -> Self {
+        Self {
+            had_session: false,
+            worker_panicked: false,
+            pump_join_timed_out: false,
+            cleanup_incomplete: false,
+        }
+    }
+
+    /// True when shutdown did not fully succeed (panic, timeout, or
+    /// incomplete proxy/haptic cleanup). Callers fail the exit on this.
+    pub fn failed(&self) -> bool {
+        self.worker_panicked || self.pump_join_timed_out || self.cleanup_incomplete
+    }
+}
+
+/// Bounded mutex acquisition for shutdown/detach paths: poll `try_lock`
+/// until `timeout`, recovering poison immediately. Returns `None` on
+/// timeout so the caller reports incomplete cleanup instead of hanging.
+/// The 1 ms poll keeps latency low without busy-spinning.
+fn lock_bounded<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    timeout: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Production pump manager: the generic lifecycle seam above instantiated
+/// with real grab/uinput/haptic/source.
+type DaemonManager =
+    PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
+impl DaemonManager {
     fn attach(&self, event: &crate::init::DeviceReadyEvent) {
         use crate::init::ReadyKind;
         if event.kind != ReadyKind::Ready {
             return;
         }
+        // No new attach once shutdown owns the teardown: avoids racing the
+        // bounded shutdown sequence on worker-owned state.
+        if self.shutdown_once.load(Ordering::SeqCst) {
+            return;
+        }
         if !self.cfg.enhanced_clicks {
-            self.proxy
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach(event);
+            let Some(mut px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
+                return;
+            };
+            px.attach(event);
             self.notify_pump();
             return;
         }
@@ -241,20 +498,29 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
             return;
         }
         {
-            let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            let live = self
-                .proxy
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_attached();
-            match attach_decision(active.as_deref(), &event.devnode, live) {
+            let Some(active) = lock_bounded(&self.active, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!("pump: active busy, deferring attach for {}", event.devnode);
+                return;
+            };
+            let live = match lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) {
+                Some(px) => px.is_attached(),
+                None => {
+                    log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
+                    return;
+                }
+            };
+            match attach_decision(
+                active.as_ref().map(|s| s.devnode.as_str()),
+                &event.devnode,
+                live,
+            ) {
                 AttachDecision::Adopt => {}
                 AttachDecision::IgnoreDuplicate => return,
                 AttachDecision::IgnoreSibling => {
                     log::info!(
                         "pump: {} ready but {} active; ignoring sibling",
                         event.devnode,
-                        active.as_deref().unwrap_or("?"),
+                        active.as_ref().map(|s| s.devnode.as_str()).unwrap_or("?"),
                     );
                     return;
                 }
@@ -287,8 +553,13 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
         // touch emit path grab safety depends on), then extras. A
         // pointer failure stays passthrough; an extras failure only
         // drops combos (pointer-only session, loud log).
+        // Bounded: a wedged worker owns the proxy; defer to reconciliation
+        // retry instead of hanging the hub callback.
         let created = {
-            let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
+                return;
+            };
             match px.uinput().create_pointer() {
                 Ok(()) => true,
                 Err(e) => {
@@ -301,15 +572,19 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
             }
         };
         if !created {
-            self.proxy
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .attach(event);
+            let Some(mut px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
+                return;
+            };
+            px.attach(event);
             self.notify_pump();
             return;
         }
         {
-            let px = self.proxy.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+                log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
+                return;
+            };
             if let Err(e) = px.uinput().create_extras() {
                 log::warn!(
                     "pump: extras uinput create failed for {}: {e:#}; continuing pointer-only (combos dropped)",
@@ -323,11 +598,14 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                 "pump: no evdev for {}; destroying uinput nodes, passthrough",
                 event.devnode
             );
-            self.proxy
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .uinput()
-                .destroy();
+            if let Some(px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) {
+                px.uinput().destroy();
+            } else {
+                log::warn!(
+                    "pump: proxy busy, leaking uinput nodes until retry for {}",
+                    event.devnode
+                );
+            }
             self.notify_pump();
             return;
         };
@@ -343,11 +621,14 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                 event.devnode,
                 src,
             );
-            self.proxy
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .uinput()
-                .destroy();
+            if let Some(px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) {
+                px.uinput().destroy();
+            } else {
+                log::warn!(
+                    "pump: proxy busy, leaking uinput nodes until retry for {}",
+                    event.devnode
+                );
+            }
             self.notify_pump();
             return;
         }
@@ -359,11 +640,14 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
                     "pump: hidraw open {} failed: {e:#}; destroying uinput nodes, passthrough",
                     event.devnode
                 );
-                self.proxy
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .uinput()
-                    .destroy();
+                if let Some(px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) {
+                    px.uinput().destroy();
+                } else {
+                    log::warn!(
+                        "pump: proxy busy, leaking uinput nodes until retry for {}",
+                        event.devnode
+                    );
+                }
                 self.notify_pump();
                 return;
             }
@@ -402,6 +686,279 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
             );
         });
     }
+
+    /// Health query for the reconciliation loop: true when `devnode`
+    /// still needs an attachment attempt. Bounded: a wedged worker owns
+    /// the proxy; on timeout return `false` (no attach now, retry on the
+    /// next pass) instead of stalling the loop that also watches the
+    /// shutdown flag. Late-sibling haptic routes commit generation-fenced
+    /// (#85): resolve + open outside the proxy mutex, commit only when
+    /// the session is still owned by the same generation.
+    fn needs_attach(&self, devnode: &str) -> bool {
+        if !self.cfg.enhanced_clicks
+            || !touch_interface_eligible(discovery::interface_number_for_node(devnode))
+        {
+            return false;
+        }
+        // Snapshot live/owner/routing/generation under brief bounded
+        // locks; no I/O. Route resolution and endpoint open happen below
+        // outside the proxy mutex so a blocked open never stalls frames.
+        let (live, owned, cur_bt, baseline_gen) = {
+            let Some(active) = lock_bounded(&self.active, PROXY_ACQUIRE_TIMEOUT) else {
+                return false;
+            };
+            let Some(mut proxy) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+                return false;
+            };
+            let live = proxy.is_attached();
+            let owned = active.as_ref().is_some_and(|s| s.devnode == devnode);
+            let (_, cur_bt) = proxy.haptic_mut().current_routing();
+            let baseline_gen = proxy.haptic_mut().generation();
+            (live, owned, cur_bt, baseline_gen)
+        };
+        if live && owned {
+            // A later actuator sibling must not require a re-grab of the
+            // healthy touch session. Resolve quietly; log only a route change.
+            // Resolution may touch sysfs; keep it outside all live locks.
+            let (node, _) = crate::evdev::haptic_node_for_quiet(devnode);
+            let needs = {
+                let tracked = self.haptic_node.lock().unwrap_or_else(|e| e.into_inner());
+                tracked.as_deref() != Some(node.as_str())
+            };
+            if needs {
+                // Open outside the proxy mutex; commit generation-fenced
+                // below. A blocked open leaves the pump responsive.
+                let prepared = crate::proxy::HapticTarget::prepare(&node, cur_bt);
+                let Some(active) = lock_bounded(&self.active, PROXY_ACQUIRE_TIMEOUT) else {
+                    return false;
+                };
+                let Some(mut proxy) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+                    return false;
+                };
+                let still_owned =
+                    proxy.is_attached() && active.as_ref().is_some_and(|s| s.devnode == devnode);
+                if still_owned
+                    && proxy
+                        .haptic_mut()
+                        .update_route_prepared(prepared, baseline_gen)
+                {
+                    *self.haptic_node.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(node.clone());
+                    log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
+                }
+                let live = proxy.is_attached();
+                return session_needs_attach(
+                    self.cfg.enhanced_clicks,
+                    active.as_ref().map(|s| s.devnode.as_str()),
+                    devnode,
+                    live,
+                );
+            }
+        }
+        let Some(active) = lock_bounded(&self.active, PROXY_ACQUIRE_TIMEOUT) else {
+            return false;
+        };
+        let Some(proxy) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
+            return false;
+        };
+        let live = proxy.is_attached();
+        session_needs_attach(
+            self.cfg.enhanced_clicks,
+            active.as_ref().map(|s| s.devnode.as_str()),
+            devnode,
+            live,
+        )
+    }
+
+    fn shutdown_inner(&self) -> ShutdownOutcome {
+        self.shutdown_inner_with_budget(
+            PUMP_JOIN_TIMEOUT,
+            PROXY_ACQUIRE_TIMEOUT,
+            crate::proxy::HAPTIC_SHUTDOWN_TIMEOUT,
+        )
+        .0
+    }
+
+    /// [`shutdown_inner`] with injected budgets for fast deterministic
+    /// tests. Returns the outcome plus the torn-down session (for the
+    /// post-teardown hub emit in [`DaemonSession::shutdown_with_budget`]).
+    pub(crate) fn shutdown_inner_with_budget(
+        &self,
+        join_timeout: std::time::Duration,
+        proxy_timeout: std::time::Duration,
+        haptic_timeout: std::time::Duration,
+    ) -> (ShutdownOutcome, Option<ActiveSession>) {
+        if self.shutdown_once.swap(true, Ordering::SeqCst) {
+            log::debug!("pump: shutdown already ran; ignoring repeat");
+            return (ShutdownOutcome::none(), None);
+        }
+        // Establish stop FIRST, before any callback or mutex wait: the
+        // wedged worker observes this and exits promptly when able, and
+        // every later bounded wait is measured against an already-running
+        // budget. Wake a poll-blocked pump immediately so it observes stop
+        // without waiting for the next deadline.
+        self.stop.store(true, Ordering::SeqCst);
+        self.notify_pump();
+        // `thread` is never worker-owned (only shutdown takes it), so a
+        // blocking poison-recovering lock is safe; the join itself is
+        // bounded via `join_bounded` (detaches a wedged worker).
+        let (worker_panicked, pump_join_timed_out) =
+            match self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some(handle) => match crate::pump::join_bounded(handle, join_timeout) {
+                    crate::pump::WorkerJoin::Completed(()) => (false, false),
+                    crate::pump::WorkerJoin::Panicked(msg) => {
+                        log::error!("pump worker thread panicked: {msg}");
+                        (true, false)
+                    }
+                    crate::pump::WorkerJoin::TimedOut => {
+                        log::error!("pump thread did not stop within {join_timeout:?}; detached");
+                        (false, true)
+                    }
+                },
+                None => (false, false),
+            };
+        // Bounded active take: a concurrent attach may briefly hold it
+        // while wedged on the proxy; time out instead of hanging.
+        let session = match lock_bounded(&self.active, proxy_timeout) {
+            Some(mut active) => active.take(),
+            None => {
+                log::error!("pump: active busy at shutdown; cleanup incomplete");
+                let outcome = ShutdownOutcome {
+                    had_session: true,
+                    worker_panicked,
+                    pump_join_timed_out,
+                    cleanup_incomplete: true,
+                };
+                return (outcome, None);
+            }
+        };
+        let mut had_session = session.is_some();
+        let mut cleanup_incomplete = false;
+        // Single bounded proxy scope for teardown + force-release + drain:
+        // one acquisition, no wait-again after a timeout.
+        match lock_bounded(&self.proxy, proxy_timeout) {
+            Some(mut proxy) => {
+                if let Some(ref s) = session {
+                    let event = init::detached(&s.devnode, s.transport);
+                    proxy.detach(&event);
+                    proxy.set_pump_ready(false);
+                    proxy.replace_source(PumpSource::Idle);
+                    proxy.uinput().destroy();
+                    log::info!("pump: {} torn down", s.devnode);
+                }
+                if proxy.is_attached() {
+                    // The hub callback claimed `active` but left a live grab
+                    // behind: force the release so shutdown never strands
+                    // native input.
+                    log::warn!("pump: live session survived detach; forcing release");
+                    had_session = true;
+                    proxy.set_pump_ready(false);
+                    proxy.replace_source(PumpSource::Idle);
+                    proxy.uinput().destroy();
+                }
+                // Draining while holding the proxy is safe: the haptic
+                // worker never needs the proxy mutex (it owns an `Arc` to
+                // the inner sender). Bounded via `AsyncHaptic::shutdown`.
+                proxy.haptic_mut().shutdown(haptic_timeout);
+            }
+            None => {
+                log::error!(
+                    "pump: proxy busy at shutdown (worker owns it); \
+                     skipping teardown/drain, process exit reclaims the grab"
+                );
+                cleanup_incomplete = true;
+                // `had_session` stays true when a session was taken but
+                // could not be torn down; when no session was taken the
+                // live grab (if any) is unreachable, still incomplete.
+                if session.is_none() {
+                    had_session = true;
+                }
+            }
+        }
+        let outcome = ShutdownOutcome {
+            had_session,
+            worker_panicked,
+            pump_join_timed_out,
+            cleanup_incomplete,
+        };
+        (outcome, session)
+    }
+}
+
+/// Owned daemon session: the pump thread, the click proxy, and the active
+/// device wiring behind one guard.
+///
+/// [`subscribe_click_proxy`] builds it (spawning the pump thread and
+/// subscribing the hub); [`DaemonSession::shutdown`] performs the orderly
+/// teardown; [`Drop`] repeats it best-effort so an early return or a
+/// panic-unwind path still stops the pump thread instead of leaking it
+/// until process exit.
+pub struct DaemonSession {
+    manager: std::sync::Arc<DaemonManager>,
+}
+
+impl DaemonSession {
+    /// Health query for the reconciliation loop: true when `devnode`
+    /// still needs an attachment attempt.
+    pub fn needs_attach(&self, devnode: &str) -> bool {
+        self.manager.needs_attach(devnode)
+    }
+
+    /// Currently owned session, if any.
+    pub fn active_session(&self) -> Option<(String, Transport)> {
+        self.manager
+            .active_session()
+            .map(|s| (s.devnode, s.transport))
+    }
+
+    /// Orderly shutdown: run the single bounded teardown FIRST (stop is
+    /// established before any callback or mutex wait, then join, then
+    /// best-effort proxy/haptic cleanup), and only then emit the
+    /// observable `Detached` for the torn-down session. Emitting after the
+    /// take makes the manager's own hub callback a no-op (active already
+    /// `None`), so there is exactly one cleanup path and no blocking
+    /// Detached runs before the deadline. Other subscribers still observe
+    /// the detach. When the worker still owns the proxy, teardown is
+    /// skipped, `cleanup_incomplete` is set, and process exit reclaims the
+    /// kernel grab. Idempotent: repeats find no session and no live
+    /// thread, emit nothing, and wait for nothing.
+    pub fn shutdown(&self, hub: &DeviceReadyHub) -> ShutdownOutcome {
+        self.shutdown_with_budget(
+            hub,
+            PUMP_JOIN_TIMEOUT,
+            PROXY_ACQUIRE_TIMEOUT,
+            crate::proxy::HAPTIC_SHUTDOWN_TIMEOUT,
+        )
+    }
+
+    /// [`shutdown`] with injected budgets for fast deterministic tests.
+    pub(crate) fn shutdown_with_budget(
+        &self,
+        hub: &DeviceReadyHub,
+        join_timeout: std::time::Duration,
+        proxy_timeout: std::time::Duration,
+        haptic_timeout: std::time::Duration,
+    ) -> ShutdownOutcome {
+        let (outcome, session) =
+            self.manager
+                .shutdown_inner_with_budget(join_timeout, proxy_timeout, haptic_timeout);
+        // Emit AFTER teardown so the manager's own Detached is a no-op
+        // (no proxy wait, no double cleanup). On repeat shutdowns `session`
+        // is `None`, so nothing is emitted twice.
+        if let Some(s) = session {
+            hub.emit(&init::detached(&s.devnode, s.transport));
+        }
+        outcome
+    }
+}
+
+impl Drop for DaemonSession {
+    fn drop(&mut self) {
+        // Explicit `shutdown` already ran on the orderly path; this only
+        // matters for early returns and panic unwinds. Bounded and
+        // idempotent: repeats wait for nothing. Reports inside.
+        self.manager.shutdown_inner();
+    }
 }
 
 /// Subscribe the opt-in click proxy to `ready_hub` (daemon only).
@@ -421,8 +978,8 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
 /// clears it — except a `Ready` for the active node whose session died on
 /// its own (disconnect self-release): that tears down the stale wiring
 /// and re-attaches fresh fds instead of early-returning into a dead
-/// session. A single pump thread drains the proxy for the process
-/// lifetime; frame rate is device-bounded.
+/// session. A single pump thread drains the proxy until session shutdown;
+/// frame rate is device-bounded.
 ///
 /// Two-node failure isolation: pointer-create failure → passthrough (no
 /// touch emit path, so no grab — same as the old single node). Extras-
@@ -435,10 +992,11 @@ impl PumpManager<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHap
 /// - same node + live proxy → ignore (duplicate);
 /// - same node + dead proxy → teardown + full re-attach;
 /// - another node active → ignore (sibling).
-pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl Fn(&str) -> bool {
-    type DaemonProxy =
-        ClickProxy<RealGrab, DualSink<RealUinput, RealUinput>, AsyncHaptic<RealHaptic>, PumpSource>;
-
+///
+/// Returns the owned [`DaemonSession`]: stop it with
+/// [`DaemonSession::shutdown`] (or drop it) so the pump thread is
+/// always stopped and joined, never forgotten.
+pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> DaemonSession {
     let uinput_node = std::env::var("LTD_UINPUT_NODE").unwrap_or("/dev/uinput".to_string());
     let proxy = std::sync::Arc::new(std::sync::Mutex::new(DaemonProxy::new(
         ProxySettings::from(cfg),
@@ -462,10 +1020,10 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
             .with_thread(thread)
             .with_control(control),
     );
-    // NOTE: the pump thread handle is never joined — the pump lives until
-    // process exit by design. `JoinHandle` is held (not detached) so a
-    // panic inside the pump does not silently vanish; the handle is
-    // dropped with the manager at process teardown.
+    // The pump thread is owned by `manager` from here on: `DaemonSession`
+    // stops it (flag) and observes it (bounded join with panic reporting)
+    // at shutdown, so the handle is never forgotten and a worker panic
+    // never vanishes silently.
     let m = std::sync::Arc::clone(&manager);
     ready_hub.subscribe(move |event: &crate::init::DeviceReadyEvent| {
         use crate::init::ReadyKind;
@@ -478,69 +1036,7 @@ pub fn subscribe_click_proxy(cfg: &Config, ready_hub: &DeviceReadyHub) -> impl F
         "click proxy subscribed (enhanced_clicks={})",
         cfg.enhanced_clicks
     );
-    // Query actual proxy health, independent of hardware polling state.
-    // Siblings wait while an owner exists; a dead owner retries its own
-    // node first, using the existing teardown/re-attach path.
-    move |devnode| {
-        if !manager.cfg.enhanced_clicks
-            || !touch_interface_eligible(discovery::interface_number_for_node(devnode))
-        {
-            return false;
-        }
-        // Snapshot live/owner/routing/generation under brief locks; no I/O.
-        // Route resolution and endpoint open happen below outside the proxy
-        // mutex so a blocked open never stalls the pump's frames.
-        let (live, owned, cur_bt, baseline_gen) = {
-            let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
-            let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
-            let live = proxy.is_attached();
-            let owned = active.as_deref() == Some(devnode);
-            let (_, bt) = proxy.haptic_mut().current_routing();
-            let gen = proxy.haptic_mut().generation();
-            (live, owned, bt, gen)
-        };
-        if live && owned {
-            // A later actuator sibling must not require a re-grab of the
-            // healthy touch session. Resolve quietly; log only a route change.
-            // Resolution may touch sysfs; keep it outside all live locks.
-            let (node, _) = crate::evdev::haptic_node_for_quiet(devnode);
-            let needs = {
-                let tracked = manager
-                    .haptic_node
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                tracked.as_deref() != Some(node.as_str())
-            };
-            if needs {
-                // Open outside the proxy mutex; commit generation-fenced
-                // below. A blocked open leaves the pump responsive.
-                let prepared = crate::proxy::HapticTarget::prepare(&node, cur_bt);
-                let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
-                let mut proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
-                let still_owned = proxy.is_attached() && active.as_deref() == Some(devnode);
-                if still_owned
-                    && proxy
-                        .haptic_mut()
-                        .update_route_prepared(prepared, baseline_gen)
-                {
-                    *manager
-                        .haptic_node
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(node.clone());
-                    log::info!("pump: late sibling updated haptic node to {node} for {devnode}");
-                }
-            }
-        }
-        let active = manager.active.lock().unwrap_or_else(|e| e.into_inner());
-        let proxy = manager.proxy.lock().unwrap_or_else(|e| e.into_inner());
-        let live = proxy.is_attached();
-        session_needs_attach(
-            manager.cfg.enhanced_clicks,
-            active.as_deref(),
-            devnode,
-            live,
-        )
-    }
+    DaemonSession { manager }
 }
 
 // Unknown layouts (including Bluetooth) keep their existing source path.
@@ -686,7 +1182,11 @@ pub fn init_node(
 }
 
 /// `run` daemon loop. Holds the socket lock, inits all current devices,
-/// then parks until signal. Clean exit removes the socket.
+/// then parks until SIGINT/SIGTERM/SIGHUP. Shutdown runs the owned
+/// [`DaemonSession`] teardown (observable detach, grab release, node
+/// teardown, actuator drain, bounded pump join) before the socket lock
+/// drops. A pump worker panic, join timeout, or incomplete cleanup fails
+/// the exit so it surfaces instead of vanishing.
 pub fn run_daemon(cfg: &Config) -> Result<()> {
     log::info!("starting {}", crate::build_identity::IDENTITY);
     let sock = lock::socket_path();
@@ -704,14 +1204,12 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         );
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    let stop = Arc::clone(&running);
-    // ctrlc covers SIGINT/SIGTERM/SIGHUP on Unix.
-    ctrlc::set_handler(move || {
-        log::info!("received shutdown signal, shutting down...");
-        stop.store(false, Ordering::SeqCst);
-    })
-    .map_err(|e| anyhow::anyhow!("installing signal handler: {e}"))?;
+    // SIGINT/SIGTERM/SIGHUP all request the same owned teardown below.
+    // The handlers only flip the process-lifetime static flag
+    // (async-signal-safe); the loop owns the rest. The guard restores
+    // previous dispositions when `run` returns. One daemon per process:
+    // a second install would reset the flag and reinstall.
+    let _signals = install_shutdown_handler()?;
 
     let mut monitor = match crate::hotplug::Monitor::open() {
         Ok(monitor) => {
@@ -724,7 +1222,11 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         }
     };
     let ready_hub = hub();
-    let needs_attach = subscribe_click_proxy(cfg, &ready_hub);
+    let session = subscribe_click_proxy(cfg, &ready_hub);
+    // Query actual proxy health, independent of hardware polling state.
+    // Siblings wait while an owner exists; a dead owner retries its own
+    // node first, using the existing teardown/re-attach path.
+    let needs_attach = |devnode: &str| session.needs_attach(devnode);
     let initial: Vec<DiscoveredDevice> = match discovery::scan_trackpads() {
         Ok(devs) if devs.is_empty() => {
             log::info!("no supported trackpads found; idling until signal");
@@ -754,7 +1256,7 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
         schedule.wake(std::time::Instant::now());
     }
     let mut overflow_reported = false;
-    while running.load(Ordering::SeqCst) {
+    while shutdown_running() {
         std::thread::sleep(crate::hotplug::LOOP_INTERVAL);
         let now = std::time::Instant::now();
         if let Some(source) = &monitor {
@@ -777,7 +1279,7 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
                 }
             }
         }
-        if let Some(work) = schedule.take_due(now, running.load(Ordering::SeqCst)) {
+        if let Some(work) = schedule.take_due(now, shutdown_running()) {
             match work {
                 crate::hotplug::Work::Hotplug => {
                     watch.scan(cfg, &ready_hub, &needs_attach, false);
@@ -794,7 +1296,27 @@ pub fn run_daemon(cfg: &Config) -> Result<()> {
             }
         }
     }
-    log::info!("shutdown complete");
+    log::info!("shutdown requested; detaching session and stopping pump...");
+    let outcome = session.shutdown(&ready_hub);
+    log::info!(
+        "shutdown complete (had_session={}, worker_panicked={}, pump_join_timed_out={}, cleanup_incomplete={})",
+        outcome.had_session,
+        outcome.worker_panicked,
+        outcome.pump_join_timed_out,
+        outcome.cleanup_incomplete
+    );
+    if outcome.worker_panicked {
+        anyhow::bail!("pump worker thread panicked; see earlier errors");
+    }
+    if outcome.pump_join_timed_out {
+        anyhow::bail!("pump thread did not stop within {PUMP_JOIN_TIMEOUT:?}");
+    }
+    if outcome.cleanup_incomplete {
+        anyhow::bail!(
+            "shutdown could not reclaim worker-owned proxy within {PROXY_ACQUIRE_TIMEOUT:?}; \
+             process exit reclaims the grab"
+        );
+    }
     Ok(())
 }
 
@@ -1412,7 +1934,7 @@ mod tests {
     use crate::proxy::{ClickProxy, GrabDevice, LogHaptic, ProxySettings, UinputSink};
     use crate::pump::{HidrawSource, ScriptReader, ScriptStep};
     use std::cell::Cell;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct TestGrab {
@@ -2772,7 +3294,10 @@ mod tests {
             "attach did not notify a poll-blocked pump"
         );
         // Owned detach (seeded active owner) must wake too.
-        *manager.active.lock().unwrap() = Some("/dev/hidraw1".to_string());
+        *manager.active.lock().unwrap() = Some(ActiveSession {
+            devnode: "/dev/hidraw1".to_string(),
+            transport: Transport::Usb,
+        });
         manager.detach(&crate::init::detached("/dev/hidraw1", Transport::Usb));
         assert!(
             control_wakes_within(&control, std::time::Duration::from_secs(2)),
@@ -2784,5 +3309,611 @@ mod tests {
             !control_wakes_within(&control, std::time::Duration::from_millis(100)),
             "unowned detach must not wake the pump"
         );
+    }
+    // ---- finding #12: owned shutdown ----
+
+    #[test]
+    fn shutdown_signal_set_is_int_term_hup() {
+        assert_eq!(
+            shutdown_signals(),
+            [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+        );
+    }
+
+    #[test]
+    fn shutdown_handler_fires_on_int_term_hup() {
+        // Real `raise(2)` through the installed handlers: each signal must
+        // flip the process-lifetime static flag. Serialized: dispositions
+        // and the static flag are process-global.
+        let _serial = SIGNAL_TEST_SERIAL.lock().unwrap();
+        let _guard = install_shutdown_handler().expect("install test handler");
+        for sig in shutdown_signals() {
+            SHUTDOWN_RUNNING.store(true, Ordering::SeqCst);
+            unsafe {
+                libc::raise(sig);
+            }
+            assert!(shutdown_requested(), "signal {sig} must request shutdown");
+            assert!(
+                !shutdown_running(),
+                "signal {sig} must clear the running flag"
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_signal_static_target_outlives_concurrent_handlers() {
+        // By construction the handler touches only a `static`: no heap
+        // allocation, no raw pointer, no reclamation. Concurrent/in-flight
+        // raises remain safe, and the target is valid after guard drop.
+        let _serial = SIGNAL_TEST_SERIAL.lock().unwrap();
+        let _guard = install_shutdown_handler().expect("install test handler");
+        // Static address is stable across installs.
+        let addr_before: *const AtomicBool = &SHUTDOWN_RUNNING;
+        SHUTDOWN_RUNNING.store(true, Ordering::SeqCst);
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| unsafe {
+                    libc::raise(libc::SIGINT);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            shutdown_requested(),
+            "concurrent raises must flip the static flag"
+        );
+        let addr_after: *const AtomicBool = &SHUTDOWN_RUNNING;
+        assert_eq!(
+            addr_before, addr_after,
+            "static target must not move across handlers"
+        );
+        drop(_guard);
+        // Still valid after guard drop (restores dispositions, keeps static).
+        assert!(shutdown_requested());
+        SHUTDOWN_RUNNING.store(true, Ordering::SeqCst);
+        assert!(shutdown_running());
+        // Re-install succeeds: rollback/restoration left dispositions usable.
+        let _guard2 = install_shutdown_handler().expect("reinstall must succeed");
+        assert!(shutdown_running());
+    }
+
+    #[test]
+    fn shutdown_signal_guard_restores_and_reinstalls() {
+        // Guard drop restores previous dispositions; a fresh install works.
+        // No signal is raised after drop (the default disposition for TERM
+        // would terminate the test process), so restoration is proven by a
+        // clean reinstall, not by delivering to the old disposition.
+        let _serial = SIGNAL_TEST_SERIAL.lock().unwrap();
+        {
+            let _guard = install_shutdown_handler().expect("install must succeed");
+            assert!(shutdown_running());
+        }
+        let _guard2 = install_shutdown_handler().expect("reinstall must succeed");
+        assert!(shutdown_running());
+    }
+
+    #[test]
+    fn session_shutdown_without_device_stops_pump_and_reports_healthy() {
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        assert!(session.active_session().is_none());
+        let outcome = session.shutdown(&hub);
+        assert!(!outcome.had_session);
+        assert!(!outcome.worker_panicked);
+        assert!(!outcome.pump_join_timed_out);
+        assert!(!outcome.cleanup_incomplete);
+        // Pump thread is gone (handle taken) and the stop flag is set.
+        assert!(session.manager.stop.load(Ordering::SeqCst));
+        assert!(session.manager.thread.lock().unwrap().is_none());
+        // Idempotent: a repeat (and the `Drop` at scope end) is a no-op.
+        let again = session.shutdown(&hub);
+        assert_eq!(again, ShutdownOutcome::none());
+    }
+
+    #[test]
+    fn shutdown_emits_detached_for_active_node_and_clears_it() {
+        let hub = hub();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        hub.subscribe(move |event: &DeviceReadyEvent| {
+            if event.kind == ReadyKind::Detached {
+                capture.lock().unwrap().push(event.devnode.clone());
+            }
+        });
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        // Claim a node the way `attach` does, without hardware I/O: the
+        // teardown below must still clear it and stay observable.
+        session
+            .manager
+            .active
+            .lock()
+            .unwrap()
+            .replace(ActiveSession {
+                devnode: "/dev/hidraw9".to_string(),
+                transport: Transport::Usb,
+            });
+        let outcome = session.shutdown(&hub);
+        assert!(outcome.had_session);
+        assert!(!outcome.worker_panicked);
+        assert!(!outcome.pump_join_timed_out);
+        assert!(!outcome.cleanup_incomplete);
+        assert_eq!(*seen.lock().unwrap(), vec!["/dev/hidraw9".to_string()]);
+        assert!(session.active_session().is_none());
+        assert!(!session.manager.proxy.lock().unwrap().is_attached());
+    }
+
+    #[test]
+    fn shutdown_inner_tears_down_remaining_wiring_without_hub_emit() {
+        // Direct `shutdown_inner` (the `Drop` path): whatever is still
+        // wired is torn down even when no hub `Detached` went out first.
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        session
+            .manager
+            .active
+            .lock()
+            .unwrap()
+            .replace(ActiveSession {
+                devnode: "/dev/hidraw9".to_string(),
+                transport: Transport::Bluetooth,
+            });
+        let outcome = session.manager.shutdown_inner();
+        assert!(outcome.had_session);
+        assert!(!outcome.worker_panicked);
+        assert!(!outcome.pump_join_timed_out);
+        assert!(!outcome.cleanup_incomplete);
+        assert!(session.active_session().is_none());
+        assert!(session.manager.stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pump_worker_panic_surfaces_through_bounded_join() {
+        use crate::pump::HidrawReader;
+        struct PanicReader;
+        impl HidrawReader for PanicReader {
+            fn read_report(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("simulated pump worker panic");
+            }
+        }
+        type PanicProxy = ClickProxy<TestGrab, TestSink, LogHaptic, HidrawSource<PanicReader>>;
+        let proxy = Arc::new(Mutex::new(PanicProxy::new(
+            ProxySettings { enhanced: true },
+            TestGrab::default(),
+            TestSink::default(),
+            LogHaptic,
+            HidrawSource::new("fixture", PanicReader),
+        )));
+        // Attach so the pump actually polls the panicking source.
+        proxy.lock().unwrap().set_pump_ready(true);
+        proxy
+            .lock()
+            .unwrap()
+            .attach(&crate::init::usb_ready("/dev/hidraw9"));
+        assert!(proxy.lock().unwrap().is_attached());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (handle, _control) = crate::pump::spawn_pump(
+            "test-panic".to_string(),
+            Arc::clone(&proxy),
+            Config::default(),
+            Arc::clone(&stop),
+        );
+        // The worker panics on its first frame; the bounded join must
+        // report the payload instead of hanging or swallowing it.
+        match crate::pump::join_bounded(handle, std::time::Duration::from_secs(5)) {
+            crate::pump::WorkerJoin::Panicked(msg) => {
+                assert!(msg.contains("simulated pump worker panic"), "got: {msg}");
+            }
+            crate::pump::WorkerJoin::Completed(()) => {
+                panic!("panicking worker must not report completion")
+            }
+            crate::pump::WorkerJoin::TimedOut => {
+                panic!("dead worker is finished; must not time out")
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_inner_force_releases_surviving_live_session() {
+        // The hub callback claimed `active` but left the proxy attached
+        // (e.g. it never finished): with no active session left, the
+        // forced-release branch must still drop the live session.
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        {
+            let mut proxy = session.manager.proxy.lock().unwrap();
+            proxy.test_claim_live("/dev/hidraw9");
+            proxy.uinput().pointer().test_mark_created();
+        }
+        assert!(session.manager.proxy.lock().unwrap().is_attached());
+        let outcome = session.manager.shutdown_inner();
+        assert!(outcome.had_session);
+        assert!(!outcome.worker_panicked);
+        assert!(!outcome.pump_join_timed_out);
+        assert!(!outcome.cleanup_incomplete);
+        let proxy = session.manager.proxy.lock().unwrap();
+        assert!(!proxy.is_attached());
+        assert!(!proxy.uinput().is_ready());
+        assert!(!proxy.grab().is_grabbed());
+    }
+
+    #[test]
+    fn daemon_session_drop_teardowns_without_prior_shutdown() {
+        // `Drop` without an explicit `shutdown` still stops and joins the
+        // pump and clears claimed wiring (best-effort, no hub emit).
+        let hub = hub();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        hub.subscribe(move |event: &DeviceReadyEvent| {
+            if event.kind == ReadyKind::Detached {
+                capture.lock().unwrap().push(event.devnode.clone());
+            }
+        });
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        let manager = Arc::clone(&session.manager);
+        manager.active.lock().unwrap().replace(ActiveSession {
+            devnode: "/dev/hidraw9".to_string(),
+            transport: Transport::Usb,
+        });
+        drop(session);
+        assert!(manager.stop.load(Ordering::SeqCst));
+        assert!(manager.thread.lock().unwrap().is_none());
+        assert!(manager.active.lock().unwrap().is_none());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_session_shutdown_surfaces_worker_panic_end_to_end() {
+        // A panicking pump worker surfaces through `DaemonSession::shutdown`,
+        // not just through the `join_bounded` unit path.
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        let old = session.manager.thread.lock().unwrap().take();
+        assert!(old.is_some(), "pump thread must be running");
+        session
+            .manager
+            .thread
+            .lock()
+            .unwrap()
+            .replace(std::thread::spawn(|| panic!("e2e worker panic")));
+        drop(old); // detaches the healthy pump thread; the stop flag exits it
+        let outcome = session.shutdown(&hub);
+        assert!(outcome.worker_panicked);
+        assert!(!outcome.pump_join_timed_out);
+        assert!(!outcome.cleanup_incomplete);
+        assert!(outcome.failed());
+    }
+
+    #[test]
+    fn daemon_session_shutdown_surfaces_pump_join_timeout_end_to_end() {
+        // A wedged pump thread detaches after the bound instead of hanging
+        // shutdown, and the outcome reports it.
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: false,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        let old = session.manager.thread.lock().unwrap().take();
+        assert!(old.is_some(), "pump thread must be running");
+        session
+            .manager
+            .thread
+            .lock()
+            .unwrap()
+            .replace(std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(3600))
+            }));
+        drop(old); // detaches the healthy pump thread; the stop flag exits it
+        let start = std::time::Instant::now();
+        let outcome = session.shutdown(&hub);
+        assert!(!outcome.worker_panicked);
+        assert!(outcome.pump_join_timed_out);
+        assert!(!outcome.cleanup_incomplete);
+        assert!(outcome.failed());
+        assert!(
+            start.elapsed() >= PUMP_JOIN_TIMEOUT,
+            "join must wait out the bound: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < PUMP_JOIN_TIMEOUT + std::time::Duration::from_secs(30),
+            "join must not hang past the bound: {:?}",
+            start.elapsed()
+        );
+    }
+
+    // ---- finding #12 regressions: wedged worker owns the real proxy mutex ----
+    //
+    // Short injected budgets (not repeated 8 s waits): join 200 ms, proxy
+    // 200 ms, haptic 50 ms. The fixture holds the ACTUAL manager proxy
+    // mutex the way `pump_once` does across `handle_frame`, so an unbounded
+    // implementation would hang past the bound.
+
+    fn retire_healthy_pump(session: &DaemonSession) {
+        // Stop and join the healthy pump thread so the fixture can model a
+        // stalled frame holding the same mutex. Restores `stop=false` so the
+        // shutdown under test establishes it.
+        session.manager.stop.store(true, Ordering::SeqCst);
+        let old = session
+            .manager
+            .thread
+            .lock()
+            .unwrap()
+            .take()
+            .expect("pump thread must be running");
+        old.join().expect("healthy pump must join");
+        session.manager.stop.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn explicit_shutdown_bounded_when_worker_holds_proxy_mutex() {
+        use std::time::Duration;
+        let join_budget = Duration::from_millis(200);
+        let proxy_budget = Duration::from_millis(200);
+        let haptic_budget = Duration::from_millis(50);
+        let hub = hub();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        hub.subscribe(move |event: &DeviceReadyEvent| {
+            if event.kind == ReadyKind::Detached {
+                capture.lock().unwrap().push(event.devnode.clone());
+            }
+        });
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        retire_healthy_pump(&session);
+        // Fixture holds the ACTUAL proxy mutex until the gate opens.
+        let proxy = Arc::clone(&session.manager.proxy);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = std::thread::spawn(move || {
+            let _held = proxy.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        *session.manager.thread.lock().unwrap() = Some(wedged);
+        session
+            .manager
+            .active
+            .lock()
+            .unwrap()
+            .replace(ActiveSession {
+                devnode: "/dev/hidraw-review-fixture".to_string(),
+                transport: Transport::Usb,
+            });
+        let start = std::time::Instant::now();
+        let outcome = session.shutdown_with_budget(&hub, join_budget, proxy_budget, haptic_budget);
+        let elapsed = start.elapsed();
+        // Stop established FIRST, before any blocking cleanup.
+        assert!(
+            session.manager.stop.load(Ordering::SeqCst),
+            "stop must be set even when the worker owns proxy"
+        );
+        // Bounded: well under the production 8 s budget.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "explicit shutdown must return within bound, took {elapsed:?}"
+        );
+        assert!(outcome.had_session);
+        assert!(outcome.pump_join_timed_out);
+        assert!(outcome.cleanup_incomplete);
+        assert!(outcome.failed());
+        // Healthy observability preserved even when incomplete: the
+        // post-teardown emit still notifies other subscribers.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/dev/hidraw-review-fixture".to_string()]
+        );
+        // Own detach is a no-op (active already taken): no double cleanup.
+        assert!(session.active_session().is_none());
+        // Release the gate so the detached fixture can exit and free the
+        // mutex; poll until the lock is reclaimable (detached, cannot join).
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if session.manager.proxy.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must release the proxy mutex after the gate opens"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Repeated shutdown/Drop must not wait again.
+        let start2 = std::time::Instant::now();
+        let again = session.shutdown_with_budget(&hub, join_budget, proxy_budget, haptic_budget);
+        assert_eq!(again, ShutdownOutcome::none());
+        assert!(
+            start2.elapsed() < Duration::from_millis(100),
+            "repeat shutdown must not wait, took {:?}",
+            start2.elapsed()
+        );
+        assert!(
+            seen.lock().unwrap().len() == 1,
+            "repeat must not emit again"
+        );
+    }
+
+    #[test]
+    fn drop_path_bounded_when_worker_holds_proxy_mutex() {
+        use std::time::Duration;
+        // Same fixture through `shutdown_inner_with_budget`: the exact code
+        // `Drop` calls (no hub emit). Short budgets, no 8 s wait.
+        let join_budget = Duration::from_millis(200);
+        let proxy_budget = Duration::from_millis(200);
+        let haptic_budget = Duration::from_millis(50);
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        retire_healthy_pump(&session);
+        let proxy = Arc::clone(&session.manager.proxy);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = std::thread::spawn(move || {
+            let _held = proxy.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        *session.manager.thread.lock().unwrap() = Some(wedged);
+        session
+            .manager
+            .active
+            .lock()
+            .unwrap()
+            .replace(ActiveSession {
+                devnode: "/dev/hidraw-review-fixture".to_string(),
+                transport: Transport::Usb,
+            });
+        let start = std::time::Instant::now();
+        let (outcome, _taken) =
+            session
+                .manager
+                .shutdown_inner_with_budget(join_budget, proxy_budget, haptic_budget);
+        let elapsed = start.elapsed();
+        assert!(
+            session.manager.stop.load(Ordering::SeqCst),
+            "stop must be set even when the worker owns proxy"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Drop-path shutdown must return within bound, took {elapsed:?}"
+        );
+        assert!(outcome.had_session);
+        assert!(outcome.pump_join_timed_out);
+        assert!(outcome.cleanup_incomplete);
+        assert!(outcome.failed());
+        assert!(session.active_session().is_none());
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if session.manager.proxy.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture must release the proxy mutex after the gate opens"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Repeat (what `Drop` at scope end does) waits for nothing.
+        let start2 = std::time::Instant::now();
+        let (again, taken2) =
+            session
+                .manager
+                .shutdown_inner_with_budget(join_budget, proxy_budget, haptic_budget);
+        assert_eq!(again, ShutdownOutcome::none());
+        assert!(taken2.is_none());
+        assert!(
+            start2.elapsed() < Duration::from_millis(100),
+            "repeat Drop must not wait, took {:?}",
+            start2.elapsed()
+        );
+    }
+
+    #[test]
+    fn poisoned_proxy_recovers_during_bounded_shutdown() {
+        use std::time::Duration;
+        // Poison the proxy mutex, then shut down with short budgets: the
+        // bounded acquire must recover the guard (not report incomplete).
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        session
+            .manager
+            .active
+            .lock()
+            .unwrap()
+            .replace(ActiveSession {
+                devnode: "/dev/hidraw-poison".to_string(),
+                transport: Transport::Usb,
+            });
+        let proxy = Arc::clone(&session.manager.proxy);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = proxy.lock().unwrap();
+            panic!("poison the proxy mutex");
+        });
+        let _ = poisoner.join();
+        assert!(session.manager.proxy.is_poisoned());
+        let outcome = session.shutdown_with_budget(
+            &hub,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        );
+        assert!(outcome.had_session);
+        assert!(!outcome.worker_panicked);
+        assert!(!outcome.cleanup_incomplete);
+        assert!(session.active_session().is_none());
+    }
+
+    #[test]
+    fn needs_attach_does_not_hang_when_proxy_busy() {
+        use std::time::Duration;
+        // Reconciliation must stay responsive (and let the loop observe the
+        // shutdown flag) even when the worker owns the proxy.
+        let hub = hub();
+        let cfg = Config {
+            enhanced_clicks: true,
+            ..Config::default()
+        };
+        let session = subscribe_click_proxy(&cfg, &hub);
+        retire_healthy_pump(&session);
+        let proxy = Arc::clone(&session.manager.proxy);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = proxy.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let start = std::time::Instant::now();
+        // Must return promptly (bounded try-lock), not hang.
+        let _ = session.needs_attach("/dev/hidraw9");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "needs_attach must be bounded, took {:?}",
+            start.elapsed()
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 }
