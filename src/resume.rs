@@ -13,8 +13,9 @@
 //!   user-session IPC (user.slice is frozen while sleep hooks run).
 //! - Daemon side: the `run` loop calls [`ResumeWatch::tick`] every
 //!   [`RESUME_REVERIFY_INTERVAL_SECS`], covering add/change/remove between or
-//!   without sleep hooks (re-verify polling via `GET_FEATURE`, re-init on
-//!   mismatch).
+//!   without sleep hooks (USB: re-verify polling via `GET_FEATURE`, re-init on
+//!   mismatch; BT: no `GET_FEATURE` equivalent, so the tick re-sends the
+//!   idempotent BT init pair best-effort on the same cadence).
 //!
 //! Clicks contract: re-init emits `Ready` on the [`DeviceReadyHub`] *after*
 //! the sequence succeeds, so the clicks pipeline re-attaches without ever
@@ -53,11 +54,14 @@ pub const RESUME_RESCAN_INTERVAL_MS: u64 = 100;
 /// Outcome of one resume pass for one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeAction {
-    /// USB polling matched or BT needs no setup; no reports or hub traffic.
+    /// USB polling read-back matched; BT present but the best-effort re-send
+    /// failed (warned, passthrough retained). No hub traffic.
     UpToDate,
-    /// USB mismatch (or unreadable verify) → multitouch-first re-init sent.
-    /// Hub `Ready` is emitted only when a live hub is passed (daemon tick);
-    /// the one-shot passes none (its hub would reach zero listeners).
+    /// USB mismatch (or unreadable verify) → multitouch-first re-init sent;
+    /// BT node present → init pair re-sent best-effort. Hub `Ready` is
+    /// emitted only on the USB daemon-tick arm with a live hub (the one-shot
+    /// passes none — its hub would reach zero listeners); the BT arm never
+    /// emits, so a periodic re-send never churns a live grab.
     Reinitialized,
     /// Node gone → recorded as detached (`Detached` emitted only with a
     /// live hub), never `Ready`.
@@ -166,19 +170,49 @@ pub fn resume_usb_node(
     Ok(ResumeAction::Reinitialized)
 }
 
-/// Observe one BT node after resume without changing driver bindings.
-/// There is no BT hardware init or polling verify on this path. A one-shot
-/// owns no proxy, so only the daemon may suppress events with its evdev grab.
-/// A vanished node is recorded `Detached`, mirroring the USB arm.
+/// Re-arm one BT node after resume: liveness check, then a best-effort
+/// re-send of the BT init pair (`F1 02 01` multitouch + `F2 21 01`
+/// host-click ON) via [`init::send_bt_init_hidraw`].
+///
+/// Why (RESEARCH H3/H5): after a BT dropout (BlueZ suspend, renegotiated
+/// connection interval, re-pair) the device can sit in basic-mouse mode
+/// with no re-arm — dead multitouch/force/middle until daemon restart.
+/// There is no BT `GET_FEATURE` equivalent (USB-first), so — unlike
+/// [`resume_usb_node`] — this path cannot verify first and re-sends
+/// unconditionally. The pair is idempotent (same two bytes every time),
+/// so a spurious pass is harmless.
+///
+/// Best-effort: a send failure warns and falls through to `UpToDate`
+/// (passthrough stays live; the pass never fails). A vanished node is
+/// recorded `Detached`, mirroring the USB arm. Emits nothing in any mode:
+/// the one-shot owns no hub, and the daemon tick deliberately adds no
+/// `Ready` here — clicks re-attach flows only through init/attach paths.
 pub fn resume_bt_node(devnode: &str) -> ResumeAction {
+    resume_bt_node_inner(devnode, &init::send_bt_init_hidraw)
+}
+
+/// [`resume_bt_node`] with an injectable send: production passes
+/// [`init::send_bt_init_hidraw`]; unit tests drive a [`init::Recorder`]
+/// (or a failing sender) without hardware.
+fn resume_bt_node_inner(devnode: &str, send: &dyn Fn(&str) -> Result<()>) -> ResumeAction {
     if !std::path::Path::new(devnode).exists() {
         log::warn!(
             "resume: BT node {devnode} gone after suspend; recording Detached (tick adopts it within one pass if it re-enumerates under a new name)"
         );
         return ResumeAction::Detached;
     }
-    log::debug!("resume: BT {devnode} present (native input retained)");
-    ResumeAction::UpToDate
+    match send(devnode) {
+        Ok(()) => {
+            log::info!("resume: BT {devnode} re-sent init (F1 02 01 + F2 21 01)");
+            ResumeAction::Reinitialized
+        }
+        Err(e) => {
+            log::warn!(
+                "resume: BT {devnode} re-init best-effort failed ({e:#}); continuing (passthrough still live)"
+            );
+            ResumeAction::UpToDate
+        }
+    }
 }
 
 /// Exact recovery command named by every resume dead-end log: no path may
@@ -342,7 +376,48 @@ mod tests {
     }
 
     #[test]
-    fn bt_oneshot_only_checks_presence_without_reinitializing() {
+    fn bt_resend_uses_pr1_pair_bytes() {
+        // The re-send reuses the PR1 helper bytes exactly: multitouch first,
+        // then host-click ON — no duplicated report literals here.
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let path = node.path().to_str().unwrap().to_string();
+        let rec = init::Recorder::default();
+        let action = resume_bt_node_inner(&path, &|_: &str| init::send_bt_init(&rec));
+        assert_eq!(action, ResumeAction::Reinitialized);
+        assert_eq!(
+            *rec.sent.borrow(),
+            vec![vec![0xF1, 0x02, 0x01], vec![0xF2, 0x21, 0x01]]
+        );
+    }
+
+    #[test]
+    fn bt_resend_failure_warns_and_continues() {
+        // Best-effort: a failed send is `UpToDate` (passthrough retained),
+        // never an error — the pass must not fail for a sibling.
+        let node = tempfile::NamedTempFile::new().unwrap();
+        let path = node.path().to_str().unwrap().to_string();
+        let action = resume_bt_node_inner(&path, &|_: &str| -> Result<()> {
+            Err(anyhow::anyhow!("no hardware"))
+        });
+        assert_eq!(action, ResumeAction::UpToDate);
+    }
+
+    #[test]
+    fn bt_missing_node_never_sends() {
+        let calls = std::cell::Cell::new(0);
+        let action = resume_bt_node_inner("/nonexistent-hidraw-bt-xyz", &|_: &str| -> Result<()> {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(action, ResumeAction::Detached);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn bt_oneshot_best_effort_never_fails() {
+        // Real-FS arm: a present-but-not-hidraw node fails the best-effort
+        // send (warn, `UpToDate`), a vanished node records `Detached`.
+        // Either way the one-shot never errors.
         let node = tempfile::NamedTempFile::new().unwrap();
         let path = node.path().to_str().unwrap().to_string();
         assert_eq!(resume_bt_node(&path), ResumeAction::UpToDate);
@@ -351,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn bt_resume_scan_without_daemon_needs_no_reinit() {
+    fn bt_resume_scan_without_daemon_best_effort() {
         let node = tempfile::NamedTempFile::new().unwrap();
         let dev = DiscoveredDevice {
             devnode: node.path().to_str().unwrap().into(),
@@ -361,6 +436,8 @@ mod tests {
         };
         // This is the core used by the no-daemon resume entry. Invalid USB
         // polling cannot affect BT; the helper owns no enhanced session.
+        // The non-hidraw tempfile fails the best-effort send → warned
+        // `UpToDate`, never a pass failure.
         let report = run_resume_scan(&[dev], 0);
         assert_eq!(report.nodes.len(), 1);
         assert_eq!(report.nodes[0].action, ResumeAction::UpToDate);
@@ -500,8 +577,8 @@ mod tests {
     #[test]
     fn scan_core_collects_per_node_errors() {
         // /dev/null exists but is not a trackpad: USB resume fails on
-        // ioctl, BT needs no setup — one node's failure never takes the
-        // pass (or the sibling) down.
+        // ioctl, BT fails its best-effort send (warned `UpToDate`) — one
+        // node's failure never takes the pass (or the sibling) down.
         let devs = vec![
             DiscoveredDevice {
                 devnode: "/dev/null".into(),
