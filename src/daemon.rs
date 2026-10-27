@@ -1577,9 +1577,11 @@ pub fn run_resume(
 pub enum TickAction {
     /// Node appeared since the last pass → full init (add path).
     Initialized(String),
-    /// Known USB node drifted → multitouch-first re-init (change path).
+    /// Known USB node drifted → multitouch-first re-init (change path);
+    /// known BT node re-armed on the verify pass (periodic re-send).
     Reinitialized(String),
-    /// Known USB node still armed; nothing sent.
+    /// Known USB node still armed; nothing sent. Known BT node present but
+    /// its best-effort re-send failed (warned, passthrough live).
     UpToDate(String),
     /// Known USB node unreadable several passes running; assuming armed,
     /// nothing sent (reprobe every [`resume::UNREADABLE_RETRY_EVERY_TICKS`]).
@@ -1603,7 +1605,9 @@ pub enum TickAction {
 ///   re-init once (assume transient), then assume armed until the periodic
 ///   reprobe ([`resume::unreadable_disposition`]) — firmware that NAKs reads
 ///   must not cause a re-init + `Ready` storm every pass;
-/// - still-present known BT node → no hardware init or binding changes;
+/// - still-present known BT node on the verify pass → best-effort
+///   idempotent init re-send ([`resume::resume_bt_node`]), no hub traffic
+///   (the fast hotplug pass skips it: add/remove/attach only);
 /// - vanished/replaced instance → `Detached` emit so clicks releases it;
 /// - initialized hardware with a missing/dead enhanced session → bounded
 ///   attachment-only `Ready`, independent of USB verify or unchanged BT
@@ -1655,6 +1659,10 @@ trait WatchHardware {
     fn initialize(&self, dev: &DiscoveredDevice) -> Result<()>;
     fn verify(&self, devnode: &str) -> Result<bool>;
     fn resume(&self, devnode: &str, verify: &Result<bool>) -> Result<resume::ResumeAction>;
+    /// Best-effort BT re-arm for a known node on the verify pass
+    /// ([`resume::resume_bt_node`]): idempotent re-send, never fails the
+    /// pass, emits nothing.
+    fn resume_bt(&self, devnode: &str) -> resume::ResumeAction;
 }
 
 struct LiveWatchHardware<'a> {
@@ -1677,6 +1685,9 @@ impl WatchHardware for LiveWatchHardware<'_> {
             Some(self.hub),
             verify,
         )
+    }
+    fn resume_bt(&self, devnode: &str) -> resume::ResumeAction {
+        resume::resume_bt_node(devnode)
     }
 }
 
@@ -1835,9 +1846,41 @@ impl ResumeWatch {
                 }
                 continue;
             }
-            if dev.transport != Transport::Usb
-                || (!verify_hardware && (!cfg.enhanced_clicks || !needs_attach(&dev.devnode)))
-            {
+            if dev.transport != Transport::Usb {
+                // Known BT node: no GET_FEATURE equivalent (USB-first), so
+                // the verify pass cannot drift-check — re-send the idempotent
+                // init pair best-effort instead (dropout leaves basic-mouse
+                // mode with no re-arm). Same 30 s cadence as the USB
+                // reverify: two small hidraw writes per pass, no wakeup cost
+                // worth a separate timer. The fast hotplug pass skips this
+                // (add/remove/attach only); a dead BT session still recovers
+                // via the attachment retry below, whose init_bluetooth
+                // already re-sends before its Ready. An absent node records
+                // Detached, mirroring the USB arm. Emits nothing here, so a
+                // periodic re-send never churns a live grab (`ready_sent`
+                // is deliberately untouched).
+                if !verify_hardware {
+                    continue;
+                }
+                match hardware.resume_bt(&dev.devnode) {
+                    resume::ResumeAction::Reinitialized => {
+                        actions.push(TickAction::Reinitialized(dev.devnode.clone()));
+                    }
+                    resume::ResumeAction::UpToDate => {
+                        actions.push(TickAction::UpToDate(dev.devnode.clone()));
+                    }
+                    resume::ResumeAction::Detached => {
+                        log::info!(
+                            "resume tick: {} detached mid-pass; dropping from snapshot",
+                            dev.devnode
+                        );
+                        detached.push(dev.devnode.clone());
+                        actions.push(TickAction::Detached(dev.devnode.clone()));
+                    }
+                }
+                continue;
+            }
+            if !verify_hardware && (!cfg.enhanced_clicks || !needs_attach(&dev.devnode)) {
                 // Healthy known hardware readback stays on the 30 s pass.
                 // A dead USB session still verifies before reacquiring a
                 // grab: polling drift may require a full rearm first.
@@ -2066,6 +2109,8 @@ mod tests {
         verifies: Cell<usize>,
         inits: Cell<usize>,
         reinits: Cell<usize>,
+        bt_reinits: Cell<usize>,
+        bt_detached: Cell<bool>,
     }
     impl<'a> TestHardware<'a> {
         fn new(hub: &'a DeviceReadyHub) -> Self {
@@ -2077,6 +2122,8 @@ mod tests {
                 verifies: Cell::new(0),
                 inits: Cell::new(0),
                 reinits: Cell::new(0),
+                bt_reinits: Cell::new(0),
+                bt_detached: Cell::new(false),
             }
         }
         fn ready(&self, dev: &DiscoveredDevice) {
@@ -2108,6 +2155,15 @@ mod tests {
             }
             self.hub.emit(&init::usb_ready(devnode));
             Ok(resume::ResumeAction::Reinitialized)
+        }
+        fn resume_bt(&self, devnode: &str) -> resume::ResumeAction {
+            self.bt_reinits.set(self.bt_reinits.get() + 1);
+            if self.bt_detached.get() {
+                return resume::ResumeAction::Detached;
+            }
+            // Mirrors live resume_bt_node: best-effort re-send, no hub traffic.
+            let _ = devnode;
+            resume::ResumeAction::Reinitialized
         }
     }
 
@@ -2845,10 +2901,13 @@ mod tests {
         // Same-window renumber hidraw8→hidraw12: removals must emit
         // BEFORE the scan loop adopts the addition, so the new node's
         // Ready is live and the stale Detached fires exactly once.
+        // Mocked hardware: the live BT re-send would otherwise touch the
+        // real (absent) hidraw12 on the steady-state pass.
         let hub = DeviceReadyHub::new();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = std::sync::Arc::clone(&seen);
         hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
+        let hardware = TestHardware::new(&hub);
         let mut watch = ResumeWatch::new(&[DiscoveredDevice {
             devnode: "/dev/hidraw8".into(),
             vendor_id: 0x05ac,
@@ -2862,7 +2921,7 @@ mod tests {
             product_id: 0x0324,
             transport: Transport::Bluetooth,
         }];
-        let actions = watch.tick_with_scan(&cfg, &hub, current, &|_| false);
+        let actions = watch.tick_with_hardware(&cfg, &hub, current, &|_| false, &hardware);
         // Removal first, then adoption — the order that heals.
         assert_eq!(
             actions,
@@ -2871,14 +2930,16 @@ mod tests {
                 TickAction::Initialized("/dev/hidraw12".into()),
             ]
         );
-        let seen = seen.lock().expect("seen lock");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].devnode, "/dev/hidraw8");
-        assert_eq!(seen[0].kind, crate::init::ReadyKind::Detached);
-        assert_eq!(seen[1].devnode, "/dev/hidraw12");
-        assert_eq!(seen[1].kind, crate::init::ReadyKind::Ready);
-        // Snapshot rebuilt on the new node: next pass is steady state.
-        let actions = watch.tick_with_scan(
+        let guard = seen.lock().expect("seen lock");
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0].devnode, "/dev/hidraw8");
+        assert_eq!(guard[0].kind, crate::init::ReadyKind::Detached);
+        assert_eq!(guard[1].devnode, "/dev/hidraw12");
+        assert_eq!(guard[1].kind, crate::init::ReadyKind::Ready);
+        drop(guard);
+        // Snapshot rebuilt on the new node: the next verify pass re-sends
+        // the BT init (no hub traffic), never a repeat Detached.
+        let actions = watch.tick_with_hardware(
             &cfg,
             &hub,
             vec![DiscoveredDevice {
@@ -2888,9 +2949,14 @@ mod tests {
                 transport: Transport::Bluetooth,
             }],
             &|_| false,
+            &hardware,
         );
-        assert!(actions.is_empty());
-        assert_eq!(seen.len(), 2, "stale Detached must fire exactly once");
+        assert_eq!(
+            actions,
+            vec![TickAction::Reinitialized("/dev/hidraw12".into())]
+        );
+        let guard = seen.lock().expect("seen lock");
+        assert_eq!(guard.len(), 2, "stale Detached must fire exactly once");
     }
 
     #[test]
@@ -3215,8 +3281,13 @@ mod tests {
     }
 
     #[test]
-    fn known_bt_ticks_leave_live_session_ownership_alone() {
+    fn known_bt_ticks_rearm_without_churning_live_session() {
+        // BT steady state on the verify pass: the idempotent init pair is
+        // re-sent every pass (Reinitialized) with no hub traffic — the live
+        // session is never detached or re-attached. Mocked hardware: the
+        // live re-send would otherwise touch the real (absent) hidraw9.
         let dev = fixture_devs().pop().unwrap();
+        assert_eq!(dev.transport, Transport::Bluetooth);
         let hub = DeviceReadyHub::new();
         let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let capture = Arc::clone(&events);
@@ -3228,19 +3299,97 @@ mod tests {
                 enhanced_clicks,
                 ..Config::default()
             };
+            let hardware = TestHardware::new(&hub);
             let mut watch = ResumeWatch::new(std::slice::from_ref(&dev));
             for _ in 0..20 {
-                assert!(watch
-                    .tick_with_scan(&cfg, &hub, vec![dev.clone()], &|node| session_needs_attach(
-                        enhanced_clicks,
-                        Some(&dev.devnode),
-                        node,
-                        true
-                    ))
-                    .is_empty());
+                assert_eq!(
+                    watch.tick_with_hardware(
+                        &cfg,
+                        &hub,
+                        vec![dev.clone()],
+                        &|node| session_needs_attach(
+                            enhanced_clicks,
+                            Some(&dev.devnode),
+                            node,
+                            true
+                        ),
+                        &hardware
+                    ),
+                    vec![TickAction::Reinitialized(dev.devnode.clone())]
+                );
             }
+            assert_eq!(hardware.bt_reinits.get(), 20);
+            assert_eq!(hardware.inits.get(), 0);
+            assert_eq!(hardware.reinits.get(), 0);
+            assert_eq!(hardware.verifies.get(), 0);
         }
         assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bt_fast_pass_skips_resend_but_still_adopts() {
+        // The fast hotplug pass is add/remove/attach only: a known BT node
+        // costs no hidraw writes there. Adoption (full init) is unaffected.
+        let dev = fixture_devs().pop().unwrap();
+        assert_eq!(dev.transport, Transport::Bluetooth);
+        let hub = hub();
+        let hardware = TestHardware::new(&hub);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(std::slice::from_ref(&dev));
+        let health = |node: &str| session_needs_attach(true, Some(&dev.devnode), node, true);
+        let actions =
+            watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        assert!(actions.is_empty());
+        assert_eq!(hardware.bt_reinits.get(), 0);
+        assert_eq!(hardware.inits.get(), 0);
+        // Unknown BT node on the fast pass still takes the full init path.
+        let mut watch = ResumeWatch::new(&[]);
+        let actions =
+            watch.reconcile_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware, false);
+        assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+        assert_eq!(hardware.bt_reinits.get(), 0);
+        assert_eq!(hardware.inits.get(), 1);
+    }
+
+    #[test]
+    fn bt_detached_mid_pass_drops_and_heals_on_next_init() {
+        // A BT node that vanishes between scan and re-send records Detached
+        // and is dropped from the snapshot; re-enumeration takes the full
+        // init path — same self-heal as the USB arm.
+        let dev = fixture_devs().pop().unwrap();
+        assert_eq!(dev.transport, Transport::Bluetooth);
+        let hub = DeviceReadyHub::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&seen);
+        hub.subscribe(move |ev| capture.lock().unwrap().push(ev.clone()));
+        let hardware = TestHardware::new(&hub);
+        hardware.bt_detached.set(true);
+        let cfg = enhanced_config();
+        let mut watch = ResumeWatch::new(std::slice::from_ref(&dev));
+        let health = |node: &str| session_needs_attach(true, Some(&dev.devnode), node, true);
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(actions, vec![TickAction::Detached(dev.devnode.clone())]);
+        assert_eq!(hardware.bt_reinits.get(), 1);
+        // Mid-pass detach drops the snapshot without hub traffic (same as
+        // the USB arm); the hub Detached belongs to the scan-remove path.
+        assert!(seen.lock().unwrap().is_empty());
+        // Re-enumerated under the same name: full init + Ready, no repeat
+        // Detached.
+        hardware.bt_detached.set(false);
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(actions, vec![TickAction::Initialized(dev.devnode.clone())]);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].kind, ReadyKind::Ready);
+        }
+        // Re-adopted: steady verify passes re-send with no further traffic.
+        let actions = watch.tick_with_hardware(&cfg, &hub, vec![dev.clone()], &health, &hardware);
+        assert_eq!(
+            actions,
+            vec![TickAction::Reinitialized(dev.devnode.clone())]
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// True when `control` becomes readable within `timeout` (drains the
