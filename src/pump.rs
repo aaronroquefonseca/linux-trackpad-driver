@@ -38,6 +38,23 @@ pub const MAX_REPORT_BYTES: usize = 512;
 /// it blocks in `poll(2)` until input/control/deadline. Only errors wait.
 pub const ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
+/// Bounded retries for transient transport gaps before giving up on a
+/// poll step. BlueZ BT hidraw can fragment/coalesce and briefly return
+/// 0-byte / short / `EAGAIN` / `EINTR` mid-click; one such hiccup must
+/// not tear down the session (which would emit held ups + SYN and let
+/// hotplug re-attach re-press = triple-click). Only sustained
+/// 0-byte exhaustion, or `ENODEV`/`ENOENT`, signals
+/// [`DisconnectError`].
+pub const TRANSIENT_READ_RETRIES: usize = 3;
+/// Backoff between transient-read retries (few ms; BT ignores polling
+/// rate, so this never changes input rate).
+pub const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(2);
+/// Smallest valid single-frame prefix (BT `0x31` = 4 B). Reads with
+/// `0 < n < MIN` are transport-shorts (fragment), retried like 0-byte;
+/// longer reads go to the parser, where prefix-vs-body mismatches are
+/// counted separately as malformed frames.
+pub const MIN_TRANSPORT_REPORT_LEN: usize = 4;
+
 /// Injectable hidraw read backend (real fd vs scripted mock for CI).
 pub trait HidrawReader: Send {
     fn read_report(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
@@ -48,12 +65,13 @@ pub trait HidrawReader: Send {
     }
 }
 
-/// Persistent device loss (unplug/replug under a live fd): a 0-byte
-/// read (node dropped the device) or `ENODEV` from `read(2)`. Transient
-/// errors (`EAGAIN` = idle, `EINTR`, short reads retried by the caller)
-/// are NOT this. The proxy classifies on this type: a disconnect
-/// self-releases the session (bounded logs, fd rebind on re-attach)
-/// instead of warning ~500×/s forever on a dead fd.
+/// Persistent device loss (unplug/replug under a live fd): sustained
+/// 0-byte reads (node dropped the device) or `ENODEV`/`ENOENT` from
+/// `read(2)`. Transient gaps (single 0-byte / short / `EAGAIN` / `EINTR`,
+/// retried with backoff inside `poll_frame`) are NOT this. The proxy
+/// classifies on this type: a disconnect self-releases the session
+/// (bounded logs, fd rebind on re-attach) instead of warning ~500×/s
+/// forever on a dead fd.
 #[derive(Debug)]
 pub struct DisconnectError(pub String);
 
@@ -167,6 +185,9 @@ pub struct HidrawSource<R: HidrawReader> {
     reader: R,
     buf: Vec<u8>,
     pending: VecDeque<TouchFrame>,
+    transient_retries: u64,
+    transport_shorts: u64,
+    malformed_frames: u64,
 }
 
 impl<R: HidrawReader> HidrawSource<R> {
@@ -176,11 +197,34 @@ impl<R: HidrawReader> HidrawSource<R> {
             reader,
             buf: vec![0u8; MAX_REPORT_BYTES],
             pending: VecDeque::new(),
+            transient_retries: 0,
+            transport_shorts: 0,
+            malformed_frames: 0,
         }
     }
 
     pub fn devnode(&self) -> &str {
         &self.devnode
+    }
+
+    /// Transient retry count (0-byte/short/`EAGAIN`/`EINTR` retries).
+    pub fn transient_retries(&self) -> u64 {
+        self.transient_retries
+    }
+
+    /// Transport-short reads observed (`0 < n < prefix`).
+    pub fn transport_shorts(&self) -> u64 {
+        self.transport_shorts
+    }
+
+    /// Parse-level malformed frames dropped (parser rejected full read).
+    pub fn malformed_frames(&self) -> u64 {
+        self.malformed_frames
+    }
+
+    /// Queued second halves from `0xF7` (fd-free drain pending).
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -217,26 +261,111 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
     }
 
     fn poll_frame(&mut self) -> Result<Option<TouchFrame>> {
+        // Queued second half of a 0xF7 double report drains fd-free
+        // first, so a malformed follow-up read can never clobber it.
+        // Preserve (never clear) `pending` on any later error path.
         if let Some(f) = self.pending.pop_front() {
+            log::debug!(
+                "pump {}: draining queued 0xF7 second half ({} left)",
+                self.devnode,
+                self.pending.len()
+            );
             return Ok(Some(f));
         }
-        let n = match self.reader.read_report(&mut self.buf) {
-            Ok(0) => {
-                return Err(DisconnectError(format!(
-                    "{} 0-byte read (device dropped the node)",
-                    self.devnode
-                ))
-                .into());
+        // Transient-read tolerance: bounded retries with few-ms backoff
+        // for 0-byte / transport-short / EAGAIN / EINTR. Exhaustion of
+        // 0-byte -> Disconnect (node really gone); exhaustion of short /
+        // EAGAIN / EINTR -> idle None (drop the fragment, no teardown).
+        // ENODEV/ENOENT -> immediate Disconnect. Other errno -> immediate
+        // generic error (proxy drops the frame, no teardown).
+        let mut attempt: usize = 0;
+        let n = loop {
+            match self.reader.read_report(&mut self.buf) {
+                Ok(0) => {
+                    self.transient_retries += 1;
+                    if attempt < TRANSIENT_READ_RETRIES {
+                        log::debug!(
+                            "pump {}: transient 0-byte read (attempt {}/{})",
+                            self.devnode,
+                            attempt + 1,
+                            TRANSIENT_READ_RETRIES
+                        );
+                        std::thread::sleep(TRANSIENT_RETRY_DELAY);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(DisconnectError(format!(
+                        "{} sustained 0-byte reads (device dropped the node)",
+                        self.devnode
+                    ))
+                    .into());
+                }
+                Ok(n) if n < MIN_TRANSPORT_REPORT_LEN => {
+                    self.transient_retries += 1;
+                    self.transport_shorts += 1;
+                    if attempt < TRANSIENT_READ_RETRIES {
+                        log::debug!(
+                            "pump {}: transport-short {n} B (attempt {}/{})",
+                            self.devnode,
+                            attempt + 1,
+                            TRANSIENT_READ_RETRIES
+                        );
+                        std::thread::sleep(TRANSIENT_RETRY_DELAY);
+                        attempt += 1;
+                        continue;
+                    }
+                    log::warn!(
+                        "pump {}: sustained transport-short {n} B, dropping frame",
+                        self.devnode
+                    );
+                    return Ok(None);
+                }
+                Ok(n) => break n,
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    self.transient_retries += 1;
+                    if attempt < TRANSIENT_READ_RETRIES {
+                        log::debug!(
+                            "pump {}: transient EAGAIN (attempt {}/{})",
+                            self.devnode,
+                            attempt + 1,
+                            TRANSIENT_READ_RETRIES
+                        );
+                        std::thread::sleep(TRANSIENT_RETRY_DELAY);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                    self.transient_retries += 1;
+                    if attempt < TRANSIENT_READ_RETRIES {
+                        log::debug!(
+                            "pump {}: transient {e} (attempt {}/{})",
+                            self.devnode,
+                            attempt + 1,
+                            TRANSIENT_READ_RETRIES
+                        );
+                        std::thread::sleep(TRANSIENT_RETRY_DELAY);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENODEV)
+                        || e.raw_os_error() == Some(libc::ENOENT) =>
+                {
+                    return Err(DisconnectError(format!("{} read: {e}", self.devnode)).into());
+                }
+                Err(e) => return Err(anyhow::anyhow!("hidraw {} read: {e}", self.devnode)),
             }
-            Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => return Ok(None),
-            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
-                return Err(DisconnectError(format!("{} read: {e}", self.devnode)).into());
-            }
-            Err(e) => return Err(anyhow::anyhow!("hidraw {} read: {e}", self.devnode)),
         };
         let report = &self.buf[..n];
         let Some(&id) = report.first() else {
+            // Unreachable for n >= MIN_TRANSPORT_REPORT_LEN, but keep the
+            // guard: count as transport-short, never abort, never touch
+            // pending (already drained above).
+            self.transport_shorts += 1;
             log::warn!("pump {}: empty report, dropping frame", self.devnode);
             return Ok(None);
         };
@@ -247,6 +376,9 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
                     Ok(Some(first))
                 }
                 Err(e) => {
+                    // Malformed double: pending was already drained, so
+                    // nothing queued is lost; just count + drop.
+                    self.malformed_frames += 1;
                     log::warn!(
                         "pump {}: malformed double report ({n} B), dropping frame: {e:#}",
                         self.devnode
@@ -258,15 +390,40 @@ impl<R: HidrawReader> TouchSource for HidrawSource<R> {
             match crate::apple_parse::parse_frame(report) {
                 Ok(f) => Ok(Some(f)),
                 Err(e) => {
-                    log::warn!(
-                        "pump {}: malformed report id {id:#04x} ({n} B), dropping frame: {e:#}",
-                        self.devnode
-                    );
+                    // Distinguish transport-short (fewer bytes than the
+                    // report id's prefix) from parse errors (bad body /
+                    // unknown id). Either way: count, drop the frame,
+                    // leave pending untouched.
+                    if is_transport_short(id, n) {
+                        self.transport_shorts += 1;
+                        log::warn!(
+                            "pump {}: transport-short report id {id:#04x} ({n} B), dropping frame: {e:#}",
+                            self.devnode
+                        );
+                    } else {
+                        self.malformed_frames += 1;
+                        log::warn!(
+                            "pump {}: malformed report id {id:#04x} ({n} B), dropping frame: {e:#}",
+                            self.devnode
+                        );
+                    }
                     Ok(None)
                 }
             }
         }
     }
+}
+
+/// True when `n` bytes cannot hold the prefix for report `id`
+/// (fragment, not a parser-level malformed body).
+fn is_transport_short(id: u8, n: usize) -> bool {
+    let prefix = match id {
+        crate::apple_parse::TRACKPAD2_USB_REPORT_ID => 12,
+        crate::apple_parse::TRACKPAD2_BT_REPORT_ID => 4,
+        crate::apple_parse::DOUBLE_REPORT_ID => 2,
+        _ => return false,
+    };
+    n < prefix
 }
 
 /// Manager-owned source: idle until a hidraw node attaches.
@@ -744,6 +901,21 @@ mod tests {
         [0, 0, 0, 0x80, 10, 6, 8, pressure, id & 0x0f]
     }
 
+    fn bt_report(clicks: u8, blocks: &[&[u8; 9]]) -> Vec<u8> {
+        let mut r = vec![0x31, clicks, 0, 0];
+        for b in blocks {
+            r.extend_from_slice(&**b);
+        }
+        r
+    }
+
+    fn double_report(sub1: Vec<u8>, sub2: Vec<u8>) -> Vec<u8> {
+        let mut dbl = vec![0xF7, sub1.len() as u8];
+        dbl.extend_from_slice(&sub1);
+        dbl.extend_from_slice(&sub2);
+        dbl
+    }
+
     #[test]
     fn tier_contract_matches_parser() {
         let src = HidrawSource::new("/dev/hidrawX", ScriptReader::default());
@@ -767,22 +939,62 @@ mod tests {
 
     #[test]
     fn malformed_dropped_never_aborts() {
-        let mut src = HidrawSource::new(
+        // Each malformed shape is isolated so transient-read retries
+        // cannot coalesce script steps: one poll per case, then a valid
+        // frame must still decode.
+        for bad in [
+            vec![0x02, 0, 0], // transport-short (< 12 B USB prefix)
+            {
+                let mut r = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                r.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // trailing 8
+                r
+            },
+        ] {
+            let mut src = HidrawSource::new(
+                "/dev/hidraw1",
+                ScriptReader::new(vec![
+                    ScriptStep::Bytes(bad),
+                    // Pad with idle so a transport-short retry (which
+                    // re-reads) lands on EAGAIN instead of the valid
+                    // frame when retries are exhausted.
+                    ScriptStep::WouldBlock,
+                    ScriptStep::WouldBlock,
+                    ScriptStep::WouldBlock,
+                    ScriptStep::Bytes(usb_report(0, &[&contact(7, 50)])),
+                ]),
+            );
+            assert!(src.poll_frame().unwrap().is_none());
+            let f = src.poll_frame().unwrap().unwrap();
+            assert_eq!(f.fingers[0].id, 7);
+        }
+    }
+
+    #[test]
+    fn malformed_counts_transport_short_vs_parse_error() {
+        // Transport-short: USB id but fewer than 12 prefix bytes.
+        let mut short = HidrawSource::new(
             "/dev/hidraw1",
             ScriptReader::new(vec![
-                ScriptStep::Bytes(vec![0x02, 0, 0]), // short
-                ScriptStep::Bytes({
-                    let mut r = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                    r.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // trailing 8
-                    r
-                }),
-                ScriptStep::Bytes(usb_report(0, &[&contact(7, 50)])),
+                ScriptStep::Bytes(vec![0x02, 0, 0, 0, 0]),
+                ScriptStep::WouldBlock,
+                ScriptStep::WouldBlock,
+                ScriptStep::WouldBlock,
             ]),
         );
-        assert!(src.poll_frame().unwrap().is_none());
-        assert!(src.poll_frame().unwrap().is_none());
-        let f = src.poll_frame().unwrap().unwrap();
-        assert_eq!(f.fingers[0].id, 7);
+        assert!(short.poll_frame().unwrap().is_none());
+        assert!(short.transport_shorts() >= 1);
+        assert_eq!(short.malformed_frames(), 0);
+        // Parse error: full prefix but body not a multiple of 9.
+        let mut malformed = HidrawSource::new(
+            "/dev/hidraw1",
+            ScriptReader::new(vec![ScriptStep::Bytes({
+                let mut r = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                r.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                r
+            })]),
+        );
+        assert!(malformed.poll_frame().unwrap().is_none());
+        assert_eq!(malformed.malformed_frames(), 1);
     }
 
     #[test]
@@ -818,24 +1030,161 @@ mod tests {
     }
 
     #[test]
-    fn zero_read_is_disconnect_error() {
-        let mut src = HidrawSource::new("/dev/hidraw1", ScriptReader::bytes(vec![Vec::new()]));
+    fn transient_zero_byte_recovers_mid_click_no_teardown() {
+        // BT hiccup mid-click: down, transient 0-byte, up. The 0-byte
+        // must be retried (debug, backoff) and the up frame returned,
+        // never a Disconnect (which would tear down the session and
+        // triple-click via hotplug re-press).
+        let down = bt_report(0, &[&contact(1, 120)]);
+        let up = bt_report(0, &[]);
+        let mut src = HidrawSource::new(
+            "/dev/hidrawBT",
+            ScriptReader::new(vec![
+                ScriptStep::Bytes(down),
+                ScriptStep::Bytes(Vec::new()),
+                ScriptStep::Bytes(up),
+            ]),
+        );
+        let a = src.poll_frame().unwrap().unwrap();
+        assert_eq!(a.fingers.len(), 1);
+        let b = src.poll_frame().unwrap().unwrap();
+        assert!(b.fingers.is_empty());
+        assert!(src.transient_retries() >= 1);
+    }
+
+    #[test]
+    fn sustained_zero_bytes_signal_disconnect() {
+        // More consecutive 0-byte reads than the retry budget: the node
+        // is really gone, so signal Disconnect for proxy teardown.
+        let zeros = (0..TRANSIENT_READ_RETRIES + 2)
+            .map(|_| ScriptStep::Bytes(Vec::new()))
+            .collect();
+        let mut src = HidrawSource::new("/dev/hidraw1", ScriptReader::new(zeros));
         let err = src.poll_frame().unwrap_err();
         assert!(is_disconnect(&err));
     }
 
     #[test]
-    fn enodev_is_disconnect_but_eio_is_transient() {
-        let mut gone = HidrawSource::new(
-            "/dev/hidraw1",
-            ScriptReader::new(vec![ScriptStep::IoError(libc::ENODEV)]),
-        );
-        assert!(is_disconnect(&gone.poll_frame().unwrap_err()));
+    fn sustained_enodev_is_disconnect_enoent_too() {
+        for errno in [libc::ENODEV, libc::ENOENT] {
+            let mut gone = HidrawSource::new(
+                "/dev/hidraw1",
+                ScriptReader::new(vec![ScriptStep::IoError(errno)]),
+            );
+            assert!(is_disconnect(&gone.poll_frame().unwrap_err()));
+        }
+    }
+
+    #[test]
+    fn eio_is_transient_not_disconnect() {
         let mut flaky = HidrawSource::new(
             "/dev/hidraw1",
             ScriptReader::new(vec![ScriptStep::IoError(libc::EIO)]),
         );
         assert!(!is_disconnect(&flaky.poll_frame().unwrap_err()));
+    }
+
+    #[test]
+    fn eintr_retried_then_idle_or_recovers() {
+        // EINTR then idle: tolerated, no error, no teardown.
+        let mut idle = HidrawSource::new(
+            "/dev/hidraw1",
+            ScriptReader::new(vec![
+                ScriptStep::IoError(libc::EINTR),
+                ScriptStep::WouldBlock,
+            ]),
+        );
+        assert!(idle.poll_frame().unwrap().is_none());
+        // EINTR then a valid frame: the frame is returned.
+        let mut recovers = HidrawSource::new(
+            "/dev/hidraw1",
+            ScriptReader::new(vec![
+                ScriptStep::IoError(libc::EINTR),
+                ScriptStep::Bytes(usb_report(0, &[&contact(4, 60)])),
+            ]),
+        );
+        let f = recovers.poll_frame().unwrap().unwrap();
+        assert_eq!(f.fingers[0].id, 4);
+    }
+
+    #[test]
+    fn transport_short_retried_then_recovers() {
+        // 2-byte fragment then a valid frame: retry lands on the frame.
+        let mut src = HidrawSource::new(
+            "/dev/hidraw1",
+            ScriptReader::new(vec![
+                ScriptStep::Bytes(vec![0x31, 0x00]),
+                ScriptStep::Bytes(bt_report(0, &[&contact(9, 77)])),
+            ]),
+        );
+        let f = src.poll_frame().unwrap().unwrap();
+        assert_eq!(f.fingers[0].id, 9);
+        assert!(src.transport_shorts() >= 1);
+    }
+
+    #[test]
+    fn malformed_frame_preserves_pending_half() {
+        // Valid 0xF7 queues its second half; a later malformed frame
+        // must not lose it: pending drains fd-free first.
+        let sub1 = {
+            let mut r = vec![0x31, 0x01, 0, 0];
+            r.extend_from_slice(&contact(1, 11));
+            r
+        };
+        let sub2 = {
+            let mut r = vec![0x31, 0x00, 0, 0];
+            r.extend_from_slice(&contact(2, 22));
+            r
+        };
+        let dbl = double_report(sub1, sub2);
+        let bad = {
+            let mut r = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            r.extend_from_slice(&[9u8; 8]);
+            r
+        };
+        let after = usb_report(0, &[&contact(7, 50)]);
+        let mut src = HidrawSource::new(
+            "/dev/hidraw9",
+            ScriptReader::new(vec![
+                ScriptStep::Bytes(dbl),
+                ScriptStep::Bytes(bad),
+                ScriptStep::Bytes(after),
+            ]),
+        );
+        let a = src.poll_frame().unwrap().unwrap();
+        assert_eq!(a.fingers[0].pressure, 11);
+        assert_eq!(src.pending_len(), 1);
+        // Second half drains without touching the fd, even though the
+        // next queued read is malformed.
+        let b = src.poll_frame().unwrap().unwrap();
+        assert_eq!(b.fingers[0].pressure, 22);
+        assert_eq!(src.pending_len(), 0);
+        // Now the malformed frame drops but counts, pending stays empty.
+        assert!(src.poll_frame().unwrap().is_none());
+        assert_eq!(src.malformed_frames(), 1);
+        assert_eq!(src.pending_len(), 0);
+        // Stream recovers on the next valid frame.
+        let c = src.poll_frame().unwrap().unwrap();
+        assert_eq!(c.fingers[0].id, 7);
+    }
+
+    #[test]
+    fn malformed_double_does_not_queue_or_stall() {
+        // Malformed 0xF7 (overshoot length) drops, queues nothing, and
+        // the next valid frame still decodes.
+        let mut overshoot = vec![0xF7, 255u8];
+        overshoot.extend_from_slice(&bt_report(0, &[&contact(1, 10)]));
+        let mut src = HidrawSource::new(
+            "/dev/hidraw9",
+            ScriptReader::new(vec![
+                ScriptStep::Bytes(overshoot),
+                ScriptStep::Bytes(usb_report(0, &[&contact(5, 90)])),
+            ]),
+        );
+        assert!(src.poll_frame().unwrap().is_none());
+        assert_eq!(src.pending_len(), 0);
+        let f = src.poll_frame().unwrap().unwrap();
+        assert_eq!(f.fingers[0].id, 5);
     }
 
     #[test]
