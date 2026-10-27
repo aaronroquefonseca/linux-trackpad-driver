@@ -1,3 +1,23 @@
+## [0.1.3] - 2026-10-27
+
+### Highlights
+
+- Bluetooth that works: the driver now arms the trackpad on Bluetooth connect, reconnect, resume, and every 30 s verify tick (multitouch + host-click reports), fixing dead multitouch, broken force click, and wrong multi-finger clicks ([#95](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/95), closes [#42](https://github.com/aaronroquefonseca/linux-trackpad-driver/issues/42)).
+- One press, one click: a deep press no longer emits a triple burst on the wire — staged force edges join continuously instead of cutting level-1 keys, and single-frame Bluetooth dips ride out the release hold ([#95](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/95)).
+- Stuck-click protection over radio links: transient Bluetooth read gaps no longer tear down the session mid-click, so link hiccups cannot synthesize phantom press/release pairs ([#95](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/95)).
+- Tolerant Bluetooth parsing: legacy `0x28` reports decode as Bluetooth frames, trailing bytes no longer drop whole frames, and half-good `0xF7` doubles keep their good half ([#95](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/95)).
+- No more double input over Bluetooth: single-node Bluetooth resolution is now trusted for the evdev grab, with loud fallback warnings instead of silent native-plus-proxy duplication ([#95](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/95)).
+- Hermetic test suite: the resume-tick test no longer scans host hardware, so packaged builds pass `check()` on machines with the trackpad attached ([#96](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/96)).
+
+### Details
+
+#### Bug Fixes
+
+- Hermetic resume tick vanish test, no host scan ([#96](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/96)) (test) ([b23f864](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/b23f864ca7e9b2899f4a641ad83e66cea3c296ba))
+- Complete Bluetooth bring-up, parsing, suppression and click staging ([#95](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/95)) (bt) ([d678ee2](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/d678ee200a6fcb1254700feef0545e76850a8d4a))
+
+Full diff: https://github.com/aaronroquefonseca/linux-trackpad-driver/compare/v0.1.2...v0.1.3
+
 ## [0.1.2] - 2026-10-19
 
 ### Highlights
