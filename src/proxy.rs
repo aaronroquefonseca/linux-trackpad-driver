@@ -67,7 +67,10 @@
 //!   the force combo fresh, so shared codes show up+SYN+down; easing back
 //!   below the force release re-presses the still-latched level-1 keys
 //!   (one SYN frame, so the restart reads as up/down pairs, never a stuck
-//!   key). `"continuous"` holds level-1 keys while force keys join (shared
+//!   key). Staged same-press coalesce (BT framing): a deep stab's staged
+//!   force edge (same physical press, marked by the machine) joins
+//!   continuously (no cut-up — one press must never read as down/up/down).
+//!   `"continuous"` holds level-1 keys while force keys join (shared
 //!   codes down once, up once — see the reference-held rule below). Skipped for
 //!   `none`/`empty` force actions, when nothing is held, and when the
 //!   edge absorbed a slide handoff (seamless merge wins for that frame).
@@ -1248,6 +1251,20 @@ where
             // when nothing is held, and when this frame absorbed a slide
             // (the seamless handoff just merged those keys: cutting them
             // would reintroduce the flutter the handoff avoided).
+            // Staged same-press coalesce (BT framing): a deep stab latches
+            // first one frame and force the next — both edges from ONE
+            // physical press. The machine marks that pair
+            // ([`ClickMachine::staged_same_press`]); the force keys join
+            // the hold continuously instead of a cut-up (LEFT down /
+            // LEFT up+SYN / FORWARD down reads as a triple-click
+            // downstream). A force edge after a sustained light hold is
+            // not staged and still cuts for the visible break.
+            let staged = self.machine.staged_same_press();
+            if staged {
+                log::debug!(
+                    "proxy: staged same-press force coalesces (no cut-up); holding level-1"
+                );
+            }
             if cfg.is_cut_transition()
                 && !ev.is_none()
                 && !ev.is_empty()
@@ -1256,6 +1273,7 @@ where
                         p.keys.iter().any(|k| k.owners.contains(&ClickLevel::First))
                     }))
                 && absorbed.is_none()
+                && !staged
             {
                 // No-op after a handoff (slide already absorbed/released),
                 // belt-and-braces so cut never leaves a slide hold behind.
@@ -11296,10 +11314,14 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
             }
             assert_eq!(key_values(&sinks.extras, 125), cancelled_super);
             assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
-            // Fresh deep contact retries first, then force on the next
-            // report; cut keeps its 5 ms floor and 50 ms button gap.
+            // Fresh two-step contact retries first, then force on the next
+            // report; cut keeps its 5 ms floor and 50 ms button gap. (A
+            // light-then-deep press, not a deep stab: the first frame stays
+            // below the force threshold so nothing stages and the force
+            // edge still cuts. Deep-stab coalescing is pinned by the
+            // bt_deep_press_* tests instead.)
             px.replace_source(ScriptSource::new(vec![
-                slide_report(5, 200, 0),
+                slide_report(5, 60, 0),
                 slide_report(5, 200, 0),
             ]));
             for ms in [70, 71, 75, 76, 125] {
@@ -12258,6 +12280,169 @@ click_1 = { action = "super+left", stagger_ms = 50 }"#,
         );
         assert_strict_alternation(&key_values(&sinks.pointer, BTN_LEFT), "BTN_LEFT");
         assert_strict_alternation(&key_values(&sinks.extras, 125), "super");
+    }
+
+    #[test]
+    fn bt_deep_press_coalesces_no_cut_up() {
+        // BT cadence: a deep stab stages first one frame and force the next
+        // ~9 ms later (110 Hz) — ONE physical press. Cut mode must NOT emit
+        // the intermediate up (LEFT down / LEFT up+SYN / FORWARD down reads
+        // as a triple-click downstream); the force keys join the hold.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "forward".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        // Force edge one BT frame later: coalesces, no cut-up.
+        let t1 = t0 + std::time::Duration::from_millis(9);
+        let ev = px.handle_frame_at(&cfg, t1).unwrap().unwrap();
+        assert!(ev.is_force());
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "staged same-press force must not cut the level-1 hold"
+        );
+        assert!(
+            sinks.extras.has(EV_KEY, BTN_EXTRA, 1),
+            "force combo joins the hold: {:?}",
+            sinks.extras.events.lock().unwrap()
+        );
+        assert!(
+            px.pending_force.is_none(),
+            "coalesced press lands immediately, nothing deferred"
+        );
+        // Steady hold stays silent; liftoff owns the single up pair.
+        let t2 = t1 + std::time::Duration::from_millis(9);
+        px.handle_frame_at(&cfg, t2).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        px.handle_frame_at(&cfg, t2 + std::time::Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, BTN_EXTRA), vec![1, 0]);
+        assert_strict_alternation(&key_values(&sinks.pointer, BTN_LEFT), "BTN_LEFT");
+    }
+
+    #[test]
+    fn bt_sustained_hold_then_force_still_cuts() {
+        // Two-step press, not a stab: light hold first (below the force
+        // threshold, so nothing stages), force edge 10 ms later after a
+        // sustained hold. Cut semantics preserved — the visible break is
+        // the point of cut. Flag-based, not a time window: any gap cuts.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 70, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 5, 5)], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "forward".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        let ev = px
+            .handle_frame_at(&cfg, t0 + std::time::Duration::from_millis(10))
+            .unwrap()
+            .unwrap();
+        assert!(ev.is_force());
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1, 0],
+            "sustained hold still cuts at the force edge"
+        );
+    }
+
+    #[test]
+    fn bt_single_frame_dip_holds_wire_silent() {
+        // BT framing: deep stab, staged force one frame later, one noisy dip
+        // frame below both releases, deep again — all inside the 30 ms
+        // window. The wire must stay silent through the dip (no ups), and
+        // a clean liftoff past the window releases once.
+        let sinks = TestSinks::new();
+        let haptic = Arc::new(FakeHaptic::new());
+        let frames = vec![
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 0, 0)], 0))),
+            Ok(Some(frame(vec![finger(1, 10, 5, 5)], 0))),
+            Ok(Some(frame(vec![finger(1, 100, 9, 9)], 0))),
+            Ok(Some(frame(vec![], 0))),
+        ];
+        let mut px = drive_ready_proxy(&sinks, &haptic, frames);
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                click_1: "left".into(),
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_1: "forward".into(),
+                force_offset: 20,
+                transition_mode: "cut".into(),
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        let t0 = std::time::Instant::now();
+        px.handle_frame_at(&cfg, t0).unwrap();
+        let t1 = t0 + std::time::Duration::from_millis(9);
+        px.handle_frame_at(&cfg, t1).unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1]);
+        // Dip frame: both latches hold, wire silent.
+        let t2 = t1 + std::time::Duration::from_millis(9);
+        assert!(px.handle_frame_at(&cfg, t2).unwrap().is_none());
+        assert_eq!(
+            key_values(&sinks.pointer, BTN_LEFT),
+            vec![1],
+            "dip must not release the hold"
+        );
+        assert_eq!(
+            key_values(&sinks.extras, BTN_EXTRA),
+            vec![1],
+            "force combo holds through the dip"
+        );
+        // Deep again, then liftoff past the window releases once.
+        let t3 = t2 + std::time::Duration::from_millis(9);
+        px.handle_frame_at(&cfg, t3).unwrap();
+        px.handle_frame_at(&cfg, t3 + std::time::Duration::from_millis(60))
+            .unwrap();
+        assert_eq!(key_values(&sinks.pointer, BTN_LEFT), vec![1, 0]);
+        assert_eq!(key_values(&sinks.extras, BTN_EXTRA), vec![1, 0]);
     }
 
     #[test]

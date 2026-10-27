@@ -7,8 +7,9 @@
 //!
 //! # Contract
 //!
-//! - Per-finger pressure vs `sensitivity` (press) / `sensitivity - margin`
-//!   (release hysteresis). Thresholds operate on the RAW pressure byte
+//! - Per-finger pressure vs `sensitivity` (press) / `max(1, sensitivity -
+//!   margin)` (release hysteresis, old floor 1). Thresholds operate on the
+//!   RAW pressure byte
 //!   (Apple nominal 0..=253, arbitrary units, `res == 0`).
 //! - Touch presence is the device flag OR pressure past
 //!   [`TOUCH_PRESSURE_FLOOR`] (10, old-service parity): light touches
@@ -16,8 +17,11 @@
 //! - Old-service debounce on the timed path ([`ClickMachine::update_at`]):
 //!   press swallowed within [`PRESS_DEBOUNCE_MS`] (50 ms) of the last
 //!   release, release held within [`RELEASE_DEBOUNCE_MS`] (30 ms) of the
-//!   press edge. Observed releases finish on idle polls once the window
-//!   expires; idle time alone never releases a still-pressed contact.
+//!   press edge — uniformly, whether or not the force level is latched
+//!   (BT framing: a single noisy sub-release frame inside the window must
+//!   not end an intentional hold). Observed releases finish on idle polls
+//!   once the window expires; idle time alone never releases a
+//!   still-pressed contact.
 //! - Finger-count at the press edge selects `click_1..=click_5` via the
 //!   existing [`crate::config::parse_click_action`].
 //! - Force second level: `force_offset > 0` arms force press at
@@ -27,10 +31,11 @@
 //!   latch semantics as the first level. `force_offset = 0` disables the
 //!   force level entirely (no behavior change).
 //! - Force release hysteresis mirrors the first level: force releases at
-//!   `sensitivity + force_offset - margin` (saturating at 0). Since the force
-//!   press sits above the first press by `force_offset`, the saturating
-//!   subtraction preserves ordering: force release >= first release, so the
-//!   force level always drops at or before the first level.
+//!   `max(release + 1, sensitivity + force_offset - margin)` (old
+//!   `release + 1` floor, so the force level always drops strictly above
+//!   the first level). Since the force press sits above the first press by
+//!   `force_offset`, the floor preserves ordering: force release > first
+//!   release, so the force level always drops at or before the first level.
 //! - Coexistence ordering: first and force latches are independent and can
 //!   both be held. Edges fire in press order (first then force), staged
 //!   across frames old-exact: a deep jump from idle latches first this
@@ -81,7 +86,10 @@
 //!   SYN) then presses the force combo fresh — shared codes show
 //!   up+SYN+down; `"continuous"` holds level-1 keys while force keys join
 //!   (shared codes down once, up once). The machine latches identically either way; the mode
-//!   only changes the proxy's wire sequence on the force edge.
+//!   only changes the proxy's wire sequence on the force edge. The proxy
+//!   coalesces a staged same-press force edge (deep stab: the machine
+//!   deferred it one frame) into a continuous join even in cut mode, so one
+//!   deep physical press never emits down/up/down.
 //! - Combination semantics: slide hands off to press (same-action =
 //!   seamless, else release-then-press, one SYN); spoof reshapes the wire
 //!   under whichever status latch holds (force > first > slide > idle
@@ -129,11 +137,13 @@ pub fn press_threshold(cfg: &Config) -> u8 {
     cfg.click.sensitivity.clamp(1, 255) as u8
 }
 
-/// Release threshold = `sensitivity - margin`, saturating at 0.
+/// Release threshold = `max(1, sensitivity - margin)` (old floor 1: a
+/// zero release would hold at pressure 0 and CH-stick the latch; BT
+/// single-byte flaps around 0..5 must never pin it).
 pub fn release_threshold(cfg: &Config) -> u8 {
     let s = cfg.click.sensitivity.clamp(1, 255);
     let m = cfg.click.margin.min(255);
-    s.saturating_sub(m) as u8
+    s.saturating_sub(m).max(1) as u8
 }
 
 /// Spoof pattern geometry (device units; density is 48/44 units/mm, so
@@ -322,6 +332,15 @@ pub struct ClickMachine {
     /// inside [`RELEASE_DEBOUNCE_MS`] of this stamp keeps the force latch
     /// (hold hysteresis: pressure noise must not end an intentional hold).
     last_force_hold_at: Option<Instant>,
+    /// True while the live first-level latch originated from a deep stab
+    /// frame that also crossed the force threshold (the force edge was
+    /// deferred by old-exact staging, so it arrives on the next frame).
+    /// The proxy coalesces that staged force edge into a continuous join
+    /// instead of a cut-up: both edges belong to ONE physical press
+    /// (BT framing). Cleared when either latch releases, on disarm, and
+    /// on reset — a later re-deepening after an ease-off is a new force
+    /// intention and still cuts.
+    staged_same_press: bool,
 }
 
 impl ClickMachine {
@@ -342,6 +361,14 @@ impl ClickMachine {
     /// Currently latched slide-level action, if any.
     pub fn slide_active(&self) -> Option<&ClickEvent> {
         self.slide_active.as_ref()
+    }
+
+    /// True while the live first latch came from a deep stab whose force
+    /// edge was staged to the next frame: the staged force edge belongs to
+    /// the same physical press, so the proxy joins it continuously instead
+    /// of emitting a cut-up (BT triple-click fix).
+    pub fn staged_same_press(&self) -> bool {
+        self.staged_same_press
     }
 
     /// Whether tracking id `id` is currently pressed (first level).
@@ -365,10 +392,17 @@ impl ClickMachine {
         crate::config::force_threshold_value(cfg.click.sensitivity, cfg.force.force_offset)
     }
 
-    /// Force release point: `sensitivity + force_offset - margin`, saturating
-    /// at 0 (mirrors [`release_threshold`]). `None` when disabled.
+    /// Force release point: `max(release + 1, sensitivity + force_offset -
+    /// margin)` (old `release + 1` floor: the force level always drops
+    /// strictly above the first level, so a single noisy byte flapping in
+    /// the 5-wide margin band can never invert the ordering). `None` when
+    /// disabled.
     pub fn force_release_threshold(cfg: &Config) -> Option<u16> {
-        Self::force_threshold(cfg).map(|press| press.saturating_sub(cfg.click.margin.min(255)))
+        Self::force_threshold(cfg).map(|press| {
+            let raw = press.saturating_sub(cfg.click.margin.min(255));
+            let first_release = u16::from(release_threshold(cfg));
+            raw.max(first_release.saturating_add(1))
+        })
     }
 
     /// Physical button bit from the raw `clicks` byte (`clicks & 1`).
@@ -424,13 +458,14 @@ impl ClickMachine {
     /// release debounce. A press within [`PRESS_DEBOUNCE_MS`] of the last
     /// release is swallowed (bits reverted so the next frame retries); a
     /// release within [`RELEASE_DEBOUNCE_MS`] of the press edge holds the
-    /// latch (first level only: a force-held frame releases immediately,
-    /// old parity). The force level is undebounced (old parity: time gates only
-    /// guard the Released↔Pressed transitions), except a suppressed
-    /// first-level press also suppresses the same-frame force edge (old
-    /// `Released` admits no `ForcePressed` directly). Likewise a
-    /// same-frame force edge behind a fresh first-level edge defers one
-    /// frame (old-exact staging, no time gate involved).
+    /// latch uniformly (including while force is latched, so a single
+    /// noisy BT sub-release frame rides out). The force level is otherwise
+    /// undebounced (old parity: time gates only guard the Released↔Pressed
+    /// transitions), except a suppressed first-level press also suppresses
+    /// the same-frame force edge (old `Released` admits no `ForcePressed`
+    /// directly). Likewise a same-frame force edge behind a fresh
+    /// first-level edge defers one frame (old-exact staging, no time gate
+    /// involved).
     pub fn update_at(
         &mut self,
         fingers: &[FingerContact],
@@ -452,10 +487,6 @@ impl ClickMachine {
         let force_press = Self::force_threshold(cfg);
         let force_release = Self::force_release_threshold(cfg);
         let armed = force_press.is_some();
-        // Entry force latch: the old service debounces the release hold
-        // only out of Pressed. Out of ForcePressed a full release drops
-        // immediately, so a force-held frame never takes the 30 ms hold.
-        let force_latched_at_entry = self.force_active.is_some();
 
         // Phase 1 (read-only): decide per-finger bit writes. Nothing mutates
         // here so a parse failure below leaves state untouched.
@@ -590,6 +621,25 @@ impl ClickMachine {
             for id in newly_force.iter() {
                 self.force_pressed.insert(*id, false);
             }
+            // BT tuning aid: a deep first frame already peaks past the
+            // force threshold, so reporters see the force edge staged one
+            // frame later (never same-frame). Log the peak vs threshold
+            // at debug so BT threshold hunts need no reproducer.
+            if let Some(fp) = force_press {
+                let peak = fingers
+                    .iter()
+                    .filter(|f| touch_present(f))
+                    .map(|f| u16::from(f.pressure))
+                    .max()
+                    .unwrap_or(0);
+                log::debug!(
+                    "clicks: deep stab stages force one frame later (peak {peak} >= force {fp}); first holds"
+                );
+            }
+            // Mark the staged same-press pair: the deferred force edge on
+            // the next frame belongs to this physical press, so the proxy
+            // coalesces it instead of cutting the hold it just emitted.
+            self.staged_same_press = true;
         }
         // Evict ids absent from this frame (a lifted finger reports no
         // block): without this a lifted finger's bit stays set and holds
@@ -613,6 +663,7 @@ impl ClickMachine {
         if !armed {
             // Disarmed mid-hold: drop the force latch + bits outright.
             self.force_active = None;
+            self.staged_same_press = false;
             for v in self.force_pressed.values_mut() {
                 *v = false;
             }
@@ -626,7 +677,7 @@ impl ClickMachine {
             }
         }
 
-        self.release_unpressed(now, force_latched_at_entry);
+        self.release_unpressed(now);
 
         // Slide releases: liftoff clears outright; a press edge that
         // actually fires hands off (the proxy releases slide keys first
@@ -714,7 +765,7 @@ impl ClickMachine {
     pub(crate) fn advance_releases_at(&mut self, now: Instant) -> bool {
         let was_first = self.active.is_some();
         let was_force = self.force_active.is_some();
-        self.release_unpressed(Some(now), was_force);
+        self.release_unpressed(Some(now));
         (was_first && self.active.is_none()) || (was_force && self.force_active.is_none())
     }
 
@@ -729,15 +780,12 @@ impl ClickMachine {
         let mut consider = |d: Instant| {
             best = Some(best.map_or(d, |b: Instant| b.min(d)));
         };
-        // First level: latched with no remaining bits. Holds while inside
-        // the 30 ms window anchored at the press edge (unless a force latch
-        // was held at entry, which releases immediately — no deadline).
+        // First level: latched with no remaining bits. Holds inside the
+        // 30 ms window anchored at the press edge — uniformly, including
+        // while the force level is latched (BT framing: same hold as the
+        // release path in [`ClickMachine::release_unpressed`]).
         if self.active.is_some() && !self.pressed.values().any(|&p| p) {
-            if self.force_active.is_some() {
-                // Force-held release drops immediately on the next idle
-                // poll: wake now.
-                consider(Instant::now());
-            } else if let Some(p) = self.last_press_at {
+            if let Some(p) = self.last_press_at {
                 consider(p + std::time::Duration::from_millis(RELEASE_DEBOUNCE_MS));
             } else {
                 consider(Instant::now());
@@ -755,17 +803,19 @@ impl ClickMachine {
         best
     }
 
-    fn release_unpressed(&mut self, now: Option<Instant>, force_latched_at_entry: bool) {
+    fn release_unpressed(&mut self, now: Option<Instant>) {
         // Release latches with no remaining bits (force first so a full
         // release clears both; first-level release implies force is gone too
-        // since force release >= first release). The first level holds
-        // while inside the release debounce window, unless force was
-        // latched at entry (old releases ForcePressed immediately, no
-        // 30 ms hold). The force level holds inside the same window anchored
-        // at its last held frame instead (DEVIATION: old drops it
-        // undebounced — a single noisy frame then ends an intentional hold
-        // and its emitted keys, e.g. super in a drag chord, flap; clean
-        // liftoff still releases outright).
+        // since force release > first release). The first level holds
+        // inside the release debounce window uniformly — including while
+        // the force level is latched (BT framing: a single noisy
+        // sub-release frame inside the window must not end an intentional
+        // hold and re-press as a phantom second click). The force level
+        // holds inside the same window anchored at its last held frame
+        // instead (DEVIATION: old drops it undebounced — a single noisy
+        // frame then ends an intentional hold and its emitted keys, e.g.
+        // super in a drag chord, flap; clean liftoff still releases
+        // outright).
         let force_hold_debounced = self.force_active.is_some()
             && !self.force_pressed.values().any(|&p| p)
             && now.is_some_and(|t| {
@@ -778,9 +828,11 @@ impl ClickMachine {
             && !force_hold_debounced
         {
             self.force_active = None;
+            // The staged pair is over: a later re-deepening is a new force
+            // intention and still cuts.
+            self.staged_same_press = false;
         }
-        let release_debounced = !force_latched_at_entry
-            && self.active.is_some()
+        let release_debounced = self.active.is_some()
             && now.is_some_and(|t| {
                 self.last_press_at.is_some_and(|p| {
                     t.saturating_duration_since(p).as_millis() < u128::from(RELEASE_DEBOUNCE_MS)
@@ -789,6 +841,7 @@ impl ClickMachine {
         if self.active.is_some() && !self.pressed.values().any(|&p| p) && !release_debounced {
             self.active = None;
             self.force_active = None;
+            self.staged_same_press = false;
             for v in self.force_pressed.values_mut() {
                 *v = false;
             }
@@ -825,6 +878,7 @@ impl ClickMachine {
         self.last_press_at = None;
         self.last_release_at = None;
         self.last_force_hold_at = None;
+        self.staged_same_press = false;
     }
 }
 
@@ -882,7 +936,9 @@ mod tests {
     }
 
     #[test]
-    fn release_saturates_at_zero() {
+    fn release_floors_at_one() {
+        // Old floor 1: `sensitivity - margin` saturating at 0 would hold
+        // at pressure 0 and CH-stick the latch; BT bytes flap around 0..5.
         let cfg = Config {
             click: crate::config::ClickConfig {
                 sensitivity: 3,
@@ -891,7 +947,7 @@ mod tests {
             },
             ..Config::default()
         };
-        assert_eq!(release_threshold(&cfg), 0);
+        assert_eq!(release_threshold(&cfg), 1);
     }
 
     #[test]
@@ -1201,6 +1257,51 @@ mod tests {
     }
 
     #[test]
+    fn staged_flag_marks_deep_stab_only() {
+        // The proxy coalesces only a staged same-press pair: a deep stab
+        // from idle (force deferred one frame) sets the flag; a light
+        // hold that deepens later never does. Easing off the force level
+        // clears it, so a later re-deepening cuts again.
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        // Deep stab: flag set on the first frame, still set after the
+        // staged force edge lands.
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 250)], 0, &cfg).unwrap();
+        assert!(m.staged_same_press());
+        m.update(&[finger(1, 250)], 0, &cfg).unwrap();
+        assert!(m.force_active().is_some());
+        assert!(m.staged_same_press());
+        // Ease below the force release: flag clears with the force latch.
+        m.update(&[finger(1, 70)], 0, &cfg).unwrap();
+        assert!(m.force_active().is_none());
+        assert!(!m.staged_same_press());
+        assert!(m.active().is_some());
+        // Re-deepening the same hold is a new force intention: no flag.
+        m.update(&[finger(1, 100)], 0, &cfg).unwrap();
+        assert!(m.force_active().is_some());
+        assert!(!m.staged_same_press());
+        // Two-step press from idle: light first, deep later — never staged.
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 70)], 0, &cfg).unwrap();
+        assert!(!m.staged_same_press());
+        m.update(&[finger(1, 100)], 0, &cfg).unwrap();
+        assert!(m.force_active().is_some());
+        assert!(!m.staged_same_press());
+    }
+
+    #[test]
     fn force_no_overflow_at_max_sensitivity() {
         let cfg = Config {
             click: crate::config::ClickConfig {
@@ -1346,7 +1447,8 @@ mod tests {
 
     #[test]
     fn force_threshold_clamp_symmetry() {
-        // Unvalidated extremes clamp exactly like press/release_threshold.
+        // Unvalidated extremes clamp exactly like press/release_threshold,
+        // then take the old floors (release >= 1, force release >= release+1).
         let cfg = Config {
             click: crate::config::ClickConfig {
                 sensitivity: 0,
@@ -1360,9 +1462,9 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(press_threshold(&cfg), 1);
-        assert_eq!(release_threshold(&cfg), 0);
+        assert_eq!(release_threshold(&cfg), 1);
         assert_eq!(ClickMachine::force_threshold(&cfg), Some(1 + 255));
-        assert_eq!(ClickMachine::force_release_threshold(&cfg), Some(1));
+        assert_eq!(ClickMachine::force_release_threshold(&cfg), Some(2));
     }
 
     #[test]
@@ -1640,10 +1742,11 @@ mod tests {
     }
 
     #[test]
-    fn force_held_release_ignores_release_debounce() {
-        // Old releases ForcePressed immediately (no 30 ms hold): staged
-        // latch (first at T, force at T+10), full liftoff at T+20 still
-        // drops both latches on that frame.
+    fn force_held_release_holds_release_debounce() {
+        // BT framing: a release inside 30 ms of the press edge holds the
+        // latch even while force is latched, so a single noisy sub-release
+        // frame rides out instead of re-pressing as a phantom second click.
+        // (Old released ForcePressed immediately with no 30 ms hold.)
         let cfg = Config {
             click: crate::config::ClickConfig {
                 sensitivity: 64,
@@ -1669,12 +1772,151 @@ mod tests {
             .unwrap()
             .force
             .is_some());
+        // Full liftoff 20 ms after the press edge: held, not dropped.
         assert!(m.update_at(&[], 0, &cfg, at(t0, 20)).unwrap().is_empty());
         assert!(
-            m.active().is_none(),
-            "force-held release must not debounce-hold the latch"
+            m.active().is_some(),
+            "force-held release inside the window must hold the latch"
         );
+        assert!(m.force_active().is_some());
+        // Past the window it drops.
+        assert!(m.update_at(&[], 0, &cfg, at(t0, 60)).unwrap().is_empty());
+        assert!(m.active().is_none());
         assert!(m.force_active().is_none());
+    }
+
+    #[test]
+    fn force_release_floors_above_first_release() {
+        // Old `release + 1` floor: force release is always strictly above
+        // the first release, so one noisy byte in the margin band can never
+        // invert the drop order — even when the raw subtraction collides.
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                sensitivity: 30,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 1,
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        let release = release_threshold(&cfg);
+        let force_release = ClickMachine::force_release_threshold(&cfg).unwrap();
+        assert_eq!(release, 25);
+        assert_eq!(ClickMachine::force_threshold(&cfg), Some(31));
+        assert_eq!(force_release, 26);
+        assert!(force_release > u16::from(release));
+        // Extreme: raw subtraction saturates to 0, floor still holds.
+        let extreme = Config {
+            click: crate::config::ClickConfig {
+                sensitivity: 1,
+                margin: 255,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 1,
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        assert_eq!(release_threshold(&extreme), 1);
+        assert_eq!(
+            ClickMachine::force_release_threshold(&extreme),
+            Some(u16::from(release_threshold(&extreme)) + 1)
+        );
+    }
+
+    #[test]
+    fn bt_single_frame_dip_with_force_latched_holds() {
+        // BT cadence: press at T, staged force at T+9ms, one noisy
+        // sub-release frame at T+18ms (pressure below BOTH releases),
+        // deep again at T+27ms. The dip frame must hold both latches —
+        // no release, no re-press — and the hold must still drop cleanly
+        // past the window.
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        // release 59, force press 84, force release 79.
+        assert_eq!(release_threshold(&cfg), 59);
+        assert_eq!(ClickMachine::force_release_threshold(&cfg), Some(79));
+        let mut m = ClickMachine::new();
+        let t0 = Instant::now();
+        assert!(m
+            .update_at(&[finger(1, 70)], 0, &cfg, at(t0, 0))
+            .unwrap()
+            .first
+            .is_some());
+        assert!(m
+            .update_at(&[finger(1, 100)], 0, &cfg, at(t0, 9))
+            .unwrap()
+            .force
+            .is_some());
+        // Single noisy dip below both releases, inside the window: holds.
+        assert!(m
+            .update_at(&[finger(1, 10)], 0, &cfg, at(t0, 18))
+            .unwrap()
+            .is_empty());
+        assert!(m.active().is_some(), "dip must not release first");
+        assert!(m.force_active().is_some(), "dip must not release force");
+        // Deep again keeps the hold; past the window a dip drops.
+        assert!(m
+            .update_at(&[finger(1, 100)], 0, &cfg, at(t0, 27))
+            .unwrap()
+            .is_empty());
+        assert!(m.force_active().is_some());
+        assert!(m
+            .update_at(&[finger(1, 10)], 0, &cfg, at(t0, 200))
+            .unwrap()
+            .is_empty());
+        assert!(m.active().is_none());
+        assert!(m.force_active().is_none());
+    }
+
+    #[test]
+    fn force_explicit_zero_haptic_stays_silent() {
+        // Explicit `force_haptic = Some(0)` is silent (no fallback buzz):
+        // the force edge carries 0 and the proxy owes no release up-pulse.
+        let cfg = Config {
+            click: crate::config::ClickConfig {
+                sensitivity: 64,
+                margin: 5,
+                ..Config::default().click
+            },
+            haptics: crate::config::HapticsConfig {
+                haptic: 5,
+                ..Config::default().haptics
+            },
+            force: crate::config::ForceConfig {
+                force_offset: 20,
+                force_1: "forward".into(),
+                ..Config::default().force
+            },
+            ..Config::default()
+        };
+        let mut silent = cfg;
+        silent.haptics.force_haptic = Some(0);
+        let mut m = ClickMachine::new();
+        m.update(&[finger(1, 70)], 0, &silent).unwrap();
+        let force = m
+            .update(&[finger(1, 100)], 0, &silent)
+            .unwrap()
+            .force
+            .unwrap();
+        assert!(force.is_force());
+        assert_eq!(force.haptic, 0);
+        assert!(!should_emit_haptic(force.haptic));
     }
 
     #[test]
