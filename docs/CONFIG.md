@@ -99,6 +99,18 @@ For a silent five-finger window drag, use `slide_5 = "super+left"` under
   haptic fires, pointer still moves fine. Fix: set `enhanced_clicks = true` and
   **restart**.
 
+## Evdev override (`LTD_EVDEV_NODE`)
+
+- `LTD_EVDEV_NODE=/dev/input/eventN`: pin the physical evdev node for the
+  grab. Unset (normal) → auto-resolve per hidraw node: sysfs parentage walk,
+  then the BT single-node trusted fallback (exactly one BT pad + one
+  MT-capable event with `004c`/`0265`-class VID:PID proof, grab-worthy),
+  then the untrusted name scan (never grabs).
+- The override is explicit-operator trust: it backs a grab like the sysfs
+  walk. Empty is ignored (falls through to auto-resolve). Use it when the
+  BT fallback logs a DOUBLE-INPUT warning on a multi-device rig, or to pin
+  a stable node across renumbering.
+
 ## Action values (`click_*`, `force_*`, `slide_*`)
 
 - `none`: no action, no haptic. `empty`: no keys, but haptic still fires on the button levels (`click_*`, `force_*`); `slide_* = empty` stays silent (prefer `none`).
