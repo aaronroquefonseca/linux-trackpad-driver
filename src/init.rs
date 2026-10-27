@@ -25,13 +25,16 @@
 //! lost until re-init), so the resume hook MUST re-send multitouch enable —
 //! [`init_usb`] always sends it first and is idempotent.
 //!
-//! Bluetooth path: single node, no init dance — straight to device-ready
-//! (bring-up + init verification scope). Note: hidraw coexists with
-//! `hid-magicmouse` on BT (no exclusivity). A live enhanced proxy session
-//! suppresses duplicate delivery with a reversible evdev grab. Init
-//! and one-shot helpers never unbind the HID driver: teardown would remove
-//! both the evdev and hidraw interfaces. No known BT polling-rate equivalent;
-//! rate tuning is USB-first.
+//! Bluetooth path: single node + two init reports, then device-ready.
+//! Bring-up sends `F1 02 01` (multitouch enable) then `F2 21 01`
+//! (host-click ON) via [`send_bt_init`] — the kernel `hid-magicmouse`
+//! probe sends the same pair, with host-click OFF by default, so without
+//! the second report the trackpad falls back to plain clicks. Best-effort:
+//! send failures warn and bring-up continues (passthrough stays live).
+//! Note: hidraw coexists with `hid-magicmouse` on BT (no exclusivity). A
+//! live enhanced proxy session suppresses duplicate delivery with a
+//! reversible evdev grab. No known BT polling-rate equivalent; rate tuning
+//! is USB-first.
 //!
 //! Clicks integration: the daemon proxy subscribes to [`DeviceReadyHub`].
 //! Init never calls into clicks; it only emits readiness. The proxy node
@@ -496,14 +499,50 @@ pub enum ReadyKind {
 }
 
 /// Bluetooth multitouch-enable report (`F1 02 01`, kernel `magicmouse` BT
-/// path). Documented for bring-up verification only: the BT path sends NO
-/// init reports (single-node, straight to use); the constant exists so tests
-/// and future verify steps pin the expected bytes without drifting.
+/// path). Sent first by [`send_bt_init`] on every BT start/reconnect.
 pub const MULTITOUCH_BT: &[u8] = &[0xF1, 0x02, 0x01];
-/// Bluetooth host-click report builder (`F2 21 0X`). Same status as
-/// [`MULTITOUCH_BT`]: documented, not sent by the BT bring-up path.
+/// Bluetooth host-click report builder (`F2 21 0X`). [`send_bt_init`] sends
+/// the ON variant; the OFF variant is available for a future disengage arm.
 pub fn host_click_bt(enabled: bool) -> [u8; 3] {
     [0xF2, 0x21, u8::from(enabled)]
+}
+
+/// Bluetooth init sequence: multitouch-enable then host-click ON.
+///
+/// Old reference driver (`reconnect.rs`) and the kernel `hid-magicmouse`
+/// probe both send `F1 02 01` + `F2 21 01` on every BT start/reconnect; the
+/// kernel default is host-click OFF, so the second report is what keeps
+/// haptic clicks alive over Bluetooth. Idempotent: safe to re-run on every
+/// BT start/reconnect (same two bytes each time).
+///
+/// Transport-agnostic over [`FeatureSender`] so unit tests drive it with
+/// [`Recorder`]; production passes [`HidrawSender`] (backoff retry + the
+/// mode-switch `EPIPE`/`EIO`-as-success precedent, same as the USB path —
+/// matching the old driver's broken-pipe tolerance). Resume reuses this
+/// for the resume re-send path.
+pub fn send_bt_init(sender: &dyn FeatureSender) -> Result<()> {
+    sender.send(MULTITOUCH_BT)?;
+    sender.send(&host_click_bt(true))?;
+    log::info!("BT init: multitouch F1 02 01, host-click F2 21 01 (ON)");
+    Ok(())
+}
+
+/// [`send_bt_init`] against a live hidraw node, with the probe/bind-race
+/// backoff retry ([`HidrawSender`]) and a best-effort `HIDIOCGFEATURE`
+/// readback logged for diagnosis (some firmware NAKs reads — unreadable is
+/// a debug note, never fatal). Errors propagate; the caller (e.g.
+/// [`init_bluetooth`]) downgrades to a warning so BT bring-up never fails
+/// on init reports alone.
+pub fn send_bt_init_hidraw(devnode: &str) -> Result<()> {
+    let sender = HidrawSender {
+        devnode: devnode.to_string(),
+    };
+    send_bt_init(&sender)?;
+    match get_feature_report_hidraw(devnode, MULTITOUCH_BT[0], MULTITOUCH_BT.len()) {
+        Ok(back) => log::debug!("BT {devnode}: multitouch readback {:02X?}", back),
+        Err(e) => log::debug!("BT {devnode}: multitouch readback unreadable: {e:#}"),
+    }
+    Ok(())
 }
 
 /// Outcome of one idempotent USB init run: the polling plan plus which
@@ -735,9 +774,18 @@ pub struct DeviceReadyEvent {
     pub kind: ReadyKind,
 }
 
-/// Bluetooth path: no init dance, straight to device-ready.
+/// Bluetooth path: single node + init reports, then device-ready.
+///
+/// Sends [`send_bt_init`] (`F1 02 01` multitouch + `F2 21 01` host-click ON)
+/// best-effort via [`send_bt_init_hidraw`]: failures warn and bring-up
+/// continues to Ready (kernel passthrough stays live), never panics.
 pub fn init_bluetooth(devnode: &str) -> DeviceReadyEvent {
-    log::info!("BT {devnode}: single-node path, no init dance — device ready");
+    if let Err(e) = send_bt_init_hidraw(devnode) {
+        log::warn!(
+            "BT {devnode}: init reports best-effort failed ({e:#}); continuing to ready (passthrough still live)"
+        );
+    }
+    log::info!("BT {devnode}: single-node path — device ready");
     DeviceReadyEvent {
         devnode: devnode.to_string(),
         transport: Transport::Bluetooth,
@@ -926,10 +974,53 @@ mod tests {
     }
 
     #[test]
-    fn bt_path_has_no_reports() {
-        let ev = init_bluetooth("/dev/hidraw9");
+    fn bt_init_sequence_order() {
+        // Multitouch first, then host-click ON — old driver + kernel order.
+        let rec = Recorder::default();
+        send_bt_init(&rec).unwrap();
+        assert_eq!(
+            *rec.sent.borrow(),
+            vec![vec![0xF1, 0x02, 0x01], vec![0xF2, 0x21, 0x01]]
+        );
+    }
+
+    #[test]
+    fn bt_init_idempotent_rerun_sends_same_reports() {
+        // Safe re-run on every BT start/reconnect: same two bytes each time.
+        let rec = Recorder::default();
+        send_bt_init(&rec).unwrap();
+        send_bt_init(&rec).unwrap();
+        let sent = rec.sent.borrow();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[0], vec![0xF1, 0x02, 0x01]);
+        assert_eq!(sent[1], vec![0xF2, 0x21, 0x01]);
+        assert_eq!(sent[2], sent[0]);
+        assert_eq!(sent[3], sent[1]);
+    }
+
+    #[test]
+    fn bt_init_propagates_sender_errors() {
+        struct FailAll;
+        impl FeatureSender for FailAll {
+            fn send(&self, _report: &[u8]) -> Result<()> {
+                Err(anyhow::anyhow!("no hardware"))
+            }
+        }
+        assert!(send_bt_init(&FailAll).is_err());
+    }
+
+    #[test]
+    fn bt_init_hidraw_missing_node_errors() {
+        // hidraw convenience propagates (caller downgrades to warning).
+        assert!(send_bt_init_hidraw("/nonexistent-hidraw-xyz").is_err());
+    }
+
+    #[test]
+    fn bt_bring_up_reaches_ready_without_hardware() {
+        // init_bluetooth is best-effort: a missing node warns, still Ready.
+        let ev = init_bluetooth("/nonexistent-hidraw-xyz");
         assert_eq!(ev.transport, Transport::Bluetooth);
-        assert_eq!(ev.devnode, "/dev/hidraw9");
+        assert_eq!(ev.devnode, "/nonexistent-hidraw-xyz");
         assert_eq!(ev.kind, ReadyKind::Ready);
     }
 

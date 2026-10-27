@@ -40,15 +40,23 @@
 //! # Frame framing
 //!
 //! - USB report `0x02`: 12-byte prefix + N × 9-byte contacts.
-//! - BT report `0x31`: 4-byte prefix + N × 9-byte contacts.
+//! - BT report `0x31` and legacy `0x28` alias: 4-byte prefix + N × 9-byte
+//!   contacts. The kernel `hid-magicmouse` `MAGICMOUSE2`/`MT2` path and the
+//!   old userspace decoder parse `0x28` identically to `0x31`; dropping
+//!   `0x28` here would discard 100% of such frames.
 //! - `clicks` = raw `report[1]`; button state is `clicks & 1` — bits 6..7
 //!   are device-timestamp bits, not buttons (for later stages).
 //! - Double report `0xf7`: two back-to-back sub-reports, see
-//!   [`parse_double_report`]; [`parse_frame`] rejects it so frame
-//!   boundaries are never silently merged.
-//! - Legacy report `0x28` (gen-1 packing, no pressure at offset 7) is
-//!   rejected with a clear error rather than misdecoded.
-//! - Max 15 contacts per frame; remainder/trailing bytes are an error.
+//!   [`parse_double_report`] (strict: both halves must decode) and
+//!   [`parse_double_report_partial`] (lossy: returns each good half, so a
+//!   malformed sibling cannot drop good contacts — mirroring the kernel,
+//!   which processes each half independently); [`parse_frame`] rejects
+//!   `0xf7` so frame boundaries are never silently merged.
+//! - Max 15 contacts per frame; trailing bytes after the last full 9-byte
+//!   block are ignored with a `debug!` log when at least one full contact
+//!   is present (BT firmware may append status bytes — dropping the whole
+//!   frame for those would stick fingers / cause extra clicks). A body that
+//!   holds zero full contacts plus trailing bytes is still an error.
 //! - Device timestamp bits exist in the prefix but are unused (as in the
 //!   kernel), so `timestamp_ms` is always 0.
 //!
@@ -74,7 +82,9 @@ pub const MAX_CONTACTS: usize = 15;
 pub const TRACKPAD2_USB_REPORT_ID: u8 = 0x02;
 /// Bluetooth multitouch report: 4-byte prefix + N × 9 B.
 pub const TRACKPAD2_BT_REPORT_ID: u8 = 0x31;
-/// Legacy gen-1 report (different packing; rejected, never misdecoded).
+/// Legacy report id: decoded identically to [`TRACKPAD2_BT_REPORT_ID`]
+/// (4-byte prefix + N × 9 B), matching the kernel `hid-magicmouse` MT2 path
+/// and the old userspace decoder.
 pub const TRACKPAD_LEGACY_REPORT_ID: u8 = 0x28;
 /// Double report: two sub-reports back-to-back.
 pub const DOUBLE_REPORT_ID: u8 = 0xf7;
@@ -203,24 +213,23 @@ pub fn parse_contact(block: &[u8]) -> Result<FingerContact> {
     })
 }
 
-/// Decode one single-frame report (`0x02` USB or `0x31` BT).
+/// Decode one single-frame report (`0x02` USB, `0x31` BT, or legacy `0x28`
+/// as a BT alias with the same 4-byte prefix).
 ///
-/// Rejects `0xf7` (use [`parse_double_report`]) and `0x28` (legacy
-/// packing) so neither frame merging nor misdecode can happen silently.
+/// Rejects `0xf7` (use [`parse_double_report`] for strict both-halves or
+/// [`parse_double_report_partial`] for lossy per-half decode) so frame
+/// boundaries are never silently merged.
 pub fn parse_frame(report: &[u8]) -> Result<TouchFrame> {
     let Some(&id) = report.first() else {
         bail!("empty report");
     };
     match id {
         TRACKPAD2_USB_REPORT_ID => parse_frame_with_prefix(report, USB_PREFIX_LEN),
-        TRACKPAD2_BT_REPORT_ID => parse_frame_with_prefix(report, BT_PREFIX_LEN),
+        TRACKPAD2_BT_REPORT_ID | TRACKPAD_LEGACY_REPORT_ID => {
+            parse_frame_with_prefix(report, BT_PREFIX_LEN)
+        }
         DOUBLE_REPORT_ID => {
             bail!("double report 0xf7 holds two frames; use parse_double_report")
-        }
-        TRACKPAD_LEGACY_REPORT_ID => {
-            bail!(
-                "legacy report 0x28 uses gen-1 packing (no pressure@7); unsupported by MT2 parser"
-            )
         }
         _ => bail!("unknown report id {id:#04x}"),
     }
@@ -234,17 +243,26 @@ fn parse_frame_with_prefix(report: &[u8], prefix: usize) -> Result<TouchFrame> {
         );
     }
     let body = &report[prefix..];
-    if !body.len().is_multiple_of(CONTACT_BLOCK_LEN) {
+    let n_full = body.len() / CONTACT_BLOCK_LEN;
+    let trailing = body.len() % CONTACT_BLOCK_LEN;
+    if n_full == 0 && trailing != 0 {
         bail!(
-            "trailing bytes: body {} not a multiple of {CONTACT_BLOCK_LEN}",
+            "trailing bytes without full contact: body {} not a multiple of {CONTACT_BLOCK_LEN}",
             body.len()
         );
     }
-    let n = body.len() / CONTACT_BLOCK_LEN;
-    if n > MAX_CONTACTS {
-        bail!("too many contacts: {n} > {MAX_CONTACTS}");
+    if n_full > MAX_CONTACTS {
+        bail!("too many contacts: {n_full} > {MAX_CONTACTS}");
     }
-    let fingers = body
+    if trailing != 0 {
+        log::debug!(
+            "report {:#04x}: ignoring {trailing} trailing byte(s) after {n_full} contact(s) (body {} B)",
+            report[0],
+            body.len()
+        );
+    }
+    let full = &body[..n_full * CONTACT_BLOCK_LEN];
+    let fingers = full
         .as_chunks::<CONTACT_BLOCK_LEN>()
         .0
         .iter()
@@ -258,11 +276,12 @@ fn parse_frame_with_prefix(report: &[u8], prefix: usize) -> Result<TouchFrame> {
 }
 
 /// Split a `0xf7` double report into its two frames.
-/// Layout: `[0xf7, first_len, <first..>, <second..>]` where `first_len` is
-/// the byte length of the first sub-report starting at offset 2 — the
-/// kernel `hid-magicmouse.c` `magicmouse_raw_event` `DOUBLE_REPORT_ID`
-/// path recurses with `(data + 2, data[1])` then
-/// `(data + 2 + data[1], size - 2 - data[1])`.
+///
+/// Strict variant: both halves must decode (trailing bytes inside each half
+/// are tolerated per [`parse_frame`]); any malformed half is an error and
+/// the caller drops the whole double. For the lossy kernel-like behavior
+/// (process the good half even when its sibling is malformed), use
+/// [`parse_double_report_partial`].
 pub fn parse_double_report(report: &[u8]) -> Result<(TouchFrame, TouchFrame)> {
     if report.first() != Some(&DOUBLE_REPORT_ID) {
         bail!("not a double report (missing 0xf7 id)");
@@ -280,6 +299,57 @@ pub fn parse_double_report(report: &[u8]) -> Result<(TouchFrame, TouchFrame)> {
     let first = parse_frame(&report[2..2 + first_len])?;
     let second = parse_frame(&report[2 + first_len..])?;
     Ok((first, second))
+}
+
+/// Lossy split of a `0xf7` double report: decode each half independently
+/// and return every good half (0–2 frames), mirroring the kernel
+/// `hid-magicmouse.c` path which processes each sub-report on its own.
+///
+/// A malformed half is skipped with a `debug!` log instead of discarding
+/// its good sibling. Outer framing errors (missing id/length, `first_len`
+/// overshoot) yield an empty vec. An empty second half (single-subreport
+/// double) is treated as absent, not malformed.
+///
+/// NOTE: the live pump still calls [`parse_double_report`]; it should
+/// migrate to this helper so one bad half can no longer drop good contacts.
+pub fn parse_double_report_partial(report: &[u8]) -> Vec<TouchFrame> {
+    if report.first() != Some(&DOUBLE_REPORT_ID) {
+        log::debug!("double report: missing 0xf7 id, dropping");
+        return Vec::new();
+    }
+    if report.len() < 2 {
+        log::debug!("double report: short, no length byte");
+        return Vec::new();
+    }
+    let first_len = usize::from(report[1]);
+    if report.len() < 2 + first_len {
+        log::debug!(
+            "double report: claims first_len {first_len}, have {}; dropping",
+            report.len() - 2
+        );
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(2);
+    let first_slice = &report[2..2 + first_len];
+    match parse_frame(first_slice) {
+        Ok(f) => out.push(f),
+        Err(e) => log::debug!(
+            "double report: dropping malformed first half ({} B): {e:#}",
+            first_slice.len()
+        ),
+    }
+    let second_slice = &report[2 + first_len..];
+    if second_slice.is_empty() {
+        return out;
+    }
+    match parse_frame(second_slice) {
+        Ok(f) => out.push(f),
+        Err(e) => log::debug!(
+            "double report: dropping malformed second half ({} B): {e:#}",
+            second_slice.len()
+        ),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -437,14 +507,17 @@ mod tests {
         assert!(parse_frame(&[]).is_err()); // empty
         assert!(parse_frame(&[0x02]).is_err()); // shorter than prefix
         assert!(parse_frame(&[0x02, 0, 0]).is_err()); // shorter than prefix
-                                                      // Trailing bytes: prefix + 8 (not a multiple of 9).
+                                                      // Trailing bytes with zero full contacts are still an error
+                                                      // (nothing good to save; pump relies on this for pure garbage).
         let mut r = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         r.extend_from_slice(&[0u8; 8]);
         assert!(parse_frame(&r).is_err());
+        let mut bt = vec![0x31, 0, 0, 0];
+        bt.extend_from_slice(&[0u8; 8]);
+        assert!(parse_frame(&bt).is_err());
         assert!(parse_frame(&[0xFF, 0, 0, 0]).is_err()); // unknown id
-        assert!(parse_frame(&[0x28, 0, 0, 0]).is_err()); // legacy, never misdecode
-        assert!(parse_frame(&[0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
-        // 0xf7 must go through parse_double_report, not parse_frame.
+                                                         // 0x28 is a BT alias now (see legacy_0x28_* tests), not an error.
+                                                         // 0xf7 must go through parse_double_report, not parse_frame.
         assert!(parse_frame(&[0xF7, 0]).is_err());
     }
 
@@ -503,12 +576,127 @@ mod tests {
         nested.extend_from_slice(&s1);
         nested.extend_from_slice(&[0xF7, 0x00]);
         assert!(parse_double_report(&nested).is_err());
-        // Trailing garbage after second frame.
+        // Trailing garbage after a full contact inside the second half is
+        // tolerated now (floor-parse): strict still succeeds.
         let mut s2 = good_sub(0, 20);
         s2.push(0xFF);
         let mut trailing = vec![0xF7, s1.len() as u8];
         trailing.extend_from_slice(&s1);
         trailing.extend_from_slice(&s2);
-        assert!(parse_double_report(&trailing).is_err());
+        let (t1, t2) = parse_double_report(&trailing).unwrap();
+        assert_eq!(t1.fingers.len(), 1);
+        assert_eq!(t2.fingers.len(), 1);
+        assert_eq!(t2.fingers[0].pressure, 20);
+    }
+
+    #[test]
+    fn legacy_0x28_alias_of_0x31_one_and_two_contacts() {
+        // 0x28 decodes identically to 0x31: same 4-byte prefix, same 9B blocks.
+        let mk = |id: u8, pressures: &[u8]| {
+            let mut r = vec![id, 0x01, 0, 0];
+            for (i, &p) in pressures.iter().enumerate() {
+                let mut c = contact_bytes(&[(3, 0x80), (7, p)]);
+                c[8] = (i as u8) & 0x0f;
+                r.extend_from_slice(&c);
+            }
+            r
+        };
+        for pressures in [vec![42u8], vec![10u8, 200u8]] {
+            let bt = parse_frame(&mk(0x31, &pressures)).unwrap();
+            let legacy = parse_frame(&mk(0x28, &pressures)).unwrap();
+            assert_eq!(legacy, bt, "0x28 must match 0x31 for {pressures:?}");
+            assert_eq!(legacy.fingers.len(), pressures.len());
+            assert_eq!(legacy.clicks, 0x01);
+            for (f, &p) in legacy.fingers.iter().zip(&pressures) {
+                assert_eq!(f.pressure, p);
+                assert!(f.contact);
+            }
+        }
+        // Bare 0x28 prefix with no contacts is an empty frame like 0x31.
+        assert!(parse_frame(&[0x28, 0, 0, 0]).unwrap().fingers.is_empty());
+    }
+
+    #[test]
+    fn trailing_bytes_tolerated_bt_floor_parse() {
+        // BT frame: 4-byte prefix + N*9 contacts + k trailing bytes (k=1..8).
+        // Must return the N good contacts, ignoring the tail.
+        for n in [1usize, 2] {
+            for k in 1..CONTACT_BLOCK_LEN {
+                let mut report = vec![0x31, 0x00, 0, 0];
+                for i in 0..n {
+                    let mut c = contact_bytes(&[(3, 0x80), (7, 50 + i as u8), (8, i as u8)]);
+                    c[8] = i as u8 & 0x0f;
+                    report.extend_from_slice(&c);
+                }
+                report.extend_from_slice(&vec![0xAA; k]);
+                let frame = parse_frame(&report)
+                    .unwrap_or_else(|e| panic!("N={n} k={k} should tolerate trailing: {e:#}"));
+                assert_eq!(frame.fingers.len(), n, "N={n} k={k}");
+                for (i, f) in frame.fingers.iter().enumerate() {
+                    assert_eq!(f.pressure, 50 + i as u8);
+                    assert!(f.contact);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_tolerated_usb_with_contacts() {
+        // USB decode itself is unchanged for well-formed frames; trailing
+        // bytes after >=1 full contact are ignored the same way as BT.
+        // Sweep k=1..8 like the BT test (every non-block-aligned tail).
+        for k in 1..CONTACT_BLOCK_LEN {
+            let mut report = vec![0x02, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            report.extend_from_slice(&contact_bytes(&[(3, 0x80), (7, 77), (8, 0x04)]));
+            report.extend_from_slice(&vec![0x55; k]);
+            let frame = parse_frame(&report)
+                .unwrap_or_else(|e| panic!("USB k={k} should tolerate trailing: {e:#}"));
+            assert_eq!(frame.fingers.len(), 1, "USB k={k}");
+            assert_eq!(frame.fingers[0].pressure, 77);
+            assert_eq!(frame.fingers[0].id, 4);
+            assert_eq!(frame.clicks, 0x01);
+        }
+    }
+
+    #[test]
+    fn double_partial_returns_good_half_when_other_bad() {
+        let good_sub = |clicks: u8, pressure: u8| {
+            let mut r = vec![0x31, clicks, 0, 0];
+            r.extend_from_slice(&contact_bytes(&[(3, 0x80), (7, pressure), (8, 0x01)]));
+            r
+        };
+        // Bad second half (unknown id): strict fails, partial keeps first.
+        let s1 = good_sub(1, 10);
+        let mut dbl_bad_second = vec![0xF7, s1.len() as u8];
+        dbl_bad_second.extend_from_slice(&s1);
+        dbl_bad_second.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00]);
+        assert!(parse_double_report(&dbl_bad_second).is_err());
+        let partial = parse_double_report_partial(&dbl_bad_second);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].fingers[0].pressure, 10);
+        assert_eq!(partial[0].clicks, 1);
+        // Bad first half (misaligned: body 8 with zero full contacts):
+        // strict fails, partial keeps second.
+        let s2 = good_sub(0, 20);
+        let mut dbl_bad_first = vec![0xF7, 12u8];
+        dbl_bad_first.extend_from_slice(&[0x31, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        dbl_bad_first.extend_from_slice(&s2);
+        assert!(parse_double_report(&dbl_bad_first).is_err());
+        let partial = parse_double_report_partial(&dbl_bad_first);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].fingers[0].pressure, 20);
+        // Both good: partial returns both in order.
+        let a = good_sub(1, 11);
+        let b = good_sub(0, 22);
+        let mut both = vec![0xF7, a.len() as u8];
+        both.extend_from_slice(&a);
+        both.extend_from_slice(&b);
+        let partial = parse_double_report_partial(&both);
+        assert_eq!(partial.len(), 2);
+        assert_eq!(partial[0].fingers[0].pressure, 11);
+        assert_eq!(partial[1].fingers[0].pressure, 22);
+        // Outer framing broken: empty vec, no panic.
+        assert!(parse_double_report_partial(&[0xF7, 255, 0x31]).is_empty());
+        assert!(parse_double_report_partial(&[0x31, 0, 0, 0]).is_empty());
     }
 }
