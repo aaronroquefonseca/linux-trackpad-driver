@@ -1131,7 +1131,8 @@ fn verify_attach_stream(chosen: &str) {
 
 /// Initialize one discovered node and return its ready event.
 /// USB: defer (node+bind) → retrying feature reports → verify → ready.
-/// BT: no reports, straight to ready. Native input is suppressed only by a
+/// BT: single node + init reports (`F1 02 01` + `F2 21 01`, best-effort
+/// inside [`init::init_bluetooth`]) → ready. Native input is suppressed only by a
 /// live proxy's reversible evdev grab, never by hardware initialization.
 /// Device setup runs independently of the enhanced-clicks gate.
 pub fn init_node(
@@ -1141,6 +1142,8 @@ pub fn init_node(
 ) -> Result<DeviceReadyEvent> {
     match dev.transport {
         Transport::Bluetooth => {
+            // BT init reports (F1 02 01 + F2 21 01) go out best-effort
+            // inside init_bluetooth, before the proxy attach below.
             let ev = init::init_bluetooth(&dev.devnode);
             ready_hub.emit(&ev);
             Ok(ev)
@@ -1474,7 +1477,9 @@ fn reconnect_classified_node(
     match transport {
         Transport::Bluetooth => {
             // No BT polling-rate equivalent (USB-first scope): -p/ config rate
-            // is intentionally ignored here, never placed on the wire.
+            // is intentionally ignored here, never placed on the wire. The BT
+            // init reports (F1 02 01 + F2 21 01) go out best-effort inside
+            // init_bluetooth below.
             if polling_override.is_some() {
                 log::warn!(
                     "BT {devnode}: skipping polling rate (unsupported on Bluetooth; USB-first)"
@@ -2326,7 +2331,7 @@ mod tests {
     fn hotplug_wake_attaches_session_without_waiting_for_verify() {
         // Finding #9: a plug event must reconcile to an attached session
         // on the fast hotplug pass, not at the next 30 s verification.
-        // Both transports: USB (feature-report init) and BT (direct Ready).
+        // Both transports: USB (feature-report init) and BT (best-effort init reports → Ready).
         use crate::hotplug::{Schedule, Work};
         use std::time::{Duration, Instant};
         for dev in fixture_devs() {
@@ -3005,7 +3010,8 @@ mod tests {
     }
 
     #[test]
-    fn init_node_bt_emits_ready_without_reports() {
+    fn init_node_bt_emits_ready_best_effort() {
+        // BT init reports are best-effort: no hardware here, still Ready.
         let hub = DeviceReadyHub::new();
         let dev = DiscoveredDevice {
             devnode: "/dev/hidraw9".into(),
