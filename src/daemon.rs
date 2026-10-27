@@ -2869,12 +2869,16 @@ mod tests {
 
     #[test]
     fn resume_tick_emits_detached_for_vanished_node() {
-        // Watch thinks an impossible node exists; the real scan can never
-        // contain it → vanish path → Detached on the hub, never Ready.
+        // Watch thinks an impossible node exists; the injected scan is
+        // empty → vanish path → Detached on the hub, never Ready.
+        // Hermetic by design: a live scan here would adopt whatever host
+        // trackpad is attached (and run real init on it), so the scan and
+        // the hardware backend are both injected.
         let hub = DeviceReadyHub::new();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = std::sync::Arc::clone(&seen);
         hub.subscribe(move |ev| capture.lock().expect("seen lock").push(ev.clone()));
+        let hardware = TestHardware::new(&hub);
         let mut watch = ResumeWatch::new(&[DiscoveredDevice {
             devnode: "/dev/hidraw-nope".into(),
             vendor_id: 0x05ac,
@@ -2882,16 +2886,21 @@ mod tests {
             transport: Transport::Usb,
         }]);
         let cfg = Config::default();
-        let actions = watch.tick(&cfg, &hub, &|_| false);
+        let actions = watch.tick_with_hardware(&cfg, &hub, Vec::new(), &|_| false, &hardware);
         assert_eq!(
             actions,
             vec![TickAction::Detached("/dev/hidraw-nope".into())]
+        );
+        assert_eq!(
+            hardware.inits.get(),
+            0,
+            "vanish-only pass must not initialize anything"
         );
         let seen = seen.lock().expect("seen lock");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].kind, crate::init::ReadyKind::Detached);
         // Second tick: steady state, no repeat traffic.
-        let actions = watch.tick(&cfg, &hub, &|_| false);
+        let actions = watch.tick_with_hardware(&cfg, &hub, Vec::new(), &|_| false, &hardware);
         assert!(actions.is_empty());
         assert_eq!(seen.len(), 1);
     }
