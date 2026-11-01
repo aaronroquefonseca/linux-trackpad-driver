@@ -1,0 +1,50 @@
+# CodeRabbit configuration for linux-trackpad-driver.
+# Docs: https://docs.coderabbit.ai/getting-started/yaml-configuration
+# Plan: public repo => OSS tier (Team features, no subscription). Note: repos
+# with <10 stars require manual `@coderabbitai review` triggers per review.
+
+language: en-US
+
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true
+    drafts: false
+  auto_approvals:
+    enabled: false
+  path_filters:
+    - "!target/**"
+    - "!**/target/**"
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        This is a Linux userspace input driver (evdev/uinput, hidraw). Focus on correctness, error handling, and resource cleanup (locks, file descriptors, threads across suspend/resume/reconnect).
+        Flag unwrap()/expect() or other panic paths reachable at runtime in daemon code; tests and build scripts are exempt.
+        Flag unsafe blocks that lack a justification comment.
+        Tests must use mocks/isolated fixtures and must not touch real hardware; flag tests requiring a physical trackpad.
+    - path: "tests/**/*.rs"
+      instructions: |
+        Ensure descriptive test names and coverage of edge cases and error paths. Tests must not require physical hardware.
+    - path: "config/**/*.toml"
+      instructions: |
+        Flag breaking changes to config keys or defaults; these must be documented.
+    - path: ".github/workflows/**"
+      instructions: |
+        Flag workflow changes that weaken CI (fmt, clippy with -D warnings, tests) or packaging checks.
+  tools:
+    clippy:
+      enabled: true
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: true
