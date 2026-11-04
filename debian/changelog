@@ -1,3 +1,11 @@
+linux-trackpad-driver (0.1.4-1) unstable; urgency=medium
+
+  * Prevent phantom tap-to-click events from contact slot reassignment.
+  * Preserve virtual contact lifetimes across hovering and report reordering.
+  * Add isolated contact lifetime regression coverage.
+
+ -- Aarón Roque Fonseca <aaronroquefonseca@gmail.com>  Wed, 04 Nov 2026 15:02:47 +0000
+
 linux-trackpad-driver (0.1.3-1) unstable; urgency=medium
 
   * Complete Bluetooth bring-up, parsing, suppression, and click staging.

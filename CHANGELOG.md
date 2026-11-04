@@ -1,3 +1,25 @@
+## [0.1.4] - 2026-11-04
+
+### Highlights
+
+- Stop unexpected left clicks when one finger rests on the pad while two or three additional fingers tap ([#99](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/99)).
+- Keep resting contacts continuous while other fingers approach, lift, or change order in device reports, preventing false taps in libinput.
+- Give genuine new touches fresh tracking identities, including when the hardware reuses a finger ID.
+- Preserve contact lifetimes and cleanup when finger-count spoofing changes the virtual touch stream.
+- Protect the fix with six isolated regressions; hardware A/B testing confirmed the original phantom returned with the previous driver and could not be reproduced with the fix.
+
+### Details
+
+#### Bug Fixes
+
+- Prevent phantom taps from contact slot reassignment (proxy) ([619a201](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/619a20163b071c23e1f29b180aa6d73a4905e77a))
+
+#### Miscellaneous
+
+- Add CodeRabbit config for OSS reviews ([#98](https://github.com/aaronroquefonseca/linux-trackpad-driver/pull/98)) (ci) ([b0ad8c5](https://github.com/aaronroquefonseca/linux-trackpad-driver/commit/b0ad8c561dab1980ed246097128d15a26d14c8de))
+
+Full diff: https://github.com/aaronroquefonseca/linux-trackpad-driver/compare/v0.1.3...v0.1.4
+
 ## [0.1.3] - 2026-10-27
 
 ### Highlights

@@ -13,7 +13,7 @@
 # The CI Fedora job additionally builds and installs a binary RPM.
 
 Name:           linux-trackpad-driver
-Version:        0.1.3
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Userspace driver enhancing Apple Magic Trackpad 2 functionality
 License:        MIT OR Apache-2.0
@@ -85,6 +85,10 @@ fi
 %{_prefix}/lib/systemd/system-sleep/ltd-resume
 
 %changelog
+* Wed Nov 04 2026 Aarón Roque Fonseca <aaronroquefonseca@gmail.com> - 0.1.4-1
+- Prevent phantom tap-to-click events from contact slot reassignment.
+- Preserve contact lifetimes across hovering and report reordering.
+
 * Tue Oct 27 2026 Aarón Roque Fonseca <aaronroquefonseca@gmail.com> - 0.1.3-1
 - Complete Bluetooth bring-up, parsing, suppression, and click staging.
 - Hermetic resume tick test with no host hardware scan.
