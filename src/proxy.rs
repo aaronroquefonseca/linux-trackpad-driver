@@ -45,8 +45,8 @@
 //!   frame carries no contacts — never from latch state alone, and never
 //!   from the physical bit under fingers (a right/combo/empty hold must not
 //!   chord left; old-service parity).
-//! - Slots are positional per frame (see [`ClickProxy::emit_touch_frame`]
-//!   slot-map docs); vacated slots are terminated with `TRACKING_ID=-1`.
+//! - Touching contacts keep stable slots for their lifetime (see
+//!   [`ClickProxy::emit_touch_frame`]); liftoff terminates `TRACKING_ID=-1`.
 //! - Orientation emits `-(raw)`; pressure/major/minor emit the
 //!   old-service normalized 60/800/800 (raw bytes are arbitrary units
 //!   the classifier drops).
@@ -669,7 +669,12 @@ pub struct ClickProxy<G, U, H, S> {
     held_force: Vec<(u16, u16)>,
     held_slide: Vec<(u16, u16)>,
     last_pos: HashMap<u8, PointerAnchor>,
-    /// Highest slot index written so far; vacated slots are terminated.
+    /// Hardware/synthetic contact id owning each live virtual slot. Report
+    /// ordering and hovering contacts must never move a touching contact.
+    contact_slots: [Option<VirtualContact>; 16],
+    /// Fresh virtual tracking id for each contact lifetime (0..=65535).
+    next_tracking_id: u16,
+    /// Highest slot index written this session, for teardown termination.
     max_slot: usize,
     /// Last `BTN_LEFT` value on the wire. `BTN_LEFT` is edge-triggered:
     /// it emits only on state change, so non-left clicks carry zero
@@ -702,6 +707,12 @@ pub struct ClickProxy<G, U, H, S> {
     /// keys live in `held_*`; pending keys carry separate ownership so cancellation
     /// cannot release a never-pressed button or revive an old action.
     pending_buttons: Option<PendingButtons>,
+}
+
+#[derive(Clone, Copy)]
+struct VirtualContact {
+    id: u8,
+    tracking_id: u16,
 }
 
 struct PendingButtons {
@@ -757,6 +768,8 @@ where
             held_force: Vec::new(),
             held_slide: Vec::new(),
             last_pos: HashMap::new(),
+            contact_slots: [None; 16],
+            next_tracking_id: 1,
             max_slot: 0,
             btn_left_down: false,
             physical_left_down: false,
@@ -1031,6 +1044,7 @@ where
         self.pending_force = None;
         self.pending_buttons = None;
         self.last_pos.clear();
+        self.contact_slots.fill(None);
         self.max_slot = 0;
         self.pump_ready = false;
         self.attached = false;
@@ -1959,13 +1973,11 @@ where
     /// Emit Type-B MT slots for one frame. No trailing `SYN`: the caller
     /// syncs once per frame after keys.
     ///
-    /// Slot-map semantics (transport-task contract): slots are POSITIONAL —
-    /// slot N is the Nth contact in the frame, reassigned every frame, and
-    /// carries no identity across frames. Identity lives in `TRACKING_ID`
-    /// (the device id); libinput pairs slot↔id per `SYN`. A slot with no
-    /// contact this frame gets `TRACKING_ID = -1`, including slots that
-    /// existed only in earlier frames (`max_slot` termination) — without
-    /// that, a 2→1 finger transition leaves a ghost contact alive downstream.
+    /// A touching contact keeps its slot until it lifts or disappears,
+    /// regardless of report ordering or non-touching contact records. New
+    /// lifetimes get a fresh tracking id; continuing touches emit axes only.
+    /// In particular, approaching fingers must not end/restart a resting
+    /// finger's slot: libinput can interpret those synthetic liftoffs as taps.
     ///
     /// Presence follows [`clicks::touch_present`] (device flag OR pressure
     /// past the touch floor, old-service parity). Per-contact axis order
@@ -2008,45 +2020,82 @@ where
         };
         let present_count = fingers.iter().filter(|f| clicks::touch_present(f)).count();
         let any_touch = present_count > 0;
-        let n = fingers.len().min(16);
-        // Single-touch position mirrors the first touching contact (slot 0);
-        // skipped with no contacts (last position stands, as on hardware).
-        let mut first_xy: Option<(i32, i32)> = None;
-        for (slot, f) in fingers.iter().take(16).enumerate() {
-            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
-            if clicks::touch_present(f) {
-                self.uinput
-                    .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(f.id))?;
-                let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.pointer.speed);
-                if first_xy.is_none() {
-                    first_xy = Some((sx, sy));
+        // Release missing/lifted owners before allocating slots to newcomers.
+        // Hovering records have no slot and cannot displace a live contact.
+        let previously_free = self.contact_slots.map(|contact| contact.is_none());
+        for slot in 0..self.contact_slots.len() {
+            if let Some(VirtualContact { id, .. }) = self.contact_slots[slot] {
+                if !fingers
+                    .iter()
+                    .any(|f| f.id == id && clicks::touch_present(f))
+                {
+                    self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
+                    self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
+                    self.contact_slots[slot] = None;
+                    self.last_pos.remove(&id);
                 }
-                self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx)?;
-                self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy)?;
-                self.uinput
-                    .emit(EV_ABS, ABS_MT_PRESSURE, TOUCH_PRESSURE_NORM)?;
-                self.uinput
-                    .emit(EV_ABS, ABS_MT_TOUCH_MAJOR, TOUCH_SIZE_NORM)?;
-                self.uinput
-                    .emit(EV_ABS, ABS_MT_TOUCH_MINOR, TOUCH_SIZE_NORM)?;
-                self.uinput.emit(
-                    EV_ABS,
-                    ABS_MT_ORIENTATION,
-                    i32::from(clicks::negate_orientation(f.orientation)),
-                )?;
-            } else {
-                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
-                self.last_pos.remove(&f.id);
             }
         }
-        // Terminate slots that existed in earlier frames but not this one.
-        if n <= self.max_slot {
-            for slot in n..=self.max_slot {
-                self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
-                self.uinput.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)?;
+        // Single-touch axes follow the first touching report contact; MT
+        // identity is independent of this pointer-emulation choice.
+        let mut first_xy: Option<(i32, i32)> = None;
+        for f in fingers.iter().filter(|f| clicks::touch_present(f)) {
+            let existing = self
+                .contact_slots
+                .iter()
+                .position(|contact| contact.is_some_and(|contact| contact.id == f.id));
+            // Prefer a previously unused slot: an end+begin in the same slot
+            // and SYN can be coalesced by consumers into a continued touch.
+            let free = || {
+                self.contact_slots
+                    .iter()
+                    .enumerate()
+                    .position(|(slot, contact)| contact.is_none() && previously_free[slot])
+                    .or_else(|| self.contact_slots.iter().position(Option::is_none))
+            };
+            let slot = match existing.or_else(free) {
+                Some(slot) => slot,
+                None => break, // The virtual device advertises 16 slots.
+            };
+            self.uinput.emit(EV_ABS, ABS_MT_SLOT, slot as i32)?;
+            if existing.is_none() {
+                // Wrapping the advertised 16-bit range must not reuse an id
+                // that is still held by a long-lived contact.
+                while self
+                    .contact_slots
+                    .iter()
+                    .flatten()
+                    .any(|contact| contact.tracking_id == self.next_tracking_id)
+                {
+                    self.next_tracking_id = self.next_tracking_id.wrapping_add(1);
+                }
+                self.uinput
+                    .emit(EV_ABS, ABS_MT_TRACKING_ID, i32::from(self.next_tracking_id))?;
+                self.contact_slots[slot] = Some(VirtualContact {
+                    id: f.id,
+                    tracking_id: self.next_tracking_id,
+                });
+                self.next_tracking_id = self.next_tracking_id.wrapping_add(1);
+                self.max_slot = self.max_slot.max(slot);
             }
+            let (sx, sy) = self.scaled_pos(f.id, f.x, f.y, cfg.pointer.speed);
+            if first_xy.is_none() {
+                first_xy = Some((sx, sy));
+            }
+            self.uinput.emit(EV_ABS, ABS_MT_POSITION_X, sx)?;
+            self.uinput.emit(EV_ABS, ABS_MT_POSITION_Y, sy)?;
+            self.uinput
+                .emit(EV_ABS, ABS_MT_PRESSURE, TOUCH_PRESSURE_NORM)?;
+            self.uinput
+                .emit(EV_ABS, ABS_MT_TOUCH_MAJOR, TOUCH_SIZE_NORM)?;
+            self.uinput
+                .emit(EV_ABS, ABS_MT_TOUCH_MINOR, TOUCH_SIZE_NORM)?;
+            self.uinput.emit(
+                EV_ABS,
+                ABS_MT_ORIENTATION,
+                i32::from(clicks::negate_orientation(f.orientation)),
+            )?;
         }
-        self.max_slot = n.saturating_sub(1);
         if let Some((sx, sy)) = first_xy {
             self.uinput.emit(EV_ABS, ABS_X, sx)?;
             self.uinput.emit(EV_ABS, ABS_Y, sy)?;
@@ -3531,6 +3580,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod touch_slots;
     use crate::apple_parse::{CapabilityTier, FingerContact, PressureUnits, TouchFrame};
     use crate::config::Config;
     use crate::daemon::PumpManager;
@@ -4008,7 +4059,7 @@ mod tests {
         // raw orientation 2 negates to -2.
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_PRESSURE, 60));
         assert!(sinks.pointer.has(EV_ABS, ABS_MT_ORIENTATION, -2));
-        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TRACKING_ID, 5));
+        assert!(sinks.pointer.has(EV_ABS, ABS_MT_TRACKING_ID, 1));
         assert!(sinks.pointer.has(EV_KEY, BTN_TOUCH, 1));
         // click_1 = left → BTN_LEFT down; haptic fired (default 2, quiet).
         assert!(sinks.pointer.has(EV_KEY, BTN_LEFT, 1));
@@ -5997,6 +6048,7 @@ mod tests {
                 assert!(!px.is_attached(), "{label}/{teardown}: still attached");
                 assert!(px.is_passthrough(), "{label}/{teardown}: not passthrough");
                 assert_eq!(px.max_slot, 0, "{label}/{teardown}: max_slot not reset");
+                assert!(px.contact_slots.iter().all(Option::is_none));
                 assert!(px.last_pos.is_empty(), "{label}/{teardown}: anchors leak");
                 assert!(!px.btn_left_down, "{label}/{teardown}: BTN_LEFT flag stuck");
                 let evs = sinks.pointer.events.lock().unwrap().clone();
@@ -7555,7 +7607,6 @@ mod tests {
             // Hold frame: moved +5/+5 at 100% speed; buttons unchanged, so
             // no BTN_LEFT traffic at all — only touch + BTN_TOUCH + TOOL + SYN.
             (EV_ABS, ABS_MT_SLOT, 0),
-            (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 15),
             (EV_ABS, ABS_MT_POSITION_Y, 25),
             (EV_ABS, ABS_MT_PRESSURE, 60),
@@ -7574,7 +7625,6 @@ mod tests {
             // Release frame: pressure 10 <= release 59, latch drops; the
             // contact is still present so touch stays up until liftoff.
             (EV_ABS, ABS_MT_SLOT, 0),
-            (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 15),
             (EV_ABS, ABS_MT_POSITION_Y, 25),
             (EV_ABS, ABS_MT_PRESSURE, 60),
@@ -7686,7 +7736,6 @@ mod tests {
             (EV_KEY, BTN_LEFT, 1),
             (EV_SYN, SYN_REPORT, 0),
             (EV_ABS, ABS_MT_SLOT, 0),
-            (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 0),
             (EV_ABS, ABS_MT_POSITION_Y, 0),
             (EV_ABS, ABS_MT_PRESSURE, 60),
@@ -7703,7 +7752,6 @@ mod tests {
             (EV_KEY, BTN_TOOL_QUINTTAP, 0),
             (EV_SYN, SYN_REPORT, 0),
             (EV_ABS, ABS_MT_SLOT, 0),
-            (EV_ABS, ABS_MT_TRACKING_ID, 1),
             (EV_ABS, ABS_MT_POSITION_X, 0),
             (EV_ABS, ABS_MT_POSITION_Y, 0),
             (EV_ABS, ABS_MT_PRESSURE, 60),
@@ -9282,11 +9330,19 @@ mod tests {
         want.push((EV_KEY, BTN_LEFT, 1));
         want.push((EV_SYN, SYN_REPORT, 0));
         // Hold: touch + TOOL + SYN only.
-        want.extend(touch_block());
+        want.extend(
+            touch_block()
+                .into_iter()
+                .filter(|&(_, code, _)| code != ABS_MT_TRACKING_ID),
+        );
         want.extend(tool_finger());
         want.push((EV_SYN, SYN_REPORT, 0));
         // Release: LEFT up + SYN (no flutter from the still-set button bit).
-        want.extend(touch_block());
+        want.extend(
+            touch_block()
+                .into_iter()
+                .filter(|&(_, code, _)| code != ABS_MT_TRACKING_ID),
+        );
         want.extend(tool_finger());
         want.push((EV_KEY, BTN_LEFT, 0));
         want.push((EV_SYN, SYN_REPORT, 0));
@@ -9380,11 +9436,19 @@ mod tests {
         want.push((EV_KEY, BTN_RIGHT, 1));
         want.push((EV_SYN, SYN_REPORT, 0));
         // Hold: touch + TOOL + SYN only, zero button traffic.
-        want.extend(touch_block(0, 0, 9, 9));
+        want.extend(
+            touch_block(0, 0, 9, 9)
+                .into_iter()
+                .filter(|&(_, code, _)| code != ABS_MT_TRACKING_ID),
+        );
         want.extend(tool_double());
         want.push((EV_SYN, SYN_REPORT, 0));
         // Release: latch drops, RIGHT up + SYN. Still no LEFT.
-        want.extend(touch_block(0, 0, 9, 9));
+        want.extend(
+            touch_block(0, 0, 9, 9)
+                .into_iter()
+                .filter(|&(_, code, _)| code != ABS_MT_TRACKING_ID),
+        );
         want.extend(tool_double());
         want.push((EV_KEY, BTN_RIGHT, 0));
         want.push((EV_SYN, SYN_REPORT, 0));
@@ -9495,11 +9559,19 @@ mod tests {
         want.push((EV_KEY, BTN_MIDDLE, 1));
         want.push((EV_SYN, SYN_REPORT, 0));
         // Hold: touch + TOOL + SYN only.
-        want.extend(touch_block());
+        want.extend(
+            touch_block()
+                .into_iter()
+                .filter(|&(_, code, _)| code != ABS_MT_TRACKING_ID),
+        );
         want.extend(tool_triple());
         want.push((EV_SYN, SYN_REPORT, 0));
         // Release: MIDDLE up + SYN. Still no LEFT.
-        want.extend(touch_block());
+        want.extend(
+            touch_block()
+                .into_iter()
+                .filter(|&(_, code, _)| code != ABS_MT_TRACKING_ID),
+        );
         want.extend(tool_triple());
         want.push((EV_KEY, BTN_MIDDLE, 0));
         want.push((EV_SYN, SYN_REPORT, 0));

@@ -166,6 +166,13 @@ USB init on /dev/hidrawN accepted (iface ..., polling [99 F2 23])
 
 - [ ] Pointer + multitouch work immediately (2-finger scroll, 3-finger gestures
       as configured in the compositor). No duplicate cursors.
+- [ ] With enhanced clicks and compositor tap-to-click enabled, rest one
+      finger lightly and repeatedly tap with two, then three additional
+      fingers. There must be no unexpected left click or cursor jump.
+      Check ordinary one/two/three-finger taps and pressure clicks separately.
+      The isolated `proxy::tests::touch_slots` regressions cover contact
+      continuity through hovering arrivals, reordering, liftoff and spoofing;
+      physical testing is still needed to validate the compositor behavior.
 
 ### 2b. `reconnect` on live daemon (udev path)
 
