@@ -30,6 +30,11 @@ hidraw/evdev ──> init (always on) ──> kernel/libinput passthrough (fallb
   (`Arbitrary` vs `Grams`) + `poll_frame()`; Apple MT2 reports `L2p`/`Arbitrary`,
   pressure is the raw byte at 9-byte-block offset 7 (0..=253 valid, arbitrary units).
 - `TouchFrame { fingers: Vec<FingerContact>, clicks /* raw report[1], button = clicks & 1 */, timestamp_ms /* always 0 */ }`.
+- The virtual Type-B stream keeps a touching contact in one slot until
+  liftoff or disappearance. Hovering records and report reordering cannot
+  relocate a resting contact. Each new lifetime gets a fresh tracking ID;
+  continuing touches update axes without restarting the contact. This also
+  applies to the emitted contacts after finger-count spoofing.
 - `EvdevGeneric` (`src/evdev_generic.rs`) is an L0/L1a stub; full decode is future work.
 
 ## Click state machine (spec)
