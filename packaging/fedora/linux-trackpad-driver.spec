@@ -46,6 +46,7 @@ cargo build --locked --release
 install -Dm755 target/release/ltd %{buildroot}%{_bindir}/ltd
 install -Dm644 config/default.toml %{buildroot}%{_sysconfdir}/%{name}/config.toml
 install -Dm644 udev/99-%{name}.rules %{buildroot}%{_udevrulesdir}/99-%{name}.rules
+install -Dm644 libinput/30-%{name}.quirks %{buildroot}%{_datadir}/libinput/30-%{name}.quirks
 install -Dm644 systemd/%{name}.service %{buildroot}%{_unitdir}/%{name}.service
 install -Dm644 systemd/%{name}-reconnect@.service %{buildroot}%{_unitdir}/%{name}-reconnect@.service
 install -Dm644 systemd/%{name}-resume.service %{buildroot}%{_unitdir}/%{name}-resume.service
@@ -79,6 +80,7 @@ fi
 %{_bindir}/ltd
 %config(noreplace) %{_sysconfdir}/%{name}/config.toml
 %{_udevrulesdir}/99-%{name}.rules
+%{_datadir}/libinput/30-%{name}.quirks
 %{_unitdir}/%{name}.service
 %{_unitdir}/%{name}-reconnect@.service
 %{_unitdir}/%{name}-resume.service

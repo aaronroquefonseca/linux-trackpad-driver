@@ -2359,6 +2359,49 @@ pub const UINPUT_VENDOR: u16 = 0x05ac;
 pub const UINPUT_PRODUCT: u16 = 0x0324;
 pub const UINPUT_VERSION: u16 = 1;
 
+/// Virtual device identity mirroring the physical transport.
+///
+/// libinput suspends internal-assumed touchpads on `SW_TABLET_MODE=1` while
+/// external ones survive. The virtual node lives on
+/// `devices/virtual/input/...` with no parent to prove external, so a
+/// USB-bustype virtual for a BT physical (or vice versa) misclassifies and
+/// freezes folded 2-in-1s while native still streams. Mirror bus/vendor/product
+/// from the physical node so the virtual respects the original behaviour:
+/// external stays external, internal stays internal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualIdentity {
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+}
+
+impl Default for VirtualIdentity {
+    fn default() -> Self {
+        Self {
+            bustype: UINPUT_BUSTYPE,
+            vendor: UINPUT_VENDOR,
+            product: UINPUT_PRODUCT,
+        }
+    }
+}
+
+/// Mirror the physical transport: USB keeps `BUS_USB/05ac`, BT uses
+/// `BUS_BLUETOOTH/004c` with the same product ID (0265/0324).
+pub fn virtual_identity_for(transport: crate::init::Transport, product_id: u16) -> VirtualIdentity {
+    match transport {
+        crate::init::Transport::Bluetooth => VirtualIdentity {
+            bustype: 0x05,
+            vendor: 0x004c,
+            product: product_id,
+        },
+        crate::init::Transport::Usb => VirtualIdentity {
+            bustype: UINPUT_BUSTYPE,
+            vendor: UINPUT_VENDOR,
+            product: product_id,
+        },
+    }
+}
+
 /// Which of the two virtual nodes a [`RealUinput`] drives. The pointer
 /// node is the touchpad (MT axes + 9 key bits + `POINTER` prop); extras
 /// is the keyboard outlet (combo codes only, no axes, no prop).
@@ -2583,6 +2626,7 @@ pub struct RealUinput {
     role: UinputRole,
     fd: Mutex<Option<std::fs::File>>,
     created: std::sync::atomic::AtomicBool,
+    identity: Mutex<VirtualIdentity>,
     /// Staged `input_event` bytes, flushed as one `write(2)` per `sync()`
     /// (one frame = one syscall). Pre-create emits are dropped with an
     /// error, never buffered: without a node there is no consumer.
@@ -2616,8 +2660,20 @@ impl RealUinput {
             role,
             fd: Mutex::new(None),
             created: std::sync::atomic::AtomicBool::new(false),
+            identity: Mutex::new(VirtualIdentity::default()),
             staging: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Mirror the physical transport on the virtual node so libinput classifies
+    /// it like the original (external stays external). Must be called before
+    /// `create`; defaults to USB 05ac:0324 for backward compatibility.
+    pub fn set_identity(&self, identity: VirtualIdentity) {
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = identity;
+    }
+
+    pub fn identity(&self) -> VirtualIdentity {
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn role(&self) -> UinputRole {
@@ -2778,9 +2834,10 @@ impl RealUinput {
         if self.is_created() {
             return Ok(());
         }
+        let identity = self.identity();
         let mut guard = self.fd.lock().unwrap_or_else(|e| e.into_inner());
         let fd = Self::open_locked(&mut guard, &self.node)?;
-        let r = Self::create_on(fd, self.role);
+        let r = Self::create_on(fd, self.role, identity);
         if r.is_err() {
             *guard = None;
         } else {
@@ -2800,12 +2857,16 @@ impl RealUinput {
         self.fd.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
-    fn create_on(fd: std::os::unix::io::RawFd, role: UinputRole) -> Result<()> {
+    fn create_on(
+        fd: std::os::unix::io::RawFd,
+        role: UinputRole,
+        identity: VirtualIdentity,
+    ) -> Result<()> {
         let mut setup = UinputSetup {
             id: InputId {
-                bustype: UINPUT_BUSTYPE,
-                vendor: UINPUT_VENDOR,
-                product: UINPUT_PRODUCT,
+                bustype: identity.bustype,
+                vendor: identity.vendor,
+                product: identity.product,
                 version: UINPUT_VERSION,
             },
             name: [0u8; 80],
@@ -4735,6 +4796,42 @@ mod tests {
                 )),
             "extras plan must contain no ABS/prop ops: {plan:?}"
         );
+    }
+
+    #[test]
+    fn virtual_identity_mirrors_physical_transport() {
+        // Folded 2-in-1: virtual must respect the original behaviour —
+        // external stays external (USB 05ac / BT 004c, same PID).
+        let usb = virtual_identity_for(Transport::Usb, 0x0324);
+        assert_eq!(usb.bustype, 0x03);
+        assert_eq!(usb.vendor, 0x05ac);
+        assert_eq!(usb.product, 0x0324);
+        let usb_lightning = virtual_identity_for(Transport::Usb, 0x0265);
+        assert_eq!(usb_lightning.product, 0x0265);
+        let bt = virtual_identity_for(Transport::Bluetooth, 0x0324);
+        assert_eq!(bt.bustype, 0x05);
+        assert_eq!(bt.vendor, 0x004c);
+        assert_eq!(bt.product, 0x0324);
+        let bt_lightning = virtual_identity_for(Transport::Bluetooth, 0x0265);
+        assert_eq!(bt_lightning.product, 0x0265);
+        // Default stays backward compatible (USB-C USB).
+        assert_eq!(
+            VirtualIdentity::default(),
+            VirtualIdentity {
+                bustype: UINPUT_BUSTYPE,
+                vendor: UINPUT_VENDOR,
+                product: UINPUT_PRODUCT,
+            }
+        );
+    }
+
+    #[test]
+    fn real_uinput_identity_defaults_usb_and_updates() {
+        let u = RealUinput::new("/nonexistent-uinput-xyz");
+        assert_eq!(u.identity(), VirtualIdentity::default());
+        u.set_identity(virtual_identity_for(Transport::Bluetooth, 0x0324));
+        assert_eq!(u.identity().bustype, 0x05);
+        assert_eq!(u.identity().vendor, 0x004c);
     }
 
     #[test]

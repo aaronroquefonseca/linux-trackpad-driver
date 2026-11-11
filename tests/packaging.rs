@@ -155,9 +155,11 @@ fn validate_pattern(value: &str) -> Result<(), String> {
 /// Parse the match (`==`) conditions of a rule line. Assignment tokens
 /// (`=`, `+=`, `:=`, `-=` — `TAG+=`, `ENV{SYSTEMD_WANTS}+=`) never gate
 /// matching and are skipped; anything else without `==`/`!=` is malformed.
-/// Only `ACTION`, `SUBSYSTEM`, `KERNELS`, `ATTRS` with `==` and strict
-/// patterns are accepted; everything else is an explicit error so future
-/// rule edits cannot appear covered while the model ignores them.
+/// Only `ACTION`, `SUBSYSTEM`, `KERNELS`, `ATTRS`, and device `ATTR` with
+/// `==` and strict patterns are accepted; everything else is an explicit
+/// error so future rule edits cannot appear covered while the model ignores
+/// them. `ATTR` is device-level (the node itself, e.g. input `name`); `ATTRS`
+/// walks parents.
 fn parse_match_conds(line: &str) -> Result<Vec<Cond>, String> {
     let mut out = Vec::new();
     for token in line.split(',') {
@@ -200,11 +202,11 @@ fn parse_match_conds(line: &str) -> Result<Vec<Cond>, String> {
                     value: value.to_string(),
                 });
             }
-            "ATTRS" => {
+            "ATTR" | "ATTRS" => {
                 let Some(attr) = attr.filter(|a| !a.is_empty()) else {
-                    return Err(format!("ATTRS needs {{attr}}: {token:?}"));
+                    return Err(format!("{key} needs {{attr}}: {token:?}"));
                 };
-                validate_pattern(value).map_err(|e| format!("ATTRS: {e}: {token:?}"))?;
+                validate_pattern(value).map_err(|e| format!("{key}: {e}: {token:?}"))?;
                 out.push(Cond {
                     key,
                     attr: Some(attr),
@@ -213,7 +215,7 @@ fn parse_match_conds(line: &str) -> Result<Vec<Cond>, String> {
             }
             _ => {
                 return Err(format!(
-                    "unsupported match key {key:?} (only ACTION, SUBSYSTEM, KERNELS, ATTRS): {token:?}"
+                    "unsupported match key {key:?} (only ACTION, SUBSYSTEM, KERNELS, ATTRS, ATTR): {token:?}"
                 ));
             }
         }
@@ -225,7 +227,15 @@ fn dev_key_matches(cond: &Cond, d: &FakeDev, action: &str) -> bool {
     match cond.key.as_str() {
         "ACTION" => strict_match(&cond.value, action),
         "SUBSYSTEM" => strict_match(&cond.value, &d.subsystem),
-        _ => panic!("device key must be ACTION or SUBSYSTEM: {}", cond.key),
+        "ATTR" => cond
+            .attr
+            .as_ref()
+            .and_then(|a| d.attrs.get(a))
+            .is_some_and(|v| strict_match(&cond.value, v)),
+        _ => panic!(
+            "device key must be ACTION, SUBSYSTEM, or ATTR: {}",
+            cond.key
+        ),
     }
 }
 
@@ -245,11 +255,12 @@ fn parent_key_matches(cond: &Cond, p: &FakeDev) -> bool {
 /// the rule carries parent keys — every parent key must hold on ONE AND THE
 /// SAME ancestor (systemd udev: "all these keys must match at one and the
 /// same parent device"; multiple `ATTRS` likewise share one device).
+/// `ATTR` is device-level like `ACTION`/`SUBSYSTEM` (the node itself).
 fn rule_matches(line: &str, ev: &FakeEvent) -> bool {
     let conds = parse_match_conds(line).unwrap_or_else(|e| panic!("invalid rule {line:?}: {e}"));
     if conds
         .iter()
-        .filter(|c| c.key == "ACTION" || c.key == "SUBSYSTEM")
+        .filter(|c| c.key == "ACTION" || c.key == "SUBSYSTEM" || c.key == "ATTR")
         .any(|c| !dev_key_matches(c, &ev.node, &ev.action))
     {
         return false;
@@ -331,14 +342,19 @@ fn rules_cover_usb_and_bt_identities_on_hidraw_add() {
     assert!(!repo_file("udev/99-linux-trackpad-driver.rules").is_empty());
     let lines = rule_lines(RULES);
     assert!(!lines.is_empty(), "rules file has no active lines");
-    for line in &lines {
+    let hidraw_lines: Vec<&&str> = lines
+        .iter()
+        .filter(|l| l.contains(r#"SUBSYSTEM=="hidraw""#))
+        .collect();
+    assert_eq!(
+        hidraw_lines.len(),
+        6,
+        "six hidraw rules expected (2 USB + 4 BT): {lines:?}"
+    );
+    for line in &hidraw_lines {
         assert!(
             line.contains(r#"ACTION=="add""#),
             "rule must be add-only: {line}"
-        );
-        assert!(
-            line.contains(r#"SUBSYSTEM=="hidraw""#),
-            "rule must match hidraw: {line}"
         );
     }
     // USB identity: ATTRS pairs on the physical USB parent.
@@ -383,7 +399,10 @@ fn rules_cover_usb_and_bt_identities_on_hidraw_add() {
 
 #[test]
 fn rules_hand_off_to_systemd_without_long_run() {
-    for line in rule_lines(RULES) {
+    for line in rule_lines(RULES)
+        .iter()
+        .filter(|l| l.contains(r#"SUBSYSTEM=="hidraw""#))
+    {
         assert!(
             line.contains(r#"TAG+="systemd""#),
             "rule must tag for systemd: {line}"
@@ -401,16 +420,47 @@ fn rules_hand_off_to_systemd_without_long_run() {
             "never long-run inside udev RUN: {line}"
         );
     }
+    // No rule anywhere may long-run inside udev RUN.
+    for line in rule_lines(RULES) {
+        assert!(
+            !line.contains("RUN+="),
+            "never long-run inside udev RUN: {line}"
+        );
+    }
+}
+
+#[test]
+fn virtual_pointer_tagged_external_like_original() {
+    // Folded 2-in-1: the virtual must inherit the physical integration
+    // (Apple Magic Trackpad 2 is external) so libinput does not suspend it
+    // on SW_TABLET_MODE while native still streams.
+    let lines = rule_lines(RULES);
+    let input_lines: Vec<&&str> = lines
+        .iter()
+        .filter(|l| l.contains(r#"SUBSYSTEM=="input""#))
+        .collect();
+    assert_eq!(input_lines.len(), 1, "one virtual input rule: {lines:?}");
+    let line = input_lines[0];
+    assert!(
+        line.contains(r#"ATTR{name}=="Linux Trackpad Driver""#),
+        "input rule must match the virtual pointer name: {line}"
+    );
+    assert!(
+        line.contains(r#"ENV{ID_INPUT_TOUCHPAD_INTEGRATION}="external""#),
+        "virtual must be tagged external like the original: {line}"
+    );
 }
 
 #[test]
 fn rules_avoid_input_idvendor_trap() {
     for line in rule_lines(RULES) {
         // systemd#37063: ATTRS{idVendor} never matches virtual input nodes.
-        // No input-subsystem matching belongs here at all.
+        // Input-subsystem matching is allowed only for the safe device-ATTR
+        // form (ATTR{name} on the node itself); parent ATTRS on input is
+        // still forbidden.
         assert!(
-            !line.contains(r#"SUBSYSTEM=="input""#),
-            "no input-node matching in this file: {line}"
+            !line.contains(r#"ATTRS{idVendor}"#) || !line.contains(r#"SUBSYSTEM=="input""#),
+            "no ATTRS idVendor on input nodes: {line}"
         );
         assert!(
             !line.contains(r#"SUBSYSTEMS=="input""#),
@@ -550,12 +600,11 @@ fn strict_parser_rejects_unsupported_match_syntax() {
     for bad in [
         // Unsupported operator.
         r#"ACTION!="add", SUBSYSTEM=="hidraw""#,
-        // Unsupported match keys (only ACTION/SUBSYSTEM/KERNELS/ATTRS).
+        // Unsupported match keys (only ACTION/SUBSYSTEM/KERNELS/ATTRS/ATTR).
         r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNEL=="hidraw0""#,
         r#"ACTION=="add", SUBSYSTEM=="hidraw", DRIVER=="usbhid""#,
         r#"ACTION=="add", SUBSYSTEM=="hidraw", SUBSYSTEMS=="usb""#,
         r#"ACTION=="add", SUBSYSTEM=="hidraw", DRIVERS=="usb""#,
-        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTR{name}=="foo""#,
         r#"ACTION=="add", SUBSYSTEM=="hidraw", PROGRAM=="/bin/true""#,
         // Unsupported pattern grammar (only exact or single trailing `*`).
         r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:004C:0324.*|0005:004C:0265.*""#,
@@ -568,19 +617,44 @@ fn strict_parser_rejects_unsupported_match_syntax() {
         // Brace shape errors.
         r#"ACTION=="add", SUBSYSTEM=="hidraw", KERNELS{foo}=="bar""#,
         r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTRS=="05ac""#,
+        r#"ACTION=="add", SUBSYSTEM=="hidraw", ATTR=="foo""#,
     ] {
         assert!(
             parse_match_conds(bad).is_err(),
             "must reject unsupported syntax: {bad}"
         );
     }
-    // Real rule lines must parse (USB ATTRS + BT trailing-star KERNELS).
+    // Real rule lines must parse (USB ATTRS + BT trailing-star KERNELS +
+    // virtual input ATTR name).
     for line in rule_lines(RULES) {
         assert!(
             parse_match_conds(line).is_ok(),
             "real rule must parse: {line}"
         );
     }
+}
+
+#[test]
+fn virtual_pointer_rule_matches_only_our_node() {
+    // The virtual integration rule must fire for the pointer node but not
+    // for unrelated virtual input (extras keyboard outlet has a different
+    // name and must stay untagged).
+    let ours = FakeEvent {
+        action: "add".to_string(),
+        node: dev("event99", "input", &[("name", "Linux Trackpad Driver")]),
+        parents: vec![],
+    };
+    let hits = matching_rules(&ours);
+    assert_eq!(hits.len(), 1, "our virtual pointer must match: {hits:?}");
+    assert!(
+        hits[0].contains("ID_INPUT_TOUCHPAD_INTEGRATION"),
+        "must tag external: {hits:?}"
+    );
+    // Generic virtual input still matches nothing.
+    assert!(
+        matching_rules(&virtual_input_node()).is_empty(),
+        "unrelated virtual input must match no rule"
+    );
 }
 
 #[test]

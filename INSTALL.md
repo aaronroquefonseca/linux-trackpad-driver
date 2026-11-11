@@ -36,9 +36,12 @@ system libraries (all dependencies in `Cargo.toml` are pure Rust plus `libc`).
 
 ```sh
 sudo install -m644 udev/99-linux-trackpad-driver.rules /etc/udev/rules.d/
+sudo install -m644 libinput/30-linux-trackpad-driver.quirks /etc/libinput/local-overrides.quirks.d/30-linux-trackpad-driver.quirks
+# or single-file override: cat libinput/30-linux-trackpad-driver.quirks | sudo tee -a /etc/libinput/local-overrides.quirks
 sudo udevadm control --reload-rules
 # Re-trigger for an already-plugged device (or unplug/replug):
 sudo udevadm trigger --subsystem-match=hidraw --action=add
+sudo udevadm trigger --subsystem-match=input --action=add
 # Watch it fire:
 udevadm monitor --udev --subsystem-match=hidraw
 ```
@@ -222,6 +225,25 @@ sudo udevadm trigger /dev/input/eventX
 ```
 
 See `docs/RESEARCH.md` §3 (`AttrPressureRange`, `AttrPalmPressureThreshold`).
+
+## Folded 2-in-1 (tablet mode)
+
+The virtual pointer mirrors the physical bus/vendor/product
+(`src/proxy.rs` `virtual_identity_for`: USB `05ac`, BT `004c`, same PID), and
+`udev/99-linux-trackpad-driver.rules` tags it
+`ID_INPUT_TOUCHPAD_INTEGRATION=external` like the Apple original plus
+`libinput/30-linux-trackpad-driver.quirks` sets
+`ModelTabletModeNoSuspend=1` on `MatchName=Linux Trackpad Driver`.
+Without those, libinput treats the virtual (no USB parent) as internal and
+suspends it on `SW_TABLET_MODE=1` while native still streams — driver ON
+freezes with clicks/haptics alive. Verify folded:
+
+```sh
+cat /sys/class/dmi/id/chassis_type # 31 = convertible
+evtest --query /dev/input/eventX EV_SW SW_TABLET_MODE; echo $?
+libinput quirks list /dev/input/eventY | grep -i TabletMode
+# virtual pointer must list ModelTabletModeNoSuspend=1
+```
 
 ## Permissions (input/hidraw groups)
 

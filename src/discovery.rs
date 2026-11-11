@@ -461,6 +461,22 @@ pub fn driver_bound_for_node(devnode: &str) -> bool {
     driver_bound_with_root(devnode, &sysfs_class_dir())
 }
 
+/// Product ID for a hidraw node via `HID_ID` uevent (`bus:vid:pid`).
+/// Returns `None` for non-hidraw paths or unreadable/malformed uevent.
+/// Used to mirror the physical product (0265/0324) on the virtual node so
+/// libinput/hwdb classify it like the original.
+pub fn product_id_for_node(devnode: &str) -> Option<u16> {
+    product_id_with_root(devnode, &sysfs_class_dir())
+}
+
+fn product_id_with_root(devnode: &str, class_root: &str) -> Option<u16> {
+    let name = hidraw_name(devnode)?;
+    let text = std::fs::read_to_string(format!("{class_root}/{name}/device/uevent")).ok()?;
+    let hid_id = hid_id_from_uevent(&text)?;
+    let (_, _, pid) = parse_hid_id(&hid_id)?;
+    Some(pid)
+}
+
 fn driver_bound_with_root(devnode: &str, class_root: &str) -> bool {
     let Some(name) = hidraw_name(devnode) else {
         return false;
@@ -657,6 +673,30 @@ mod tests {
         assert_eq!(trailing_int("/dev/input/event2"), Some(2));
         assert_eq!(trailing_int("/dev/hidraw"), None);
         assert_eq!(trailing_int(""), None);
+    }
+
+    #[test]
+    fn product_id_from_fake_sysfs_uevent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("hidraw");
+        std::fs::create_dir_all(root.join("hidraw3/device")).unwrap();
+        std::fs::write(
+            root.join("hidraw3/device/uevent"),
+            "HID_ID=0003:000005AC:00000324\n",
+        )
+        .unwrap();
+        assert_eq!(
+            product_id_with_root("/dev/hidraw3", root.to_str().unwrap()),
+            Some(0x0324)
+        );
+        assert_eq!(
+            product_id_with_root("/dev/input/event2", root.to_str().unwrap()),
+            None
+        );
+        assert_eq!(
+            product_id_with_root("/dev/hidraw9", root.to_str().unwrap()),
+            None
+        );
     }
 
     #[test]

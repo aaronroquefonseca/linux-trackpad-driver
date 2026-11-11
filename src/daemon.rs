@@ -555,11 +555,28 @@ impl DaemonManager {
         // drops combos (pointer-only session, loud log).
         // Bounded: a wedged worker owns the proxy; defer to reconciliation
         // retry instead of hanging the hub callback.
+        // Mirror the physical bus/vendor/product on the virtual so libinput
+        // classifies it like the original (external stays external in
+        // tablet mode, internal stays internal).
+        let identity = {
+            let product = crate::discovery::product_id_for_node(&event.devnode)
+                .unwrap_or(crate::proxy::UINPUT_PRODUCT);
+            crate::proxy::virtual_identity_for(event.transport, product)
+        };
         let created = {
             let Some(px) = lock_bounded(&self.proxy, PROXY_ACQUIRE_TIMEOUT) else {
                 log::warn!("pump: proxy busy, deferring attach for {}", event.devnode);
                 return;
             };
+            px.uinput().pointer().set_identity(identity);
+            px.uinput().extras().set_identity(identity);
+            log::info!(
+                "pump: virtual identity {:04x}:{:04x} (bus {:04x}) for {}",
+                identity.vendor,
+                identity.product,
+                identity.bustype,
+                event.devnode
+            );
             match px.uinput().create_pointer() {
                 Ok(()) => true,
                 Err(e) => {
