@@ -1,0 +1,7 @@
+# libinput quirk: keep the virtual pointer alive in tablet mode like the
+# physical original. The Apple Magic Trackpad 2 is external and survives
+# SW_TABLET_MODE; the virtual node must too. Match the actual uinput name
+# (src/proxy.rs UINPUT_NAME); the Extras keyboard outlet needs no quirk.
+[Linux Trackpad Driver keep active in tablet mode]
+MatchName=Linux Trackpad Driver
+ModelTabletModeNoSuspend=1

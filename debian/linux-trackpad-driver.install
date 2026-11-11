@@ -1,5 +1,6 @@
 target/release/ltd usr/bin
 udev/99-linux-trackpad-driver.rules lib/udev/rules.d
+libinput/30-linux-trackpad-driver.quirks usr/share/libinput
 systemd/linux-trackpad-driver.service lib/systemd/system
 systemd/linux-trackpad-driver-reconnect@.service lib/systemd/system
 systemd/linux-trackpad-driver-resume.service lib/systemd/system
